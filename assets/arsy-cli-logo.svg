@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="ARSY CLI">
+  <rect width="32" height="32" rx="7" fill="#0a0a0a"/>
+  <g fill="none" stroke="#4ade80" stroke-linecap="round" stroke-linejoin="round">
+    <path d="m8.5 9.5 6.5 6.5-6.5 6.5" stroke-width="3.2"/>
+    <path d="M17.5 22.5h6" stroke-width="3.2"/>
+  </g>
+  <g fill="#4ade80">
+    <circle cx="8.5" cy="9.5" r="2.1"/>
+    <circle cx="8.5" cy="22.5" r="2.1"/>
+    <circle cx="23.5" cy="22.5" r="2.1"/>
+  </g>
+  <g fill="#0a0a0a">
+    <circle cx="8.5" cy="9.5" r=".8"/>
+    <circle cx="8.5" cy="22.5" r=".8"/>
+    <circle cx="23.5" cy="22.5" r=".8"/>
+  </g>
+</svg>
