@@ -145,7 +145,7 @@ Mulai lebih kecil daripada target arsitektur:
 ```text
 Cargo.toml
 crates/
-  arsy-cli/
+  arsy-code/
   arsy-core/
   arsy-tui/
 tests/

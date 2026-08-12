@@ -1,23 +1,23 @@
 <p align="center">
-  <img src="assets/arsy-cli-logo.svg" alt="Logo ARSY CLI" width="180" />
+  <img src="assets/arsy-code-logo.svg" alt="Logo ARSY CODE" width="180" />
 </p>
 
-<h1 align="center">ARSY CLI</h1>
+<h1 align="center">ARSY CODE</h1>
 
 <p align="center">
   Harness agent rekayasa perangkat lunak yang lokal, dapat diaudit, dan tidak terikat satu model.
 </p>
 
-**ARSY** adalah core/platform; repository ini berisi **ARSY CLI**, antarmuka terminalnya.
+**ARSY** adalah core/platform; repository ini berisi **ARSY CODE**, antarmuka terminalnya.
 
 > [!IMPORTANT]
-> ARSY CLI masih berada pada tahap desain produk dan arsitektur. CLI belum tersedia untuk digunakan.
+> ARSY CODE masih berada pada tahap desain produk dan arsitektur. CLI belum tersedia untuk digunakan.
 
-## Kenapa ARSY CLI?
+## Kenapa ARSY CODE?
 
 Tool coding agent yang bagus tidak cukup hanya bisa memanggil model dan menjalankan shell. Ia harus memahami aturan repo, menjaga konteks panjang, memilih alat yang tepat, meminta izin pada batas yang benar, mengoordinasikan pekerjaan paralel, dan meninggalkan jejak yang dapat diaudit.
 
-ARSY CLI dirancang sebagai harness terminal-first untuk kebutuhan tersebut:
+ARSY CODE dirancang sebagai harness terminal-first untuk kebutuhan tersebut:
 
 - **Provider-neutral** — model dipilih per tugas tanpa mengubah mesin agent.
 - **Policy-first** — setiap tool call melewati evaluasi izin, sandbox, dan audit log.
@@ -30,7 +30,7 @@ ARSY CLI dirancang sebagai harness terminal-first untuk kebutuhan tersebut:
 
 ```console
 $ arsy
-ARSY CLI · workspace: ~/code/payments · model: auto
+ARSY CODE · workspace: ~/code/payments · model: auto
 
 › telusuri penyebab checkout timeout, buat fix terkecil, lalu jalankan tes terkait
 
@@ -122,4 +122,4 @@ Desain ini mengambil pelajaran dari produk publik tanpa menyalin implementasi at
 - [OpenAI Codex AGENTS.md](https://developers.openai.com/codex/guides/agents-md/) — instruksi proyek berjenjang.
 - [OpenAI Codex MCP](https://developers.openai.com/codex/mcp/) — integrasi tools dan context melalui MCP.
 
-ARSY CLI adalah proyek independen dan tidak berafiliasi dengan Anthropic maupun OpenAI.
+ARSY CODE adalah proyek independen dan tidak berafiliasi dengan Anthropic maupun OpenAI.

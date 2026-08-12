@@ -334,7 +334,7 @@ Remote runner menerima execution envelope yang sudah diputuskan policy. Runner t
 
 ```text
 crates/
-  arsy-cli/        # entrypoint dan headless output
+  arsy-code/        # entrypoint dan headless output
   arsy-tui/        # terminal interface
   arsy-core/       # session, turn, task, contracts
   arsy-models/     # provider adapters
