@@ -93,6 +93,23 @@ impl EventEnvelope {
             payload,
         }
     }
+
+    pub(crate) fn validate_for_append(
+        &self,
+        stream: SessionId,
+        sequence: u64,
+    ) -> Result<(), StoreError> {
+        if self.session != stream {
+            return Err(StoreError::StreamMismatch);
+        }
+        if self.sequence != sequence {
+            return Err(StoreError::InvalidSequence {
+                expected: sequence,
+                actual: self.sequence,
+            });
+        }
+        self.payload.validate()
+    }
 }
 
 pub trait EventStore: Send + Sync {
@@ -154,19 +171,10 @@ impl EventStore for MemoryEventStore {
                 .0
                 .checked_add(offset as u64 + 1)
                 .ok_or(StoreError::SequenceOverflow)?;
-            if event.session != stream {
-                return Err(StoreError::StreamMismatch);
-            }
-            if event.sequence != sequence {
-                return Err(StoreError::InvalidSequence {
-                    expected: sequence,
-                    actual: event.sequence,
-                });
-            }
+            event.validate_for_append(stream, sequence)?;
             if !ids.insert(event.id) {
                 return Err(StoreError::DuplicateEvent(event.id));
             }
-            event.payload.validate()?;
         }
 
         stored.extend(events);
