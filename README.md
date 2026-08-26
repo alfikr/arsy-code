@@ -1,13 +1,13 @@
-<p align="center"><img src="assets/arsy-cli-logo.svg" alt="ARSY CLI logo" width="180" /></p>
-<h1 align="center">ARSY CLI</h1>
+<p align="center"><img src="assets/arsy-code-logo.svg" alt="ARSY CODE logo" width="180" /></p>
+<h1 align="center">ARSY CODE</h1>
 <p align="center">A local, auditable, model-independent software-engineering agent harness.</p>
 
-**ARSY** is the core platform; this repository contains **ARSY CLI**, its terminal interface.
+**ARSY** is the core platform; this repository contains **ARSY CODE**, its terminal interface.
 
 > [!IMPORTANT]
-> ARSY CLI is still in the product and architecture design stage. The CLI is not yet available.
+> ARSY CODE is still in the product and architecture design stage. The CLI is not yet available.
 
-## Why ARSY CLI?
+## Why ARSY CODE?
 
 A capable coding agent needs more than a model connection and shell access. It must understand repository instructions, preserve long-running context, select the right capability, request approval at the correct boundary, coordinate parallel work, and leave an auditable trail.
 
@@ -22,7 +22,7 @@ A capable coding agent needs more than a model connection and shell access. It m
 
 ```console
 $ arsy
-ARSY CLI · workspace: ~/code/payments · model: auto
+ARSY CODE · workspace: ~/code/payments · model: auto
 
 › find the cause of the checkout timeout, make the smallest fix, then run the relevant tests
 
@@ -101,4 +101,4 @@ See the [threat model](docs/29-threat-model.md).
 | CLI implementation | Not started |
 | Stable API | Not available |
 
-ARSY CLI is independent and is not affiliated with Anthropic or OpenAI.
+ARSY CODE is independent and is not affiliated with Anthropic or OpenAI.
