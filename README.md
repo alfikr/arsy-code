@@ -1,57 +1,47 @@
-<p align="center">
-  <img src="assets/arsy-cli-logo.svg" alt="Logo ARSY CLI" width="180" />
-</p>
-
+<p align="center"><img src="assets/arsy-cli-logo.svg" alt="ARSY CLI logo" width="180" /></p>
 <h1 align="center">ARSY CLI</h1>
+<p align="center">A local, auditable, model-independent software-engineering agent harness.</p>
 
-<p align="center">
-  Harness agent rekayasa perangkat lunak yang lokal, dapat diaudit, dan tidak terikat satu model.
-</p>
-
-**ARSY** adalah core/platform; repository ini berisi **ARSY CLI**, antarmuka terminalnya.
+**ARSY** is the core platform; this repository contains **ARSY CLI**, its terminal interface.
 
 > [!IMPORTANT]
-> ARSY CLI masih berada pada tahap desain produk dan arsitektur. CLI belum tersedia untuk digunakan.
+> ARSY CLI is still in the product and architecture design stage. The CLI is not yet available.
 
-## Kenapa ARSY CLI?
+## Why ARSY CLI?
 
-Tool coding agent yang bagus tidak cukup hanya bisa memanggil model dan menjalankan shell. Ia harus memahami aturan repo, menjaga konteks panjang, memilih alat yang tepat, meminta izin pada batas yang benar, mengoordinasikan pekerjaan paralel, dan meninggalkan jejak yang dapat diaudit.
+A capable coding agent needs more than a model connection and shell access. It must understand repository instructions, preserve long-running context, select the right capability, request approval at the correct boundary, coordinate parallel work, and leave an auditable trail.
 
-ARSY CLI dirancang sebagai harness terminal-first untuk kebutuhan tersebut:
+- **Provider-neutral** — select models per task without changing the runtime.
+- **Policy-first** — every effect passes through permission evaluation, sandboxing, and audit.
+- **Durable** — sessions, events, operation results, and checkpoints survive restarts.
+- **Composable** — support operations, MCP, skills, hooks, and `AGENTS.md`.
+- **Multi-agent** — represent work as a dependency graph with explicit budgets and concurrency limits.
+- **Observable** — keep tokens, cost, latency, edits, approvals, and verification traceable.
 
-- **Provider-neutral** — model dipilih per tugas tanpa mengubah mesin agent.
-- **Policy-first** — setiap tool call melewati evaluasi izin, sandbox, dan audit log.
-- **Durable** — sesi, event, hasil tool, dan checkpoint dapat dilanjutkan setelah proses berhenti.
-- **Composable** — dukungan bawaan untuk tools, MCP, skills, hooks, dan instruksi `AGENTS.md`.
-- **Multi-agent** — pekerjaan dapat dipecah menjadi DAG dengan budget dan batas konkurensi yang jelas.
-- **Observable** — penggunaan token, biaya, latensi, perubahan file, approval, dan hasil verifikasi dapat ditelusuri.
-
-## Pengalaman yang dituju
+## Intended experience
 
 ```console
 $ arsy
 ARSY CLI · workspace: ~/code/payments · model: auto
 
-› telusuri penyebab checkout timeout, buat fix terkecil, lalu jalankan tes terkait
+› find the cause of the checkout timeout, make the smallest fix, then run the relevant tests
 
-  ✓ membaca AGENTS.md dan status git
-  ✓ memetakan alur request checkout
-  ! perlu izin: menjalankan integration test dengan akses network lokal
+  ✓ read AGENTS.md and Git status
+  ✓ mapped the checkout request flow
+  ! approval required: run integration tests with local network access
   → approve once / approve rule / deny
 ```
 
-Mode penggunaan yang direncanakan:
-
 ```console
-arsy                         # TUI interaktif
-arsy run "perbaiki bug #42" # eksekusi non-interaktif
-arsy resume <session-id>     # lanjutkan sesi
-arsy review                  # review perubahan lokal
-arsy mcp list                # kelola integrasi MCP
-arsy doctor                  # diagnosis environment
+arsy                         # interactive TUI
+arsy run "fix bug #42"      # non-interactive execution
+arsy resume <session-id>     # resume a session
+arsy review                  # review local changes
+arsy mcp list                # manage MCP integrations
+arsy doctor                  # diagnose the environment
 ```
 
-## Arsitektur singkat
+## Architecture at a glance
 
 ```mermaid
 flowchart LR
@@ -60,8 +50,8 @@ flowchart LR
     S --> O[Agent Orchestrator]
     O --> M[Model Gateway]
     O --> P[Policy Engine]
-    P --> T[Tool Runtime]
-    T --> L[Local tools]
+    P --> T[Operation Runtime]
+    T --> L[Local capabilities]
     T --> X[MCP servers]
     T --> R[Remote runners]
     S --> E[(SQLite event log)]
@@ -69,57 +59,46 @@ flowchart LR
     T --> E
 ```
 
-Mesin inti menggunakan event log sebagai sumber kebenaran. Model hanya mengusulkan aksi; policy engine yang memutuskan apakah aksi boleh langsung berjalan, harus di-sandbox, memerlukan persetujuan, atau ditolak.
+The immutable event log is the source of truth. Models propose actions; policy decides whether they may run directly, require sandboxing or approval, or must be denied.
 
-## Dokumen desain
+## Design documents
 
-- [Dokumen produk](docs/PRODUCT.md) — pengguna, ruang lingkup, fitur, roadmap, dan metrik.
-- [Arsitektur](docs/ARCHITECTURE.md) — komponen, alur turn, keamanan, data, dan kegagalan.
-- [Tech stack](docs/TECH_STACK.md) — pilihan teknologi, struktur repo, dan urutan implementasi.
+- [Complete architecture specification](docs/INDEX.md)
+- [Product requirements](docs/02-product-requirements.md)
+- [System architecture](docs/04-system-architecture.md)
+- [Rust workspace and technology choices](docs/05-rust-workspace.md)
+- [Competitive research](docs/01-competitive-research.md) and [claim ledger](docs/report-source.md)
+- [Accepted ADRs](docs/ADR/)
 
 ## Target MVP
 
-MVP sengaja dibatasi pada satu agent lokal yang solid:
+1. Interactive TUI and non-interactive execution.
+2. Official Anthropic and OpenAI API adapters.
+3. File, search, patch, shell, and read-only Git operations.
+4. Hierarchical instructions through `AGENTS.md`.
+5. Approval policy, workspace sandbox, and audit log.
+6. Persistent sessions, resume, context compaction, and token/cost summaries.
+7. MCP client support for stdio and Streamable HTTP.
 
-1. TUI interaktif dan mode non-interaktif.
-2. Adapter model Anthropic dan OpenAI melalui API resmi.
-3. Tools file, pencarian, patch, shell, dan git read-only.
-4. Instruksi berjenjang melalui `AGENTS.md`.
-5. Approval policy, sandbox workspace, dan audit log.
-6. Sesi persisten, resume, compaction, serta ringkasan biaya/token.
-7. MCP client untuk STDIO dan Streamable HTTP.
+Multi-agent orchestration, remote runners, plugin marketplaces, and a default daemon remain gated on a measured, stable single-agent foundation.
 
-Multi-agent, remote runners, plugin marketplace, dan daemon masuk setelah fondasi single-agent terukur stabil.
+## Security principles
 
-## Prinsip keamanan
+- Model and operation output is always untrusted.
+- Read and write are separate capabilities.
+- Network, filesystem, process, and credentials have separate policies.
+- Destructive commands cannot rely on generic approval.
+- Secrets never enter prompts or event logs.
+- Every external effect has an operation ID, status, and result evidence.
 
-- Output model dan tool selalu dianggap tidak tepercaya.
-- Read dan write adalah capability berbeda.
-- Network, filesystem, process, dan credential memiliki policy terpisah.
-- Perintah destruktif tidak boleh lolos lewat approval generik.
-- Secret tidak dimasukkan ke prompt atau event log.
-- Setiap side effect memiliki `call_id`, status, dan bukti hasil.
-
-Detail threat model tersedia di [dokumen arsitektur](docs/ARCHITECTURE.md#model-keamanan).
+See the [threat model](docs/29-threat-model.md).
 
 ## Status
 
 | Area | Status |
-| --- | --- |
-| Product brief | Selesai |
-| Arsitektur awal | Selesai |
-| Tech stack | Selesai |
-| Implementasi CLI | Belum dimulai |
-| API stabil | Belum tersedia |
+|---|---|
+| Product and architecture specification | Complete |
+| CLI implementation | Not started |
+| Stable API | Not available |
 
-## Referensi
-
-Desain ini mengambil pelajaran dari produk publik tanpa menyalin implementasi atau identitasnya:
-
-- [Claude Code](https://github.com/anthropics/claude-code) — terminal-first coding agent dan ekosistem plugin.
-- [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage) — pola sesi dan mode non-interaktif.
-- [OpenAI Codex configuration](https://developers.openai.com/codex/config-basic/) — konfigurasi berlapis, approval, dan sandbox.
-- [OpenAI Codex AGENTS.md](https://developers.openai.com/codex/guides/agents-md/) — instruksi proyek berjenjang.
-- [OpenAI Codex MCP](https://developers.openai.com/codex/mcp/) — integrasi tools dan context melalui MCP.
-
-ARSY CLI adalah proyek independen dan tidak berafiliasi dengan Anthropic maupun OpenAI.
+ARSY CLI is independent and is not affiliated with Anthropic or OpenAI.
