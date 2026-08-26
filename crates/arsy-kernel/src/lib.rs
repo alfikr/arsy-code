@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod domain;
 pub mod event;
+pub mod projection;
 pub mod sqlite;
 
 /// Workspace package version.
