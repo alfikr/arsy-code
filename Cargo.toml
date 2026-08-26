@@ -9,6 +9,11 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/suiflex/arsy-code"
 
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["serde", "v4"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
