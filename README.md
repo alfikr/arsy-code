@@ -101,4 +101,6 @@ See the [threat model](docs/29-threat-model.md).
 | CLI implementation | Not started |
 | Stable API | Not available |
 
-ARSY CODE is independent and is not affiliated with Anthropic or OpenAI.
+## License
+
+ARSY CODE is an independent open-source project licensed under the [MIT License](LICENSE). It is not affiliated with Anthropic or OpenAI.
