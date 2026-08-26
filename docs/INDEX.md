@@ -2,7 +2,7 @@
 
 Status: implementation-ready design baseline, 2026-08-26. Runtime implementation is intentionally out of scope.
 
-Start with [vision](00-vision.md), [research](01-competitive-research.md), [architecture](04-system-architecture.md), and [roadmap](31-roadmap.md). Evidence and pinned revisions live in [report-source.md](report-source.md). Existing Indonesian product notes and ADRs remain historical inputs; where they conflict, this numbered set and accepted records in `ADR/` govern.
+Start with [vision](00-vision.md), [research](01-competitive-research.md), [architecture](04-system-architecture.md), and [roadmap](31-roadmap.md). Evidence and pinned revisions live in [report-source.md](report-source.md). Where documents conflict, this numbered set and accepted records in `ADR/` govern.
 
 | Area | Documents |
 |---|---|
