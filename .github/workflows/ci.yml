@@ -30,6 +30,8 @@ jobs:
         run: cargo +1.85.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo +1.85.0 test --workspace --all-features --locked
+      - name: Compatibility fixtures
+        run: python3 fixtures/compat/check.py
 
   dependencies:
     name: Advisories and licenses

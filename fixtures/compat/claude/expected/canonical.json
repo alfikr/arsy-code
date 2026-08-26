@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "fixture": "claude",
+  "ecosystem": "claude",
+  "coverage": ["nested_instructions", "settings_precedence", "skills", "hooks", "agents", "plugins", "mcp"],
+  "instructions": [
+    {"source": "input/CLAUDE.md", "scope": ".", "precedence": 0, "level": "mapped"},
+    {"source": "input/services/payments/CLAUDE.md", "scope": "services/payments", "precedence": 1, "level": "mapped"}
+  ],
+  "settings": {
+    "sources": ["input/.claude/settings.json", "input/.claude/settings.local.json"],
+    "model": "claude-opus-4-1",
+    "allow": ["fs.read:**"],
+    "deny": ["process.exec:rm:*"],
+    "repository_can_grant": false
+  },
+  "skills": [
+    {"source": "input/.claude/skills/review/SKILL.md", "name": "review", "level": "mapped"}
+  ],
+  "hooks": [
+    {"source": "input/.claude/settings.json", "event": "before_operation", "matcher": "process.exec", "effect": "external_command", "level": "mapped"}
+  ],
+  "agents": [
+    {"source": "input/.claude/agents/reviewer.md", "name": "reviewer", "requested_operations": ["fs.read", "search.text"], "authority": "request-only", "level": "mapped"}
+  ],
+  "plugins": [
+    {"source": "input/.claude-plugin/plugin.json", "name": "fixture-audit", "version": "1.0.0", "code_execution": "quarantined", "level": "parsed"}
+  ],
+  "mcp": [
+    {"source": "input/.mcp.json", "name": "docs", "transport": "stdio", "command": "node", "args": ["docs-server.js"], "trust": "untrusted", "level": "mapped"}
+  ]
+}

@@ -13,6 +13,8 @@ Start with [vision](00-vision.md), [research](01-competitive-research.md), [arch
 | Protocols and compatibility | [20](20-protocols.md), [21](21-compatibility-claude.md), [22](22-compatibility-codex.md), [23](23-compatibility-omp.md), [24](24-mcp-acp.md), [25](25-ide-integration.md) |
 | Quality | [26](26-observability.md), [27](27-evaluation-benchmarks.md), [28](28-performance.md), [29](29-threat-model.md), [30](30-testing-strategy.md), [31](31-roadmap.md), [32](32-critic-review.md), [33](33-diagnostics.md), [34](34-distribution.md) |
 
+Golden compatibility inputs and expected loss reports live in the [fixture corpus](../fixtures/compat/README.md).
+
 ## Evidence notation
 
 - **V** — verified in source at a pinned revision.

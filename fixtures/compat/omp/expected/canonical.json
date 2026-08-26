@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "fixture": "omp",
+  "ecosystem": "omp",
+  "coverage": ["nested_instructions", "settings_precedence", "skills", "agents", "plugins", "mcp"],
+  "instructions": [
+    {"source": "input/packages/api/.omp/AGENTS.md", "scope": "packages/api", "precedence": 0, "level": "behavior-tested"}
+  ],
+  "settings": {
+    "sources": ["input/packages/api/.omp/config.yml"],
+    "model_roles": {"review": "openai/gpt-5:high"},
+    "skills_enabled": true,
+    "repository_can_grant": false
+  },
+  "skills": [
+    {"source": "input/packages/api/.omp/skills/review/SKILL.md", "name": "review", "level": "behavior-tested"}
+  ],
+  "hooks": [],
+  "agents": [
+    {"source": "input/packages/api/.omp/agents/reviewer.md", "name": "reviewer", "model_role": "review", "requested_operations": ["fs.read", "search.text"], "authority": "request-only", "level": "mapped"}
+  ],
+  "plugins": [
+    {"source": "input/packages/api/.omp/extensions/audit.ts", "name": "fixture-audit", "code_execution": "quarantined", "level": "parsed"}
+  ],
+  "mcp": [
+    {"source": "input/packages/api/.omp/mcp.json", "name": "docs", "transport": "stdio", "command": "node", "args": ["docs-server.js"], "trust": "untrusted", "level": "behavior-tested"}
+  ]
+}
