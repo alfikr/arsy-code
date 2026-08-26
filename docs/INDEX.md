@@ -6,7 +6,7 @@ Start with [vision](00-vision.md), [research](01-competitive-research.md), [arch
 
 | Area | Documents |
 |---|---|
-| Product | [00](00-vision.md), [02](02-product-requirements.md), [03](03-design-principles.md), [35](35-configuration.md) |
+| Product | [00](00-vision.md), [02](02-product-requirements.md), [03](03-design-principles.md), [35](35-configuration.md), [36](36-cli-tui.md) |
 | Core runtime | [04](04-system-architecture.md), [05](05-rust-workspace.md), [06](06-agent-runtime.md), [07](07-context-engine.md), [08](08-prompt-compiler.md), [09](09-model-provider-layer.md), [10](10-tool-capability-system.md) |
 | Code and execution | [11](11-code-intelligence.md), [12](12-edit-engine.md), [13](13-execution-runtime.md), [14](14-security-sandbox.md), [15](15-policy-permissions.md) |
 | State and agents | [16](16-session-persistence.md), [17](17-memory-knowledge.md), [18](18-agent-orchestration.md), [19](19-plugin-extension-system.md) |
