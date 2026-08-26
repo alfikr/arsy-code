@@ -1,0 +1,19 @@
+[package]
+name = "arsy-code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+dap = []
+wasm = []
+remote-transports = []
+
+[dependencies]
+arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
+
+[lints]
+workspace = true

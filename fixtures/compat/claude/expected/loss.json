@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "fixture": "claude",
+  "losses": [
+    {
+      "source": "input/.claude-plugin/plugin.json",
+      "concept": "plugin_code_execution",
+      "level": "unsupported",
+      "reason": "Plugin declarations are imported, but JavaScript entrypoints never execute in the core."
+    },
+    {
+      "source": "input/.claude/settings.json",
+      "concept": "hook_command_execution",
+      "level": "mapped",
+      "reason": "The lifecycle mapping is preserved; execution still requires an explicit operation policy grant."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "docs": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["docs-server.js"],
+      "enabled": true
+    }
+  }
+}

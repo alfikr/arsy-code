@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/arsy-kernel", "crates/arsy-code", "crates/arsy-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/suiflex/arsy-code"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"

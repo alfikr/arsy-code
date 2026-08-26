@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "fixture": "codex",
+  "losses": [
+    {
+      "source": "input/.codex/config.toml",
+      "concept": "workspace_write_sandbox",
+      "level": "mapped",
+      "reason": "The request maps only when the local backend can provide equal or stronger confinement."
+    }
+  ]
+}

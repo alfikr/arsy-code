@@ -1,0 +1,6 @@
+modelRoles:
+  review: openai/gpt-5:high
+skills:
+  enabled: true
+extensions:
+  - ./.omp/extensions/audit.ts

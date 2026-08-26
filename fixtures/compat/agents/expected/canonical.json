@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "fixture": "agents",
+  "ecosystem": "agents-md",
+  "coverage": ["nested_instructions"],
+  "instructions": [
+    {"source": "input/AGENTS.md", "scope": ".", "precedence": 0, "level": "behavior-tested"},
+    {"source": "input/services/AGENTS.md", "scope": "services", "precedence": 1, "level": "behavior-tested"},
+    {"source": "input/services/payments/AGENTS.override.md", "scope": "services/payments", "precedence": 2, "level": "behavior-tested"}
+  ],
+  "settings": {},
+  "skills": [],
+  "hooks": [],
+  "agents": [],
+  "plugins": [],
+  "mcp": []
+}

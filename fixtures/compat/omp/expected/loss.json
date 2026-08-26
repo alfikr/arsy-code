@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "fixture": "omp",
+  "losses": [
+    {
+      "source": "input/.omp/AGENTS.md",
+      "concept": "farther_native_context",
+      "level": "behavior-tested",
+      "reason": "OMP nearest non-empty native discovery intentionally shadows the farther root file."
+    },
+    {
+      "source": "input/packages/api/.omp/extensions/audit.ts",
+      "concept": "typescript_extension_execution",
+      "level": "unsupported",
+      "reason": "TypeScript extensions never execute inside the ARSY core."
+    }
+  ]
+}

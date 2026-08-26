@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "fixture": "codex",
+  "ecosystem": "codex",
+  "coverage": ["nested_instructions", "settings_precedence", "skills", "mcp"],
+  "instructions": [
+    {"source": "input/AGENTS.md", "scope": ".", "precedence": 0, "level": "behavior-tested"},
+    {"source": "input/services/api/AGENTS.override.md", "scope": "services/api", "precedence": 1, "level": "behavior-tested"}
+  ],
+  "settings": {
+    "sources": ["input/.codex/config.toml"],
+    "provider": "openai",
+    "model": "gpt-5",
+    "approval_default": "ask",
+    "sandbox_request": "workspace-write",
+    "mapping_requirement": "equal-or-stronger",
+    "repository_can_grant": false
+  },
+  "skills": [
+    {"source": "input/.codex/skills/review/SKILL.md", "name": "review", "level": "mapped"}
+  ],
+  "hooks": [],
+  "agents": [],
+  "plugins": [],
+  "mcp": [
+    {"source": "input/.codex/config.toml", "name": "docs", "transport": "stdio", "command": "node", "args": ["docs-server.js"], "trust": "untrusted", "level": "mapped"}
+  ]
+}
