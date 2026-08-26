@@ -11,7 +11,7 @@ Start with [vision](00-vision.md), [research](01-competitive-research.md), [arch
 | Code and execution | [11](11-code-intelligence.md), [12](12-edit-engine.md), [13](13-execution-runtime.md), [14](14-security-sandbox.md), [15](15-policy-permissions.md) |
 | State and agents | [16](16-session-persistence.md), [17](17-memory-knowledge.md), [18](18-agent-orchestration.md), [19](19-plugin-extension-system.md) |
 | Protocols and compatibility | [20](20-protocols.md), [21](21-compatibility-claude.md), [22](22-compatibility-codex.md), [23](23-compatibility-omp.md), [24](24-mcp-acp.md), [25](25-ide-integration.md) |
-| Quality | [26](26-observability.md), [27](27-evaluation-benchmarks.md), [28](28-performance.md), [29](29-threat-model.md), [30](30-testing-strategy.md), [31](31-roadmap.md), [32](32-critic-review.md) |
+| Quality | [26](26-observability.md), [27](27-evaluation-benchmarks.md), [28](28-performance.md), [29](29-threat-model.md), [30](30-testing-strategy.md), [31](31-roadmap.md), [32](32-critic-review.md), [33](33-diagnostics.md) |
 
 ## Evidence notation
 
