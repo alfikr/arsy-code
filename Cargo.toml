@@ -13,7 +13,9 @@ repository = "https://github.com/suiflex/arsy-code"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
+sha2 = "=0.11.0"
 uuid = { version = "1.0", features = ["serde", "v4"] }
+zstd = { version = "=0.13.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

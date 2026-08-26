@@ -52,6 +52,7 @@ id_type!(AgentId);
 id_type!(OperationId);
 id_type!(EventId);
 id_type!(CorrelationId);
+id_type!(ArtifactId);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]

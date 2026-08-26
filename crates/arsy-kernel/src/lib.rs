@@ -1,5 +1,6 @@
 //! Pure domain types shared by ARSY components.
 
+pub mod artifact;
 pub mod domain;
 pub mod event;
 pub mod sqlite;
