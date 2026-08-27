@@ -25,6 +25,7 @@ Fuzz protocol/config/patch parsers, permission patterns, model tool inputs and s
 6. Redaction is idempotent and secrets never cross marked sinks.
 7. Projection rebuild equals incremental projection.
 8. Schema migrations either commit fully or preserve the old store.
+9. Reconnect and refresh cannot widen authority: a reconnected connection or reloaded extension never gains a capability its previous grant did not include.
 
 ## CI and platform matrix
 
