@@ -6,6 +6,7 @@ pub mod domain;
 pub mod event;
 pub mod migrate;
 pub mod operation;
+pub mod policy;
 pub mod projection;
 pub mod sqlite;
 
