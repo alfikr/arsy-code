@@ -31,7 +31,7 @@ flowchart LR
 
 ## Safety and fidelity
 
-Repository configuration is untrusted and cannot grant itself capabilities. Hooks cannot bypass denial. Commands and model fields are parsed as data, never interpolated into a shell without policy. Unknown keys produce diagnostics; security-sensitive unknowns fail closed. `arsy compat explain claude` should show source, precedence, canonical mapping, and loss.
+Repository configuration is untrusted and cannot grant itself capabilities. Hooks cannot bypass denial. Commands and model fields are parsed as data, never interpolated into a shell without policy. Unknown keys produce diagnostics; security-sensitive unknowns fail closed. [`arsy compat explain claude`](36-cli-tui.md) shows source, precedence, canonical mapping, and loss.
 
 ## Acceptance and open questions
 

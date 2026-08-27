@@ -30,7 +30,7 @@ pub struct ProtocolEnvelope<T> {
 
 ## Transport
 
-The semantic protocol is transport-neutral. Initial transports are stdio JSON lines for embedding and Unix socket/named pipe for local daemon. WebSocket serves remote/event-stream clients after authentication. gRPC is deferred until streaming/interoperability evidence outweighs schema duplication.
+The semantic protocol is transport-neutral. Initial transports are stdio JSON lines for embedding and Unix socket/named pipe for local daemon; [`arsy serve`](36-cli-tui.md) is the entry point and defaults to stdio. WebSocket serves remote/event-stream clients after authentication. gRPC is deferred until streaming/interoperability evidence outweighs schema duplication.
 
 ```mermaid
 graph LR

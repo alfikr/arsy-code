@@ -14,7 +14,7 @@ flowchart LR
   B --> SS[MCP server adapter] --> EX[External MCP client]
 ```
 
-Support stdio and Streamable HTTP first; legacy SSE only behind compatibility demand. Negotiate capabilities, correlate requests, bound messages/timeouts, support cancellation/progress, authenticate HTTP, and require policy for sampling/elicitation/tool effects. Resources become external-resource references and artifacts; annotations remain untrusted. MCP Apps render in a sandboxed UI origin with a mediated bridge.
+Support stdio and Streamable HTTP first; legacy SSE only behind compatibility demand. Connections are managed through [`arsy mcp`](36-cli-tui.md), whose `test` subcommand negotiates capabilities without invoking a tool. Negotiate capabilities, correlate requests, bound messages/timeouts, support cancellation/progress, authenticate HTTP, and require policy for sampling/elicitation/tool effects. Resources become external-resource references and artifacts; annotations remain untrusted. MCP Apps render in a sandboxed UI origin with a mediated bridge.
 
 ## ACP design
 

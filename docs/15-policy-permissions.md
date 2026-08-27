@@ -48,7 +48,7 @@ sequenceDiagram
 
 ## Security and failure
 
-Rules compile to a deterministic normalized form and return an explanation trace. Glob/path/command parsers are fuzzed. Approval is bound to exact operation digest and expires on mutation. Cached grants cannot exceed their original constraints. Hooks can deny or request approval but cannot grant authority.
+Rules compile to a deterministic normalized form and return an explanation trace, which [`arsy policy explain`](36-cli-tui.md) prints without executing the operation. Glob/path/command parsers are fuzzed. Approval is bound to exact operation digest and expires on mutation. Cached grants cannot exceed their original constraints. Hooks can deny or request approval but cannot grant authority.
 
 ## Compatibility
 

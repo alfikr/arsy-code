@@ -37,7 +37,7 @@ Lifecycle events include harness/session/turn/model/operation/edit/command/commi
 
 ## Security, compatibility, versioning
 
-Signatures establish publisher identity, not safety. Install shows requested capabilities; updates cannot expand them silently. Claude/OMP plugins are parsed into declarative pieces; unsupported executable behavior is quarantined or requires an external compatibility runner. Plugin API versions independently; host imports are capability- and version-negotiated.
+Signatures establish publisher identity, not safety. Install shows requested capabilities; updates cannot expand them silently. [`arsy plugin`](36-cli-tui.md) surfaces install, inspection, and removal, and `arsy skill list` and `arsy hook list` report what is loaded. Claude/OMP plugins are parsed into declarative pieces; unsupported executable behavior is quarantined or requires an external compatibility runner. Plugin API versions independently; host imports are capability- and version-negotiated.
 
 ## Decision
 

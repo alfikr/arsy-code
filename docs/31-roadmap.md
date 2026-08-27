@@ -21,7 +21,7 @@ Persistence, protocol, policy, artifacts, and evals precede autonomy. Sandboxing
 
 ## Migration and versioning
 
-Version CLI releases with SemVer; protocol, config, plugin API, session schema, and each compatibility adapter carry independent versions/capabilities. Migrations are explicit commands with backup, dry-run, loss report, and rollback guidance. Old sessions are never silently rewritten.
+Version CLI releases with SemVer; protocol, config, plugin API, session schema, and each compatibility adapter carry independent versions/capabilities. Migrations are explicit commands with backup, dry-run, loss report, and rollback guidance; [`arsy migrate`](36-cli-tui.md) reports without writing unless `--apply` is given. Old sessions are never silently rewritten.
 
 ## First implementation slice
 
