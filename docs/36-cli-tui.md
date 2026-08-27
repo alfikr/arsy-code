@@ -69,6 +69,8 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy mcp remove <NAME>` | one connection name | `--scope <user\|workspace>` | remove a connection definition from the named scope | 5 |
 | `arsy mcp enable <NAME>` / `arsy mcp disable <NAME>` | one connection name | `--scope <user\|workspace>` | toggle a connection without deleting its definition | 5 |
 | `arsy mcp test <NAME>` | one connection name | `--timeout <SECONDS>` | connect, negotiate capabilities, and disconnect; never invokes a tool | 5 |
+| `arsy mcp reconnect <NAME>` | one connection name, or none with `--all` | `--all`, `--timeout <SECONDS>` | restore a dropped live connection and re-apply its capability ceiling | 5 |
+| `arsy mcp refresh <NAME>` | one connection name, or none with `--all` | `--all` | re-run tool, resource, and prompt discovery without tearing the connection down | 5 |
 
 ### Extensions
 
@@ -78,6 +80,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy plugin install <SOURCE>` | one path or registry reference | `--scope <user\|workspace>` | display the requested capabilities and install only on explicit confirmation | 8 |
 | `arsy plugin inspect <ID>` | one plugin ID | global flags | show the manifest, requested and granted capabilities, limits, and publisher identity | 8 |
 | `arsy plugin remove <ID>` | one plugin ID | `--force` | uninstall a plugin and revoke its grants | 8 |
+| `arsy plugin refresh [ID]` | optional plugin ID; omitted refreshes every source | `--dry-run` | reload plugins, skills, and hooks from their sources, effective at the next turn boundary | 8 |
 | `arsy skill list` | none | `--source` | list loaded skills with their originating layer and authority class | 5 |
 | `arsy hook list` | none | `--event <NAME>` | list registered hooks with lifecycle event, declared effect class, and origin | 8 |
 
@@ -109,6 +112,15 @@ interactive TTY and otherwise defaults off.
 `arsy auth set` never accepts a secret as an argument, because arguments reach the process list and
 shell history. When no credential store is available it fails; it never falls back to plaintext
 storage. No command prints a stored secret in any output mode.
+
+`arsy mcp reconnect` repairs a live connection and re-applies its capability ceiling; `arsy mcp test`
+is a separate probe that connects and disconnects without touching the session. Neither accepts a
+capability the connection did not already hold: a tool that appears only after reconnecting and falls
+outside the ceiling is rejected, not adopted.
+
+`arsy plugin refresh` reloads plugins, skills, and hooks, takes effect at the next turn boundary
+rather than immediately, and refuses any source whose manifest requests wider capabilities than were
+approved at install. `--dry-run` reports what would change and loads nothing.
 
 `arsy migrate` and `arsy gc` report without writing unless `--apply` is given, so a forgotten flag
 cannot destroy data. `arsy migrate` takes a verified backup before applying and leaves the original
