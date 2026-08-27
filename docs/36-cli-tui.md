@@ -21,16 +21,105 @@ Unknown flags, missing arguments, invalid UTF-8, and invalid enum values are usa
 
 ## Commands
 
-| Command | Positional arguments | Command flags | Description |
-|---|---|---|---|
-| `arsy` | none | global flags | open the interactive TUI in the workspace |
-| `arsy run <TASK>` | one required task string; `-` reads it from stdin | global flags | execute one task non-interactively and exit at its terminal state |
-| `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested |
-| `arsy review [REVISION]` | optional Git revision; omitted means the working-tree diff | `--base <REVISION>` plus global flags | produce a structured review without modifying the workspace |
-| `arsy mcp list` | none | global flags | list configured MCP connections, transports, trust labels, and enabled state without connecting |
-| `arsy doctor` | none | `--strict` plus global flags | check configuration, credentials by handle, sandbox backends, Git, providers without a billable request, and release provenance; `--strict` turns warnings into failure |
+Every command accepts the global flags above and honours the output modes and exit codes below.
+**Availability** names the roadmap phase that first ships the command; a command listed here but not
+yet available exits `2` with an `ARSY-SCH-*` diagnostic naming its phase, never a generic parse error.
 
-`arsy mcp` without `list` prints its help and exits with usage status. `--base` is invalid unless `REVISION` is absent. `resume --follow` is implied in an interactive TTY and otherwise defaults off. Review and doctor are read-only; provider checks are non-destructive capability probes.
+Commands whose name is `list`, `show`, `explain`, `inspect`, or `test`, plus `doctor` and `eval`, are
+read-only: they never mutate the workspace, session history, or stored configuration.
+
+### Session
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy` | none | global flags | open the interactive TUI in the workspace | 2 |
+| `arsy run <TASK>` | one required task string; `-` reads it from stdin | global flags | execute one task non-interactively and exit at its terminal state | 1 |
+| `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
+| `arsy review [REVISION]` | optional Git revision; omitted means the working-tree diff | `--base <REVISION>` plus global flags | produce a structured review without modifying the workspace | 6 |
+| `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |
+| `arsy session show <SESSION_ID>` | one required session ID | `--turns`, `--evidence` | show turns, recorded evidence, approvals, and totals for one session | 1 |
+| `arsy session export <SESSION_ID>` | one required session ID | `--out <PATH>`, `--include-artifacts` | export canonical events as JSONL for audit or forensic review | 1 |
+| `arsy session rewind <SESSION_ID>` | one required session ID | `--to <EVENT_ID>` required | create a new branch pointing at an earlier event; never truncates history | 1 |
+| `arsy session fork <SESSION_ID>` | one required session ID | `--at <EVENT_ID>` | start a new session recording ancestry from an existing one | 1 |
+
+### Configuration and policy
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy config explain [KEY]` | optional dotted key; omitted explains every key | `--source-only` | show the effective value, the layer that supplied it, the merge strategy, and the rejected candidates | 1 |
+| `arsy compat explain <ECOSYSTEM>` | one of `claude`, `codex`, `omp` | `--loss-only` | show discovered sources, precedence, canonical mapping, and the loss report | 5 |
+| `arsy policy explain <OPERATION>` | one canonical operation kind | `--resource <REF>`, `--actor <ID>` | evaluate a policy query and print the decision, deciding rule, and policy source without executing anything | 1 |
+
+### Credentials and models
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in the OS credential store, and print only the resulting handle | 1 |
+| `arsy auth list` | none | global flags | list stored credential handles with provider, creation time, and last use; never the secret value | 1 |
+| `arsy auth remove <HANDLE>` | one required handle | `--force` | delete a stored credential and report the configuration keys that referenced it | 1 |
+| `arsy provider list` | none | `--all` | list providers resolved as allowed, with the ceiling that narrowed them | 1 |
+| `arsy model list` | none | `--provider <ID>`, `--capability <NAME>` | list allowed models with tri-state capabilities, capability source, and observation date | 2 |
+
+### Connections
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy mcp list` | none | global flags | list configured MCP connections, transports, trust labels, and enabled state without connecting | 5 |
+| `arsy mcp add <NAME>` | one connection name | `--transport <stdio\|http>`, `--command`, `--url`, `--scope <user\|workspace>` | write a connection definition; `--scope` defaults to `user` | 5 |
+| `arsy mcp remove <NAME>` | one connection name | `--scope <user\|workspace>` | remove a connection definition from the named scope | 5 |
+| `arsy mcp enable <NAME>` / `arsy mcp disable <NAME>` | one connection name | `--scope <user\|workspace>` | toggle a connection without deleting its definition | 5 |
+| `arsy mcp test <NAME>` | one connection name | `--timeout <SECONDS>` | connect, negotiate capabilities, and disconnect; never invokes a tool | 5 |
+
+### Extensions
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy plugin list` | none | `--capabilities` | list installed plugins with version, signature status, and granted capabilities | 8 |
+| `arsy plugin install <SOURCE>` | one path or registry reference | `--scope <user\|workspace>` | display the requested capabilities and install only on explicit confirmation | 8 |
+| `arsy plugin inspect <ID>` | one plugin ID | global flags | show the manifest, requested and granted capabilities, limits, and publisher identity | 8 |
+| `arsy plugin remove <ID>` | one plugin ID | `--force` | uninstall a plugin and revoke its grants | 8 |
+| `arsy skill list` | none | `--source` | list loaded skills with their originating layer and authority class | 5 |
+| `arsy hook list` | none | `--event <NAME>` | list registered hooks with lifecycle event, declared effect class, and origin | 8 |
+
+### Evidence
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy artifact show <REF>` | one `artifact://` reference | `--max-bytes <N>` | render a bounded, redacted excerpt with the artifact's metadata | 1 |
+| `arsy artifact export <REF>` | one `artifact://` reference | `--out <PATH>` required | write the artifact to a caller-named path and report what redaction removed | 1 |
+
+### Maintenance
+
+| Command | Positional arguments | Command flags | Description | Availability |
+|---|---|---|---|---|
+| `arsy doctor` | none | `--strict` | check configuration, credentials by handle, sandbox backends, Git, providers without a billable request, and release provenance; `--strict` turns warnings into failure | 1 |
+| `arsy migrate <TARGET>` | one of `config`, `session` | `--apply`, `--backup <PATH>` | report the planned migration and its loss report; `--apply` is required to write | 1 |
+| `arsy gc` | none | `--apply`, `--retention <DURATION>` | report artifacts unreachable and past retention; `--apply` is required to delete | 1 |
+| `arsy serve` | none | `--transport <stdio\|socket>` | serve the canonical protocol for an embedding client; defaults to stdio and is never a background daemon | 1 |
+| `arsy eval <SUITE>` | one suite path or ID | `--trials <N>`, `--out <PATH>` | run an evaluation suite and report outcome, efficiency, and safety metrics | 1 |
+| `arsy completions <SHELL>` | one of `bash`, `zsh`, `fish`, `powershell` | none | print a shell completion script to standard output | 1 |
+
+### Command rules
+
+A group name used without a subcommand — `arsy mcp`, `arsy session`, `arsy auth`, `arsy plugin`,
+`arsy artifact`, `arsy config`, `arsy compat`, `arsy policy` — prints its help and exits with usage
+status. `--base` is invalid unless `REVISION` is absent. `resume --follow` is implied in an
+interactive TTY and otherwise defaults off.
+
+`arsy auth set` never accepts a secret as an argument, because arguments reach the process list and
+shell history. When no credential store is available it fails; it never falls back to plaintext
+storage. No command prints a stored secret in any output mode.
+
+`arsy migrate` and `arsy gc` report without writing unless `--apply` is given, so a forgotten flag
+cannot destroy data. `arsy migrate` takes a verified backup before applying and leaves the original
+store openable if it fails.
+
+`arsy mcp add` writes to the user `config.toml` by default and to `.arsy/config.toml` under
+`--scope workspace`. A definition written at either scope remains untrusted content: it declares a
+connection, and grants no capability.
+
+ARSY has no update command. Updates and rollbacks are handled by the installation channel, as
+specified in [distribution](34-distribution.md).
 
 ## TUI behavior
 
