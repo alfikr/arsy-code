@@ -35,6 +35,26 @@ Wasmtime/WASI components receive preopened capability resources via `cap-std`, f
 
 Lifecycle events include harness/session/turn/model/operation/edit/command/commit/agent/compaction stages. Hooks may observe, transform a schema-limited payload, deny, request approval, inject attributed context, or schedule one follow-up. Recursion depth, reentrancy keys, timeout, and origin prevent loops. Hook failure policy is event-specific and explicit.
 
+## Refresh
+
+Layer 1 and layer 2 sources — instructions, skills, prompts, schemas, commands, hook rules, and
+adapter declarations — are re-read from their origin on refresh. A WASM component is reloaded as a
+new module version; the running instance is drained rather than killed mid-invocation.
+
+Refresh takes effect at a turn boundary and never inside one. A turn finishes with the extension set
+it began with, so a hook or skill cannot change the rules under an agent that is already applying
+them.
+
+Refresh cannot widen capability. A manifest whose requested capabilities exceed what was granted at
+install is not loaded; it requires explicit approval through `arsy plugin install`, exactly as an
+update does. Without this rule refresh would be the way around the update restriction above.
+
+A failed refresh keeps the previously loaded version. One malformed source never leaves the host with
+no extensions, and each failure is reported against the source that caused it rather than as a single
+opaque error.
+
+Every refresh appends an event naming which sources changed, which were rejected, and why.
+
 ## Security, compatibility, versioning
 
 Signatures establish publisher identity, not safety. Install shows requested capabilities; updates cannot expand them silently. [`arsy plugin`](36-cli-tui.md) surfaces install, inspection, and removal, and `arsy skill list` and `arsy hook list` report what is loaded. Claude/OMP plugins are parsed into declarative pieces; unsupported executable behavior is quarantined or requires an external compatibility runner. Plugin API versions independently; host imports are capability- and version-negotiated.
