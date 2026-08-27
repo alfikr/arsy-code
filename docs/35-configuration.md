@@ -4,7 +4,7 @@
 
 ARSY native configuration is UTF-8 TOML named `config.toml`. Native files require `schema_version = 1`; unknown keys are errors, and unknown keys under `policy`, `sandbox`, `secrets`, or `telemetry` fail closed.
 
-The resolver reads these six layers in authority order, then returns the effective value and a source trace for every key:
+The resolver reads these six layers in authority order, then returns the effective value and a source trace for every key, which [`arsy config explain`](36-cli-tui.md) prints:
 
 1. enterprise `config.toml`: `/etc/arsy/` on Linux, `/Library/Application Support/ARSY/` on macOS, or `%ProgramData%\ARSY\` on Windows;
 2. user `config.toml`: `$XDG_CONFIG_HOME/arsy/` (fallback `~/.config/arsy/`) on Linux, `~/Library/Application Support/ARSY/` on macOS, or `%AppData%\ARSY\` on Windows;

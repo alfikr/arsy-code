@@ -33,13 +33,21 @@ ARSY CODE · workspace: ~/code/payments · model: auto
 ```
 
 ```console
-arsy                         # interactive TUI
-arsy run "fix bug #42"      # non-interactive execution
-arsy resume <session-id>     # resume a session
-arsy review                  # review local changes
-arsy mcp list                # manage MCP integrations
-arsy doctor                  # diagnose the environment
+arsy                          # interactive TUI
+arsy run "fix bug #42"        # non-interactive execution
+arsy session list             # find a session to resume
+arsy resume <session-id>      # resume a session
+arsy review                   # review local changes
+arsy auth set anthropic       # store a provider credential as a handle
+arsy config explain policy    # show effective config and where it came from
+arsy policy explain fs.write  # ask whether an operation would be allowed
+arsy mcp add docs --transport stdio --command ...   # manage MCP connections
+arsy doctor                   # diagnose the environment
 ```
+
+The full surface — session, configuration, policy, credentials, connections, extensions, evidence,
+and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-tui.md). ARSY has no
+update command; updates come from the installation channel.
 
 ## Architecture at a glance
 

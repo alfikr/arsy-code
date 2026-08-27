@@ -35,4 +35,4 @@ Use repeated trials, confidence intervals, paired tasks, held-out sets, and cost
 
 ## Decision
 
-Ship the eval runner in Phase 1 with a small trustworthy suite; expand before advanced routing, memory, or multi-agent claims.
+Ship the eval runner in Phase 1 with a small trustworthy suite, invoked as [`arsy eval`](36-cli-tui.md); expand before advanced routing, memory, or multi-agent claims.

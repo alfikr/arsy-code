@@ -46,7 +46,7 @@ OpenAI, Anthropic, Google, xAI, DeepSeek, Mistral, MiniMax, Qwen, Moonshot, Groq
 
 ## Security, failure, and routing
 
-Credentials are handles resolved inside the provider worker and never prompt fragments. Wire bodies are size-limited and redacted. Streams normalize partial tool arguments without executing them. Retries honor idempotency and provider retry hints. Policy-controlled routing considers task class, measured quality, latency, cost, residency, and capability; users can pin a model or disable routing.
+Credentials are handles resolved inside the provider worker and never prompt fragments; [`arsy auth`](36-cli-tui.md) creates and revokes them, and `arsy provider list` and `arsy model list` show what a resolved policy allows. Wire bodies are size-limited and redacted. Streams normalize partial tool arguments without executing them. Retries honor idempotency and provider retry hints. Policy-controlled routing considers task class, measured quality, latency, cost, residency, and capability; users can pin a model or disable routing.
 
 ## Decision
 

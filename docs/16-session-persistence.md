@@ -39,7 +39,7 @@ graph LR
   E --> B[(Artifact CAS)]
 ```
 
-Resume replays after the latest verified checkpoint. Rewind creates a new branch pointing to an earlier event; it does not truncate. Fork records ancestry. Migrations are explicit, checksum-verified, backed up, and reversible where possible. UI preferences live separately and reference session IDs.
+Resume replays after the latest verified checkpoint. Rewind creates a new branch pointing to an earlier event; it does not truncate. Fork records ancestry. Resume, rewind, fork, and JSONL export are reached through [`arsy resume` and `arsy session`](36-cli-tui.md); unreachable artifacts past retention are collected by `arsy gc`. Migrations are explicit, checksum-verified, backed up, and reversible where possible. UI preferences live separately and reference session IDs.
 
 ## Failure, security, performance
 

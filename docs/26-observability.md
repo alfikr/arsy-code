@@ -18,7 +18,7 @@ OpenTelemetry export is optional and off by default for content. Local structure
 
 ## Artifact system
 
-Large logs, images, PDFs, test/coverage reports, profiles, database results, screenshots, and debug traces live in CAS. `artifact://session/<id>/<artifact>` is a reference identity, not a filesystem path. Metadata records MIME type, digest, size, creator, source revision, sensitivity, retention, and derivation. Model renderers receive bounded excerpts and retrieval handles.
+Large logs, images, PDFs, test/coverage reports, profiles, database results, screenshots, and debug traces live in CAS. `artifact://session/<id>/<artifact>` is a reference identity, not a filesystem path, readable through [`arsy artifact show`](36-cli-tui.md). Metadata records MIME type, digest, size, creator, source revision, sensitivity, retention, and derivation. Model renderers receive bounded excerpts and retrieval handles.
 
 ## Failure and performance
 
