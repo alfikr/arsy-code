@@ -1,6 +1,7 @@
 //! Pure domain types shared by ARSY components.
 
 pub mod artifact;
+pub mod capability;
 pub mod domain;
 pub mod event;
 pub mod migrate;
