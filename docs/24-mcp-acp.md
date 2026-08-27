@@ -16,6 +16,31 @@ flowchart LR
 
 Support stdio and Streamable HTTP first; legacy SSE only behind compatibility demand. Connections are managed through [`arsy mcp`](36-cli-tui.md), whose `test` subcommand negotiates capabilities without invoking a tool. Negotiate capabilities, correlate requests, bound messages/timeouts, support cancellation/progress, authenticate HTTP, and require policy for sampling/elicitation/tool effects. Resources become external-resource references and artifacts; annotations remain untrusted. MCP Apps render in a sandboxed UI origin with a mediated bridge.
 
+## Connection lifecycle
+
+A connection that drops is retried with bounded backoff and an explicit attempt limit, mirroring the
+language-server rule in [code intelligence](11-code-intelligence.md). When the limit is exhausted the
+connection is marked failed and stays failed; it is never retried indefinitely.
+
+Reconnecting never widens authority. Identity, trust label, rate limit, body cap, and capability
+ceiling are re-applied on every reconnect, and the server re-negotiates from scratch. A tool,
+resource, or prompt that appears after a reconnect and falls outside the ceiling is rejected with an
+`ARSY-POL-*` diagnostic rather than silently accepted, because otherwise disconnecting and
+reconnecting would be a way to acquire capability.
+
+Authentication failure and a policy-disabled connection are both excluded from automatic retry. Each
+requires an explicit `arsy mcp reconnect`, so a rejected credential cannot become a retry loop.
+
+Requests in flight when a connection drops fail with an `ARSY-PRT-*` diagnostic and are retried only
+when the operation is idempotent, under the retry rules in [diagnostics](33-diagnostics.md).
+
+Refresh is re-discovery without tearing the connection down, for servers whose tool, resource, or
+prompt list changes while connected. It invalidates the discovery cache for that connection and
+nothing else; the session, its correlations, and its in-flight work are untouched. Refreshed entries
+pass the same ceiling check as newly discovered ones.
+
+Both reconnect and refresh append an event recording the connection, the trigger, and what changed.
+
 ## ACP design
 
 Map `initialize`, authentication, `session/new|load|prompt|cancel`, updates, permission requests, filesystem, and terminal methods to protocol projections and operations. Honor absolute paths and 1-based lines at the adapter, then canonicalize internally. Advertise only implemented capabilities. Extension `_meta` and underscore methods never alter core authority.
