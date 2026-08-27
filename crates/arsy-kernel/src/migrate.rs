@@ -188,7 +188,12 @@ fn storage(error: rusqlite::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::{Durability, SqliteEventStore};
+    use crate::{
+        domain::{CorrelationId, Principal, SessionId},
+        event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StreamVersion},
+        sqlite::{Durability, SqliteEventStore},
+    };
+    use serde_json::Value;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -290,6 +295,37 @@ mod tests {
         );
         // The original still opens, which is the promise a failed migration makes.
         drop(SqliteEventStore::open(&path, Durability::Normal).unwrap());
+        cleanup(&path);
+        cleanup(&backup);
+    }
+
+    #[test]
+    fn events_survive_a_migration_unchanged() {
+        let path = seeded_store();
+        let backup = store_path();
+        let store = SqliteEventStore::open(&path, Durability::Normal).unwrap();
+        let session = SessionId::new();
+        let events: Vec<_> = (1..=32)
+            .map(|sequence| {
+                EventEnvelope::new(
+                    session,
+                    sequence,
+                    Principal::System,
+                    None,
+                    CorrelationId::new(),
+                    SchemaVersion(1),
+                    "test.event",
+                    EventPayload::Inline { data: Value::Null },
+                )
+            })
+            .collect();
+        store
+            .append(session, StreamVersion(0), events.clone())
+            .unwrap();
+
+        apply_with(&path, &backup, GOOD).unwrap();
+
+        assert_eq!(store.read(session, 1, usize::MAX).unwrap(), events);
         cleanup(&path);
         cleanup(&backup);
     }
