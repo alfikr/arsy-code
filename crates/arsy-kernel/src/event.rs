@@ -221,6 +221,14 @@ pub enum StoreError {
         bytes: usize,
         max: usize,
     },
+    MigrationRequired {
+        current: u32,
+        expected: u32,
+    },
+    SchemaTooNew {
+        current: u32,
+        supported: u32,
+    },
     Serialization(String),
     Storage(String),
 }
@@ -248,6 +256,14 @@ impl fmt::Display for StoreError {
                     "inline payload is {bytes} bytes; maximum is {max}"
                 )
             }
+            Self::MigrationRequired { current, expected } => write!(
+                formatter,
+                "store schema is version {current}; this build needs {expected}, run a migration"
+            ),
+            Self::SchemaTooNew { current, supported } => write!(
+                formatter,
+                "store schema is version {current}; this build supports only {supported}"
+            ),
             Self::Serialization(message) | Self::Storage(message) => formatter.write_str(message),
         }
     }

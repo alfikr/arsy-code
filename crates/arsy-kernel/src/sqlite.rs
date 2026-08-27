@@ -34,6 +34,13 @@ CREATE INDEX IF NOT EXISTS events_correlation
     ON events(correlation_id, stream_id, sequence);
 "#;
 
+/// Shape of the schema this binary writes and reads.
+///
+/// Stamped into SQLite's own `user_version` rather than a bookkeeping table:
+/// the pragma costs no table and moves inside the same transaction as the
+/// statements it describes.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Durability {
@@ -80,7 +87,27 @@ impl SqliteEventStore {
         let path = path.as_ref().to_path_buf();
         let connection = Connection::open(&path).map_err(storage)?;
         configure(&connection, durability)?;
-        connection.execute_batch(SCHEMA).map_err(storage)?;
+        match read_schema_version(&connection)? {
+            // Either a new file or one written before stamping began; both
+            // already have the v1 shape, and `SCHEMA` is idempotent.
+            0 => {
+                connection.execute_batch(SCHEMA).map_err(storage)?;
+                write_schema_version(&connection, SCHEMA_VERSION)?;
+            }
+            SCHEMA_VERSION => {}
+            current if current < SCHEMA_VERSION => {
+                return Err(StoreError::MigrationRequired {
+                    current,
+                    expected: SCHEMA_VERSION,
+                })
+            }
+            current => {
+                return Err(StoreError::SchemaTooNew {
+                    current,
+                    supported: SCHEMA_VERSION,
+                })
+            }
+        }
         Ok(Self {
             path,
             writer: Mutex::new(connection),
@@ -283,6 +310,26 @@ impl EventStore for SqliteEventStore {
     }
 }
 
+pub(crate) fn read_schema_version(connection: &Connection) -> Result<u32, StoreError> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(storage)?;
+    version
+        .try_into()
+        .map_err(|_| StoreError::Storage("negative schema version".into()))
+}
+
+pub(crate) fn write_schema_version(
+    connection: &Connection,
+    version: u32,
+) -> Result<(), StoreError> {
+    // Pragmas reject bound parameters, so the value is formatted in; it is a
+    // `u32`, so there is nothing to inject.
+    connection
+        .execute_batch(&format!("PRAGMA user_version = {version};"))
+        .map_err(storage)
+}
+
 fn configure(connection: &Connection, durability: Durability) -> Result<(), StoreError> {
     connection
         .busy_timeout(Duration::from_secs(5))
@@ -356,6 +403,38 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    #[test]
+    fn opening_stamps_the_schema_version() {
+        let path = database_path();
+        let store = SqliteEventStore::open(&path, Durability::Normal).unwrap();
+        let connection = store.reader().unwrap();
+
+        assert_eq!(read_schema_version(&connection).unwrap(), SCHEMA_VERSION);
+        drop(connection);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn a_store_from_a_newer_build_is_refused() {
+        let path = database_path();
+        drop(SqliteEventStore::open(&path, Durability::Normal).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        write_schema_version(&connection, SCHEMA_VERSION + 1).unwrap();
+        drop(connection);
+
+        let error = SqliteEventStore::open(&path, Durability::Normal)
+            .err()
+            .expect("a newer schema must not open");
+        assert_eq!(
+            error,
+            StoreError::SchemaTooNew {
+                current: SCHEMA_VERSION + 1,
+                supported: SCHEMA_VERSION,
+            }
+        );
+        remove_database(&path);
     }
 
     #[test]
