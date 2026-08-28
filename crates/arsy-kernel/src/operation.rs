@@ -83,14 +83,40 @@ pub enum ConcurrencyRule {
     ExclusiveGlobal,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonType {
+    String,
+    Number,
+    Boolean,
+    Object,
+    Array,
+}
+
+impl JsonType {
+    fn accepts(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+            Self::Boolean => value.is_boolean(),
+            Self::Object => value.is_object(),
+            Self::Array => value.is_array(),
+        }
+    }
+}
+
+/// The small schema surface needed by the first typed operations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InputSchema {
+    pub required: BTreeMap<String, JsonType>,
+    pub allow_extra: bool,
+}
+
 /// What an executor publishes about itself.
-///
-/// ponytail: no `SchemaRef` yet. The spec puts input and output schemas here,
-/// but schema generation and the request decoder are a later slice and nothing
-/// would read them today.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OperationContract {
     pub kind: OperationKind,
+    pub input_schema: InputSchema,
     /// The actions this operation may need. Concrete resources arrive with the
     /// request, not the contract.
     pub actions: Vec<CapabilityAction>,
@@ -142,6 +168,8 @@ pub struct OperationOutcome {
     pub value: Option<ResourceRef>,
     /// What the executor observed itself doing. Authoritative over prediction.
     pub observed_effects: Vec<Effect>,
+    /// Artifacts, logs, or reports that substantiate the outcome.
+    pub evidence: Vec<ResourceRef>,
     pub state: Option<StateVersion>,
 }
 
@@ -205,6 +233,8 @@ impl OperationRegistry {
             .get(&request.kind)
             .ok_or_else(|| OperationError::Unregistered(request.kind.clone()))?;
 
+        validate_input(&executor.contract().input_schema, &request.input)?;
+
         for requirement in &request.requirements {
             let covered = grants
                 .iter()
@@ -216,6 +246,38 @@ impl OperationRegistry {
 
         executor.execute(request, grants)
     }
+}
+
+fn validate_input(schema: &InputSchema, input: &serde_json::Value) -> Result<(), OperationError> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| OperationError::Schema("input must be an object".into()))?;
+    for (field, expected) in &schema.required {
+        match object.get(field) {
+            Some(value) if expected.accepts(value) => {}
+            Some(_) => {
+                return Err(OperationError::Schema(format!(
+                    "input field {field} has the wrong type"
+                )))
+            }
+            None => {
+                return Err(OperationError::Schema(format!(
+                    "input field {field} is required"
+                )))
+            }
+        }
+    }
+    if !schema.allow_extra {
+        if let Some(field) = object
+            .keys()
+            .find(|field| !schema.required.contains_key(*field))
+        {
+            return Err(OperationError::Schema(format!(
+                "input field {field} is not allowed"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,6 +298,7 @@ impl std::error::Error for RegistrationError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationError {
     Unregistered(OperationKind),
+    Schema(String),
     Ungranted(CapabilityRequirement),
     Execution(String),
 }
@@ -244,6 +307,7 @@ impl fmt::Display for OperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unregistered(kind) => write!(formatter, "no executor for operation {kind}"),
+            Self::Schema(message) => write!(formatter, "invalid operation input: {message}"),
             Self::Ungranted(requirement) => write!(
                 formatter,
                 "no grant covers {} on {}:{}",
@@ -266,9 +330,11 @@ mod tests {
         domain::GrantId,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Reader {
         contract: OperationContract,
+        calls: AtomicUsize,
     }
 
     impl Reader {
@@ -276,10 +342,15 @@ mod tests {
             Arc::new(Self {
                 contract: OperationContract {
                     kind: OperationKind::new(kind).unwrap(),
+                    input_schema: InputSchema {
+                        required: BTreeMap::from([("path".into(), JsonType::String)]),
+                        allow_extra: false,
+                    },
                     actions: vec![CapabilityAction::FsRead],
                     idempotency: Idempotency::Idempotent,
                     concurrency: ConcurrencyRule::Parallel,
                 },
+                calls: AtomicUsize::new(0),
             })
         }
     }
@@ -294,6 +365,7 @@ mod tests {
             request: &OperationRequest,
             _grants: &[CapabilityGrant],
         ) -> Result<OperationOutcome, OperationError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(OperationOutcome {
                 value: None,
                 observed_effects: request
@@ -304,6 +376,7 @@ mod tests {
                         resource: requirement.resource.clone(),
                     })
                     .collect(),
+                evidence: vec![ResourceRef::new("artifact", "evidence-1").unwrap()],
                 state: None,
             })
         }
@@ -353,8 +426,11 @@ mod tests {
         let mut registry = OperationRegistry::new();
         registry.register(Reader::new("fs.read")).unwrap();
 
-        let outcome = registry.dispatch(&request("/repo/src/main.rs"), &[grant("/repo/src/**")], 0);
-        assert!(outcome.is_ok());
+        let outcome = registry
+            .dispatch(&request("/repo/src/main.rs"), &[grant("/repo/src/**")], 0)
+            .unwrap();
+        assert_eq!(outcome.observed_effects.len(), 1);
+        assert_eq!(outcome.evidence.len(), 1);
 
         assert_eq!(
             registry.dispatch(&request("/etc/passwd"), &[grant("/repo/src/**")], 0),
@@ -390,6 +466,21 @@ mod tests {
             registry.dispatch(&asked, &[grant("/**")], 0),
             Err(OperationError::Unregistered(_))
         ));
+    }
+
+    #[test]
+    fn schema_failure_never_reaches_the_executor() {
+        let executor = Reader::new("fs.read");
+        let mut registry = OperationRegistry::new();
+        registry.register(executor.clone()).unwrap();
+        let mut malformed = request("/repo/main.rs");
+        malformed.input = json!({ "path": 42 });
+
+        assert!(matches!(
+            registry.dispatch(&malformed, &[grant("/**")], 0),
+            Err(OperationError::Schema(_))
+        ));
+        assert_eq!(executor.calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]
