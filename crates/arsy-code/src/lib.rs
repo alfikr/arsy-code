@@ -1,4 +1,6 @@
 //! Filesystem, search, edit, and execution capabilities for ARSY CODE.
 
+pub mod resource;
+
 /// Version shared with the domain kernel.
 pub const VERSION: &str = arsy_kernel::VERSION;

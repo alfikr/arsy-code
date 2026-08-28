@@ -10,6 +10,7 @@ license = "MIT"
 repository = "https://github.com/suiflex/arsy-code"
 
 [workspace.dependencies]
+cap-std = "=4.0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
