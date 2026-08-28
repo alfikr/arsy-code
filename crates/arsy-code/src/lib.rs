@@ -1,5 +1,6 @@
 //! Filesystem, search, edit, and execution capabilities for ARSY CODE.
 
+pub mod edit;
 pub mod resource;
 pub mod search;
 
