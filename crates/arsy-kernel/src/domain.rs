@@ -55,7 +55,7 @@ id_type!(CorrelationId);
 id_type!(ArtifactId);
 id_type!(GrantId);
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Principal {
     User(String),

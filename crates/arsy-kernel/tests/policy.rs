@@ -117,6 +117,7 @@ fn query() -> impl Strategy<Value = PolicyQuery> {
             operation: OperationKind::new("fs.read").expect("a valid kind"),
             requirement: CapabilityRequirement::new(action, resource(value)),
             operation_digest: StateVersion::from_digest([7; 32]),
+            resource_version: Some(StateVersion::from_digest([8; 32])),
             context: RiskContext { reversible },
         })
 }

@@ -13,7 +13,7 @@ use crate::{
     operation::OperationKind,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::VecDeque, fmt};
 
 /// What a rule does when it matches. Ordered by how much it restricts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -25,7 +25,7 @@ pub enum RuleEffect {
 }
 
 /// Which actor a rule speaks about.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorMatch {
     Any,
@@ -114,8 +114,11 @@ impl RuleSet {
             left.source
                 .cmp(&right.source)
                 .then_with(|| left.effect.cmp(&right.effect))
+                .then_with(|| left.actor.cmp(&right.actor))
                 .then_with(|| left.action.cmp(&right.action))
                 .then_with(|| left.pattern.to_string().cmp(&right.pattern.to_string()))
+                .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
+                .then_with(|| left.delegation_depth.cmp(&right.delegation_depth))
         });
         Self {
             rules: compiled,
@@ -162,6 +165,31 @@ impl RuleSet {
 
         let decision = self.decide(query, first, &mut trace);
         PolicyOutcome { decision, trace }
+    }
+
+    /// Evaluate through a caller-owned bounded cache. The key includes the
+    /// normalized rules and the complete query, including resource state.
+    pub fn evaluate_cached(&self, query: &PolicyQuery, cache: &mut DecisionCache) -> PolicyOutcome {
+        if let Some(entry) = cache
+            .entries
+            .iter()
+            .find(|entry| entry.rules == self.rules && entry.query == *query)
+        {
+            return entry.outcome.clone();
+        }
+
+        let outcome = self.evaluate(query);
+        if cache.capacity > 0 {
+            if cache.entries.len() == cache.capacity {
+                cache.entries.pop_front();
+            }
+            cache.entries.push_back(CacheEntry {
+                rules: self.rules.clone(),
+                query: query.clone(),
+                outcome: outcome.clone(),
+            });
+        }
+        outcome
     }
 
     fn decide(
@@ -245,6 +273,9 @@ pub struct PolicyQuery {
     /// Binds any approval to this exact operation, so a mutated request cannot
     /// reuse the answer.
     pub operation_digest: StateVersion,
+    /// Version of the canonical resource state inspected by policy. A changed
+    /// version cannot reuse an earlier cached decision.
+    pub resource_version: Option<StateVersion>,
     pub context: RiskContext,
 }
 
@@ -307,6 +338,37 @@ pub struct PolicyOutcome {
     pub trace: Vec<TraceEntry>,
 }
 
+/// A bounded decision cache. Callers choose the bound and lifetime explicitly.
+#[derive(Clone, Debug)]
+pub struct DecisionCache {
+    capacity: usize,
+    entries: VecDeque<CacheEntry>,
+}
+
+impl DecisionCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    rules: Vec<PolicyRule>,
+    query: PolicyQuery,
+    outcome: PolicyOutcome,
+}
+
 impl PolicyOutcome {
     /// The rules that actually bore on the decision.
     pub fn matched(&self) -> impl Iterator<Item = &TraceEntry> {
@@ -340,6 +402,7 @@ mod tests {
                 ResourceRef::new("file", value).unwrap(),
             ),
             operation_digest: StateVersion::from_digest([0; 32]),
+            resource_version: Some(StateVersion::from_digest([1; 32])),
             context: RiskContext::default(),
         }
     }
@@ -425,5 +488,23 @@ mod tests {
         assert!(!grant
             .scope
             .admits(&ResourceRef::new("file", "/etc/passwd").unwrap()));
+    }
+
+    #[test]
+    fn cache_keys_on_complete_inputs_and_resource_version() {
+        let rules = RuleSet::compile([rule(PolicySource::User, RuleEffect::Allow, "/repo/**")]);
+        let mut cache = DecisionCache::new(2);
+        let first = query("/repo/main.rs");
+        let mut changed_resource = first.clone();
+        changed_resource.resource_version = Some(StateVersion::from_digest([2; 32]));
+        let changed_input = query("/repo/other.rs");
+
+        rules.evaluate_cached(&first, &mut cache);
+        rules.evaluate_cached(&first, &mut cache);
+        assert_eq!(cache.len(), 1);
+        rules.evaluate_cached(&changed_resource, &mut cache);
+        assert_eq!(cache.len(), 2);
+        rules.evaluate_cached(&changed_input, &mut cache);
+        assert_eq!(cache.len(), 2, "the cache must remain bounded");
     }
 }
