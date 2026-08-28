@@ -17,6 +17,8 @@ arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
 cap-std.workspace = true
 ignore = "=0.4.23"
 sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

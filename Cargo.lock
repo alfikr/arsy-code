@@ -32,6 +32,8 @@ dependencies = [
  "arsy-kernel",
  "cap-std",
  "ignore",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
 ]
