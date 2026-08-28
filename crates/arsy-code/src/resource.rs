@@ -1,5 +1,6 @@
 use arsy_kernel::domain::{ResourceRef, ResourceRefError};
 use cap_std::{ambient_authority, fs::Dir};
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
     fs::File,
@@ -11,6 +12,12 @@ use std::{
 pub struct ResolvedFile {
     resource: ResourceRef,
     file: File,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FileContent {
+    pub bytes: Vec<u8>,
+    pub digest: arsy_kernel::domain::StateVersion,
 }
 
 impl ResolvedFile {
@@ -25,16 +32,39 @@ impl ResolvedFile {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    pub fn read(self, max_bytes: u64) -> io::Result<FileContent> {
+        use io::Read;
+
+        let mut bytes = Vec::new();
+        self.file
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "file exceeds read limit",
+            ));
+        }
+        let digest = arsy_kernel::domain::StateVersion::from_digest(Sha256::digest(&bytes).into());
+        Ok(FileContent { bytes, digest })
+    }
 }
 
 /// A capability directory that confines all path resolution to one workspace.
 pub struct Workspace {
     root: Dir,
+    path: PathBuf,
 }
 
 impl Workspace {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
-        Dir::open_ambient_dir(root, ambient_authority()).map(|root| Self { root })
+        let path = std::fs::canonicalize(root)?;
+        Dir::open_ambient_dir(&path, ambient_authority()).map(|root| Self { root, path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn resolve_file(&self, path: impl AsRef<Path>) -> Result<ResolvedFile, ResolveError> {
