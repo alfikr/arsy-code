@@ -72,6 +72,12 @@ impl fmt::Display for CapabilityAction {
     }
 }
 
+/// Compile-time bounds on a permission glob. A pattern on the security
+/// boundary that takes unbounded time or memory to compile is a denial of
+/// service, and no legitimate rule needs more than this.
+pub const MAX_GLOB_BYTES: usize = 1024;
+pub const MAX_GLOB_METACHARACTERS: usize = 32;
+
 /// A scheme plus a glob over canonical resource values.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResourcePattern {
@@ -89,6 +95,22 @@ impl ResourcePattern {
         let glob = glob.into();
         if scheme.is_empty() {
             return Err(PatternError::EmptyScheme);
+        }
+        if glob.len() > MAX_GLOB_BYTES {
+            return Err(PatternError::TooLong {
+                len: glob.len(),
+                max: MAX_GLOB_BYTES,
+            });
+        }
+        let metacharacters = glob
+            .chars()
+            .filter(|c| matches!(c, '*' | '?' | '[' | '{'))
+            .count();
+        if metacharacters > MAX_GLOB_METACHARACTERS {
+            return Err(PatternError::TooComplex {
+                metacharacters,
+                max: MAX_GLOB_METACHARACTERS,
+            });
         }
         let matcher = GlobBuilder::new(&glob)
             .literal_separator(true)
@@ -317,6 +339,8 @@ fn earliest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 pub enum PatternError {
     EmptyScheme,
     InvalidGlob(String),
+    TooLong { len: usize, max: usize },
+    TooComplex { metacharacters: usize, max: usize },
 }
 
 impl fmt::Display for PatternError {
@@ -324,6 +348,16 @@ impl fmt::Display for PatternError {
         match self {
             Self::EmptyScheme => formatter.write_str("resource pattern scheme cannot be empty"),
             Self::InvalidGlob(message) => write!(formatter, "invalid resource glob: {message}"),
+            Self::TooLong { len, max } => {
+                write!(formatter, "resource glob is {len} bytes, limit is {max}")
+            }
+            Self::TooComplex {
+                metacharacters,
+                max,
+            } => write!(
+                formatter,
+                "resource glob has {metacharacters} wildcards, limit is {max}"
+            ),
         }
     }
 }
