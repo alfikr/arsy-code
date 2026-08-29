@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod capability;
+pub mod context;
 pub mod domain;
 pub mod event;
 pub mod migrate;

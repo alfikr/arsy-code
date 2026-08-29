@@ -69,6 +69,7 @@ id_type!(CorrelationId);
 id_type!(ArtifactId);
 id_type!(FindingId);
 id_type!(ApprovalId);
+id_type!(FragmentId);
 id_type!(ContextViewId);
 id_type!(CheckpointId);
 id_type!(SubscriptionId);
