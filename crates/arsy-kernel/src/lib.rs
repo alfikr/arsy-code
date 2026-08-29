@@ -8,6 +8,7 @@ pub mod migrate;
 pub mod operation;
 pub mod policy;
 pub mod projection;
+pub mod protocol;
 pub mod sqlite;
 
 /// Workspace package version.

@@ -46,13 +46,22 @@ macro_rules! id_type {
     };
 }
 
+id_type!(WorkspaceId);
 id_type!(SessionId);
 id_type!(TurnId);
+id_type!(ItemId);
 id_type!(AgentId);
+id_type!(TaskId);
 id_type!(OperationId);
 id_type!(EventId);
 id_type!(CorrelationId);
 id_type!(ArtifactId);
+id_type!(FindingId);
+id_type!(ApprovalId);
+id_type!(ContextViewId);
+id_type!(CheckpointId);
+id_type!(SubscriptionId);
+id_type!(RequestId);
 id_type!(GrantId);
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
