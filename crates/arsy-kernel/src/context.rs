@@ -1,11 +1,18 @@
 //! Typed, provenance-preserving context and dependency-safe views.
 
-use crate::domain::{ArtifactId, ContextViewId, FragmentId, ResourceRef, SessionId, TaskId};
+use crate::{
+    domain::{
+        ArtifactId, ContextViewId, CorrelationId, EventId, FragmentId, Principal, ResourceRef,
+        SessionId, TaskId,
+    },
+    event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt};
 
 pub const MAX_CONTEXT_FRAGMENTS: usize = 4096;
+pub const SUMMARY_CREATED: &str = "summary.created";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -186,6 +193,108 @@ impl TryFrom<ContextFragmentWire> for ContextFragment {
             value.freshness,
             value.dependencies,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct EventCitation {
+    pub id: EventId,
+    pub sequence: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(try_from = "CompactionSummaryWire")]
+pub struct CompactionSummary {
+    pub summary: ContextFragment,
+    pub citations: Vec<EventCitation>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CompactionSummaryWire {
+    summary: ContextFragment,
+    citations: Vec<EventCitation>,
+}
+
+impl CompactionSummary {
+    pub fn new(
+        summary: ContextFragment,
+        citations: Vec<EventCitation>,
+    ) -> Result<Self, ContextError> {
+        if summary.kind != FragmentKind::Summary
+            || summary.source_kind() != FragmentSourceKind::Derived
+            || summary.authority() != Authority::Untrusted
+        {
+            return Err(ContextError::InvalidSummary);
+        }
+        if citations.is_empty() || citations.len() > MAX_CONTEXT_FRAGMENTS {
+            return Err(ContextError::InvalidCitations);
+        }
+        let unique_ids: HashSet<_> = citations.iter().map(|citation| citation.id).collect();
+        let unique_sequences: HashSet<_> =
+            citations.iter().map(|citation| citation.sequence).collect();
+        if unique_ids.len() != citations.len()
+            || unique_sequences.len() != citations.len()
+            || citations.iter().any(|citation| citation.sequence == 0)
+        {
+            return Err(ContextError::InvalidCitations);
+        }
+        Ok(Self { summary, citations })
+    }
+
+    pub fn append(
+        &self,
+        store: &dyn EventStore,
+        session: SessionId,
+        expected: StreamVersion,
+        actor: Principal,
+        correlation: CorrelationId,
+        schema: SchemaVersion,
+    ) -> Result<StreamVersion, ContextError> {
+        self.originals(store, session)?;
+        let payload = serde_json::to_value(self)
+            .map_err(|error| ContextError::Serialization(error.to_string()))?;
+        let event = EventEnvelope::new(
+            session,
+            expected
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::SequenceOverflow)?,
+            actor,
+            self.citations.last().map(|citation| citation.id),
+            correlation,
+            schema,
+            SUMMARY_CREATED,
+            EventPayload::Inline { data: payload },
+        );
+        store
+            .append(session, expected, vec![event])
+            .map_err(Into::into)
+    }
+
+    pub fn originals(
+        &self,
+        store: &dyn EventStore,
+        session: SessionId,
+    ) -> Result<Vec<EventEnvelope>, ContextError> {
+        self.citations
+            .iter()
+            .map(|citation| {
+                store
+                    .read(session, citation.sequence, 1)?
+                    .into_iter()
+                    .next()
+                    .filter(|event| event.id == citation.id)
+                    .ok_or(ContextError::MissingCitedEvent(*citation))
+            })
+            .collect()
+    }
+}
+
+impl TryFrom<CompactionSummaryWire> for CompactionSummary {
+    type Error = ContextError;
+
+    fn try_from(value: CompactionSummaryWire) -> Result<Self, Self::Error> {
+        Self::new(value.summary, value.citations)
     }
 }
 
@@ -432,6 +541,17 @@ pub enum ContextError {
     DuplicateFragmentId,
     InvalidRankingSignal,
     TooManyFragments { count: usize, max: usize },
+    InvalidSummary,
+    InvalidCitations,
+    MissingCitedEvent(EventCitation),
+    Serialization(String),
+    Store(StoreError),
+}
+
+impl From<StoreError> for ContextError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
 }
 
 impl fmt::Display for ContextError {
@@ -453,6 +573,20 @@ impl fmt::Display for ContextError {
             Self::TooManyFragments { count, max } => {
                 write!(formatter, "context has {count} fragments; maximum is {max}")
             }
+            Self::InvalidSummary => formatter
+                .write_str("a compacted summary must be an untrusted derived summary fragment"),
+            Self::InvalidCitations => formatter.write_str(
+                "a compacted summary must cite a bounded, non-empty set of unique events",
+            ),
+            Self::MissingCitedEvent(citation) => write!(
+                formatter,
+                "cited event {} is not at sequence {}",
+                citation.id, citation.sequence
+            ),
+            Self::Serialization(error) => {
+                write!(formatter, "summary serialization failed: {error}")
+            }
+            Self::Store(error) => write!(formatter, "event store failed: {error}"),
         }
     }
 }
@@ -462,6 +596,7 @@ impl std::error::Error for ContextError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn fragment(
         id: FragmentId,
@@ -488,6 +623,85 @@ mod tests {
             dependencies,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn compaction_keeps_cited_originals_addressable_after_resume() {
+        let store = crate::event::MemoryEventStore::default();
+        let session = SessionId::new();
+        let actor = Principal::User("tester".into());
+        let correlation = CorrelationId::new();
+        let originals: Vec<_> = (1..=2)
+            .map(|sequence| {
+                EventEnvelope::new(
+                    session,
+                    sequence,
+                    actor.clone(),
+                    None,
+                    correlation,
+                    SchemaVersion(1),
+                    "message.created",
+                    EventPayload::Inline {
+                        data: json!({ "sequence": sequence }),
+                    },
+                )
+            })
+            .collect();
+        store
+            .append(session, StreamVersion(0), originals.clone())
+            .unwrap();
+        let summary = ContextFragment::new(
+            FragmentId::new(),
+            FragmentKind::Summary,
+            ResourceRef::new("event", "summary").unwrap(),
+            FragmentSourceKind::Derived,
+            ContextScope::Session(session),
+            ArtifactId::new(),
+            10,
+            Authority::Untrusted,
+            Confidence::new(8_000).unwrap(),
+            Freshness::Current,
+            vec![],
+        )
+        .unwrap();
+        let compaction = CompactionSummary::new(
+            summary,
+            originals
+                .iter()
+                .map(|event| EventCitation {
+                    id: event.id,
+                    sequence: event.sequence,
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            compaction
+                .append(
+                    &store,
+                    session,
+                    StreamVersion(2),
+                    actor,
+                    correlation,
+                    SchemaVersion(1),
+                )
+                .unwrap(),
+            StreamVersion(3)
+        );
+        assert_eq!(compaction.originals(&store, session).unwrap(), originals);
+        let resumed = store.read(session, 1, 3).unwrap();
+        assert_eq!(resumed.len(), 3);
+        assert_eq!(resumed[2].kind, SUMMARY_CREATED);
+        assert_eq!(
+            serde_json::from_value::<CompactionSummary>(match &resumed[2].payload {
+                EventPayload::Inline { data } => data.clone(),
+                EventPayload::Artifact { .. } => unreachable!(),
+            })
+            .unwrap()
+            .citations,
+            compaction.citations
+        );
     }
 
     #[test]
