@@ -5,8 +5,8 @@
 //! sees a provider dialect. Operations never touch a provider, so a second
 //! adapter is a new [`ModelProvider`] impl and nothing else.
 //!
-//! Model profiles and capability probing are deliberately not here: they are a
-//! separate concern (`docs/09` "canonical profile") on a later milestone.
+//! Model profiles and capability probing live in [`crate::model_profile`] so
+//! observing model behavior stays separate from provider wire execution.
 
 pub mod anthropic;
 

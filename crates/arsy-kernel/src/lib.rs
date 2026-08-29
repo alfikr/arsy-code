@@ -6,6 +6,7 @@ pub mod context;
 pub mod domain;
 pub mod event;
 pub mod migrate;
+pub mod model_profile;
 pub mod operation;
 pub mod policy;
 pub mod projection;
