@@ -15,6 +15,8 @@
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
 //! | `ARSY-PRV-1001` | no credential store is registered |
 
+mod eval;
+
 use arsy_kernel::{
     domain::{Principal, SessionId},
     event::EventStore,
@@ -47,7 +49,6 @@ const UNAVAILABLE: &[(&str, u8)] = &[
     ("compat", 5),
     ("completions", 1),
     ("config", 1),
-    ("eval", 1),
     ("gc", 1),
     ("hook", 8),
     ("mcp", 5),
@@ -69,6 +70,7 @@ Usage:
   arsy run <TASK>            execute one task non-interactively ('-' reads stdin)
   arsy resume <SESSION_ID>   resume a recorded session
   arsy doctor                report platform, sandbox, credential, and config state
+  arsy eval <SUITE>          run a pinned evaluation fixture
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
@@ -165,6 +167,11 @@ pub enum Command {
         handle: SecretHandle,
         force: bool,
     },
+    Eval {
+        suite: PathBuf,
+        trials: Option<u32>,
+        out: Option<PathBuf>,
+    },
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -187,6 +194,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
     let mut strict = false;
     let mut force = false;
     let mut handle = None;
+    let mut trials = None;
+    let mut out = None;
     let mut name: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
@@ -201,6 +210,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             "--strict" => strict = true,
             "--force" => force = true,
             "--handle" => handle = Some(value(&mut arguments, "--handle")?),
+            "--trials" => {
+                let raw = value(&mut arguments, "--trials")?;
+                trials = Some(
+                    raw.parse()
+                        .map_err(|_| usage("--trials must be an integer"))?,
+                );
+            }
+            "--out" => out = Some(PathBuf::from(value(&mut arguments, "--out")?)),
             other if other.starts_with("--") => return Err(usage(format!("unknown flag {other}"))),
             other if name.is_none() => name = Some(other.to_owned()),
             other => positional.push(other.to_owned()),
@@ -225,6 +242,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             }
             Command::Doctor { strict }
         }
+        Some("eval") => Command::Eval {
+            suite: PathBuf::from(only_argument(positional, "eval", "<SUITE>")?),
+            trials,
+            out,
+        },
         Some("auth") => match positional.first().map(String::as_str) {
             Some("set") => {
                 positional.remove(0);
@@ -456,6 +478,12 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         }
         Command::AuthList => auth_list(emitter),
         Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
+        Command::Eval { suite, trials, out } => {
+            let workspace = workspace_root(&invocation.workspace)?;
+            let report = eval::run(&workspace, suite, *trials, out.as_deref())?;
+            emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
+            Ok(0)
+        }
     }
 }
 
