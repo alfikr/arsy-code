@@ -853,6 +853,10 @@ fn user_config() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arsy_kernel::{
+        event::{EventPayload, EventStore},
+        protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
+    };
 
     #[test]
     fn auth_entry_points_parse_without_accepting_a_secret_argument() {
@@ -873,5 +877,63 @@ mod tests {
             Command::AuthRemove { .. }
         ));
         assert!(parse(["auth", "set", "anthropic", "raw-secret"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn minimal_cli_recovers_a_crashed_session_and_has_bounded_noninteractive_outcomes() {
+        let workspace = std::env::temp_dir().join(format!("arsy-cli-{}", SessionId::new()));
+        std::fs::create_dir(&workspace).unwrap();
+        let session = SessionId::new();
+        let store = open_store(&workspace).unwrap();
+        let service = AgentService::attach(store.clone(), session).unwrap();
+        let request = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+            session,
+            prompt: "recover this exact task".to_owned(),
+            extensions: Extensions::new(),
+        }));
+        service.start_turn(actor(), &request).unwrap();
+        drop(service);
+
+        let invocation = Invocation {
+            workspace: workspace.clone(),
+            output: Some(Output::Ci),
+            command: Command::Resume {
+                session,
+                follow: false,
+            },
+        };
+        assert_eq!(
+            resume(&invocation, session, false, &mut Emitter::new(Output::Ci)),
+            Ok(0)
+        );
+
+        let events = store.read(session, 1, 8).unwrap();
+        assert_eq!(events.len(), 2, "resume appends; it never rewrites history");
+        assert_eq!(events[0].kind, "turn.started");
+        assert_eq!(events[1].kind, "turn.failed");
+        let EventPayload::Inline { data } = &events[0].payload else {
+            panic!("turn evidence must remain inline");
+        };
+        assert!(data.to_string().contains("recover this exact task"));
+
+        assert_eq!(doctor(&invocation, false, &mut Emitter::new(Output::Ci)), 0);
+        assert_eq!(Diagnostic::error("ARSY-PRV-1000", "", "").exit_code(), 5);
+        assert_eq!(Diagnostic::error("ARSY-POL-1000", "", "").exit_code(), 3);
+        assert_eq!(
+            execute(
+                &Invocation {
+                    command: Command::Tui,
+                    ..invocation
+                },
+                false,
+                &mut Emitter::new(Output::Ci),
+            )
+            .unwrap_err()
+            .exit_code(),
+            2,
+            "no TTY refuses instead of waiting for interactive input"
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
