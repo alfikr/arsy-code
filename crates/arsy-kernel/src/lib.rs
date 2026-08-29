@@ -9,6 +9,7 @@ pub mod migrate;
 pub mod operation;
 pub mod policy;
 pub mod projection;
+pub mod prompt;
 pub mod protocol;
 pub mod provider;
 pub mod secret;
