@@ -8,6 +8,7 @@ use super::{
     CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelProvider, ModelRole,
     ProviderDescriptor, ProviderError, StopReason,
 };
+use crate::secret::SecretValue;
 use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, fmt, time::Duration};
 
@@ -43,6 +44,13 @@ pub struct ApiKey(String);
 impl ApiKey {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// Credential resolved from a [`SecretHandle`](crate::secret::SecretHandle).
+    /// The broker has already registered the value for redaction, so the key
+    /// exists in cleartext only between here and the wire.
+    pub fn from_secret(secret: &SecretValue) -> Self {
+        Self(secret.expose().to_owned())
     }
 }
 

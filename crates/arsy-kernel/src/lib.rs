@@ -10,6 +10,7 @@ pub mod policy;
 pub mod projection;
 pub mod protocol;
 pub mod provider;
+pub mod secret;
 pub mod service;
 pub mod sqlite;
 pub mod transport;
