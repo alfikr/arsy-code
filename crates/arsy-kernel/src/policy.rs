@@ -9,11 +9,15 @@ use crate::{
         CapabilityAction, CapabilityGrant, CapabilityRequirement, PolicySource, ResourcePattern,
         ResourceScope,
     },
-    domain::{GrantId, Principal, StateVersion},
+    domain::{ApprovalId, GrantId, Principal, StateVersion},
     operation::OperationKind,
+    protocol::ApprovalResolution,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 
 /// What a rule does when it matches. Ordered by how much it restricts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -219,12 +223,17 @@ impl RuleSet {
             });
             return PolicyDecision::RequireApproval(approval_from(
                 query,
+                rule,
                 "the effect is irreversible",
             ));
         }
 
-        if first[effect_slot(RuleEffect::RequireApproval)].is_some() {
-            return PolicyDecision::RequireApproval(approval_from(query, "a rule requires review"));
+        if let Some(rule) = first[effect_slot(RuleEffect::RequireApproval)] {
+            return PolicyDecision::RequireApproval(approval_from(
+                query,
+                rule,
+                "a rule requires review",
+            ));
         }
 
         PolicyDecision::Deny(DenialReason {
@@ -254,12 +263,16 @@ fn grant_from(query: &PolicyQuery, rule: &PolicyRule) -> CapabilityGrant {
     }
 }
 
-fn approval_from(query: &PolicyQuery, reason: &str) -> ApprovalRequest {
+fn approval_from(query: &PolicyQuery, rule: &PolicyRule, reason: &str) -> ApprovalRequest {
     ApprovalRequest {
+        id: ApprovalId::new(),
         actor: query.actor.clone(),
         operation: query.operation.clone(),
         requirement: query.requirement.clone(),
         operation_digest: query.operation_digest,
+        reversible: query.context.reversible,
+        expires_at_ms: rule.expires_at_ms,
+        delegation_depth: rule.delegation_depth,
         reason: reason.to_owned(),
     }
 }
@@ -309,12 +322,153 @@ impl PolicyDecision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
+    pub id: ApprovalId,
     pub actor: Principal,
     pub operation: OperationKind,
     pub requirement: CapabilityRequirement,
     pub operation_digest: StateVersion,
+    pub reversible: bool,
+    pub expires_at_ms: Option<u64>,
+    pub delegation_depth: u32,
     pub reason: String,
 }
+
+impl ApprovalRequest {
+    pub fn intended_effect(&self) -> String {
+        format!(
+            "Run {} with permission to {} {}:{}",
+            self.operation,
+            self.requirement.action,
+            self.requirement.resource.scheme(),
+            self.requirement.resource.value()
+        )
+    }
+
+    pub fn scope(&self) -> String {
+        format!(
+            "Only {}:{}",
+            self.requirement.resource.scheme(),
+            self.requirement.resource.value()
+        )
+    }
+
+    pub const fn reversibility(&self) -> &'static str {
+        if self.reversible {
+            "The intended effect is reversible"
+        } else {
+            "The intended effect is irreversible"
+        }
+    }
+}
+
+/// One-shot resolver for approval requests. The trusted transport supplies the
+/// approver identity; untrusted request payloads never get to name it.
+pub struct ApprovalFlow {
+    capacity: usize,
+    pending: BTreeMap<ApprovalId, ApprovalRequest>,
+    records: Vec<ApprovalRecord>,
+}
+
+impl ApprovalFlow {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            pending: BTreeMap::new(),
+            records: Vec::new(),
+        }
+    }
+
+    pub fn request(&mut self, request: ApprovalRequest) -> Result<(), ApprovalError> {
+        if self.pending.contains_key(&request.id) {
+            return Err(ApprovalError::Duplicate);
+        }
+        if self.pending.len() >= self.capacity {
+            return Err(ApprovalError::Capacity);
+        }
+        self.pending.insert(request.id, request);
+        Ok(())
+    }
+
+    pub fn resolve(
+        &mut self,
+        resolution: &ApprovalResolution,
+        approver: Principal,
+    ) -> Result<&ApprovalRecord, ApprovalError> {
+        let request = self
+            .pending
+            .get(&resolution.approval)
+            .ok_or(ApprovalError::Unknown)?;
+        if request.operation_digest != resolution.operation_digest {
+            return Err(ApprovalError::OperationChanged);
+        }
+
+        let grant = resolution
+            .approved
+            .then(|| exact_grant(request))
+            .transpose()?;
+        let request = self
+            .pending
+            .remove(&resolution.approval)
+            .ok_or(ApprovalError::Unknown)?;
+        self.records.push(ApprovalRecord {
+            request,
+            approver,
+            approved: resolution.approved,
+            grant,
+        });
+        Ok(self.records.last().expect("the record was just pushed"))
+    }
+
+    pub fn records(&self) -> &[ApprovalRecord] {
+        &self.records
+    }
+}
+
+fn exact_grant(request: &ApprovalRequest) -> Result<CapabilityGrant, ApprovalError> {
+    let resource = &request.requirement.resource;
+    let pattern = ResourcePattern::new(resource.scheme(), globset::escape(resource.value()))
+        .map_err(|_| ApprovalError::InvalidScope)?;
+    Ok(CapabilityGrant {
+        id: GrantId::new(),
+        actor: request.actor.clone(),
+        action: request.requirement.action,
+        scope: ResourceScope::single(pattern),
+        expires_at_ms: request.expires_at_ms,
+        delegation_depth: 0,
+        source: PolicySource::User,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRecord {
+    pub request: ApprovalRequest,
+    pub approver: Principal,
+    pub approved: bool,
+    pub grant: Option<CapabilityGrant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalError {
+    Capacity,
+    Duplicate,
+    Unknown,
+    OperationChanged,
+    InvalidScope,
+}
+
+impl fmt::Display for ApprovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Capacity => "approval queue is full",
+            Self::Duplicate => "approval request already exists",
+            Self::Unknown => "approval request is unknown or already resolved",
+            Self::OperationChanged => "operation changed after approval was requested",
+            Self::InvalidScope => "approval scope cannot be represented safely",
+        })
+    }
+}
+
+impl std::error::Error for ApprovalError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenialReason {
