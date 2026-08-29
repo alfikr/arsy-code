@@ -9,6 +9,7 @@ pub mod operation;
 pub mod policy;
 pub mod projection;
 pub mod protocol;
+pub mod service;
 pub mod sqlite;
 
 /// Workspace package version.

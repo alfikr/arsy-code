@@ -351,10 +351,16 @@ pub enum Admission {
     Replay,
 }
 
+impl Admission {
+    pub const fn is_replay(&self) -> bool {
+        matches!(self, Self::Replay)
+    }
+}
+
 /// Bounded record of idempotency keys already admitted.
 ///
-/// ponytail: in-memory and per-process; move behind the event store when the
-/// agent service needs replay safety across restarts.
+/// In-memory and per-process; the agent service rehydrates it from committed
+/// events via [`RequestLedger::record`] so retries stay safe across restarts.
 #[derive(Debug, Default)]
 pub struct RequestLedger {
     seen: HashMap<IdempotencyKey, StateVersion>,
@@ -363,6 +369,11 @@ pub struct RequestLedger {
 impl RequestLedger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Re-admit a key that a durable log already proves was admitted.
+    pub fn record(&mut self, key: IdempotencyKey, digest: StateVersion) {
+        self.seen.insert(key, digest);
     }
 
     /// Requests without a key are always `Fresh`; retries of a declared key are
