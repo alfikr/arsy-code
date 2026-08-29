@@ -1,4 +1,5 @@
 use crate::domain::{CorrelationId, EventId, Principal, ResourceRef, SessionId};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -10,15 +11,15 @@ use std::{
 
 pub const MAX_INLINE_EVENT_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct StreamVersion(pub u64);
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SchemaVersion(pub u32);
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "storage", rename_all = "snake_case")]
 pub enum EventPayload {
     Inline {
@@ -48,7 +49,7 @@ impl EventPayload {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct EventEnvelope {
     pub id: EventId,
     pub session: SessionId,

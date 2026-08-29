@@ -10,6 +10,7 @@ use crate::{
     },
     event::EventEnvelope,
 };
+use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,7 +31,9 @@ pub const MAX_SUBSCRIPTION_BATCH: usize = 512;
 /// Unknown optional fields carried forward across a minor version skew.
 pub type Extensions = BTreeMap<String, Value>;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 pub struct ProtocolVersion {
     pub major: u32,
     pub minor: u32,
@@ -73,8 +76,11 @@ impl fmt::Display for ProtocolVersion {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(try_from = "String")]
+#[schemars(with = "String")]
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
@@ -107,7 +113,7 @@ impl TryFrom<String> for IdempotencyKey {
 
 /// Request envelope. Unknown envelope fields are preserved in `extensions`
 /// so a newer peer's optional additions survive a round trip.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ProtocolEnvelope<T> {
     pub protocol: ProtocolVersion,
     pub request_id: RequestId,
@@ -150,7 +156,7 @@ impl ProtocolEnvelope<ClientRequest> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum ClientRequest {
     Initialize(Initialize),
@@ -179,7 +185,7 @@ impl ClientRequest {
     ];
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct Initialize {
     pub protocol_versions: Vec<ProtocolVersion>,
     #[serde(default)]
@@ -188,21 +194,21 @@ pub struct Initialize {
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct WorkspaceOpen {
     pub root: ResourceRef,
     #[serde(default, flatten, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct SessionCreate {
     pub workspace: WorkspaceId,
     #[serde(default, flatten, skip_serializing_if = "Extensions::is_empty")]
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct SessionResume {
     pub session: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,7 +217,7 @@ pub struct SessionResume {
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct TurnStart {
     pub session: SessionId,
     pub prompt: String,
@@ -221,7 +227,7 @@ pub struct TurnStart {
 
 /// Approval is security-relevant: it binds a decision to one operation digest,
 /// so unknown fields are rejected instead of preserved.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalResolution {
     pub approval: ApprovalId,
@@ -229,7 +235,7 @@ pub struct ApprovalResolution {
     pub approved: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct AgentControl {
     pub agent: AgentId,
     pub action: AgentAction,
@@ -237,7 +243,7 @@ pub struct AgentControl {
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
     Interrupt,
@@ -245,7 +251,7 @@ pub enum AgentAction {
     Resume,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct ArtifactRead {
     pub artifact: ArtifactId,
     pub max_bytes: u64,
@@ -253,7 +259,7 @@ pub struct ArtifactRead {
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub struct Subscribe {
     pub session: SessionId,
     /// Resume point after a reconnect; absent means "from the beginning".
@@ -263,7 +269,7 @@ pub struct Subscribe {
     pub extensions: Extensions,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ServerEvent {
     Initialized {
@@ -340,6 +346,17 @@ fn decode<T: serde::de::DeserializeOwned>(
         });
     }
     serde_json::from_value(raw).map_err(|error| ProtocolError::Malformed(error.to_string()))
+}
+
+/// JSON Schema for a client request envelope, derived from the Rust types.
+/// Never hand-maintained: conformance tests compare messages against this.
+pub fn request_schema() -> Schema {
+    schemars::schema_for!(ProtocolEnvelope<ClientRequest>)
+}
+
+/// JSON Schema for a server event envelope, derived from the Rust types.
+pub fn event_schema() -> Schema {
+    schemars::schema_for!(ProtocolEnvelope<ServerEvent>)
 }
 
 /// Verdict for a request carrying an idempotency key.

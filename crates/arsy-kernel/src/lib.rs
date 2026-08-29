@@ -11,6 +11,7 @@ pub mod projection;
 pub mod protocol;
 pub mod service;
 pub mod sqlite;
+pub mod transport;
 
 /// Workspace package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
