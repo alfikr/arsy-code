@@ -9,16 +9,20 @@ use arsy_kernel::{
         ModelKey, ModelMessage, ModelProvider, ModelRole, ProviderDescriptor, ProviderError,
         StopReason, ToolSchema,
     },
+    secret::{Redactor, SecretHandle},
 };
 use serde_json::json;
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 /// Replays a canned response and records the request it was given.
 struct FakeTransport {
     status: u16,
     headers: Vec<(String, String)>,
     body: Vec<&'static str>,
-    sent: Mutex<Vec<String>>,
+    sent: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeTransport {
@@ -27,7 +31,7 @@ impl FakeTransport {
             status: 200,
             headers: Vec::new(),
             body,
-            sent: Mutex::new(Vec::new()),
+            sent: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -201,6 +205,30 @@ fn the_adapter_owns_wire_format_and_authentication() {
 }
 
 #[test]
+fn model_call_redacts_registered_credentials_before_the_wire() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let sent = Arc::clone(&transport.sent);
+    let handle = SecretHandle::new("os", "anthropic").unwrap();
+    let mut redactor = Redactor::new();
+    redactor.register(&handle, "super-secret-key").unwrap();
+    let provider = AnthropicProvider::with_base_url(
+        "https://example.test",
+        ApiKey::new("wire-key"),
+        transport,
+    )
+    .with_redactor(redactor);
+    let mut request = request(Vec::new());
+    request.messages[0].content = vec![ModelContent::Text {
+        text: "never send super-secret-key".to_owned(),
+    }];
+
+    let _ = provider.stream(&request).unwrap().count();
+    let wire = sent.lock().unwrap();
+    assert!(!wire[0].contains("super-secret-key"));
+    assert!(wire[0].contains("[redacted:secret://os/anthropic]"));
+}
+
+#[test]
 fn http_failures_normalize_with_the_provider_retry_hint() {
     let cases = [
         (
@@ -222,7 +250,7 @@ fn http_failures_normalize_with_the_provider_retry_hint() {
             status,
             headers: vec![("retry-after".to_owned(), "9".to_owned())],
             body: vec![body],
-            sent: Mutex::new(Vec::new()),
+            sent: Arc::new(Mutex::new(Vec::new())),
         };
         let provider = AnthropicProvider::with_base_url(
             "https://example.test",

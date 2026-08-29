@@ -16,6 +16,9 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
 
+pub const OS_STORE_ID: &str = "os";
+const OS_SERVICE: &str = "arsy";
+
 /// Scheme every handle string carries.
 pub const SECRET_SCHEME: &str = "secret://";
 
@@ -119,6 +122,79 @@ pub trait CredentialStore: Send + Sync {
     /// Raw credential, or [`SecretError::NotFound`]. An implementation must not
     /// substitute a value from another source on a miss.
     fn resolve(&self, name: &str) -> Result<String, SecretError>;
+}
+
+/// Native macOS Keychain, Windows Credential Manager, or Linux Secret Service.
+/// Unsupported platforms fail instead of falling back to memory or a file.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OsCredentialStore;
+
+impl OsCredentialStore {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn entry(name: &str) -> Result<keyring::Entry, SecretError> {
+        keyring::Entry::new(OS_SERVICE, name).map_err(|error| SecretError::Store {
+            handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
+            message: error.to_string(),
+        })
+    }
+
+    pub fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            Self::entry(name)?
+                .set_password(value)
+                .map_err(|error| SecretError::Store {
+                    handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
+                    message: error.to_string(),
+                })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
+    }
+
+    pub fn remove(&self, name: &str) -> Result<(), SecretError> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            Self::entry(name)?.delete_credential().map_err(|error| {
+                let handle = SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid");
+                if matches!(error, keyring::Error::NoEntry) {
+                    SecretError::NotFound(handle)
+                } else {
+                    SecretError::Store {
+                        handle,
+                        message: error.to_string(),
+                    }
+                }
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
+    }
+}
+
+impl CredentialStore for OsCredentialStore {
+    fn id(&self) -> &str {
+        OS_STORE_ID
+    }
+
+    fn resolve(&self, name: &str) -> Result<String, SecretError> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            Self::entry(name)?.get_password().map_err(|error| {
+                let handle = SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid");
+                if matches!(error, keyring::Error::NoEntry) {
+                    SecretError::NotFound(handle)
+                } else {
+                    SecretError::Store {
+                        handle,
+                        message: error.to_string(),
+                    }
+                }
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
+    }
 }
 
 /// Owns the registered stores and the redactor they feed.

@@ -21,6 +21,8 @@ zstd = { version = "=0.13.3", default-features = false }
 globset = "=0.4.19"
 proptest = "1"
 tempfile = "3"
+rpassword = "7.4"
+keyring = { version = "=3.6.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

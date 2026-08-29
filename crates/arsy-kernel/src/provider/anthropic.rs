@@ -8,7 +8,7 @@ use super::{
     CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelProvider, ModelRole,
     ProviderDescriptor, ProviderError, StopReason,
 };
-use crate::secret::SecretValue;
+use crate::secret::{Redactor, SecretValue};
 use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, fmt, time::Duration};
 
@@ -65,6 +65,7 @@ pub struct AnthropicProvider<T> {
     base_url: String,
     key: ApiKey,
     transport: T,
+    redactor: Redactor,
 }
 
 impl<T: WireTransport> AnthropicProvider<T> {
@@ -81,7 +82,13 @@ impl<T: WireTransport> AnthropicProvider<T> {
             base_url: base_url.into(),
             key,
             transport,
+            redactor: Redactor::new(),
         }
+    }
+
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Canonical request to Anthropic Messages wire form.
@@ -165,7 +172,12 @@ impl<T: WireTransport> ModelProvider for AnthropicProvider<T> {
     }
 
     fn stream(&self, request: &CanonicalModelRequest) -> Result<ModelEventStream, ProviderError> {
-        let response = self.transport.send(self.encode(request))?;
+        let mut wire = self.encode(request);
+        wire.body = self
+            .redactor
+            .sanitize(&wire.body)
+            .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+        let response = self.transport.send(wire)?;
         if response.status != 200 {
             return Err(normalize_status(response));
         }
