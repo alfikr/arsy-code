@@ -210,6 +210,22 @@ impl RuleSet {
         }
 
         if let Some(rule) = first[effect_slot(RuleEffect::Allow)] {
+            if query.requirement.action == CapabilityAction::GitWrite
+                && query.context.workspace == WorkspaceCleanliness::Dirty
+            {
+                trace.push(TraceEntry {
+                    source: rule.source,
+                    effect: RuleEffect::Allow,
+                    pattern: rule.pattern.to_string(),
+                    matched: true,
+                    note: "allow raised to approval: the workspace has uncommitted changes",
+                });
+                return PolicyDecision::RequireApproval(approval_from(
+                    query,
+                    rule,
+                    "the workspace has uncommitted changes",
+                ));
+            }
             // Irreversible work is never waved through on a rule alone.
             if query.context.reversible {
                 return PolicyDecision::Allow(grant_from(query, rule));
@@ -299,11 +315,26 @@ pub struct PolicyQuery {
 pub struct RiskContext {
     /// Whether the effect can be undone. Irreversible work never auto-runs.
     pub reversible: bool,
+    /// A dirty workspace raises Git mutations to approval so uncommitted work
+    /// cannot be overwritten under a broad allow rule.
+    pub workspace: WorkspaceCleanliness,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCleanliness {
+    Clean,
+    Dirty,
+    #[default]
+    Unknown,
 }
 
 impl Default for RiskContext {
     fn default() -> Self {
-        Self { reversible: true }
+        Self {
+            reversible: true,
+            workspace: WorkspaceCleanliness::Unknown,
+        }
     }
 }
 
@@ -609,6 +640,31 @@ mod tests {
         assert!(outcome
             .matched()
             .any(|entry| entry.note.contains("irreversible")));
+    }
+
+    #[test]
+    fn dirty_workspace_raises_git_mutation_to_approval() {
+        let mut git_rule = rule(PolicySource::User, RuleEffect::Allow, "*");
+        git_rule.action = CapabilityAction::GitWrite;
+        git_rule.pattern = ResourcePattern::new("git", "*").unwrap();
+        let rules = RuleSet::compile([git_rule]);
+        let mut asked = query("unused");
+        asked.operation = OperationKind::new("git.commit").unwrap();
+        asked.requirement = CapabilityRequirement::new(
+            CapabilityAction::GitWrite,
+            ResourceRef::new("git", ".").unwrap(),
+        );
+        asked.context.workspace = WorkspaceCleanliness::Dirty;
+
+        let outcome = rules.evaluate(&asked);
+
+        assert!(matches!(
+            outcome.decision,
+            PolicyDecision::RequireApproval(_)
+        ));
+        assert!(outcome
+            .matched()
+            .any(|entry| entry.note.contains("uncommitted changes")));
     }
 
     #[test]

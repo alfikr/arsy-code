@@ -120,7 +120,10 @@ fn query() -> impl Strategy<Value = PolicyQuery> {
             requirement: CapabilityRequirement::new(action, resource(value)),
             operation_digest: StateVersion::from_digest([7; 32]),
             resource_version: Some(StateVersion::from_digest([8; 32])),
-            context: RiskContext { reversible },
+            context: RiskContext {
+                reversible,
+                ..RiskContext::default()
+            },
         })
 }
 
@@ -139,7 +142,10 @@ fn approval_flow_binds_effect_scope_digest_and_approver() {
         ),
         operation_digest: StateVersion::from_digest([7; 32]),
         resource_version: None,
-        context: RiskContext { reversible: false },
+        context: RiskContext {
+            reversible: false,
+            ..RiskContext::default()
+        },
     };
     let rules = RuleSet::compile([PolicyRule {
         source: PolicySource::User,
