@@ -333,7 +333,7 @@ fn execution(error: io::Error) -> OperationError {
     OperationError::Execution(error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use arsy_kernel::artifact::{ArtifactReadLimits, FileArtifactStore};
