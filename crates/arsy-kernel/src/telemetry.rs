@@ -87,7 +87,10 @@ impl Telemetry {
 
     pub fn record(&self, event: TelemetryEvent) {
         if event.kind == TelemetryKind::Trace
-            && self.trace_sequence.fetch_add(1, Ordering::Relaxed) % self.sample_every != 0
+            && !self
+                .trace_sequence
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(self.sample_every)
         {
             return;
         }
