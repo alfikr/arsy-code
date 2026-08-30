@@ -977,6 +977,7 @@ mod tests {
             "no TTY refuses instead of waiting for interactive input"
         );
 
+        drop(store);
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }
