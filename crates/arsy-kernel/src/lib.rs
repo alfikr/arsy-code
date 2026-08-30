@@ -16,6 +16,7 @@ pub mod provider;
 pub mod secret;
 pub mod service;
 pub mod sqlite;
+pub mod telemetry;
 pub mod transport;
 
 /// Workspace package version.
