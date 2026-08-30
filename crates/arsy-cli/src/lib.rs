@@ -8,7 +8,7 @@
 //! | `ARSY-SCH-1000` | unknown command |
 //! | `ARSY-SCH-1001` | usage error: unknown flag, missing or extra argument, bad value |
 //! | `ARSY-SCH-1002` | documented command that its roadmap phase has not shipped yet |
-//! | `ARSY-SCH-1003` | bare `arsy`: the interactive TUI is unavailable |
+//! | `ARSY-SCH-1003` | bare `arsy`: no terminal, or TUI disabled at build time |
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
@@ -16,6 +16,8 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 
 mod eval;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 use arsy_kernel::{
     domain::{Principal, SessionId},
@@ -461,14 +463,27 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             let _ = writeln!(io::stdout(), "arsy {} ({})", arsy_code::VERSION, platform());
             Ok(0)
         }
+        Command::Tui if !tty => Err(Diagnostic::error(
+            "ARSY-SCH-1003",
+            "the interactive TUI requires a terminal",
+            "there is no terminal; use `arsy run <TASK>`",
+        )),
+        #[cfg(feature = "tui")]
+        Command::Tui => {
+            let workspace = workspace_root(&invocation.workspace)?;
+            let frame = tui::TuiState::new(workspace.display().to_string(), SessionId::new())
+                .render(
+                    tui::terminal_width(),
+                    std::env::var_os("NO_COLOR").is_none(),
+                );
+            write!(io::stdout(), "{frame}").map_err(storage_failed)?;
+            Ok(0)
+        }
+        #[cfg(not(feature = "tui"))]
         Command::Tui => Err(Diagnostic::error(
             "ARSY-SCH-1003",
-            "the interactive TUI is not available",
-            if tty {
-                "it ships in phase 2; use `arsy run <TASK>` meanwhile"
-            } else {
-                "there is no terminal; use `arsy run <TASK>`"
-            },
+            "the interactive TUI is disabled in this build",
+            "install a build with the `tui` feature",
         )),
         Command::Run { task } => run(invocation, task, emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
