@@ -34,6 +34,7 @@ version = "0.1.0"
 dependencies = [
  "arsy-code",
  "arsy-kernel",
+ "keyring",
  "rpassword",
  "serde",
  "serde_json",

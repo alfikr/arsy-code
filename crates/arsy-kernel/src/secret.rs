@@ -132,13 +132,6 @@ pub struct OsCredentialStore;
 impl OsCredentialStore {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn entry(name: &str) -> Result<keyring::Entry, SecretError> {
-        #[cfg(target_os = "linux")]
-        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
-            return Err(SecretError::Store {
-                handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
-                message: "D-Bus session bus is unavailable".to_owned(),
-            });
-        }
         keyring::Entry::new(OS_SERVICE, name).map_err(|error| SecretError::Store {
             handle: SecretHandle::new(OS_STORE_ID, name).expect("fixed store ID is valid"),
             message: error.to_string(),
