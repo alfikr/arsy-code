@@ -274,7 +274,7 @@ fn wait_bounded(
 #[cfg(unix)]
 fn terminate(child: &Child) -> bool {
     Command::new("kill")
-        .args(["-TERM", &format!("-{}", child.id())])
+        .args(["-TERM", "--", &format!("-{}", child.id())])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -286,7 +286,7 @@ fn terminate(child: &Child) -> bool {
 #[cfg(unix)]
 fn force_kill(child: &mut Child) -> Result<(), OperationError> {
     let status = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
+        .args(["-KILL", "--", &format!("-{}", child.id())])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())

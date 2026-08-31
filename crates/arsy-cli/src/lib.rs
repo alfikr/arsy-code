@@ -924,7 +924,6 @@ mod tests {
 
     #[test]
     fn minimal_cli_recovers_a_crashed_session_and_has_bounded_noninteractive_outcomes() {
-        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         let workspace = std::env::temp_dir().join(format!("arsy-cli-{}", SessionId::new()));
         std::fs::create_dir(&workspace).unwrap();
         let session = SessionId::new();
