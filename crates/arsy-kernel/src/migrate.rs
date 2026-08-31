@@ -10,7 +10,8 @@ use crate::{
     sqlite::{read_schema_version, write_schema_version, SCHEMA_VERSION},
 };
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
-use std::{path::Path, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{fs::File, io::Read, path::Path, time::Duration};
 
 /// One step from one schema version to the next.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,7 +151,31 @@ fn write_verified_backup(
             "backup does not carry the source schema version".into(),
         ));
     }
+    drop(copy);
+    let checksum = file_checksum(backup)?;
+    if file_checksum(backup)? != checksum {
+        return Err(StoreError::Storage(
+            "backup checksum changed during verification".into(),
+        ));
+    }
     Ok(())
+}
+
+fn file_checksum(path: &Path) -> Result<[u8; 32], StoreError> {
+    let mut file = File::open(path)
+        .map_err(|error| StoreError::Storage(format!("{}: {error}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            StoreError::Storage(format!("could not checksum {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// A store written before stamping began already has the baseline shape.
@@ -347,5 +372,17 @@ mod tests {
         );
         cleanup(&path);
         cleanup(&backup);
+    }
+
+    #[test]
+    fn backup_checksum_covers_the_complete_file() {
+        let path = store_path();
+        fs::write(&path, b"complete backup").unwrap();
+        let before = file_checksum(&path).unwrap();
+
+        fs::write(&path, b"complete backuP").unwrap();
+
+        assert_ne!(file_checksum(&path).unwrap(), before);
+        cleanup(&path);
     }
 }

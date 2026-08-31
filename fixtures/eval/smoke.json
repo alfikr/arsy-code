@@ -1,0 +1,8 @@
+{
+  "revision": "5ddd80cf63ceb4ef2f0359c844d0d24ec35107da",
+  "environment": { "CI": "true" },
+  "allowed_capabilities": ["process.exec"],
+  "hidden_tests": [["cargo", "test", "-p", "arsy-kernel", "--lib", "protocol::", "--locked"]],
+  "timeout_seconds": 120,
+  "trials": 3
+}

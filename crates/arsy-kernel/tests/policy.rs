@@ -12,8 +12,10 @@ use arsy_kernel::{
     domain::{GrantId, Principal, ResourceRef, StateVersion},
     operation::OperationKind,
     policy::{
-        ActorMatch, PolicyDecision, PolicyQuery, PolicyRule, RiskContext, RuleEffect, RuleSet,
+        ActorMatch, ApprovalError, ApprovalFlow, PolicyDecision, PolicyQuery, PolicyRule,
+        RiskContext, RuleEffect, RuleSet,
     },
+    protocol::ApprovalResolution,
 };
 use proptest::prelude::*;
 
@@ -117,12 +119,102 @@ fn query() -> impl Strategy<Value = PolicyQuery> {
             operation: OperationKind::new("fs.read").expect("a valid kind"),
             requirement: CapabilityRequirement::new(action, resource(value)),
             operation_digest: StateVersion::from_digest([7; 32]),
-            context: RiskContext { reversible },
+            resource_version: Some(StateVersion::from_digest([8; 32])),
+            context: RiskContext {
+                reversible,
+                ..RiskContext::default()
+            },
         })
 }
 
 fn queries() -> impl Strategy<Value = Vec<PolicyQuery>> {
     prop::collection::vec(query(), 1..8)
+}
+
+#[test]
+fn approval_flow_binds_effect_scope_digest_and_approver() {
+    let mut asked = PolicyQuery {
+        actor: Principal::System,
+        operation: OperationKind::new("fs.read").unwrap(),
+        requirement: CapabilityRequirement::new(
+            CapabilityAction::FsRead,
+            resource("/repo/src/[literal].rs"),
+        ),
+        operation_digest: StateVersion::from_digest([7; 32]),
+        resource_version: None,
+        context: RiskContext {
+            reversible: false,
+            ..RiskContext::default()
+        },
+    };
+    let rules = RuleSet::compile([PolicyRule {
+        source: PolicySource::User,
+        effect: RuleEffect::RequireApproval,
+        actor: ActorMatch::Any,
+        action: CapabilityAction::FsRead,
+        pattern: pattern("/repo/**"),
+        expires_at_ms: Some(100),
+        delegation_depth: 1,
+    }]);
+    let PolicyDecision::RequireApproval(request) = rules.evaluate(&asked).decision else {
+        panic!("expected approval");
+    };
+    assert!(request.intended_effect().contains("fs.read"));
+    assert_eq!(request.scope(), "Only file:/repo/src/[literal].rs");
+    assert_eq!(
+        request.reversibility(),
+        "The intended effect is irreversible"
+    );
+
+    let approval = request.id;
+    let mut flow = ApprovalFlow::new(1);
+    flow.request(request.clone()).unwrap();
+    assert_eq!(flow.request(request), Err(ApprovalError::Duplicate));
+    asked.operation_digest = StateVersion::from_digest([8; 32]);
+    assert_eq!(
+        flow.resolve(
+            &ApprovalResolution {
+                approval,
+                operation_digest: asked.operation_digest,
+                approved: true,
+            },
+            Principal::User("mallory".into()),
+        ),
+        Err(ApprovalError::OperationChanged)
+    );
+
+    let approver = Principal::User("ada".into());
+    let record = flow
+        .resolve(
+            &ApprovalResolution {
+                approval,
+                operation_digest: StateVersion::from_digest([7; 32]),
+                approved: true,
+            },
+            approver.clone(),
+        )
+        .unwrap();
+    assert_eq!(record.approver, approver);
+    let grant = record.grant.as_ref().unwrap();
+    assert!(grant.permits(&record.request.requirement, 99));
+    assert!(!grant.permits(&record.request.requirement, 100));
+    assert_eq!(grant.delegation_depth, 0);
+    assert!(!grant.permits(
+        &CapabilityRequirement::new(CapabilityAction::FsRead, resource("/repo/src/x.rs")),
+        0
+    ));
+    assert_eq!(
+        flow.resolve(
+            &ApprovalResolution {
+                approval,
+                operation_digest: StateVersion::from_digest([7; 32]),
+                approved: true,
+            },
+            Principal::User("ada".into()),
+        ),
+        Err(ApprovalError::Unknown)
+    );
+    assert_eq!(flow.records().len(), 1);
 }
 
 /// A grant carries a fresh random identifier, so decisions are compared by

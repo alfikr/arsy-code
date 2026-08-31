@@ -1,0 +1,354 @@
+//! The provider boundary as an outside caller sees it: canonical request in,
+//! normalized events out, with no Anthropic vocabulary crossing the line.
+
+use arsy_kernel::{
+    protocol::IdempotencyKey,
+    provider::{
+        anthropic::{AnthropicProvider, ApiKey, WireRequest, WireResponse, WireTransport},
+        stream_with_retry, CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream,
+        ModelKey, ModelMessage, ModelProvider, ModelRole, ProviderDescriptor, ProviderError,
+        StopReason, ToolSchema,
+    },
+    secret::{Redactor, SecretHandle},
+};
+use serde_json::json;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+/// Replays a canned response and records the request it was given.
+struct FakeTransport {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<&'static str>,
+    sent: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeTransport {
+    fn streaming(body: Vec<&'static str>) -> Self {
+        Self {
+            status: 200,
+            headers: Vec::new(),
+            body,
+            sent: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl WireTransport for FakeTransport {
+    fn send(&self, request: WireRequest) -> Result<WireResponse, ProviderError> {
+        self.sent.lock().unwrap().push(format!(
+            "{} {} {}",
+            request.url,
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(";"),
+            request.body
+        ));
+        Ok(WireResponse {
+            status: self.status,
+            headers: self.headers.clone(),
+            lines: Box::new(
+                self.body
+                    .clone()
+                    .into_iter()
+                    .map(|line| Ok(line.to_owned())),
+            ),
+        })
+    }
+}
+
+fn request(tools: Vec<ToolSchema>) -> CanonicalModelRequest {
+    CanonicalModelRequest {
+        model: ModelKey {
+            provider: "anthropic".to_owned(),
+            model: "claude-opus-5".to_owned(),
+        },
+        system: Some("be terse".to_owned()),
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "read Cargo.toml".to_owned(),
+            }],
+        }],
+        tools,
+        max_output_tokens: 256,
+        idempotency_key: IdempotencyKey::new("turn-1").unwrap(),
+    }
+}
+
+fn read_tool() -> ToolSchema {
+    ToolSchema {
+        name: "fs.read".to_owned(),
+        description: "read a file".to_owned(),
+        input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+    }
+}
+
+/// A tool call split across three fragments: none of them is valid JSON, and
+/// only the completed call is executable.
+#[test]
+fn partial_tool_arguments_are_streamed_but_never_executable_until_complete() {
+    let transport = FakeTransport::streaming(vec![
+        r#"event: message_start"#,
+        r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs.read"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"th\":\"Cargo"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":".toml\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":12,"output_tokens":34}}"#,
+        r#"data: {"type":"message_stop"}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events = collect(provider.stream(&request(vec![read_tool()])).unwrap());
+
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::ToolCallStarted {
+                index: 0,
+                id: "toolu_1".to_owned(),
+                name: "fs.read".to_owned(),
+            },
+            ModelEvent::ToolCallDelta {
+                index: 0,
+                fragment: "{\"pa".to_owned(),
+            },
+            ModelEvent::ToolCallDelta {
+                index: 0,
+                fragment: "th\":\"Cargo".to_owned(),
+            },
+            ModelEvent::ToolCallDelta {
+                index: 0,
+                fragment: ".toml\"}".to_owned(),
+            },
+            ModelEvent::ToolCallCompleted {
+                index: 0,
+                id: "toolu_1".to_owned(),
+                name: "fs.read".to_owned(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            ModelEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 34,
+            },
+            ModelEvent::Completed {
+                stop: StopReason::ToolUse,
+            },
+        ]
+    );
+}
+
+/// A stream cut off mid-arguments must not produce an executable call.
+#[test]
+fn a_truncated_tool_call_yields_no_completed_call() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs.read"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pa"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events: Vec<_> = provider
+        .stream(&request(vec![read_tool()]))
+        .unwrap()
+        .collect();
+
+    assert!(matches!(
+        events.last(),
+        Some(Err(ProviderError::Decode(message)))
+            if message.contains("never completed")
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(ModelEvent::ToolCallCompleted { .. }))),
+        "an incomplete argument buffer must never become an executable call"
+    );
+}
+
+#[test]
+fn the_adapter_owns_wire_format_and_authentication() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+    let encoded = provider.encode(&request(vec![read_tool()]));
+
+    assert_eq!(encoded.url, "https://example.test/v1/messages");
+    assert!(encoded
+        .headers
+        .contains(&("x-api-key".to_owned(), "sk-test".to_owned())));
+    assert!(encoded
+        .headers
+        .iter()
+        .any(|(name, value)| name == "anthropic-version"
+            && value == arsy_kernel::provider::anthropic::API_VERSION));
+
+    let body: serde_json::Value = serde_json::from_str(&encoded.body).unwrap();
+    assert_eq!(body["model"], "claude-opus-5");
+    assert_eq!(body["max_tokens"], 256);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["system"], "be terse");
+    assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(body["tools"][0]["name"], "fs.read");
+
+    // The credential is not reachable through a formatter.
+    assert_eq!(format!("{:?}", ApiKey::new("sk-test")), "ApiKey(redacted)");
+}
+
+#[test]
+fn model_call_redacts_registered_credentials_before_the_wire() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let sent = Arc::clone(&transport.sent);
+    let handle = SecretHandle::new("os", "anthropic").unwrap();
+    let mut redactor = Redactor::new();
+    redactor.register(&handle, "super-secret-key").unwrap();
+    let provider = AnthropicProvider::with_base_url(
+        "https://example.test",
+        ApiKey::new("wire-key"),
+        transport,
+    )
+    .with_redactor(redactor);
+    let mut request = request(Vec::new());
+    request.messages[0].content = vec![ModelContent::Text {
+        text: "never send super-secret-key".to_owned(),
+    }];
+
+    let _ = provider.stream(&request).unwrap().count();
+    let wire = sent.lock().unwrap();
+    assert!(!wire[0].contains("super-secret-key"));
+    assert!(wire[0].contains("[redacted:secret://os/anthropic]"));
+}
+
+#[test]
+fn http_failures_normalize_with_the_provider_retry_hint() {
+    let cases = [
+        (
+            401u16,
+            r#"{"error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+        ),
+        (
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+        (
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"overloaded"}}"#,
+        ),
+    ];
+    let mut normalized = Vec::new();
+    for (status, body) in cases {
+        let transport = FakeTransport {
+            status,
+            headers: vec![("retry-after".to_owned(), "9".to_owned())],
+            body: vec![body],
+            sent: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider = AnthropicProvider::with_base_url(
+            "https://example.test",
+            ApiKey::new("sk-test"),
+            transport,
+        );
+        let Err(error) = provider.stream(&request(Vec::new())) else {
+            panic!("http {status} must not produce a stream");
+        };
+        normalized.push(error);
+    }
+
+    assert_eq!(
+        normalized[0],
+        ProviderError::Auth("authentication_error: invalid x-api-key".to_owned())
+    );
+    assert_eq!(normalized[0].retry_after(0), None, "auth is deterministic");
+    assert_eq!(
+        normalized[1],
+        ProviderError::RateLimited {
+            retry_after: Some(Duration::from_secs(9)),
+        }
+    );
+    assert_eq!(
+        normalized[1].retry_after(3),
+        Some(Duration::from_secs(9)),
+        "the provider hint wins over the default backoff"
+    );
+    assert_eq!(
+        normalized[2],
+        ProviderError::Server {
+            status: 529,
+            message: "overloaded_error: overloaded".to_owned(),
+        }
+    );
+    assert!(normalized[2].retry_after(0).is_some());
+}
+
+/// A second provider is a new impl and nothing else: the same caller drives it
+/// through the same trait, with no operation-side change.
+#[test]
+fn a_second_provider_needs_no_change_above_the_trait() {
+    struct EchoProvider(ProviderDescriptor);
+
+    impl ModelProvider for EchoProvider {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.0
+        }
+
+        fn stream(
+            &self,
+            request: &CanonicalModelRequest,
+        ) -> Result<ModelEventStream, ProviderError> {
+            let text = format!("{}", request.model);
+            Ok(Box::new(
+                [
+                    Ok(ModelEvent::TextDelta { text }),
+                    Ok(ModelEvent::Completed {
+                        stop: StopReason::EndTurn,
+                    }),
+                ]
+                .into_iter(),
+            ))
+        }
+    }
+
+    let anthropic = AnthropicProvider::with_base_url(
+        "https://example.test",
+        ApiKey::new("sk-test"),
+        FakeTransport::streaming(vec![
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]),
+    );
+    let echo = EchoProvider(ProviderDescriptor {
+        id: "echo".to_owned(),
+        max_retries: 0,
+    });
+
+    let providers: [&dyn ModelProvider; 2] = [&anthropic, &echo];
+    for provider in providers {
+        let events = collect(
+            stream_with_retry(provider, &request(Vec::new()), &mut |_| {
+                panic!("no retry expected")
+            })
+            .unwrap(),
+        );
+        assert!(matches!(events.first(), Some(ModelEvent::TextDelta { .. })));
+        assert_eq!(
+            events.last(),
+            Some(&ModelEvent::Completed {
+                stop: StopReason::EndTurn
+            })
+        );
+    }
+}
+
+fn collect(stream: ModelEventStream) -> Vec<ModelEvent> {
+    stream.map(Result::unwrap).collect()
+}

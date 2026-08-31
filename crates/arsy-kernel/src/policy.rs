@@ -9,11 +9,15 @@ use crate::{
         CapabilityAction, CapabilityGrant, CapabilityRequirement, PolicySource, ResourcePattern,
         ResourceScope,
     },
-    domain::{GrantId, Principal, StateVersion},
+    domain::{ApprovalId, GrantId, Principal, StateVersion},
     operation::OperationKind,
+    protocol::ApprovalResolution,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 
 /// What a rule does when it matches. Ordered by how much it restricts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -25,7 +29,7 @@ pub enum RuleEffect {
 }
 
 /// Which actor a rule speaks about.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorMatch {
     Any,
@@ -114,8 +118,11 @@ impl RuleSet {
             left.source
                 .cmp(&right.source)
                 .then_with(|| left.effect.cmp(&right.effect))
+                .then_with(|| left.actor.cmp(&right.actor))
                 .then_with(|| left.action.cmp(&right.action))
                 .then_with(|| left.pattern.to_string().cmp(&right.pattern.to_string()))
+                .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
+                .then_with(|| left.delegation_depth.cmp(&right.delegation_depth))
         });
         Self {
             rules: compiled,
@@ -164,6 +171,31 @@ impl RuleSet {
         PolicyOutcome { decision, trace }
     }
 
+    /// Evaluate through a caller-owned bounded cache. The key includes the
+    /// normalized rules and the complete query, including resource state.
+    pub fn evaluate_cached(&self, query: &PolicyQuery, cache: &mut DecisionCache) -> PolicyOutcome {
+        if let Some(entry) = cache
+            .entries
+            .iter()
+            .find(|entry| entry.rules == self.rules && entry.query == *query)
+        {
+            return entry.outcome.clone();
+        }
+
+        let outcome = self.evaluate(query);
+        if cache.capacity > 0 {
+            if cache.entries.len() == cache.capacity {
+                cache.entries.pop_front();
+            }
+            cache.entries.push_back(CacheEntry {
+                rules: self.rules.clone(),
+                query: query.clone(),
+                outcome: outcome.clone(),
+            });
+        }
+        outcome
+    }
+
     fn decide(
         &self,
         query: &PolicyQuery,
@@ -178,6 +210,22 @@ impl RuleSet {
         }
 
         if let Some(rule) = first[effect_slot(RuleEffect::Allow)] {
+            if query.requirement.action == CapabilityAction::GitWrite
+                && query.context.workspace == WorkspaceCleanliness::Dirty
+            {
+                trace.push(TraceEntry {
+                    source: rule.source,
+                    effect: RuleEffect::Allow,
+                    pattern: rule.pattern.to_string(),
+                    matched: true,
+                    note: "allow raised to approval: the workspace has uncommitted changes",
+                });
+                return PolicyDecision::RequireApproval(approval_from(
+                    query,
+                    rule,
+                    "the workspace has uncommitted changes",
+                ));
+            }
             // Irreversible work is never waved through on a rule alone.
             if query.context.reversible {
                 return PolicyDecision::Allow(grant_from(query, rule));
@@ -191,12 +239,17 @@ impl RuleSet {
             });
             return PolicyDecision::RequireApproval(approval_from(
                 query,
+                rule,
                 "the effect is irreversible",
             ));
         }
 
-        if first[effect_slot(RuleEffect::RequireApproval)].is_some() {
-            return PolicyDecision::RequireApproval(approval_from(query, "a rule requires review"));
+        if let Some(rule) = first[effect_slot(RuleEffect::RequireApproval)] {
+            return PolicyDecision::RequireApproval(approval_from(
+                query,
+                rule,
+                "a rule requires review",
+            ));
         }
 
         PolicyDecision::Deny(DenialReason {
@@ -226,12 +279,16 @@ fn grant_from(query: &PolicyQuery, rule: &PolicyRule) -> CapabilityGrant {
     }
 }
 
-fn approval_from(query: &PolicyQuery, reason: &str) -> ApprovalRequest {
+fn approval_from(query: &PolicyQuery, rule: &PolicyRule, reason: &str) -> ApprovalRequest {
     ApprovalRequest {
+        id: ApprovalId::new(),
         actor: query.actor.clone(),
         operation: query.operation.clone(),
         requirement: query.requirement.clone(),
         operation_digest: query.operation_digest,
+        reversible: query.context.reversible,
+        expires_at_ms: rule.expires_at_ms,
+        delegation_depth: rule.delegation_depth,
         reason: reason.to_owned(),
     }
 }
@@ -245,6 +302,9 @@ pub struct PolicyQuery {
     /// Binds any approval to this exact operation, so a mutated request cannot
     /// reuse the answer.
     pub operation_digest: StateVersion,
+    /// Version of the canonical resource state inspected by policy. A changed
+    /// version cannot reuse an earlier cached decision.
+    pub resource_version: Option<StateVersion>,
     pub context: RiskContext,
 }
 
@@ -255,11 +315,26 @@ pub struct PolicyQuery {
 pub struct RiskContext {
     /// Whether the effect can be undone. Irreversible work never auto-runs.
     pub reversible: bool,
+    /// A dirty workspace raises Git mutations to approval so uncommitted work
+    /// cannot be overwritten under a broad allow rule.
+    pub workspace: WorkspaceCleanliness,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCleanliness {
+    Clean,
+    Dirty,
+    #[default]
+    Unknown,
 }
 
 impl Default for RiskContext {
     fn default() -> Self {
-        Self { reversible: true }
+        Self {
+            reversible: true,
+            workspace: WorkspaceCleanliness::Unknown,
+        }
     }
 }
 
@@ -278,12 +353,153 @@ impl PolicyDecision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalRequest {
+    pub id: ApprovalId,
     pub actor: Principal,
     pub operation: OperationKind,
     pub requirement: CapabilityRequirement,
     pub operation_digest: StateVersion,
+    pub reversible: bool,
+    pub expires_at_ms: Option<u64>,
+    pub delegation_depth: u32,
     pub reason: String,
 }
+
+impl ApprovalRequest {
+    pub fn intended_effect(&self) -> String {
+        format!(
+            "Run {} with permission to {} {}:{}",
+            self.operation,
+            self.requirement.action,
+            self.requirement.resource.scheme(),
+            self.requirement.resource.value()
+        )
+    }
+
+    pub fn scope(&self) -> String {
+        format!(
+            "Only {}:{}",
+            self.requirement.resource.scheme(),
+            self.requirement.resource.value()
+        )
+    }
+
+    pub const fn reversibility(&self) -> &'static str {
+        if self.reversible {
+            "The intended effect is reversible"
+        } else {
+            "The intended effect is irreversible"
+        }
+    }
+}
+
+/// One-shot resolver for approval requests. The trusted transport supplies the
+/// approver identity; untrusted request payloads never get to name it.
+pub struct ApprovalFlow {
+    capacity: usize,
+    pending: BTreeMap<ApprovalId, ApprovalRequest>,
+    records: Vec<ApprovalRecord>,
+}
+
+impl ApprovalFlow {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            pending: BTreeMap::new(),
+            records: Vec::new(),
+        }
+    }
+
+    pub fn request(&mut self, request: ApprovalRequest) -> Result<(), ApprovalError> {
+        if self.pending.contains_key(&request.id) {
+            return Err(ApprovalError::Duplicate);
+        }
+        if self.pending.len() >= self.capacity {
+            return Err(ApprovalError::Capacity);
+        }
+        self.pending.insert(request.id, request);
+        Ok(())
+    }
+
+    pub fn resolve(
+        &mut self,
+        resolution: &ApprovalResolution,
+        approver: Principal,
+    ) -> Result<&ApprovalRecord, ApprovalError> {
+        let request = self
+            .pending
+            .get(&resolution.approval)
+            .ok_or(ApprovalError::Unknown)?;
+        if request.operation_digest != resolution.operation_digest {
+            return Err(ApprovalError::OperationChanged);
+        }
+
+        let grant = resolution
+            .approved
+            .then(|| exact_grant(request))
+            .transpose()?;
+        let request = self
+            .pending
+            .remove(&resolution.approval)
+            .ok_or(ApprovalError::Unknown)?;
+        self.records.push(ApprovalRecord {
+            request,
+            approver,
+            approved: resolution.approved,
+            grant,
+        });
+        Ok(self.records.last().expect("the record was just pushed"))
+    }
+
+    pub fn records(&self) -> &[ApprovalRecord] {
+        &self.records
+    }
+}
+
+fn exact_grant(request: &ApprovalRequest) -> Result<CapabilityGrant, ApprovalError> {
+    let resource = &request.requirement.resource;
+    let pattern = ResourcePattern::new(resource.scheme(), globset::escape(resource.value()))
+        .map_err(|_| ApprovalError::InvalidScope)?;
+    Ok(CapabilityGrant {
+        id: GrantId::new(),
+        actor: request.actor.clone(),
+        action: request.requirement.action,
+        scope: ResourceScope::single(pattern),
+        expires_at_ms: request.expires_at_ms,
+        delegation_depth: 0,
+        source: PolicySource::User,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRecord {
+    pub request: ApprovalRequest,
+    pub approver: Principal,
+    pub approved: bool,
+    pub grant: Option<CapabilityGrant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalError {
+    Capacity,
+    Duplicate,
+    Unknown,
+    OperationChanged,
+    InvalidScope,
+}
+
+impl fmt::Display for ApprovalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Capacity => "approval queue is full",
+            Self::Duplicate => "approval request already exists",
+            Self::Unknown => "approval request is unknown or already resolved",
+            Self::OperationChanged => "operation changed after approval was requested",
+            Self::InvalidScope => "approval scope cannot be represented safely",
+        })
+    }
+}
+
+impl std::error::Error for ApprovalError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DenialReason {
@@ -305,6 +521,37 @@ pub struct TraceEntry {
 pub struct PolicyOutcome {
     pub decision: PolicyDecision,
     pub trace: Vec<TraceEntry>,
+}
+
+/// A bounded decision cache. Callers choose the bound and lifetime explicitly.
+#[derive(Clone, Debug)]
+pub struct DecisionCache {
+    capacity: usize,
+    entries: VecDeque<CacheEntry>,
+}
+
+impl DecisionCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    rules: Vec<PolicyRule>,
+    query: PolicyQuery,
+    outcome: PolicyOutcome,
 }
 
 impl PolicyOutcome {
@@ -340,6 +587,7 @@ mod tests {
                 ResourceRef::new("file", value).unwrap(),
             ),
             operation_digest: StateVersion::from_digest([0; 32]),
+            resource_version: Some(StateVersion::from_digest([1; 32])),
             context: RiskContext::default(),
         }
     }
@@ -395,6 +643,31 @@ mod tests {
     }
 
     #[test]
+    fn dirty_workspace_raises_git_mutation_to_approval() {
+        let mut git_rule = rule(PolicySource::User, RuleEffect::Allow, "*");
+        git_rule.action = CapabilityAction::GitWrite;
+        git_rule.pattern = ResourcePattern::new("git", "*").unwrap();
+        let rules = RuleSet::compile([git_rule]);
+        let mut asked = query("unused");
+        asked.operation = OperationKind::new("git.commit").unwrap();
+        asked.requirement = CapabilityRequirement::new(
+            CapabilityAction::GitWrite,
+            ResourceRef::new("git", ".").unwrap(),
+        );
+        asked.context.workspace = WorkspaceCleanliness::Dirty;
+
+        let outcome = rules.evaluate(&asked);
+
+        assert!(matches!(
+            outcome.decision,
+            PolicyDecision::RequireApproval(_)
+        ));
+        assert!(outcome
+            .matched()
+            .any(|entry| entry.note.contains("uncommitted changes")));
+    }
+
+    #[test]
     fn the_trace_names_the_rule_that_decided() {
         let rules = RuleSet::compile([
             rule(PolicySource::User, RuleEffect::Allow, "/repo/**"),
@@ -425,5 +698,23 @@ mod tests {
         assert!(!grant
             .scope
             .admits(&ResourceRef::new("file", "/etc/passwd").unwrap()));
+    }
+
+    #[test]
+    fn cache_keys_on_complete_inputs_and_resource_version() {
+        let rules = RuleSet::compile([rule(PolicySource::User, RuleEffect::Allow, "/repo/**")]);
+        let mut cache = DecisionCache::new(2);
+        let first = query("/repo/main.rs");
+        let mut changed_resource = first.clone();
+        changed_resource.resource_version = Some(StateVersion::from_digest([2; 32]));
+        let changed_input = query("/repo/other.rs");
+
+        rules.evaluate_cached(&first, &mut cache);
+        rules.evaluate_cached(&first, &mut cache);
+        assert_eq!(cache.len(), 1);
+        rules.evaluate_cached(&changed_resource, &mut cache);
+        assert_eq!(cache.len(), 2);
+        rules.evaluate_cached(&changed_input, &mut cache);
+        assert_eq!(cache.len(), 2, "the cache must remain bounded");
     }
 }

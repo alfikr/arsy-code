@@ -1,11 +1,22 @@
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 use uuid::Uuid;
 
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(
-            Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+            Clone,
+            Copy,
+            Debug,
+            Deserialize,
+            Eq,
+            Hash,
+            JsonSchema,
+            Ord,
+            PartialEq,
+            PartialOrd,
+            Serialize,
         )]
         #[serde(transparent)]
         pub struct $name(Uuid);
@@ -46,16 +57,26 @@ macro_rules! id_type {
     };
 }
 
+id_type!(WorkspaceId);
 id_type!(SessionId);
 id_type!(TurnId);
+id_type!(ItemId);
 id_type!(AgentId);
+id_type!(TaskId);
 id_type!(OperationId);
 id_type!(EventId);
 id_type!(CorrelationId);
 id_type!(ArtifactId);
+id_type!(FindingId);
+id_type!(ApprovalId);
+id_type!(FragmentId);
+id_type!(ContextViewId);
+id_type!(CheckpointId);
+id_type!(SubscriptionId);
+id_type!(RequestId);
 id_type!(GrantId);
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Principal {
     User(String),
@@ -63,14 +84,14 @@ pub enum Principal {
     System,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
 #[serde(try_from = "ResourceRefWire")]
 pub struct ResourceRef {
     scheme: String,
     value: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct ResourceRefWire {
     scheme: String,
     value: String,
@@ -191,6 +212,20 @@ impl<'de> Deserialize<'de> for StateVersion {
     }
 }
 
+/// Hand-written because the wire form is a hex string, not the byte array.
+impl JsonSchema for StateVersion {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("StateVersion")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateVersionError;
 
@@ -202,7 +237,9 @@ impl fmt::Display for StateVersionError {
 
 impl std::error::Error for StateVersionError {}
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
 #[serde(transparent)]
 pub struct WorkspaceVersion(pub StateVersion);
 
