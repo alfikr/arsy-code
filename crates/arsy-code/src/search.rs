@@ -33,7 +33,11 @@ impl Workspace {
             truncated: false,
         };
         let mut files = 0;
-        for entry in WalkBuilder::new(self.path()).standard_filters(true).build() {
+        for entry in WalkBuilder::new(self.path())
+            .standard_filters(true)
+            .require_git(false)
+            .build()
+        {
             let entry = entry.map_err(SearchError::Walk)?;
             if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                 continue;
