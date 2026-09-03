@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/arsy-kernel", "crates/arsy-code", "crates/arsy-cli"]
+members = ["crates/arsy-kernel", "crates/arsy-code", "crates/arsy-cli", "crates/arsy-sandbox"]
 resolver = "2"
 
 [workspace.package]
@@ -25,6 +25,11 @@ rpassword = "7.4"
 keyring = { version = "=3.6.3", default-features = false }
 tree-sitter = "=0.25.10"
 tree-sitter-rust = "=0.24.2"
+rlimit = "=0.11.0"
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+libc = "=0.2.189"
+windows-sys = "=0.61.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

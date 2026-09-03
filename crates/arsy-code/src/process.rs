@@ -1,3 +1,5 @@
+use crate::sandbox::SandboxPlan;
+use arsy_kernel::policy::SandboxAssurance;
 use arsy_kernel::{
     artifact::{ArtifactStore, NewArtifact, Sensitivity},
     capability::{CapabilityAction, CapabilityGrant},
@@ -44,6 +46,7 @@ pub struct ProcessResult {
     pub cleanup: Cleanup,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    pub sandbox_assurance: SandboxAssurance,
 }
 
 pub struct ProcessExecutor {
@@ -52,6 +55,7 @@ pub struct ProcessExecutor {
     environment: BTreeMap<String, String>,
     grace: Duration,
     retain_until_ms: u64,
+    sandbox: Option<SandboxPlan>,
 }
 
 impl ProcessExecutor {
@@ -84,7 +88,13 @@ impl ProcessExecutor {
             environment,
             grace,
             retain_until_ms,
+            sandbox: None,
         }
+    }
+
+    pub fn with_sandbox(mut self, plan: SandboxPlan) -> Self {
+        self.sandbox = Some(plan);
+        self
     }
 
     fn run(
@@ -105,9 +115,19 @@ impl ProcessExecutor {
             ));
         }
 
-        let mut command = Command::new(program);
+        let mut command = if let Some(plan) = &self.sandbox {
+            if plan.program != *program || input.max_output_bytes > plan.limits.max_output_bytes {
+                return Err(OperationError::Schema(
+                    "process request exceeds its sandbox plan".into(),
+                ));
+            }
+            plan.command(program, args)
+        } else {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        };
         command
-            .args(args)
             .env_clear()
             .envs(&self.environment)
             .stdin(Stdio::null())
@@ -151,6 +171,10 @@ impl ProcessExecutor {
             cleanup,
             stdout_truncated: stdout.truncated,
             stderr_truncated: stderr.truncated,
+            sandbox_assurance: self
+                .sandbox
+                .as_ref()
+                .map_or(SandboxAssurance::None, |plan| plan.assurance),
         };
         let result_artifact = self.put(
             &serde_json::to_vec(&result)

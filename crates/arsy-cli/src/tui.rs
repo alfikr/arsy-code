@@ -3,7 +3,7 @@
 use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
-    policy::ApprovalRequest,
+    policy::{ApprovalRequest, SandboxAssurance},
 };
 use std::fmt;
 
@@ -24,6 +24,7 @@ pub struct TuiState {
     cursor: u64,
     timeline: Vec<TimelineEntry>,
     streaming: Option<String>,
+    sandbox_assurance: SandboxAssurance,
 }
 
 impl TuiState {
@@ -34,7 +35,12 @@ impl TuiState {
             cursor: 0,
             timeline: Vec::new(),
             streaming: None,
+            sandbox_assurance: SandboxAssurance::None,
         }
+    }
+
+    pub fn set_sandbox_assurance(&mut self, assurance: SandboxAssurance) {
+        self.sandbox_assurance = assurance;
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -74,7 +80,10 @@ impl TuiState {
         let mut lines = vec![
             fit(&format!("{title}  {}", self.workspace), width),
             fit(
-                &format!("session {}  event {}", self.session, self.cursor),
+                &format!(
+                    "session {}  event {}  sandbox {}",
+                    self.session, self.cursor, self.sandbox_assurance
+                ),
                 width,
             ),
         ];
@@ -171,6 +180,7 @@ mod tests {
         let first = state.render(80, false);
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(first.contains("task>"));
+        assert!(first.contains("sandbox none"));
         assert!(!first.contains("\x1b["));
 
         let event = EventEnvelope::new(

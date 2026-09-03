@@ -1,0 +1,31 @@
+name: Performance
+
+on:
+  pull_request:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-thresholds:
+    name: Deterministic regression thresholds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 test -p arsy-code benchmark::tests --locked
+      - run: cargo +1.98.0 bench -p arsy-code --bench performance --locked -- --gate
+
+  noisy-end-to-end:
+    name: Noisy cold/warm repository benchmarks
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 bench -p arsy-code --bench performance --locked

@@ -1,0 +1,6 @@
+[
+  "mandatory instruction",
+  "src/lib.rs is relevant",
+  "fix the failing test",
+  "network is denied"
+]

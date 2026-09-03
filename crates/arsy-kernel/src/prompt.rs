@@ -55,6 +55,60 @@ pub trait PromptStrategy: Send + Sync {
     fn render(&self, ir: &PromptIr) -> Result<Vec<RenderedSegment>, String>;
 }
 
+/// The five deliberately small family strategies. They share the same typed
+/// IR and differ only in instruction order, so no adapter can reinterpret or
+/// drop a fragment while formatting a provider request.
+#[derive(Clone, Copy, Debug)]
+pub struct FamilyPromptStrategy {
+    family: ModelFamily,
+}
+
+impl FamilyPromptStrategy {
+    pub const fn new(family: ModelFamily) -> Self {
+        Self { family }
+    }
+}
+
+impl PromptStrategy for FamilyPromptStrategy {
+    fn supports(&self, family: ModelFamily) -> bool {
+        self.family == family
+    }
+
+    fn render(&self, ir: &PromptIr) -> Result<Vec<RenderedSegment>, String> {
+        let order = match self.family {
+            ModelFamily::Gpt => [0, 2, 3, 1],
+            ModelFamily::Claude => [0, 3, 2, 1],
+            ModelFamily::Gemini => [2, 0, 3, 1],
+            ModelFamily::QwenDeepseek => [0, 2, 1, 3],
+            // Weak local models get the concrete task before background text.
+            ModelFamily::Local => [1, 0, 3, 2],
+        };
+        let rank = |kind| match kind {
+            PromptFragmentKind::StableInstruction => order[0],
+            PromptFragmentKind::Task => order[1],
+            PromptFragmentKind::Context => order[2],
+            PromptFragmentKind::PermissionState => order[3],
+        };
+        let mut fragments = ir.fragments().iter().enumerate().collect::<Vec<_>>();
+        fragments.sort_by_key(|(position, fragment)| (rank(fragment.kind), *position));
+        Ok(fragments
+            .into_iter()
+            .map(|(_, fragment)| RenderedSegment {
+                fragment: fragment.id,
+                text: fragment.content.clone(),
+            })
+            .collect())
+    }
+}
+
+pub const BUILT_IN_STRATEGIES: [FamilyPromptStrategy; 5] = [
+    FamilyPromptStrategy::new(ModelFamily::Gpt),
+    FamilyPromptStrategy::new(ModelFamily::Claude),
+    FamilyPromptStrategy::new(ModelFamily::Gemini),
+    FamilyPromptStrategy::new(ModelFamily::QwenDeepseek),
+    FamilyPromptStrategy::new(ModelFamily::Local),
+];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CacheSegment {
     pub fragment: FragmentId,
@@ -231,6 +285,8 @@ mod tests {
 
     struct Failing;
 
+    struct Dropping;
+
     impl PromptStrategy for Failing {
         fn supports(&self, family: ModelFamily) -> bool {
             family == ModelFamily::Claude
@@ -238,6 +294,16 @@ mod tests {
 
         fn render(&self, _ir: &PromptIr) -> Result<Vec<RenderedSegment>, String> {
             Err("unsupported schema".to_owned())
+        }
+    }
+
+    impl PromptStrategy for Dropping {
+        fn supports(&self, _family: ModelFamily) -> bool {
+            true
+        }
+
+        fn render(&self, _ir: &PromptIr) -> Result<Vec<RenderedSegment>, String> {
+            Ok(Vec::new())
         }
     }
 
@@ -284,6 +350,30 @@ mod tests {
         assert_eq!(
             compiled.degradation.as_deref(),
             Some("strategy failed: unsupported schema")
+        );
+    }
+
+    #[test]
+    fn a_strategy_cannot_drop_a_mandatory_instruction() {
+        let instruction = FragmentId::new();
+        let compiled = compile(
+            ModelFamily::Gpt,
+            vec![PromptFragment {
+                id: instruction,
+                kind: PromptFragmentKind::StableInstruction,
+                content: "mandatory".into(),
+            }],
+            &[&Dropping],
+            &Redactor::new(),
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(compiled.manifest, vec![instruction]);
+        assert_eq!(compiled.segments[0].text, "mandatory");
+        assert_eq!(
+            compiled.degradation.as_deref(),
+            Some("strategy emitted invalid provenance")
         );
     }
 }
