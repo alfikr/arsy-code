@@ -1,3 +1,3 @@
 # ForgeGuard
 
-For code changes, use `/forgeguard-engineering`.
+For code changes, use `forgeguard-engineering`.
