@@ -13,7 +13,7 @@ use arsy_kernel::{
     operation::OperationKind,
     policy::{
         ActorMatch, ApprovalError, ApprovalFlow, PolicyDecision, PolicyQuery, PolicyRule,
-        RiskContext, RuleEffect, RuleSet,
+        RiskContext, RuleEffect, RuleSet, SandboxAssurance,
     },
     protocol::ApprovalResolution,
 };
@@ -92,6 +92,7 @@ fn rule() -> impl Strategy<Value = PolicyRule> {
                 pattern: pattern(glob),
                 expires_at_ms,
                 delegation_depth,
+                minimum_assurance: SandboxAssurance::None,
             },
         )
 }
@@ -155,6 +156,7 @@ fn approval_flow_binds_effect_scope_digest_and_approver() {
         pattern: pattern("/repo/**"),
         expires_at_ms: Some(100),
         delegation_depth: 1,
+        minimum_assurance: SandboxAssurance::None,
     }]);
     let PolicyDecision::RequireApproval(request) = rules.evaluate(&asked).decision else {
         panic!("expected approval");

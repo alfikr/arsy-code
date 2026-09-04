@@ -752,11 +752,14 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
         })
         .collect();
 
-    warnings.push(Diagnostic::warning(
-        "ARSY-SBX-1000",
-        "no sandbox worker is available, so achieved assurance is `none`",
-        "run only operations you accept unsandboxed until a worker ships",
-    ));
+    let sandbox_assurance = installed_sandbox_assurance();
+    if sandbox_assurance == arsy_kernel::policy::SandboxAssurance::None {
+        warnings.push(Diagnostic::warning(
+            "ARSY-SBX-1000",
+            "no complete sandbox worker is available, so achieved assurance is `none`",
+            "install arsy-sandbox-worker and the platform controls before running effects",
+        ));
+    }
     let credentials = catalog(OsCredentialStore).unwrap_or_default().len();
     if credentials == 0 {
         warnings.push(Diagnostic::warning(
@@ -772,7 +775,7 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
     emitter.result(json!({
         "platform": platform(),
         "version": arsy_code::VERSION,
-        "sandbox_assurance": "none",
+        "sandbox_assurance": sandbox_assurance.as_str(),
         "provider_auth": if credentials == 0 { "none" } else { "configured" },
         "storage": storage,
         "config_layers": config,
@@ -785,6 +788,24 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
         (true, Some(terminal)) => terminal.exit_code(),
         _ => 0,
     }
+}
+
+fn installed_sandbox_assurance() -> arsy_kernel::policy::SandboxAssurance {
+    let Ok(executable) = std::env::current_exe() else {
+        return arsy_kernel::policy::SandboxAssurance::None;
+    };
+    let worker = executable.with_file_name(if cfg!(windows) {
+        "arsy-sandbox-worker.exe"
+    } else {
+        "arsy-sandbox-worker"
+    });
+    if !worker.is_file() {
+        return arsy_kernel::policy::SandboxAssurance::None;
+    }
+    arsy_code::sandbox::PlatformSandbox::detect()
+        .map_or(arsy_kernel::policy::SandboxAssurance::None, |backend| {
+            backend.assurance()
+        })
 }
 
 fn read_stdin() -> Result<String, Diagnostic> {

@@ -55,6 +55,8 @@ pub struct PolicyRule {
     /// Carried into any grant this rule produces.
     pub expires_at_ms: Option<u64>,
     pub delegation_depth: u32,
+    #[serde(default)]
+    pub minimum_assurance: SandboxAssurance,
 }
 
 impl PolicyRule {
@@ -62,6 +64,7 @@ impl PolicyRule {
         self.actor.matches(&query.actor)
             && self.action == query.requirement.action
             && self.pattern.matches(&query.requirement.resource)
+            && query.context.sandbox >= self.minimum_assurance
     }
 }
 
@@ -123,6 +126,7 @@ impl RuleSet {
                 .then_with(|| left.pattern.to_string().cmp(&right.pattern.to_string()))
                 .then_with(|| left.expires_at_ms.cmp(&right.expires_at_ms))
                 .then_with(|| left.delegation_depth.cmp(&right.delegation_depth))
+                .then_with(|| left.minimum_assurance.cmp(&right.minimum_assurance))
         });
         Self {
             rules: compiled,
@@ -308,9 +312,33 @@ pub struct PolicyQuery {
     pub context: RiskContext,
 }
 
-/// ponytail: only what a rule reads today. Sandbox assurance, test coverage,
-/// and model confidence appear in the spec but have no producer until the
-/// sandbox workers and the context engine exist.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxAssurance {
+    #[default]
+    None,
+    Process,
+    Filesystem,
+    Full,
+}
+
+impl SandboxAssurance {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Process => "process",
+            Self::Filesystem => "filesystem",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl fmt::Display for SandboxAssurance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RiskContext {
     /// Whether the effect can be undone. Irreversible work never auto-runs.
@@ -318,6 +346,7 @@ pub struct RiskContext {
     /// A dirty workspace raises Git mutations to approval so uncommitted work
     /// cannot be overwritten under a broad allow rule.
     pub workspace: WorkspaceCleanliness,
+    pub sandbox: SandboxAssurance,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -334,6 +363,7 @@ impl Default for RiskContext {
         Self {
             reversible: true,
             workspace: WorkspaceCleanliness::Unknown,
+            sandbox: SandboxAssurance::None,
         }
     }
 }
@@ -575,6 +605,7 @@ mod tests {
             pattern: ResourcePattern::new("file", glob).unwrap(),
             expires_at_ms: None,
             delegation_depth: 1,
+            minimum_assurance: SandboxAssurance::None,
         }
     }
 
@@ -598,6 +629,21 @@ mod tests {
 
         assert!(matches!(outcome.decision, PolicyDecision::Deny(_)));
         assert_eq!(outcome.matched().count(), 0);
+    }
+
+    #[test]
+    fn a_rule_can_require_achieved_sandbox_assurance() {
+        let mut guarded = rule(PolicySource::User, RuleEffect::Allow, "/repo/**");
+        guarded.minimum_assurance = SandboxAssurance::Full;
+        let rules = RuleSet::compile([guarded]);
+        let mut request = query("/repo/main.rs");
+
+        assert!(matches!(
+            rules.evaluate(&request).decision,
+            PolicyDecision::Deny(_)
+        ));
+        request.context.sandbox = SandboxAssurance::Full;
+        assert!(rules.evaluate(&request).decision.is_allow());
     }
 
     #[test]
