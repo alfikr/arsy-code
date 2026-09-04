@@ -1,3 +1,7 @@
 /.forgeguard/
 /target/
 docs/.obsidian
+.codex/
+.claude/
+.agents/
+.forgeguard/

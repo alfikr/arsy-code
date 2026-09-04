@@ -5,7 +5,11 @@ use arsy_kernel::{
     event::{EventEnvelope, EventPayload},
     policy::{ApprovalRequest, SandboxAssurance},
 };
-use std::fmt;
+use std::{
+    fmt,
+    io::{BufRead, Write},
+    process::{Command, Stdio},
+};
 
 const MAX_TIMELINE_EVENTS: usize = 1_000;
 const DEFAULT_WIDTH: usize = 80;
@@ -25,6 +29,7 @@ pub struct TuiState {
     timeline: Vec<TimelineEntry>,
     streaming: Option<String>,
     sandbox_assurance: SandboxAssurance,
+    model_route: Option<ModelRoute>,
 }
 
 impl TuiState {
@@ -36,11 +41,16 @@ impl TuiState {
             timeline: Vec::new(),
             streaming: None,
             sandbox_assurance: SandboxAssurance::None,
+            model_route: None,
         }
     }
 
     pub fn set_sandbox_assurance(&mut self, assurance: SandboxAssurance) {
         self.sandbox_assurance = assurance;
+    }
+
+    pub fn set_model_route(&mut self, route: ModelRoute) {
+        self.model_route = Some(route);
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -87,6 +97,9 @@ impl TuiState {
                 width,
             ),
         ];
+        if let Some(route) = &self.model_route {
+            lines.push(fit(&format!("model {route}  mode read-only"), width));
+        }
         lines.extend(
             self.timeline
                 .iter()
@@ -99,7 +112,7 @@ impl TuiState {
             lines.push(fit(text, width));
         }
         lines.push(fit("task> ", width));
-        lines.join("\n") + "\n"
+        lines.join("\n")
     }
 
     pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
@@ -117,6 +130,56 @@ impl TuiState {
         .join("\n")
             + "\n"
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelRoute {
+    pub model: String,
+}
+
+impl fmt::Display for ModelRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "codex/{}", self.model)
+    }
+}
+
+pub fn detect_model_route() -> Option<ModelRoute> {
+    Command::new("codex")
+        .args(["login", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+        .then(|| ModelRoute {
+            model: "default".to_owned(),
+        })
+}
+
+pub fn select_model_route(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    route: &ModelRoute,
+) -> std::io::Result<Option<ModelRoute>> {
+    writeln!(writer, "Detected logged-in provider: codex")?;
+    write!(writer, "model [{}]> ", route.model)?;
+    writer.flush()?;
+    Ok(read_task(reader)?.map(|model| ModelRoute {
+        model: if model.is_empty() {
+            route.model.clone()
+        } else {
+            model
+        },
+    }))
+}
+
+pub fn read_task(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    let task = line.trim().to_owned();
+    Ok((task != ":quit").then_some(task))
 }
 
 pub fn terminal_width() -> usize {
@@ -224,5 +287,38 @@ mod tests {
             ..event
         };
         assert_eq!(state.apply(&wrong), Err(TuiError::WrongSession));
+    }
+
+    #[test]
+    fn task_input_stays_open_until_quit_or_eof() {
+        let mut input = std::io::Cursor::new(b"inspect the harness\n\n:quit\nignored\n");
+        assert_eq!(
+            read_task(&mut input).unwrap().as_deref(),
+            Some("inspect the harness")
+        );
+        assert_eq!(read_task(&mut input).unwrap().as_deref(), Some(""));
+        assert_eq!(read_task(&mut input).unwrap(), None);
+
+        let mut eof = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_task(&mut eof).unwrap(), None);
+    }
+
+    #[test]
+    fn provider_and_model_are_selected_before_tasks() {
+        let route = ModelRoute {
+            model: "gpt-default".into(),
+        };
+        let mut input = std::io::Cursor::new(b"gpt-test\n");
+        let mut output = Vec::new();
+        let selected = select_model_route(&mut input, &mut output, &route).unwrap();
+        assert_eq!(
+            selected,
+            Some(ModelRoute {
+                model: "gpt-test".into(),
+            })
+        );
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("provider: codex"));
     }
 }
