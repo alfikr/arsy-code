@@ -1,3 +1,3 @@
-# CLAUDE.md
+# ForgeGuard
 
-Configuration and project rules.
+For code changes, use `forgeguard-engineering`.

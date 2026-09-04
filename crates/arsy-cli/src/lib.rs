@@ -12,8 +12,10 @@
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
+//! | `ARSY-PRV-1002` | an installed provider CLI failed |
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
 //! | `ARSY-PRV-1001` | no credential store is registered |
+//! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
 mod eval;
 #[cfg(feature = "tui")]
@@ -548,16 +550,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             "there is no terminal; use `arsy run <TASK>`",
         )),
         #[cfg(feature = "tui")]
-        Command::Tui => {
-            let workspace = workspace_root(&invocation.workspace)?;
-            let frame = tui::TuiState::new(workspace.display().to_string(), SessionId::new())
-                .render(
-                    tui::terminal_width(),
-                    std::env::var_os("NO_COLOR").is_none(),
-                );
-            write!(io::stdout(), "{frame}").map_err(storage_failed)?;
-            Ok(0)
-        }
+        Command::Tui => run_tui(invocation, emitter),
         #[cfg(not(feature = "tui"))]
         Command::Tui => Err(Diagnostic::error(
             "ARSY-SCH-1003",
@@ -728,44 +721,168 @@ fn secret_failed(error: impl ToString) -> Diagnostic {
     )
 }
 
+#[cfg(feature = "tui")]
+fn terminal_failed(error: impl ToString) -> Diagnostic {
+    Diagnostic::error(
+        "ARSY-UIX-1000",
+        format!("interactive terminal failed: {}", error.to_string()),
+        "check the terminal input and output, then retry",
+    )
+}
+
+#[cfg(feature = "tui")]
+fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let workspace = workspace_root(&invocation.workspace)?;
+    let mut stdout = io::stdout();
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let Some(detected) = tui::detect_model_route() else {
+        return Err(Diagnostic::error(
+            "ARSY-PRV-1000",
+            "no logged-in Codex CLI was detected",
+            "install Codex and run `codex login`, then retry",
+        ));
+    };
+    let Some(route) =
+        tui::select_model_route(&mut stdin, &mut stdout, &detected).map_err(terminal_failed)?
+    else {
+        return Ok(0);
+    };
+    let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
+    state.set_model_route(route.clone());
+    let frame = state.render(
+        tui::terminal_width(),
+        std::env::var_os("NO_COLOR").is_none(),
+    );
+    write!(stdout, "{frame}").map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    while let Some(task) = tui::read_task(&mut stdin).map_err(terminal_failed)? {
+        if !task.is_empty() {
+            if let Err(diagnostic) = run_external(invocation, &task, &route, emitter) {
+                emitter.diagnostic(&diagnostic);
+            }
+        }
+        write!(stdout, "task> ").map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+    }
+    Ok(0)
+}
+
+#[cfg(feature = "tui")]
+fn run_external(
+    invocation: &Invocation,
+    task: &str,
+    route: &tui::ModelRoute,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let task = prepare_task(task, emitter)?;
+    let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    let status = external_status(&workspace_root(&invocation.workspace)?, &task, route);
+    match status {
+        Ok(status) if status.success() => {
+            let outcome = json!({"provider": "codex", "model": route.model});
+            service
+                .complete_turn(actor, admission.turn, &outcome)
+                .map_err(storage_failed)?;
+            emitter.result(json!({
+                "session": session.to_string(),
+                "turn": admission.turn.to_string(),
+                "status": "completed",
+                "model": route.to_string(),
+            }));
+            Ok(0)
+        }
+        Ok(status) => fail_external_turn(
+            &service,
+            actor,
+            admission.turn,
+            session,
+            format!("{route} exited with status {status}"),
+            emitter,
+        ),
+        Err(error) => fail_external_turn(
+            &service,
+            actor,
+            admission.turn,
+            session,
+            format!("could not run {route}: {error}"),
+            emitter,
+        ),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn external_status(
+    workspace: &Path,
+    task: &str,
+    route: &tui::ModelRoute,
+) -> io::Result<std::process::ExitStatus> {
+    let mut command = std::process::Command::new("codex");
+    command.args(["exec", "--ephemeral", "--sandbox", "read-only", "--cd"]);
+    command.arg(workspace);
+    if route.model != "default" {
+        command.args(["--model", &route.model]);
+    }
+    command.arg("-");
+    let mut child = command
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Err(error) = child
+        .stdin
+        .take()
+        .expect("piped stdin is available")
+        .write_all(task.as_bytes())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    child.wait()
+}
+
+#[cfg(feature = "tui")]
+fn fail_external_turn(
+    service: &AgentService,
+    actor: Principal,
+    turn: arsy_kernel::domain::TurnId,
+    session: SessionId,
+    message: String,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let diagnostic = Diagnostic::error(
+        "ARSY-PRV-1002",
+        message,
+        "verify the selected CLI login and model, then retry",
+    );
+    service
+        .fail_turn(actor, turn, "provider_cli", diagnostic.message.clone())
+        .map_err(storage_failed)?;
+    emitter.diagnostic(&diagnostic);
+    emitter.result(json!({
+        "session": session.to_string(),
+        "turn": turn.to_string(),
+        "status": "failed",
+    }));
+    Ok(diagnostic.exit_code())
+}
+
 fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let task = if task == "-" {
         read_stdin()?
     } else {
         task.to_owned()
     };
-    if task.trim().is_empty() {
-        return Err(usage("run requires a non-empty task"));
-    }
-    let mut broker = SecretBroker::new();
-    broker.register_store(Box::new(OsCredentialStore));
-    for record in catalog(OsCredentialStore)? {
-        broker.resolve(&record.handle).map_err(secret_failed)?;
-    }
-    let task = broker.redactor().sanitize(&task).map_err(secret_failed)?;
-    emitter.install_redactor(broker.redactor().clone());
-    let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    let session = SessionId::new();
-    emitter.session = Some(session);
-    let service = AgentService::attach(store, session).map_err(storage_failed)?;
-    let actor = actor();
-    let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
-        session,
-        prompt: task,
-        extensions: Extensions::new(),
-    }));
-    let admission = service
-        .start_turn(actor.clone(), &envelope)
-        .map_err(storage_failed)?;
+    let task = prepare_task(&task, emitter)?;
+    let (service, actor, admission, session) = record_turn(invocation, task, emitter)?;
 
     // ponytail: the turn is durable before dispatch, so this failure is
-    // recoverable by `arsy resume`. Dispatch itself needs a resolved provider
-    // credential; until `arsy auth` registers a credential store there is none,
-    // and inventing an answer would be worse than refusing.
+    // recoverable by `arsy resume`. Direct provider transport is not wired yet;
+    // the interactive TUI can use a logged-in Codex CLI without copying its token.
     let diagnostic = Diagnostic::error(
         "ARSY-PRV-1000",
         "no provider credential is available, so the turn was not dispatched",
-        "store a credential with `arsy auth set <PROVIDER>` once it ships, then rerun",
+        "use the interactive TUI with a logged-in Codex CLI",
     );
     service
         .fail_turn(
@@ -782,6 +899,49 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         "status": "failed",
     }));
     Ok(diagnostic.exit_code())
+}
+
+fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic> {
+    if task.trim().is_empty() {
+        return Err(usage("run requires a non-empty task"));
+    }
+    let mut broker = SecretBroker::new();
+    broker.register_store(Box::new(OsCredentialStore));
+    for record in catalog(OsCredentialStore)? {
+        broker.resolve(&record.handle).map_err(secret_failed)?;
+    }
+    let task = broker.redactor().sanitize(task).map_err(secret_failed)?;
+    emitter.install_redactor(broker.redactor().clone());
+    Ok(task)
+}
+
+fn record_turn(
+    invocation: &Invocation,
+    task: String,
+    emitter: &mut Emitter,
+) -> Result<
+    (
+        AgentService,
+        Principal,
+        arsy_kernel::service::TurnAdmission,
+        SessionId,
+    ),
+    Diagnostic,
+> {
+    let store = open_store(&workspace_root(&invocation.workspace)?)?;
+    let session = SessionId::new();
+    emitter.session = Some(session);
+    let service = AgentService::attach(store, session).map_err(storage_failed)?;
+    let actor = actor();
+    let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+        session,
+        prompt: task,
+        extensions: Extensions::new(),
+    }));
+    let admission = service
+        .start_turn(actor.clone(), &envelope)
+        .map_err(storage_failed)?;
+    Ok((service, actor, admission, session))
 }
 
 fn resume(
