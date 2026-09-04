@@ -48,7 +48,6 @@ const RECORD_SCHEMA: u32 = 1;
 /// instead of failing as unknown input.
 const UNAVAILABLE: &[(&str, u8)] = &[
     ("artifact", 1),
-    ("compat", 5),
     ("completions", 1),
     ("config", 1),
     ("gc", 1),
@@ -73,6 +72,7 @@ Usage:
   arsy resume <SESSION_ID>   resume a recorded session
   arsy doctor                report platform, sandbox, credential, and config state
   arsy eval <SUITE>          run a pinned evaluation fixture
+  arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
@@ -174,6 +174,9 @@ pub enum Command {
         trials: Option<u32>,
         out: Option<PathBuf>,
     },
+    CompatExplain {
+        ecosystem: arsy_code::compat::Ecosystem,
+    },
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -189,103 +192,122 @@ pub struct Invocation {
 
 /// Parse arguments without touching the filesystem or starting a session.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diagnostic> {
-    let mut arguments = args.into_iter();
-    let mut workspace = None;
-    let mut output = None;
-    let mut follow = false;
-    let mut strict = false;
-    let mut force = false;
-    let mut handle = None;
-    let mut trials = None;
-    let mut out = None;
-    let mut name: Option<String> = None;
-    let mut positional: Vec<String> = Vec::new();
-
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--help" | "-h" => return Ok(invocation(workspace, output, Command::Help)),
-            "--version" | "-V" => return Ok(invocation(workspace, output, Command::Version)),
-            "--workspace" => workspace = Some(PathBuf::from(value(&mut arguments, "--workspace")?)),
-            "--output" => output = Some(output_mode(&value(&mut arguments, "--output")?)?),
-            "--no-color" => {}
-            "--follow" => follow = true,
-            "--strict" => strict = true,
-            "--force" => force = true,
-            "--handle" => handle = Some(value(&mut arguments, "--handle")?),
-            "--trials" => {
-                let raw = value(&mut arguments, "--trials")?;
-                trials = Some(
-                    raw.parse()
-                        .map_err(|_| usage("--trials must be an integer"))?,
-                );
-            }
-            "--out" => out = Some(PathBuf::from(value(&mut arguments, "--out")?)),
-            other if other.starts_with("--") => return Err(usage(format!("unknown flag {other}"))),
-            other if name.is_none() => name = Some(other.to_owned()),
-            other => positional.push(other.to_owned()),
-        }
+    let parsed = collect_arguments(args)?;
+    if let Some(command) = parsed.early {
+        return Ok(invocation(parsed.workspace, parsed.output, command));
     }
-
-    let command = match name.as_deref() {
+    let command = match parsed.name.as_deref() {
         None => Command::Tui,
         Some("run") => Command::Run {
-            task: only_argument(positional, "run", "<TASK>")?,
+            task: only_argument(parsed.positional, "run", "<TASK>")?,
         },
-        Some("resume") => {
-            let id = only_argument(positional, "resume", "<SESSION_ID>")?;
-            let session = id
-                .parse()
-                .map_err(|_| usage(format!("`{id}` is not a canonical session ID")))?;
-            Command::Resume { session, follow }
-        }
-        Some("doctor") => {
-            if !positional.is_empty() {
-                return Err(usage("doctor takes no positional argument"));
-            }
-            Command::Doctor { strict }
-        }
+        Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
+        Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
         Some("eval") => Command::Eval {
-            suite: PathBuf::from(only_argument(positional, "eval", "<SUITE>")?),
-            trials,
-            out,
+            suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
+            trials: parsed.trials,
+            out: parsed.out,
         },
-        Some("auth") => match positional.first().map(String::as_str) {
-            Some("set") => {
-                positional.remove(0);
-                Command::AuthSet {
-                    provider: only_argument(positional, "auth set", "<PROVIDER>")?,
-                    handle,
-                }
-            }
-            Some("list") if positional.len() == 1 => Command::AuthList,
-            Some("remove") => {
-                positional.remove(0);
-                let raw = only_argument(positional, "auth remove", "<HANDLE>")?;
-                Command::AuthRemove {
-                    handle: raw.try_into().map_err(secret_failed)?,
-                    force,
-                }
-            }
-            _ => return Err(usage("auth requires set, list, or remove")),
+        Some("compat") => Command::CompatExplain {
+            ecosystem: compatibility_kind(parsed.positional)?,
         },
-        Some(other) => {
-            return Err(
-                match UNAVAILABLE.iter().find(|(known, _)| *known == other) {
-                    Some((_, phase)) => Diagnostic::error(
-                        "ARSY-SCH-1002",
-                        format!("`arsy {other}` is not available yet"),
-                        format!("it ships in phase {phase}; see docs/36-cli-tui.md"),
-                    ),
-                    None => Diagnostic::error(
-                        "ARSY-SCH-1000",
-                        format!("unknown command `{other}`"),
-                        "run `arsy --help` for the available commands",
-                    ),
-                },
-            )
-        }
+        Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        Some(other) => return Err(unknown_command(other)),
     };
-    Ok(invocation(workspace, output, command))
+    Ok(invocation(parsed.workspace, parsed.output, command))
+}
+
+#[derive(Default)]
+struct ParsedArguments {
+    workspace: Option<PathBuf>,
+    output: Option<Output>,
+    follow: bool,
+    strict: bool,
+    force: bool,
+    handle: Option<String>,
+    trials: Option<u32>,
+    out: Option<PathBuf>,
+    name: Option<String>,
+    positional: Vec<String>,
+    early: Option<Command>,
+}
+
+fn collect_arguments<I: IntoIterator<Item = String>>(
+    args: I,
+) -> Result<ParsedArguments, Diagnostic> {
+    let mut arguments = args.into_iter();
+    let mut parsed = ParsedArguments::default();
+
+    while let Some(argument) = arguments.next() {
+        if apply_switch(&argument, &mut parsed) {
+            if parsed.early.is_some() {
+                return Ok(parsed);
+            }
+            continue;
+        }
+        if apply_value_flag(&argument, &mut parsed, &mut arguments)? {
+            continue;
+        }
+        if argument.starts_with("--") {
+            return Err(usage(format!("unknown flag {argument}")));
+        }
+        if parsed.name.is_none() {
+            parsed.name = Some(argument);
+        } else {
+            parsed.positional.push(argument);
+        }
+    }
+    Ok(parsed)
+}
+
+fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
+    match argument {
+        "--help" | "-h" => parsed.early = Some(Command::Help),
+        "--version" | "-V" => parsed.early = Some(Command::Version),
+        "--no-color" => {}
+        "--follow" => parsed.follow = true,
+        "--strict" => parsed.strict = true,
+        "--force" => parsed.force = true,
+        _ => return false,
+    }
+    true
+}
+
+fn apply_value_flag(
+    argument: &str,
+    parsed: &mut ParsedArguments,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<bool, Diagnostic> {
+    match argument {
+        "--workspace" => parsed.workspace = Some(PathBuf::from(value(arguments, argument)?)),
+        "--output" => parsed.output = Some(output_mode(&value(arguments, argument)?)?),
+        "--handle" => parsed.handle = Some(value(arguments, argument)?),
+        "--trials" => {
+            parsed.trials = Some(
+                value(arguments, argument)?
+                    .parse()
+                    .map_err(|_| usage("--trials must be an integer"))?,
+            );
+        }
+        "--out" => parsed.out = Some(PathBuf::from(value(arguments, argument)?)),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn unknown_command(command: &str) -> Diagnostic {
+    match UNAVAILABLE.iter().find(|(known, _)| *known == command) {
+        Some((_, phase)) => Diagnostic::error(
+            "ARSY-SCH-1002",
+            format!("`arsy {command}` is not available yet"),
+            format!("it ships in phase {phase}; see docs/36-cli-tui.md"),
+        ),
+        None => Diagnostic::error(
+            "ARSY-SCH-1000",
+            format!("unknown command `{command}`"),
+            "run `arsy --help` for the available commands",
+        ),
+    }
 }
 
 fn invocation(workspace: Option<PathBuf>, output: Option<Output>, command: Command) -> Invocation {
@@ -293,6 +315,63 @@ fn invocation(workspace: Option<PathBuf>, output: Option<Output>, command: Comma
         workspace: workspace.unwrap_or_else(|| PathBuf::from(".")),
         output,
         command,
+    }
+}
+
+fn compatibility_kind(
+    mut positional: Vec<String>,
+) -> Result<arsy_code::compat::Ecosystem, Diagnostic> {
+    if positional.first().map(String::as_str) != Some("explain") {
+        return Err(usage("compat requires `explain <claude|codex|omp|agents>`"));
+    }
+    positional.remove(0);
+    match only_argument(positional, "compat explain", "<KIND>")?.as_str() {
+        "claude" => Ok(arsy_code::compat::Ecosystem::Claude),
+        "codex" => Ok(arsy_code::compat::Ecosystem::Codex),
+        "omp" => Ok(arsy_code::compat::Ecosystem::Omp),
+        "agents" => Ok(arsy_code::compat::Ecosystem::AgentsMd),
+        other => Err(usage(format!("unsupported compatibility kind `{other}`"))),
+    }
+}
+
+fn parse_resume(positional: Vec<String>, follow: bool) -> Result<Command, Diagnostic> {
+    let id = only_argument(positional, "resume", "<SESSION_ID>")?;
+    let session = id
+        .parse()
+        .map_err(|_| usage(format!("`{id}` is not a canonical session ID")))?;
+    Ok(Command::Resume { session, follow })
+}
+
+fn parse_doctor(positional: Vec<String>, strict: bool) -> Result<Command, Diagnostic> {
+    if !positional.is_empty() {
+        return Err(usage("doctor takes no positional argument"));
+    }
+    Ok(Command::Doctor { strict })
+}
+
+fn parse_auth(
+    mut positional: Vec<String>,
+    handle: Option<String>,
+    force: bool,
+) -> Result<Command, Diagnostic> {
+    match positional.first().map(String::as_str) {
+        Some("set") => {
+            positional.remove(0);
+            Ok(Command::AuthSet {
+                provider: only_argument(positional, "auth set", "<PROVIDER>")?,
+                handle,
+            })
+        }
+        Some("list") if positional.len() == 1 => Ok(Command::AuthList),
+        Some("remove") => {
+            positional.remove(0);
+            let raw = only_argument(positional, "auth remove", "<HANDLE>")?;
+            Ok(Command::AuthRemove {
+                handle: raw.try_into().map_err(secret_failed)?,
+                force,
+            })
+        }
+        _ => Err(usage("auth requires set, list, or remove")),
     }
 }
 
@@ -499,7 +578,37 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
             Ok(0)
         }
+        Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
     }
+}
+
+fn compat_explain(
+    invocation: &Invocation,
+    ecosystem: arsy_code::compat::Ecosystem,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let current = std::env::current_dir().map_err(storage_failed)?;
+    let working = if current.starts_with(&root) {
+        current
+    } else {
+        root.clone()
+    };
+    let fixture = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let report = arsy_code::compat::CompatibilityImporter::new(&root)
+        .import(ecosystem, &working, fixture)
+        .map_err(|error| {
+            Diagnostic::error(
+                "ARSY-CMP-1001",
+                format!("compatibility import failed: {error}"),
+                "fix the reported source or use a supported equal-or-stronger policy mapping",
+            )
+        })?;
+    emitter.result(report.explain());
+    Ok(0)
 }
 
 const CATALOG_NAME: &str = "__catalog__";
@@ -941,6 +1050,19 @@ mod tests {
             Command::AuthRemove { .. }
         ));
         assert!(parse(["auth", "set", "anthropic", "raw-secret"].map(str::to_owned)).is_err());
+    }
+
+    #[test]
+    fn compatibility_explain_is_a_real_command() {
+        assert_eq!(
+            parse(["compat", "explain", "claude"].map(str::to_owned))
+                .unwrap()
+                .command,
+            Command::CompatExplain {
+                ecosystem: arsy_code::compat::Ecosystem::Claude
+            }
+        );
+        assert!(parse(["compat", "explain", "unknown"].map(str::to_owned)).is_err());
     }
 
     #[test]

@@ -69,7 +69,13 @@ impl Workspace {
 
     pub fn resolve_file(&self, path: impl AsRef<Path>) -> Result<ResolvedFile, ResolveError> {
         let path = confined(path.as_ref())?;
-        let canonical = self.root.canonicalize(&path)?;
+        let canonical = self.root.canonicalize(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                ResolveError::OutsideWorkspace
+            } else {
+                ResolveError::Io(error)
+            }
+        })?;
         let canonical = confined(&canonical)?;
         let file = self.root.open(&canonical)?.into_std();
         let value = canonical
@@ -214,9 +220,9 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().unwrap();
         symlink(outside.path(), temp.path().join("escape")).unwrap();
 
-        assert!(Workspace::open(temp.path())
-            .unwrap()
-            .resolve_file("escape")
-            .is_err());
+        assert!(matches!(
+            Workspace::open(temp.path()).unwrap().resolve_file("escape"),
+            Err(ResolveError::OutsideWorkspace)
+        ));
     }
 }
