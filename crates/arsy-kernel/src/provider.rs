@@ -9,6 +9,8 @@
 //! observing model behavior stays separate from provider wire execution.
 
 pub mod anthropic;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod wire;
 
 use crate::protocol::IdempotencyKey;

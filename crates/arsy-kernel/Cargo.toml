@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
+ureq = { workspace = true, optional = true }
 uuid.workspace = true
 zstd.workspace = true
 
@@ -32,3 +33,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# The real HTTP transport for provider adapters. Off by default so the
+# kernel stays buildable without a TLS stack.
+http = ["dep:ureq"]
