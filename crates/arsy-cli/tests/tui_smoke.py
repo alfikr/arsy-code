@@ -230,6 +230,13 @@ def main():
             with terminal.lock:
                 assert b"sk-provider-wizard-value" not in terminal.received
 
+            # Switching without restarting: the session still runs what it
+            # resolved at startup, and the rows say which is which rather than
+            # letting the new choice look like it did not take.
+            terminal.send(b"/provider\r")
+            terminal.expect("acme")
+            terminal.expect("in use after a restart")
+
             # Leaving a wizard step cancels the wizard, not the session.
             terminal.send(b"/provider\r")
             terminal.send(b"+new\r")

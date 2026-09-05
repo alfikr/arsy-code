@@ -1353,6 +1353,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
     let mut providers = configured_providers(invocation);
+    // What the configuration names now, which is not what this session resolved
+    // once `/provider` has switched and the restart has not happened yet.
+    let mut chosen_provider = configured_default(invocation);
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
@@ -1407,7 +1410,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
             }
-            Prompt::Provider(step) => composer.offer(step.rows(&providers, &route.provider), 0),
+            Prompt::Provider(step) => composer.offer(
+                step.rows(&providers, &route.provider, chosen_provider.as_deref()),
+                0,
+            ),
             _ => composer.offer(None, 0),
         }
         // A credential is typed, never shown, and never remembered.
@@ -1455,6 +1461,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         writeln!(stdout, "{}", tui::safe_text(&message))
                             .map_err(terminal_failed)?;
                         providers = configured_providers(invocation);
+                        chosen_provider = configured_default(invocation);
                         // Configuration decides the provider, so the session has
                         // to be restarted to pick up a change to it rather than
                         // pretend the running one moved.
@@ -1529,6 +1536,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task if line.split_whitespace().next() == Some("/provider") => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 providers = configured_providers(invocation);
+                chosen_provider = configured_default(invocation);
                 draft = tui::ProviderDraft::default();
                 prompt = Prompt::Provider(tui::ProviderStep::Pick);
             }
@@ -1763,6 +1771,17 @@ enum ProviderNext {
     Ask(tui::ProviderStep),
     Done(String),
     Cancelled(String),
+}
+
+/// The provider the configuration names right now.
+#[cfg(feature = "tui")]
+fn configured_default(invocation: &Invocation) -> Option<String> {
+    let root = workspace_root(&invocation.workspace).ok()?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    load_config(&root, &working)
+        .ok()?
+        .provider_default()
+        .map(str::to_owned)
 }
 
 /// The models a configured endpoint offers, as picker rows.
@@ -3361,19 +3380,29 @@ mod tests {
 
         // The pick list carries the actions under the providers, and offers
         // nothing to remove when nothing is configured.
-        let rows = Step::Pick.rows(&providers, "myai").expect("a list");
+        let rows = Step::Pick
+            .rows(&providers, "myai", Some("myai"))
+            .expect("a list");
         assert_eq!(rows[0].0, "myai");
         // The active one says so, so a provider that is merely not current does
         // not read as one that was removed.
         assert_eq!(rows[0].1, "in use");
-        let rows = Step::Pick.rows(&providers, "other").expect("a list");
+        let rows = Step::Pick.rows(&providers, "other", None).expect("a list");
         assert!(rows[0].1.contains("switch"), "{:?}", rows[0]);
+
+        // Switched but not restarted: the session still runs the old one, and
+        // the row says which is which rather than letting the new choice look
+        // like it did not take.
+        let rows = Step::Pick
+            .rows(&providers, "other", Some("myai"))
+            .expect("a list");
+        assert!(rows[0].1.contains("after a restart"), "{:?}", rows[0]);
         assert!(rows.iter().any(|(name, _)| name == "+new"));
         assert!(rows.iter().any(|(name, _)| name == "-remove"));
-        let empty = Step::Pick.rows(&[], "").expect("a list");
+        let empty = Step::Pick.rows(&[], "", None).expect("a list");
         assert!(empty.iter().all(|(name, _)| name != "-remove"));
         assert!(
-            Step::Name.rows(&providers, "myai").is_none(),
+            Step::Name.rows(&providers, "myai", None).is_none(),
             "a name is typed"
         );
     }

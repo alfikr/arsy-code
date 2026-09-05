@@ -53,9 +53,11 @@ single-line composer.
 
 `/provider` opens the configured endpoints in the composer's own menu, with a row
 to add one and, once something is configured, a row to remove one. Choosing an
-endpoint makes it the default. The row for the endpoint in use says so, because
-adding one makes it the default and a provider that is merely not current must
-not read as one that was removed. Adding walks one question per field — name,
+endpoint makes it the default. The rows say which endpoint is which: the one
+this session resolved at startup is marked in use, and one chosen since then is
+marked as taking effect at the next restart. Adding a provider makes it the
+default, and without those markers the one it replaced reads as removed rather
+than as merely not current. Adding walks one question per field — name,
 dialect, base URL, models (one slug, or several separated by commas, the first
 being the default), where to keep the credential, then the credential
 itself, which is painted as bullets, kept out of the input history, and never

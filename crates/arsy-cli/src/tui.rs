@@ -333,7 +333,16 @@ impl ProviderStep {
     }
 
     /// The rows this step offers, or none when it collects free text.
-    pub fn rows(self, providers: &[String], active: &str) -> Option<Vec<(String, String)>> {
+    /// `running` is the provider this session resolved at startup; `default` is
+    /// what the configuration names now. They differ between a switch and the
+    /// restart that picks it up, and saying so is the whole point of the
+    /// marker.
+    pub fn rows(
+        self,
+        providers: &[String],
+        running: &str,
+        default: Option<&str>,
+    ) -> Option<Vec<(String, String)>> {
         let named = |rows: &[(&str, &str)]| {
             Some(
                 rows.iter()
@@ -349,8 +358,10 @@ impl ProviderStep {
                 let mut rows: Vec<(String, String)> = providers
                     .iter()
                     .map(|name| {
-                        let note = if name == active {
+                        let note = if name == running {
                             "in use"
+                        } else if default == Some(name.as_str()) {
+                            "chosen · in use after a restart"
                         } else {
                             "switch to this provider"
                         };
