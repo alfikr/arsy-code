@@ -132,7 +132,8 @@ def main():
             # the highlighted command, which a second Enter then sends.
             terminal.send(b"/")
             terminal.expect("› /model")
-            terminal.send(b"\x1b[B\x1b[B")
+            # Three rows down from /model: /effort, /mcp, then /hooks.
+            terminal.send(b"\x1b[B\x1b[B\x1b[B")
             terminal.expect("› /hooks")
             terminal.send(b"\r\r")
             terminal.expect("1 hook declared; none loaded")

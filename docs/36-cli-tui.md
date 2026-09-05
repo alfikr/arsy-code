@@ -51,6 +51,17 @@ forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
 
+`/effort low|medium|high` sets how much reasoning a turn asks for, `/effort off`
+clears it, and a bare `/effort` reports the current level without changing it.
+The choice is remembered beside the model. Unset is the default and sends no
+reasoning field at all, so a host without such a model sees the request it always
+saw. The two dialects spend it differently: Chat Completions takes the level by
+name as `reasoning_effort`, while Messages takes a share of `max_tokens` as a
+thinking budget, floored at the 1024 tokens the API requires and omitted when the
+output budget cannot hold both the floor and an answer. A scripted `arsy run`
+ignores the remembered level and sends no reasoning field, so a pipeline cannot
+change behaviour because of an interactive choice made elsewhere.
+
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
 of range number, a slug with whitespace — is rejected with a reason and the
@@ -217,6 +228,12 @@ ARSY has no update command. Updates and rollbacks are handled by the installatio
 specified in [distribution](34-distribution.md).
 
 ## TUI behavior
+
+The status line carries the model route, the reasoning effort (`effort:—` when
+unset), the checked-out branch when the workspace is a Git checkout, and the
+workspace path. The branch is read from `.git/HEAD` once per prompt, so a
+checkout made in another terminal appears on the next line rather than at the
+next restart.
 
 The TUI has a session timeline, task input, status line, evidence/diagnostic detail, and an approval view. At startup it detects a logged-in Codex installation through `codex login status`, then asks for a model; an empty selection uses the Codex default. Codex credentials and configuration remain owned by Codex and are never copied into ARSY. Entering a task runs it through Codex in read-only mode and returns to the task prompt; `:quit` or end-of-file exits. It displays the active workspace, model route, session ID, achieved sandbox assurance, token/cost totals, and whether the result is degraded. Keyboard actions and screen-reader labels must expose every action available by pointer.
 
