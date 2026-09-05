@@ -87,6 +87,7 @@ Usage:
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
   arsy auth set <PROVIDER>   store a credential in the OS credential store
+  arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
 
@@ -176,6 +177,11 @@ pub enum Command {
     AuthSet {
         provider: String,
         handle: Option<String>,
+    },
+    /// `arsy auth login <PROVIDER>`: sign in through the provider's OAuth
+    /// client instead of storing an API key.
+    AuthLogin {
+        provider: String,
     },
     AuthList,
     AuthRemove {
@@ -411,6 +417,12 @@ fn parse_auth(
                 handle,
             })
         }
+        Some("login") => {
+            positional.remove(0);
+            Ok(Command::AuthLogin {
+                provider: only_argument(positional, "auth login", "<PROVIDER>")?,
+            })
+        }
         Some("list") if positional.len() == 1 => Ok(Command::AuthList),
         Some("remove") => {
             positional.remove(0);
@@ -420,7 +432,7 @@ fn parse_auth(
                 force,
             })
         }
-        _ => Err(usage("auth requires set, list, or remove")),
+        _ => Err(usage("auth requires set, login, list, or remove")),
     }
 }
 
@@ -639,6 +651,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::AuthSet { provider, handle } => {
             auth_set(provider, handle.as_deref(), tty, emitter)
         }
+        Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
         Command::AuthList => auth_list(emitter),
         Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
         Command::Eval { suite, trials, out } => {
@@ -719,6 +732,18 @@ struct AuthRecord {
     handle: SecretHandle,
     created_at: u64,
     last_used: Option<u64>,
+    /// How the credential was obtained. Defaulted so a catalog written before
+    /// OAuth existed still reads.
+    #[serde(default)]
+    kind: CredentialKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialKind {
+    #[default]
+    ApiKey,
+    OAuth,
 }
 
 fn catalog(store: OsCredentialStore) -> Result<Vec<AuthRecord>, Diagnostic> {
@@ -766,12 +791,14 @@ fn auth_set(
     let now = now()?;
     if let Some(record) = records.iter_mut().find(|record| record.handle == handle) {
         record.provider = provider.to_owned();
+        record.kind = CredentialKind::ApiKey;
     } else {
         records.push(AuthRecord {
             provider: provider.to_owned(),
             handle: handle.clone(),
             created_at: now,
             last_used: None,
+            kind: CredentialKind::ApiKey,
         });
     }
     if let Err(error) = save_catalog(store, &records) {
@@ -784,6 +811,96 @@ fn auth_set(
     }
     emitter.result(json!({"provider": provider, "handle": handle}));
     Ok(0)
+}
+
+/// Sign in to a provider through the OAuth client its configuration names.
+///
+/// The resulting token set is stored under the same handle an API key would
+/// use, so everything downstream — resolution, redaction, `auth remove` —
+/// treats the two the same.
+fn auth_login(
+    invocation: &Invocation,
+    provider: &str,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working)?;
+    let endpoint = config.endpoint(Some(provider)).ok_or_else(|| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!("no provider endpoint named `{provider}` is configured"),
+            "add a `[provider.endpoint.<name>]` table to the user config.toml",
+        )
+    })?;
+    let oauth = endpoint.oauth.as_ref().ok_or_else(|| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!("provider `{provider}` has no OAuth client configured"),
+            format!(
+                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key with                  `arsy auth set {provider}`"
+            ),
+        )
+    })?;
+
+    let transport = arsy_kernel::provider::http::HttpTransport::default();
+    let tokens = if arsy_kernel::oauth::uses_device_grant(oauth) {
+        let prompt = arsy_kernel::oauth::begin_device(&transport, oauth).map_err(login_failed)?;
+        // Printed rather than opened: the operator may be on another machine,
+        // and this is the grant that does not need a local browser at all.
+        emitter.result(json!({
+            "provider": provider,
+            "verification_uri": prompt.verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| prompt.verification_uri.clone()),
+            "user_code": prompt.user_code,
+        }));
+        arsy_kernel::oauth::poll_device(&transport, oauth, &prompt, &mut std::thread::sleep)
+            .map_err(login_failed)?
+    } else {
+        let mut url = None;
+        let tokens = arsy_kernel::oauth::authorization_code(&transport, oauth, &mut |authorize| {
+            url = Some(authorize.to_owned());
+            let _ = writeln!(io::stderr(), "Open this URL to sign in:\n  {authorize}");
+        });
+        tokens.map_err(login_failed)?
+    };
+
+    let handle = SecretHandle::new(OS_STORE_ID, provider).map_err(secret_failed)?;
+    let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
+    let store = OsCredentialStore;
+    store.set(handle.name(), &raw).map_err(secret_failed)?;
+    let mut records = catalog(store)?;
+    let now = now()?;
+    match records.iter_mut().find(|record| record.handle == handle) {
+        Some(record) => {
+            record.provider = provider.to_owned();
+            record.kind = CredentialKind::OAuth;
+        }
+        None => records.push(AuthRecord {
+            provider: provider.to_owned(),
+            handle: handle.clone(),
+            created_at: now,
+            last_used: None,
+            kind: CredentialKind::OAuth,
+        }),
+    }
+    save_catalog(store, &records)?;
+    emitter.result(json!({
+        "provider": provider,
+        "handle": handle,
+        "kind": "oauth",
+        "expires_at": tokens.expires_at,
+    }));
+    Ok(0)
+}
+
+fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
+    Diagnostic::error(
+        ARSY_PRV_1000,
+        error.to_string(),
+        "check the OAuth client in `arsy config explain`, then run `arsy auth login` again",
+    )
 }
 
 fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {

@@ -9,6 +9,7 @@
 use crate::{Diagnostic, ARSY_PRV_1000};
 use arsy_kernel::{
     config::{Config, Dialect, Endpoint},
+    oauth::{self, TokenSet},
     provider::{
         anthropic::AnthropicProvider, http::HttpTransport, openai::OpenAiProvider, wire::ApiKey,
         ModelProvider,
@@ -22,6 +23,7 @@ use arsy_kernel::{
 pub enum CredentialSource {
     ConfiguredEnv,
     Keyring,
+    OAuth,
     DefaultEnv,
 }
 
@@ -30,6 +32,7 @@ impl CredentialSource {
         match self {
             Self::ConfiguredEnv => "configured_env",
             Self::Keyring => "keyring",
+            Self::OAuth => "oauth",
             Self::DefaultEnv => "default_env",
         }
     }
@@ -106,7 +109,7 @@ fn credential(
         match OsCredentialStore.resolve(handle.name()) {
             Ok(value) => {
                 if let Some(value) = present(Some(value)) {
-                    return Ok((value, CredentialSource::Keyring));
+                    return stored(endpoint, handle, value);
                 }
             }
             Err(SecretError::NotFound(_)) => {}
@@ -141,6 +144,54 @@ fn present(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// Interpret what the credential store holds for this endpoint.
+///
+/// `arsy auth login` writes a token set as JSON under the same handle an API
+/// key would use, so the two are told apart by shape rather than by a second
+/// lookup. An expired access token is refreshed and written back here, which
+/// is the only place that can happen before the value reaches the wire.
+fn stored(
+    endpoint: &Endpoint,
+    handle: &SecretHandle,
+    value: String,
+) -> Result<(String, CredentialSource), Diagnostic> {
+    let Ok(tokens) = serde_json::from_str::<TokenSet>(&value) else {
+        return Ok((value, CredentialSource::Keyring));
+    };
+    if !tokens.is_expired(oauth::now()) {
+        return Ok((tokens.access_token, CredentialSource::OAuth));
+    }
+    let oauth_client = endpoint.oauth.as_ref().ok_or_else(|| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!(
+                "the stored login for provider `{}` has expired and its OAuth client is no                  longer configured",
+                endpoint.id
+            ),
+            format!("restore the `[provider.endpoint.{}.oauth]` table", endpoint.id),
+        )
+    })?;
+    let refreshed =
+        oauth::refresh(&HttpTransport::default(), oauth_client, &tokens).map_err(|error| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!(
+                    "the stored login for provider `{}` could not be renewed: {error}",
+                    endpoint.id
+                ),
+                format!("run `arsy auth login {}` again", endpoint.id),
+            )
+        })?;
+    // Written back before use: a rotated refresh token is single-use, so
+    // losing it here would cost the operator a re-login on the next run.
+    let raw = serde_json::to_string(&refreshed)
+        .map_err(|error| credential_failed(&endpoint.id, error))?;
+    OsCredentialStore
+        .set(handle.name(), &raw)
+        .map_err(|error| credential_failed(&endpoint.id, error))?;
+    Ok((refreshed.access_token, CredentialSource::OAuth))
+}
+
 /// A handle to name the credential in redacted output.
 ///
 /// The configured keyring handle when there is one, otherwise a synthetic
@@ -151,7 +202,7 @@ fn redaction_handle(
     source: CredentialSource,
 ) -> Result<SecretHandle, Diagnostic> {
     match (source, &endpoint.credential) {
-        (CredentialSource::Keyring, Some(handle)) => Ok(handle.clone()),
+        (CredentialSource::Keyring | CredentialSource::OAuth, Some(handle)) => Ok(handle.clone()),
         (_, _) => {
             let name = match source {
                 CredentialSource::ConfiguredEnv => endpoint
@@ -247,6 +298,13 @@ credential = "secret://os/local"
                 .unwrap()
                 .to_string(),
             "secret://os/local"
+        );
+        assert_eq!(
+            redaction_handle(endpoint, CredentialSource::OAuth)
+                .unwrap()
+                .to_string(),
+            "secret://os/local",
+            "an access token is masked under the handle it was stored against"
         );
         assert_eq!(
             redaction_handle(endpoint, CredentialSource::ConfiguredEnv)
