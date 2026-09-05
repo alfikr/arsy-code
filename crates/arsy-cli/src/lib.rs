@@ -1424,10 +1424,14 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // session: the setting is unchanged and the task prompt
                 // returns. Every picker has to be listed here, or leaving one
                 // exits ARSY instead.
-                None if matches!(prompt, Prompt::Model | Prompt::Effort) => {
+                None if matches!(prompt, Prompt::Model | Prompt::Effort | Prompt::Provider(_)) => {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
+                        Prompt::Provider(_) => {
+                            draft = tui::ProviderDraft::default();
+                            "Provider unchanged.".to_owned()
+                        }
                         _ => format!("Model unchanged: {route}"),
                     };
                     writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
@@ -1814,9 +1818,7 @@ fn provider_step(
             "+new" => Ok(ProviderNext::Ask(Step::Name)),
             "-remove" => Ok(ProviderNext::Ask(Step::Remove)),
             chosen if providers.iter().any(|name| name == chosen) => {
-                write_config(invocation, |config| {
-                    config_edit::set_default(config, chosen)
-                })?;
+                write_config(|config| config_edit::set_default(config, chosen))?;
                 Ok(ProviderNext::Done(format!("Provider: {chosen}")))
             }
             other => Err(format!(
@@ -1856,7 +1858,7 @@ fn provider_step(
             Ok(ProviderNext::Ask(Step::Key))
         }
         Step::Key => {
-            let handle = store_credential(&draft.name, &draft.store, answer)?;
+            let handle = store_credential(invocation, &draft.name, &draft.store, answer)?;
             let endpoint = config_edit::Endpoint {
                 name: draft.name.clone(),
                 kind: draft.kind.clone(),
@@ -1864,7 +1866,7 @@ fn provider_step(
                 model: draft.model.clone(),
                 credential: handle,
             };
-            write_config(invocation, |config| {
+            write_config(|config| {
                 let config = config_edit::ensure_schema(config);
                 let config = config_edit::append_endpoint(&config, &endpoint);
                 config_edit::set_default(&config, &endpoint.name)
@@ -1889,9 +1891,7 @@ fn provider_step(
                 return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
             }
             let name = draft.name.clone();
-            write_config(invocation, |config| {
-                config_edit::remove_endpoint(config, &name)
-            })?;
+            write_config(|config| config_edit::remove_endpoint(config, &name))?;
             Ok(ProviderNext::Done(format!(
                 "Removed provider {name}. Its credential was left in place; \
                  `arsy auth list` shows it."
@@ -1903,28 +1903,53 @@ fn provider_step(
 /// Put a typed credential where the operator asked for it, and give back the
 /// handle the configuration should point at.
 #[cfg(feature = "tui")]
-fn store_credential(name: &str, store: &str, secret: &str) -> Result<String, String> {
+fn store_credential(
+    invocation: &Invocation,
+    name: &str,
+    store: &str,
+    secret: &str,
+) -> Result<String, String> {
     let secret = secret.trim();
     if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
         return Err("that credential is too short to redact safely".to_owned());
     }
-    if store == "keychain" {
-        return OsCredentialStore
+    let handle = if store == "keychain" {
+        OsCredentialStore
             .set(name, secret)
-            .map(|()| format!("secret://{OS_STORE_ID}/{name}"))
-            .map_err(|error| format!("the credential store refused it: {error}"));
+            .map_err(|error| format!("the credential store refused it: {error}"))?;
+        SecretHandle::new(OS_STORE_ID, name)
+    } else {
+        let file = format!("{name}.key");
+        let path = FileCredentialStore::path(&file)
+            .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut written = owner_only(&path).map_err(|error| error.message)?;
+        written
+            .write_all(secret.as_bytes())
+            .map_err(|error| error.to_string())?;
+        SecretHandle::new(FILE_STORE_ID, file)
     }
-    let file = format!("{name}.key");
-    let path = FileCredentialStore::path(&file)
-        .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let mut handle = owner_only(&path).map_err(|error| error.message)?;
-    handle
-        .write_all(secret.as_bytes())
-        .map_err(|error| error.to_string())?;
-    Ok(format!("secret://{FILE_STORE_ID}/{file}"))
+    .map_err(|error| error.to_string())?;
+
+    // Catalogued exactly as `arsy auth set` catalogues one, for two reasons:
+    // `auth list` can show it, and every turn registers the catalogued handles
+    // for redaction — a credential missing from the catalog is one that could
+    // reach output unredacted.
+    let store = CatalogStore::resolve(invocation);
+    let mut records = catalog(store).map_err(|error| error.message)?;
+    let now = now().map_err(|error| error.message)?;
+    records.retain(|record| record.handle != handle);
+    records.push(AuthRecord {
+        provider: name.to_owned(),
+        handle: handle.clone(),
+        created_at: now,
+        last_used: None,
+        kind: CredentialKind::ApiKey,
+    });
+    save_catalog(store, &records).map_err(|error| error.message)?;
+    Ok(handle.to_string())
 }
 
 /// Rewrite the user configuration through `edit`.
@@ -1932,8 +1957,7 @@ fn store_credential(name: &str, store: &str, secret: &str) -> Result<String, Str
 /// The file is read and written whole, so `edit` sees exactly what is on disk
 /// and nothing it did not change can move.
 #[cfg(feature = "tui")]
-fn write_config(invocation: &Invocation, edit: impl FnOnce(&str) -> String) -> Result<(), String> {
-    let _ = invocation;
+fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
     let path = arsy_kernel::config::user_config()
         .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
     let original = match std::fs::read_to_string(&path) {

@@ -204,6 +204,12 @@ def main():
             terminal.send(b"sk-provider-wizard-value\r")
             terminal.expect("Added provider acme")
 
+            # A credential the wizard stored is catalogued like one `auth set`
+            # stores: `auth list` shows it, and every turn registers catalogued
+            # handles for redaction.
+            terminal.send(b"/auth\r")
+            terminal.expect("secret://file/acme.key")
+
             written = (root / "Library/Application Support/ARSY/config.toml")
             if not written.exists():
                 written = root / "config/arsy/config.toml"
@@ -219,6 +225,14 @@ def main():
             # The credential must not be anywhere the terminal kept.
             with terminal.lock:
                 assert b"sk-provider-wizard-value" not in terminal.received
+
+            # Leaving a wizard step cancels the wizard, not the session.
+            terminal.send(b"/provider\r")
+            terminal.send(b"+new\r")
+            terminal.expect("new provider")
+            terminal.send(b"\x03")
+            terminal.expect("Provider unchanged")
+            assert child.poll() is None, "leaving /provider ended the session"
 
             # Removing asks first, and `no` leaves the configuration alone.
             terminal.send(b"/provider\r")
