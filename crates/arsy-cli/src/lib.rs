@@ -743,6 +743,11 @@ struct AuthRecord {
 enum CredentialKind {
     #[default]
     ApiKey,
+    // Spelled out, because the derived snake_case of `OAuth` is `o_auth`,
+    // which is not what an operator reading the catalog expects to see. The
+    // alias keeps a catalog written under the derived name readable, so the
+    // rename cannot turn one into "corrupt".
+    #[serde(rename = "oauth", alias = "o_auth")]
     OAuth,
 }
 
@@ -838,7 +843,8 @@ fn auth_login(
             ARSY_PRV_1000,
             format!("provider `{provider}` has no OAuth client configured"),
             format!(
-                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key with                  `arsy auth set {provider}`"
+                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
+                 with `arsy auth set {provider}`"
             ),
         )
     })?;
@@ -2075,6 +2081,38 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    /// The catalog is written by one version and read by the next, so a
+    /// record from before logins existed has to keep working.
+    #[test]
+    fn an_older_credential_catalog_still_reads() {
+        let old = r#"[{"provider":"anthropic","handle":"secret://os/anthropic","created_at":1,"last_used":null}]"#;
+        let records: Vec<AuthRecord> = serde_json::from_str(old).unwrap();
+        assert_eq!(records[0].provider, "anthropic");
+        assert_eq!(
+            records[0].kind,
+            CredentialKind::ApiKey,
+            "a record written before logins existed is an API key"
+        );
+
+        // Round-trips under the name the catalog actually stores.
+        let written = serde_json::to_string(&[AuthRecord {
+            kind: CredentialKind::OAuth,
+            ..records[0].clone()
+        }])
+        .unwrap();
+        assert!(written.contains(r#""kind":"oauth""#), "{written}");
+        let back: Vec<AuthRecord> = serde_json::from_str(&written).unwrap();
+        assert_eq!(back[0].kind, CredentialKind::OAuth);
+
+        let derived = written.replace(r#""kind":"oauth""#, r#""kind":"o_auth""#);
+        let back: Vec<AuthRecord> = serde_json::from_str(&derived).unwrap();
+        assert_eq!(
+            back[0].kind,
+            CredentialKind::OAuth,
+            "a catalog written under the derived name must not read as corrupt"
+        );
+    }
 
     #[test]
     fn auth_entry_points_parse_without_accepting_a_secret_argument() {

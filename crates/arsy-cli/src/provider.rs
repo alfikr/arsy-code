@@ -154,25 +154,56 @@ fn present(value: Option<String>) -> Option<String> {
 /// key would use, so the two are told apart by shape rather than by a second
 /// lookup. An expired access token is refreshed and written back here, which
 /// is the only place that can happen before the value reaches the wire.
+/// What the credential store is holding for this endpoint.
+#[derive(Debug, Eq, PartialEq)]
+enum Stored {
+    /// Anything that is not a token set, taken verbatim.
+    ApiKey(String),
+    Token(TokenSet),
+    /// A token set that has to be renewed before it is used.
+    Expired(TokenSet),
+}
+
+/// Tell an API key from a stored login by shape.
+///
+/// `arsy auth login` writes a token set as JSON under the same handle an API
+/// key would use, so there is no second lookup to disambiguate them. Anything
+/// that does not deserialize as a token set is an API key, which keeps a key
+/// that happens to look like JSON usable.
+fn classify(value: String, now: u64) -> Stored {
+    match serde_json::from_str::<TokenSet>(&value) {
+        Err(_) => Stored::ApiKey(value),
+        Ok(tokens) if tokens.is_expired(now) => Stored::Expired(tokens),
+        Ok(tokens) => Stored::Token(tokens),
+    }
+}
+
+/// Interpret what the credential store holds, renewing a lapsed login.
+///
+/// This is the only place a refresh can happen before the value reaches the
+/// wire, so it is also the only place the renewed token can be written back.
 fn stored(
     endpoint: &Endpoint,
     handle: &SecretHandle,
     value: String,
 ) -> Result<(String, CredentialSource), Diagnostic> {
-    let Ok(tokens) = serde_json::from_str::<TokenSet>(&value) else {
-        return Ok((value, CredentialSource::Keyring));
+    let tokens = match classify(value, oauth::now()) {
+        Stored::ApiKey(value) => return Ok((value, CredentialSource::Keyring)),
+        Stored::Token(tokens) => return Ok((tokens.access_token, CredentialSource::OAuth)),
+        Stored::Expired(tokens) => tokens,
     };
-    if !tokens.is_expired(oauth::now()) {
-        return Ok((tokens.access_token, CredentialSource::OAuth));
-    }
     let oauth_client = endpoint.oauth.as_ref().ok_or_else(|| {
         Diagnostic::error(
             ARSY_PRV_1000,
             format!(
-                "the stored login for provider `{}` has expired and its OAuth client is no                  longer configured",
+                "the stored login for provider `{}` has expired and its OAuth client is no \
+                 longer configured",
                 endpoint.id
             ),
-            format!("restore the `[provider.endpoint.{}.oauth]` table", endpoint.id),
+            format!(
+                "restore the `[provider.endpoint.{}.oauth]` table",
+                endpoint.id
+            ),
         )
     })?;
     let refreshed =
@@ -322,6 +353,48 @@ credential = "secret://os/local"
                 .unwrap()
                 .to_string(),
             "secret://env/OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn a_stored_credential_is_told_apart_by_shape_not_by_a_second_lookup() {
+        let now = 1_000_000;
+        let token = |body: &str| classify(body.to_owned(), now);
+
+        assert_eq!(
+            token("sk-ant-api03-plain-key"),
+            Stored::ApiKey("sk-ant-api03-plain-key".to_owned())
+        );
+        assert_eq!(
+            token(r#"{"note":"not a login"}"#),
+            Stored::ApiKey(r#"{"note":"not a login"}"#.to_owned()),
+            "JSON that is not a token set is still an API key, taken verbatim"
+        );
+
+        let live = format!(r#"{{"access_token":"at","expires_at":{}}}"#, now + 3600);
+        assert!(matches!(token(&live), Stored::Token(_)));
+
+        assert!(
+            matches!(token(r#"{"access_token":"at"}"#), Stored::Token(_)),
+            "a login with no stated expiry is taken at face value, not refreshed every time"
+        );
+
+        assert!(matches!(
+            token(&format!(
+                r#"{{"access_token":"at","expires_at":{}}}"#,
+                now - 1
+            )),
+            Stored::Expired(_)
+        ));
+        assert!(
+            matches!(
+                token(&format!(
+                    r#"{{"access_token":"at","expires_at":{}}}"#,
+                    now + oauth::EXPIRY_MARGIN.as_secs() - 1
+                )),
+                Stored::Expired(_)
+            ),
+            "a token inside the margin is renewed, so it cannot lapse between check and use"
         );
     }
 
