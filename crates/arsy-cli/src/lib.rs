@@ -975,6 +975,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // A configured endpoint is preferred, because it is the one ARSY talks to
     // itself. The Codex CLI stays the fallback for an operator who has not
     // configured anything, so this session keeps working as it did.
+    //
+    // ponytail: resolved once, so an OAuth access token is the one this
+    // session started with; a session outliving the token's lifetime would
+    // need re-resolving per turn, which costs a credential-store read each
+    // time. An API key does not expire, and `arsy run` resolves per
+    // invocation, so only a long interactive OAuth session is affected.
     let native = load_config(&workspace, &workspace)
         .and_then(|config| {
             let resolved = provider::resolve(&config, None)?;

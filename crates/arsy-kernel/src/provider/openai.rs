@@ -265,8 +265,9 @@ impl EventDecoder {
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| ProviderError::Decode(error.to_string()))?;
         // A gateway may report a mid-stream failure as an error object in the
-        // stream rather than as a status.
-        if let Some(error) = value.get("error") {
+        // stream rather than as a status. Some send the key on every chunk with
+        // a null value, which is the absence of an error, not one.
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             return Err(normalize_stream_error(error));
         }
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {

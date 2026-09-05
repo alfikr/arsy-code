@@ -284,7 +284,9 @@ fn arguments_that_never_parse_are_rejected_rather_than_guessed_at() {
 #[test]
 fn text_streams_as_deltas_and_a_length_stop_is_normalized() {
     let transport = FakeTransport::streaming(vec![
-        r#"data: {"choices":[{"index":0,"delta":{"content":"he"}}]}"#,
+        // Some gateways send the error key on every chunk with a null value.
+        // That is the absence of an error, not one.
+        r#"data: {"error":null,"choices":[{"index":0,"delta":{"content":"he"}}]}"#,
         r#"data: {"choices":[{"index":0,"delta":{"content":"llo"}}]}"#,
         r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
         r#"data: [DONE]"#,

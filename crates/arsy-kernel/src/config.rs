@@ -385,19 +385,24 @@ impl Config {
 
         // A dialect is required the first time; a later layer may refine an
         // endpoint it already knows without repeating it.
-        let kind = match string(table, "kind", &format!("{prefix}.kind"), path)? {
-            Some(raw) => Dialect::parse(raw).ok_or_else(|| {
-                reject(format!(
-                    "`{prefix}.kind` must be \"anthropic\" or \"openai\", not \"{raw}\""
-                ))
-            })?,
-            None => match self.endpoints.get(id) {
-                Some(existing) => existing.kind,
-                None => return Err(reject(format!("`{prefix}` requires `kind`"))),
-            },
+        let stated_kind = string(table, "kind", &format!("{prefix}.kind"), path)?
+            .map(|raw| {
+                Dialect::parse(raw).ok_or_else(|| {
+                    reject(format!(
+                        "`{prefix}.kind` must be \"anthropic\" or \"openai\", not \"{raw}\""
+                    ))
+                })
+            })
+            .transpose()?;
+        let existing = self.endpoints.remove(id);
+        let kind = match (stated_kind, &existing) {
+            (Some(kind), _) => kind,
+            (None, Some(existing)) => existing.kind,
+            (None, None) => return Err(reject(format!("`{prefix}` requires `kind`"))),
         };
 
-        let mut endpoint = self.endpoints.remove(id).unwrap_or(Endpoint {
+        let introduced = existing.is_none();
+        let mut endpoint = existing.unwrap_or(Endpoint {
             id: id.to_owned(),
             kind,
             base_url: kind.default_base_url().to_owned(),
@@ -407,17 +412,28 @@ impl Config {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             oauth: None,
         });
-        if endpoint.kind != kind {
+        // Changing the dialect changes which API the default base URL names,
+        // so one inherited from the previous dialect cannot be kept.
+        let redialected = endpoint.kind != kind;
+        if redialected {
             endpoint.kind = kind;
             endpoint.base_url = kind.default_base_url().to_owned();
         }
-        self.record(layer, path, &format!("{prefix}.kind"), kind.as_str());
-        self.record(
-            layer,
-            path,
-            &format!("{prefix}.base_url"),
-            &endpoint.base_url,
-        );
+        // Only a layer that actually supplied a value may claim it in the
+        // trace. Attributing an inherited value to the last layer that merely
+        // mentioned the endpoint would make `arsy config explain` name the
+        // wrong file, which is the one thing it exists to get right.
+        if introduced || stated_kind.is_some() {
+            self.record(layer, path, &format!("{prefix}.kind"), kind.as_str());
+        }
+        if introduced || redialected {
+            self.record(
+                layer,
+                path,
+                &format!("{prefix}.base_url"),
+                &endpoint.base_url,
+            );
+        }
 
         if let Some(base_url) = string(table, "base_url", &format!("{prefix}.base_url"), path)? {
             validate_base_url(base_url).map_err(|message| {
@@ -756,7 +772,7 @@ base_url = "https://user.test/v1/"
             Some("ENTERPRISE_KEY"),
             "a key the later layer did not set survives"
         );
-        let trace = config.explain(Some("provider.endpoint.proxy.base_url"));
+        let trace = config.explain(Some("provider.endpoint.proxy"));
         assert_eq!(
             trace["values"]["provider.endpoint.proxy.base_url"]["layer"],
             "user"
@@ -764,6 +780,82 @@ base_url = "https://user.test/v1/"
         assert_eq!(
             trace["values"]["provider.endpoint.proxy.base_url"]["path"],
             serde_json::json!(user)
+        );
+    }
+
+    /// The source trace exists to name the file a value came from, so a later
+    /// layer that merely mentions an endpoint must not take credit for keys it
+    /// never set.
+    #[test]
+    fn a_layer_only_claims_the_keys_it_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let enterprise = write(
+            directory.path(),
+            "enterprise.toml",
+            r#"
+schema_version = 1
+[provider.endpoint.p]
+kind = "openai"
+base_url = "https://enterprise.test/v1"
+"#,
+        );
+        let user = write(
+            directory.path(),
+            "user.toml",
+            r#"
+schema_version = 1
+[provider.endpoint.p]
+api_key_env = "K"
+"#,
+        );
+
+        let config = load(&[(Layer::Enterprise, enterprise), (Layer::User, user)]);
+        let trace = config.explain(Some("provider.endpoint.p"));
+
+        assert_eq!(
+            trace["values"]["provider.endpoint.p.base_url"]["layer"], "enterprise",
+            "the user layer never mentioned base_url"
+        );
+        assert_eq!(
+            trace["values"]["provider.endpoint.p.kind"]["layer"], "enterprise",
+            "nor the dialect it inherited"
+        );
+        assert_eq!(
+            trace["values"]["provider.endpoint.p.api_key_env"]["layer"],
+            "user"
+        );
+        assert_eq!(
+            config.endpoint(None).unwrap().base_url,
+            "https://enterprise.test/v1"
+        );
+    }
+
+    /// A base URL only means an API once a dialect is fixed, so inheriting one
+    /// across a change of dialect would point the new adapter at the old API.
+    #[test]
+    fn changing_the_dialect_drops_a_base_url_inherited_from_the_old_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let enterprise = write(
+            directory.path(),
+            "enterprise.toml",
+            "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n",
+        );
+        let user = write(
+            directory.path(),
+            "user.toml",
+            "schema_version = 1\n[provider.endpoint.p]\nkind = \"anthropic\"\n",
+        );
+
+        let config = load(&[(Layer::Enterprise, enterprise), (Layer::User, user)]);
+        let endpoint = config.endpoint(None).unwrap();
+
+        assert_eq!(endpoint.kind, Dialect::Anthropic);
+        assert_eq!(endpoint.base_url, Dialect::Anthropic.default_base_url());
+        assert_eq!(
+            config.explain(Some("provider.endpoint.p.base_url"))["values"]
+                ["provider.endpoint.p.base_url"]["layer"],
+            "user",
+            "the layer that changed the dialect is the one the new default came from"
         );
     }
 
