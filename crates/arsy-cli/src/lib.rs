@@ -793,8 +793,62 @@ fn config_explain(
 ) -> Result<i32, Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    emitter.result(load_config(&root, &working)?.explain(key));
+    let report = load_config(&root, &working)?.explain(key);
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        human_config(&report, key)
+    });
     Ok(0)
+}
+
+/// `config explain` for a reader: one row per key with the value it resolved to
+/// and the layer that decided it.
+///
+/// The machine record carries the full path of every source file; a row names
+/// the layer instead and lists the paths once underneath, because the same file
+/// otherwise repeats on every line and pushes the values off the screen.
+fn human_config(report: &Value, key: Option<&str>) -> Value {
+    let Some(values) = report["values"].as_object() else {
+        return report.clone();
+    };
+    if values.is_empty() {
+        return json!({"configuration": match key {
+            Some(key) => format!("No configuration sets `{key}`."),
+            None => "No configuration is set; every value is a built-in default.".to_owned(),
+        }});
+    }
+    let label = values
+        .keys()
+        .map(|key| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut listing = format!(
+        "{} value{} set\n",
+        values.len(),
+        if values.len() == 1 { "" } else { "s" }
+    );
+    let mut paths: Vec<&str> = Vec::new();
+    for (name, entry) in values {
+        let value = entry["value"]
+            .as_str()
+            .map_or_else(|| plain(&entry["value"]), terminal_text);
+        let layer = entry["layer"].as_str().unwrap_or("?");
+        listing.push_str(&format!(
+            "\n  {name}{}  {value}  [{layer}]",
+            " ".repeat(label - name.chars().count()),
+        ));
+        if let Some(path) = entry["path"].as_str() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    listing.push('\n');
+    for path in paths {
+        listing.push_str(&format!("\n  from {}", terminal_text(path)));
+    }
+    json!({"configuration": listing})
 }
 
 /// Read every configuration layer for this workspace.
@@ -1003,8 +1057,60 @@ fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
 
 fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let records = catalog(OsCredentialStore)?;
-    emitter.result(json!({"credentials": records}));
+    emitter.result(if emitter.output == Output::Json {
+        json!({"credentials": records})
+    } else {
+        human_credentials(&records)
+    });
     Ok(0)
+}
+
+/// `auth list` for a reader: one row per credential, handle and kind first,
+/// because the handle is what a `credential = ` line has to be pointed at.
+///
+/// Values are never read here, only handles, so nothing on these rows is a
+/// secret.
+fn human_credentials(records: &[AuthRecord]) -> Value {
+    if records.is_empty() {
+        return json!({
+            "credentials": "No credentials are stored. `arsy auth set <PROVIDER>` stores one and \
+                            prints the handle to point `credential` at."
+        });
+    }
+    let handles: Vec<String> = records
+        .iter()
+        .map(|record| record.handle.to_string())
+        .collect();
+    let label = handles
+        .iter()
+        .map(|handle| handle.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut listing = format!(
+        "{} credential{} stored\n",
+        records.len(),
+        if records.len() == 1 { "" } else { "s" }
+    );
+    // `oauth` and `api_key` differ in width, so the column after them only
+    // lines up if the kind is padded too.
+    let kind = |record: &AuthRecord| plain(&json!(record.kind));
+    let kinds = records.iter().map(kind).collect::<Vec<_>>();
+    let kind_label = kinds.iter().map(|kind| kind.len()).max().unwrap_or(0);
+    for ((record, handle), kind) in records.iter().zip(&handles).zip(&kinds) {
+        listing.push_str(&format!(
+            "\n  {handle}{}  {kind}{}  provider {}{}",
+            " ".repeat(label - handle.chars().count()),
+            " ".repeat(kind_label - kind.len()),
+            terminal_text(&record.provider),
+            if record.last_used.is_some() {
+                ""
+            } else {
+                "  · never used"
+            },
+        ));
+    }
+    listing.push('\n');
+    json!({"credentials": listing})
 }
 
 fn auth_remove(
@@ -2638,6 +2744,83 @@ mod tests {
             let args = inspection_args(line).expect("mapped");
             assert!(parse(args).is_err(), "{line} reached auth mutation");
         }
+    }
+
+    /// `/settings` and `/auth` print to a reader, not to a parser: the machine
+    /// record is still the one JSON mode emits.
+    #[test]
+    fn configuration_and_credentials_render_as_rows_for_a_reader() {
+        let report = json!({
+            "schema_version": 1,
+            "diagnostics": [],
+            "values": {
+                "provider.default": {"layer": "user", "path": "/cfg/config.toml", "value": "myai"},
+                "provider.endpoint.myai.kind": {
+                    "layer": "workspace", "path": "/ws/.arsy/config.toml", "value": "openai"
+                },
+            },
+        });
+
+        let rendered = human_config(&report, None);
+        let listing = rendered["configuration"].as_str().expect("one string");
+        assert!(listing.starts_with("2 values set"), "{listing}");
+        assert!(
+            listing.contains("provider.default             myai  [user]"),
+            "{listing}"
+        );
+        assert!(listing.contains("openai  [workspace]"), "{listing}");
+        // Each source file is named once, under the rows, rather than repeated
+        // on every one of them.
+        assert_eq!(listing.matches("/cfg/config.toml").count(), 1, "{listing}");
+        assert!(listing.contains("from /ws/.arsy/config.toml"), "{listing}");
+
+        // Nothing set is a sentence, not an empty object.
+        let empty = human_config(&json!({"values": {}}), Some("provider.default"));
+        let listing = empty["configuration"].as_str().expect("one string");
+        assert!(listing.contains("provider.default"), "{listing}");
+        assert!(listing.contains("No configuration"), "{listing}");
+
+        // Credentials list handles, never values, so a row is safe to show.
+        let records = vec![
+            AuthRecord {
+                provider: "myai".to_owned(),
+                handle: SecretHandle::new("os", "myai").unwrap(),
+                created_at: 1,
+                last_used: None,
+                kind: CredentialKind::ApiKey,
+            },
+            AuthRecord {
+                provider: "acme".to_owned(),
+                handle: SecretHandle::new("file", "acme.key").unwrap(),
+                created_at: 2,
+                last_used: Some(9),
+                kind: CredentialKind::OAuth,
+            },
+        ];
+        let rendered = human_credentials(&records);
+        let listing = rendered["credentials"].as_str().expect("one string");
+        assert!(listing.starts_with("2 credentials stored"), "{listing}");
+        assert!(listing.contains("secret://os/myai"), "{listing}");
+        assert!(
+            listing.contains("api_key  provider myai  · never used"),
+            "{listing}"
+        );
+        // The kind column is padded, so what follows it lines up.
+        assert!(listing.contains("oauth    provider acme"), "{listing}");
+        assert_eq!(
+            listing.matches("never used").count(),
+            1,
+            "only the unused credential carries the marker: {listing}"
+        );
+
+        let empty = human_credentials(&[]);
+        assert!(
+            empty["credentials"]
+                .as_str()
+                .expect("one string")
+                .contains("auth set"),
+            "an empty list must say how to add one"
+        );
     }
 
     #[cfg(feature = "tui")]
