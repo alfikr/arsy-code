@@ -42,11 +42,13 @@ flowchart LR
 
 ## Provider coverage
 
-OpenAI, Anthropic, Google, xAI, DeepSeek, Mistral, MiniMax, Qwen, Moonshot, Groq, Together, OpenRouter, Azure OpenAI, Bedrock, Vertex, Ollama, llama.cpp, LM Studio, and custom compatible servers are adapter targets—not launch guarantees. First release implements the minimum routes required by eval coverage.
+Two adapters have landed: the Anthropic Messages dialect and the OpenAI Chat Completions dialect. Both are written against the dialect rather than a vendor, and the base URL comes from configuration, so the OpenAI adapter also serves OpenRouter, LiteLLM, Azure-style gateways, Ollama, llama.cpp, and LM Studio without a further adapter. Google, xAI, Bedrock, and Vertex remain adapter targets—not launch guarantees.
+
+HTTP is injected as a `WireTransport`, so a dialect's wire contract is exercised without a network; the implementation that reaches a host lives in one module and knows nothing about which provider it is carrying.
 
 ## Security, failure, and routing
 
-Credentials are handles resolved inside the provider worker and never prompt fragments; [`arsy auth`](36-cli-tui.md) creates and revokes them, and `arsy provider list` and `arsy model list` show what a resolved policy allows. Wire bodies are size-limited and redacted. Streams normalize partial tool arguments without executing them. Retries honor idempotency and provider retry hints. Policy-controlled routing considers task class, measured quality, latency, cost, residency, and capability; users can pin a model or disable routing.
+Credentials are handles resolved inside the provider worker and never prompt fragments; [`arsy auth`](36-cli-tui.md) creates and revokes them, by API key (`arsy auth set`) or by an OAuth device or PKCE login against the client the configuration names (`arsy auth login`), and `arsy provider list` and `arsy model list` show what a resolved policy allows. Wire bodies are size-limited and redacted. Streams normalize partial tool arguments without executing them. Retries honor idempotency and provider retry hints. Policy-controlled routing considers task class, measured quality, latency, cost, residency, and capability; users can pin a model or disable routing.
 
 ## Decision
 
