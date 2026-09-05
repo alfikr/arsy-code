@@ -8,6 +8,7 @@ pub mod domain;
 pub mod event;
 pub mod migrate;
 pub mod model_profile;
+pub mod oauth;
 pub mod observer;
 pub mod operation;
 pub mod orchestration;
