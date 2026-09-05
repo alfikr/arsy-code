@@ -30,8 +30,10 @@ carries the other read-only inspections under their own names: `/settings [KEY]`
 for `config explain`, `/doctor`, `/auth` for the credential listing, and
 `/compat claude|codex|omp|agents`. Each expands to the CLI command it stands for
 and is parsed by the same grammar, so an unsupported argument is refused with the
-CLI's diagnostic. No slash command mutates state: `auth set`, `auth login`, and
-`auth remove` are not reachable from the TUI. These work even without provider
+CLI's diagnostic. Every command on this route is read-only — `auth set`,
+`auth login`, and `auth remove` are not reachable from the TUI — so `/model`,
+which writes the accepted answer to the user configuration, remains the only
+slash command that changes state. These work even without provider
 authentication. Repeat an inspection to reload its source files. Unknown slash
 commands report an error instead of becoming model prompts.
 
