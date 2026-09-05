@@ -11,6 +11,7 @@
 pub mod anthropic;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod openai;
 pub mod wire;
 
 use crate::protocol::IdempotencyKey;
