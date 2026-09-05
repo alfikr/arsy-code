@@ -17,6 +17,9 @@ use std::collections::VecDeque;
 pub const API_VERSION: &str = "2023-06-01";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
+/// Smallest thinking budget the Messages API accepts.
+const THINKING_FLOOR: u32 = 1024;
+
 pub struct AnthropicProvider<T> {
     descriptor: ProviderDescriptor,
     base_url: String,
@@ -54,6 +57,23 @@ impl<T: WireTransport> AnthropicProvider<T> {
         body.insert("model".to_owned(), json!(request.model.model));
         body.insert("max_tokens".to_owned(), json!(request.max_output_tokens));
         body.insert("stream".to_owned(), json!(true));
+
+        // This dialect spends reasoning from the output budget, so the level is
+        // a share of `max_tokens`. The budget has a floor of 1024 and must stay
+        // under the budget it is taken from, so a request too small to hold both
+        // carries no thinking block rather than an argument the host rejects.
+        if let Some(budget) = request.effort.and_then(|effort| {
+            let (numerator, denominator) = effort.thinking_share();
+            let share = request.max_output_tokens / denominator * numerator;
+            let ceiling = request.max_output_tokens.checked_sub(1)?;
+            (ceiling >= THINKING_FLOOR).then(|| share.clamp(THINKING_FLOOR, ceiling))
+        }) {
+            body.insert(
+                "thinking".to_owned(),
+                json!({"type": "enabled", "budget_tokens": budget}),
+            );
+        }
+
         if let Some(system) = &request.system {
             body.insert("system".to_owned(), json!(system));
         }
