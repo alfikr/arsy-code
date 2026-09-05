@@ -9,6 +9,7 @@ use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
     policy::{ApprovalRequest, SandboxAssurance},
+    provider::Effort,
 };
 use serde_json::Value;
 use std::{
@@ -243,6 +244,7 @@ pub enum Action {
 /// command cannot appear in the menu and not in the help, or the reverse.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "choose the provider model"),
+    ("/effort", "set reasoning effort; low | medium | high | off"),
     (
         "/mcp",
         "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
@@ -264,7 +266,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 9;
+const MENU_ROWS: usize = 10;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -721,6 +723,7 @@ pub struct TuiState {
     streaming: Option<String>,
     sandbox_assurance: SandboxAssurance,
     model_route: Option<ModelRoute>,
+    effort: Option<Effort>,
 }
 
 impl TuiState {
@@ -733,6 +736,7 @@ impl TuiState {
             streaming: None,
             sandbox_assurance: SandboxAssurance::None,
             model_route: None,
+            effort: None,
         }
     }
 
@@ -742,6 +746,10 @@ impl TuiState {
 
     pub fn set_model_route(&mut self, route: ModelRoute) {
         self.model_route = Some(route);
+    }
+
+    pub fn set_effort(&mut self, effort: Option<Effort>) {
+        self.effort = effort;
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -837,19 +845,32 @@ impl TuiState {
     }
 
     /// The status row shown under the composer: warm model, green directory.
-    pub fn status_row(&self, width: usize, colour: bool) -> String {
+    /// `branch` is passed rather than kept, because it belongs to the checkout
+    /// and can change while the session is open.
+    pub fn status_row(&self, width: usize, colour: bool, branch: Option<&str>) -> String {
         let route = self
             .model_route
             .as_ref()
             .map_or_else(|| "no model".to_owned(), ModelRoute::to_string);
-        fit(
-            &format!(
-                "  {}  {}",
-                paint(colour, MODEL, &route),
-                paint(colour, CWD, &self.workspace),
+        let mut row = format!("  {}", paint(colour, MODEL, &route));
+        // An unset effort says so, because "no reasoning knob is sent" and
+        // "some level is in force" have to be told apart at a glance.
+        row.push_str(&format!(
+            "  {}",
+            paint(
+                colour,
+                DIM,
+                &self.effort.map_or_else(
+                    || "effort:—".to_owned(),
+                    |effort| format!("effort:{effort}")
+                ),
             ),
-            width.max(MIN_WIDTH),
-        )
+        ));
+        if let Some(branch) = branch {
+            row.push_str(&format!("  {}", paint(colour, ACCENT, branch)));
+        }
+        row.push_str(&format!("  {}", paint(colour, CWD, &self.workspace)));
+        fit(&row, width.max(MIN_WIDTH))
     }
 
     pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
@@ -1308,6 +1329,29 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The checked-out branch, read straight from `.git/HEAD`.
+///
+/// ponytail: a file read rather than `git rev-parse`, so the status row costs
+/// no subprocess per prompt. It follows the `gitdir:` pointer a worktree or
+/// submodule leaves behind, and reports a detached head as a short id. It does
+/// not walk up to a parent repository: a workspace that is not itself a
+/// checkout simply has no branch to show.
+pub fn branch(workspace: &std::path::Path) -> Option<String> {
+    let dot_git = workspace.join(".git");
+    let git_dir = match std::fs::read_to_string(&dot_git) {
+        Ok(pointer) => workspace.join(pointer.trim().strip_prefix("gitdir:")?.trim()),
+        Err(_) => dot_git,
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let name = match head.strip_prefix("ref: refs/heads/") {
+        Some(name) => name,
+        // Detached: the file holds the commit id itself.
+        None => head.get(..8)?,
+    };
+    (!name.is_empty()).then(|| safe_text(name))
+}
+
 /// `stty size` is asked first: `COLUMNS` is inherited from the shell and goes
 /// stale as soon as the window is resized.
 pub fn terminal_width() -> usize {
@@ -1431,7 +1475,18 @@ mod tests {
         assert!(first.contains("none · read-only"));
         assert!(!first.contains("\x1b["));
         assert!(first.lines().all(|line| line.chars().count() == 80));
-        assert_eq!(state.status_row(80, false), "  no model  /repo");
+        // No model, no effort, and no checkout: the row still says what is
+        // missing rather than dropping the field.
+        assert_eq!(
+            state.status_row(80, false, None),
+            "  no model  effort:—  /repo"
+        );
+        state.set_effort(Some(Effort::High));
+        assert_eq!(
+            state.status_row(80, false, Some("feat/x")),
+            "  no model  effort:high  feat/x  /repo"
+        );
+        state.set_effort(None);
 
         let event = EventEnvelope::new(
             session,

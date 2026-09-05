@@ -29,8 +29,8 @@ use arsy_kernel::{
     event::EventStore,
     protocol::{ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope, TurnStart},
     provider::{
-        CanonicalModelRequest, ModelContent, ModelEvent, ModelKey, ModelMessage, ModelProvider,
-        ModelRole, ProviderError,
+        CanonicalModelRequest, Effort, ModelContent, ModelEvent, ModelKey, ModelMessage,
+        ModelProvider, ModelRole, ProviderError,
     },
     secret::{
         CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
@@ -1115,8 +1115,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
 
+    let mut effort = saved_effort();
+
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
+    state.set_effort(effort);
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -1147,7 +1150,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
 
     loop {
         let status = match prompt {
-            Prompt::Task => state.status_row(tui::terminal_width(), colour),
+            // The branch is read per line rather than kept, so a checkout made
+            // in another terminal shows up on the next prompt.
+            Prompt::Task => state.status_row(
+                tui::terminal_width(),
+                colour,
+                tui::branch(&workspace).as_deref(),
+            ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
@@ -1200,6 +1209,16 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 prompt = Prompt::Model;
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
+            Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let (picked, changed, message) = resolve_effort(&line, effort);
+                if changed {
+                    effort = picked;
+                    state.set_effort(effort);
+                    remember_effort(effort, emitter);
+                }
+                writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+            }
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 if line.split_whitespace().next() == Some("/help") {
@@ -1243,6 +1262,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     native.as_ref(),
                     &line,
                     &route,
+                    effort,
                     colour,
                     &keys,
                     &mut decoder,
@@ -1329,6 +1349,17 @@ fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
     }
 }
 
+#[cfg(feature = "tui")]
+fn remember_effort(effort: Option<Effort>, emitter: &mut Emitter) {
+    if let Err(error) = save_effort(effort) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-UIX-1001",
+            format!("the effort choice was not remembered: {error}"),
+            "check that the ARSY user configuration directory is writable",
+        ));
+    }
+}
+
 /// The remembered model lives beside the user configuration layer that
 /// `arsy doctor` already reports.
 #[cfg(feature = "tui")]
@@ -1360,6 +1391,66 @@ fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     std::fs::write(path, format!("{route}\n"))
 }
 
+/// The remembered reasoning effort, beside the remembered model.
+#[cfg(feature = "tui")]
+fn effort_store() -> Option<PathBuf> {
+    Some(arsy_kernel::config::user_config()?.with_file_name("effort"))
+}
+
+/// The effort chosen last time, re-validated on read for the same reason the
+/// model is: an unreadable file must not decide what a turn sends.
+#[cfg(feature = "tui")]
+fn saved_effort() -> Option<Effort> {
+    Effort::parse(std::fs::read_to_string(effort_store()?).ok()?.trim())
+}
+
+/// `None` clears the choice, so a turn goes back to carrying no reasoning knob.
+#[cfg(feature = "tui")]
+fn save_effort(effort: Option<Effort>) -> io::Result<()> {
+    let path = effort_store()
+        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match effort {
+        Some(effort) => std::fs::write(path, format!("{effort}\n")),
+        None => match std::fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+    }
+}
+
+/// Take `/effort [low|medium|high|off]` and report what to say about it.
+///
+/// Returns the new setting and the line to print. A bare `/effort` reports the
+/// current one rather than changing it, because a command that silently cycles
+/// a setting is a command whose result has to be read back out of the status
+/// row to be trusted.
+#[cfg(feature = "tui")]
+fn resolve_effort(line: &str, current: Option<Effort>) -> (Option<Effort>, bool, String) {
+    let levels = Effort::ALL.map(Effort::as_str).join(", ");
+    match line.split_whitespace().nth(1) {
+        None => (
+            current,
+            false,
+            match current {
+                Some(effort) => format!("Effort: {effort} ({levels}, or off)"),
+                None => format!("Effort: unset, so no reasoning knob is sent ({levels}, or off)"),
+            },
+        ),
+        Some("off" | "none" | "unset") => (None, true, "Effort: unset".to_owned()),
+        Some(word) => match Effort::parse(word) {
+            Some(effort) => (Some(effort), true, format!("Effort: {effort}")),
+            None => (
+                current,
+                false,
+                format!("`{word}` is not an effort level. Use {levels}, or off."),
+            ),
+        },
+    }
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
@@ -1367,6 +1458,7 @@ fn run_turn(
     native: Option<&provider::Resolved>,
     task: &str,
     route: &tui::ModelRoute,
+    effort: Option<Effort>,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
@@ -1380,6 +1472,7 @@ fn run_turn(
             resolved,
             &task,
             route,
+            effort,
             admission.turn,
             colour,
             keys,
@@ -1487,6 +1580,7 @@ fn native_status(
     resolved: &provider::Resolved,
     task: &str,
     route: &tui::ModelRoute,
+    effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -1509,6 +1603,7 @@ fn native_status(
         // tool offered now would have nowhere to run.
         tools: Vec::new(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
+        effort,
         idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(turn.to_string())
             .map_err(io::Error::other)?,
     };
@@ -2121,6 +2216,10 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         // would invite calls nothing can run.
         tools: Vec::new(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
+        // Reasoning effort is chosen in the TUI with `/effort`. A scripted run
+        // takes the request it always took, so a remembered interactive choice
+        // cannot quietly change what a pipeline sends.
+        effort: None,
         // The turn id, so a retried attempt is provably the same request.
         idempotency_key: IdempotencyKey::new(admission.turn.to_string())
             .map_err(|error| storage_failed(error.to_string()))?,
@@ -2519,11 +2618,78 @@ mod tests {
 
     #[cfg(feature = "tui")]
     #[test]
+    fn effort_is_set_reported_and_cleared_from_one_line() {
+        // A bare `/effort` reports rather than changes, so the status row is
+        // never the only place the current level can be read.
+        let (picked, changed, message) = resolve_effort("/effort", None);
+        assert_eq!(picked, None);
+        assert!(!changed, "a report is not a change");
+        assert!(message.contains("unset"), "{message}");
+        assert!(message.contains("low, medium, high"), "{message}");
+
+        let (picked, changed, message) = resolve_effort("/effort", Some(Effort::Medium));
+        assert_eq!(picked, Some(Effort::Medium));
+        assert!(!changed);
+        assert!(message.contains("medium"), "{message}");
+
+        for level in Effort::ALL {
+            let (picked, changed, message) = resolve_effort(&format!("/effort {level}"), None);
+            assert_eq!(picked, Some(level));
+            assert!(changed);
+            assert!(message.contains(level.as_str()), "{message}");
+        }
+
+        // `off` clears it, which is how a turn goes back to sending no
+        // reasoning knob at all.
+        for word in ["off", "none", "unset"] {
+            let (picked, changed, _) =
+                resolve_effort(&format!("/effort {word}"), Some(Effort::High));
+            assert_eq!(picked, None, "{word} did not clear the level");
+            assert!(changed);
+        }
+
+        // A typo keeps the current level instead of silently clearing it.
+        let (picked, changed, message) = resolve_effort("/effort hihg", Some(Effort::High));
+        assert_eq!(picked, Some(Effort::High));
+        assert!(!changed, "a rejected word must not change the setting");
+        assert!(message.contains("hihg"), "{message}");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_branch_comes_from_head_including_a_worktree_pointer() {
+        let root = std::env::temp_dir().join(format!("arsy-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        assert_eq!(tui::branch(&root), None, "no checkout, no branch");
+
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/slash-menu\n").unwrap();
+        assert_eq!(tui::branch(&repo).as_deref(), Some("feat/slash-menu"));
+
+        // Detached: HEAD holds the commit id, so the row shows a short one.
+        std::fs::write(repo.join(".git/HEAD"), "3cd02230f0f0f0f0f0f0\n").unwrap();
+        assert_eq!(tui::branch(&repo).as_deref(), Some("3cd02230"));
+
+        // A worktree or submodule leaves a `gitdir:` pointer where the
+        // directory would be.
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../repo/.git\n").unwrap();
+        assert_eq!(tui::branch(&linked).as_deref(), Some("3cd02230"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
     fn the_menu_and_the_dispatch_table_hold_the_same_commands() {
-        // `/model`, `/help`, and `/quit` are answered by the loop itself; every
-        // other offered command must be an inspection it knows how to run.
+        // `/model`, `/effort`, `/help`, and `/quit` are answered by the loop
+        // itself; every other offered command must be an inspection it knows
+        // how to run.
         for (name, _) in tui::COMMANDS {
-            let handled = matches!(*name, "/model" | "/help" | "/quit")
+            let handled = matches!(*name, "/model" | "/effort" | "/help" | "/quit")
                 || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
