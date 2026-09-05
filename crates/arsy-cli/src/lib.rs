@@ -1900,29 +1900,7 @@ fn provider_step(
             Ok(ProviderNext::Ask(Step::Model))
         }
         Step::Model => {
-            // One host serves several models, so the step takes a list. The
-            // first is the endpoint's default; the rest are what `/model`
-            // offers beside it.
-            let mut models = Vec::new();
-            for slug in answer.split(',') {
-                let slug = slug.trim();
-                if slug.is_empty() {
-                    continue;
-                }
-                if !config_edit::is_writable(slug) {
-                    return Err(format!(
-                        "`{}` is not a model slug: plain ASCII, no quotes or backslashes",
-                        tui::safe_text(slug)
-                    ));
-                }
-                if !models.iter().any(|existing| existing == slug) {
-                    models.push(slug.to_owned());
-                }
-            }
-            if models.is_empty() {
-                return Err("name at least one model".to_owned());
-            }
-            draft.models = models;
+            draft.models = model_slugs(answer)?;
             Ok(ProviderNext::Ask(Step::Store))
         }
         Step::Store => {
@@ -1973,6 +1951,32 @@ fn provider_step(
             )))
         }
     }
+}
+
+/// One host serves several models, so the model step takes a list. The first is
+/// the endpoint's default; the rest are what `/model` offers beside it.
+#[cfg(feature = "tui")]
+fn model_slugs(answer: &str) -> Result<Vec<String>, String> {
+    let mut models: Vec<String> = Vec::new();
+    for slug in answer
+        .split(',')
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+    {
+        if !config_edit::is_writable(slug) {
+            return Err(format!(
+                "`{}` is not a model slug: plain ASCII, no quotes or backslashes",
+                tui::safe_text(slug)
+            ));
+        }
+        if !models.iter().any(|existing| existing == slug) {
+            models.push(slug.to_owned());
+        }
+    }
+    if models.is_empty() {
+        return Err("name at least one model".to_owned());
+    }
+    Ok(models)
 }
 
 /// Put a typed credential where the operator asked for it, and give back the

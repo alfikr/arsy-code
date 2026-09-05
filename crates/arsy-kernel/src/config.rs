@@ -171,6 +171,18 @@ pub struct Endpoint {
     pub oauth: Option<OAuth>,
 }
 
+impl Endpoint {
+    /// Put the default at the head of the offered models: a picker that does
+    /// not list the model the endpoint is already using cannot show what is in
+    /// force.
+    fn offer_default_first(&mut self) {
+        if let Some(model) = &self.model {
+            self.models.retain(|listed| listed != model);
+            self.models.insert(0, model.clone());
+        }
+    }
+}
+
 /// Response cap used when an endpoint does not set one. Large enough for a
 /// substantial edit, small enough to bound a runaway response.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
@@ -523,32 +535,11 @@ impl Config {
         }
         if let Some(value) = table.get("models") {
             let key = format!("{prefix}.models");
-            let listed = value.as_array().ok_or_else(|| ConfigError {
-                path: path.to_path_buf(),
-                message: format!("`{key}` must be an array of model names"),
-            })?;
-            let mut models = Vec::with_capacity(listed.len());
-            for entry in listed {
-                let name = entry
-                    .as_str()
-                    .filter(|name| !name.is_empty())
-                    .ok_or_else(|| ConfigError {
-                        path: path.to_path_buf(),
-                        message: format!("`{key}` must hold non-empty model names"),
-                    })?;
-                if !models.iter().any(|existing| existing == name) {
-                    models.push(name.to_owned());
-                }
-            }
+            let models = model_list(value, &key, path)?;
             self.record(layer, path, &key, models.join(", "));
             endpoint.models = models;
         }
-        // The default is offered too, and first: a picker that does not list
-        // the model the endpoint is already using cannot show what is in force.
-        if let Some(model) = &endpoint.model {
-            endpoint.models.retain(|listed| listed != model);
-            endpoint.models.insert(0, model.clone());
-        }
+        endpoint.offer_default_first();
         if let Some(value) = table.get("max_output_tokens") {
             let key = format!("{prefix}.max_output_tokens");
             let tokens = value
@@ -682,6 +673,28 @@ fn as_table<'a>(
         path: path.to_path_buf(),
         message: format!("`{key}` must be a table"),
     })
+}
+
+/// `models = [...]` as a list of distinct, non-empty names, in the order given.
+fn model_list(value: &toml::Value, key: &str, path: &Path) -> Result<Vec<String>, ConfigError> {
+    let reject = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        message,
+    };
+    let listed = value
+        .as_array()
+        .ok_or_else(|| reject(format!("`{key}` must be an array of model names")))?;
+    let mut models = Vec::with_capacity(listed.len());
+    for entry in listed {
+        let name = entry
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| reject(format!("`{key}` must hold non-empty model names")))?;
+        if !models.iter().any(|existing| existing == name) {
+            models.push(name.to_owned());
+        }
+    }
+    Ok(models)
 }
 
 fn string<'a>(
