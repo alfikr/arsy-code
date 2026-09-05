@@ -23,6 +23,9 @@ use std::{
 /// The only schema this build understands.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// Name every configuration layer uses.
+pub const CONFIG_FILE: &str = "config.toml";
+
 /// Documented sections that parse but have no runtime effect yet. Listing them
 /// keeps "unknown keys are errors" true without rejecting a forward-looking
 /// file.
@@ -144,8 +147,16 @@ pub struct Endpoint {
     pub credential: Option<SecretHandle>,
     pub api_key_env: Option<String>,
     pub model: Option<String>,
+    /// Cap on one response. Providers differ in what they accept and the
+    /// Anthropic dialect requires a value, so it is configurable rather than
+    /// fixed.
+    pub max_output_tokens: u32,
     pub oauth: Option<OAuth>,
 }
+
+/// Response cap used when an endpoint does not set one. Large enough for a
+/// substantial edit, small enough to bound a runaway response.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
 /// Effective value of one key and the file it won from.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -360,7 +371,13 @@ impl Config {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "kind" | "base_url" | "credential" | "api_key_env" | "model" | "oauth"
+                "kind"
+                    | "base_url"
+                    | "credential"
+                    | "api_key_env"
+                    | "model"
+                    | "max_output_tokens"
+                    | "oauth"
             ) {
                 return Err(reject(format!("unknown key `{prefix}.{key}`")));
             }
@@ -387,6 +404,7 @@ impl Config {
             credential: None,
             api_key_env: None,
             model: None,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             oauth: None,
         });
         if endpoint.kind != kind {
@@ -431,6 +449,16 @@ impl Config {
         if let Some(model) = string(table, "model", &format!("{prefix}.model"), path)? {
             self.record(layer, path, &format!("{prefix}.model"), model);
             endpoint.model = Some(model.clone());
+        }
+        if let Some(value) = table.get("max_output_tokens") {
+            let key = format!("{prefix}.max_output_tokens");
+            let tokens = value
+                .as_integer()
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens > 0)
+                .ok_or_else(|| reject(format!("`{key}` must be a positive integer")))?;
+            self.record(layer, path, &key, tokens.to_string());
+            endpoint.max_output_tokens = tokens;
         }
         if let Some(oauth) = table.get("oauth") {
             endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
@@ -604,12 +632,12 @@ pub fn layers(workspace: &Path, working: &Path) -> Vec<(Layer, PathBuf)> {
     if let Some(path) = user_config() {
         layers.push((Layer::User, path));
     }
-    layers.push((Layer::Workspace, workspace.join(".arsy/config.toml")));
+    layers.push((Layer::Workspace, workspace.join(".arsy").join(CONFIG_FILE)));
     if let Ok(relative) = working.strip_prefix(workspace) {
         let mut directory = workspace.to_path_buf();
         for component in relative.components() {
             directory.push(component);
-            layers.push((Layer::Nested, directory.join(".arsy/config.toml")));
+            layers.push((Layer::Nested, directory.join(".arsy").join(CONFIG_FILE)));
         }
     }
     layers
@@ -637,8 +665,22 @@ pub fn enterprise_config() -> Option<PathBuf> {
     None
 }
 
-#[cfg(target_os = "linux")]
+/// Directory that replaces the platform user-configuration location.
+///
+/// The same override the Codex CLI offers as `CODEX_HOME`. It exists so a run
+/// can be pointed at a throwaway configuration — a test, a container, a second
+/// account — without editing the operator's own file.
+pub const CONFIG_HOME_VAR: &str = "ARSY_CONFIG_HOME";
+
 pub fn user_config() -> Option<PathBuf> {
+    match std::env::var_os(CONFIG_HOME_VAR) {
+        Some(home) if !home.is_empty() => Some(Path::new(&home).join(CONFIG_FILE)),
+        _ => platform_user_config(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_user_config() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
@@ -646,18 +688,18 @@ pub fn user_config() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn user_config() -> Option<PathBuf> {
+fn platform_user_config() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|home| Path::new(&home).join("Library/Application Support/ARSY/config.toml"))
 }
 
 #[cfg(target_os = "windows")]
-pub fn user_config() -> Option<PathBuf> {
+fn platform_user_config() -> Option<PathBuf> {
     std::env::var_os("AppData").map(|base| Path::new(&base).join("ARSY/config.toml"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn user_config() -> Option<PathBuf> {
+fn platform_user_config() -> Option<PathBuf> {
     None
 }
 
@@ -788,6 +830,10 @@ credential = "secret://os/official"
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\nport = 1\n",
                 "unknown key `provider.endpoint.p.port`",
             ),
+            (
+                "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\nmax_output_tokens = 0\n",
+                "`provider.endpoint.p.max_output_tokens` must be a positive integer",
+            ),
         ];
         for (index, (body, expected)) in cases.into_iter().enumerate() {
             let path = write(directory.path(), &format!("case{index}.toml"), body);
@@ -828,6 +874,7 @@ scopes = ["offline_access"]
 
         let endpoint = config.endpoint(None).unwrap();
         assert_eq!(endpoint.id, "local");
+        assert_eq!(endpoint.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(config.model_default(), Some("claude-sonnet-4-6"));
         assert_eq!(endpoint.oauth.as_ref().unwrap().client_id, "arsy");
         assert_eq!(endpoint.oauth.as_ref().unwrap().scopes, ["offline_access"]);
