@@ -11,6 +11,7 @@
 //! | `ARSY-SCH-1003` | bare `arsy`: no terminal, or TUI disabled at build time |
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
+//! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
@@ -19,13 +20,18 @@
 
 mod eval;
 mod integrations;
+pub mod provider;
 #[cfg(feature = "tui")]
 pub mod tui;
 
 use arsy_kernel::{
     domain::{Principal, SessionId},
     event::EventStore,
-    protocol::{ClientRequest, Extensions, ProtocolEnvelope, TurnStart},
+    protocol::{ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope, TurnStart},
+    provider::{
+        CanonicalModelRequest, ModelContent, ModelEvent, ModelKey, ModelMessage, ModelProvider,
+        ModelRole, ProviderError,
+    },
     secret::{
         CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
         OS_STORE_ID,
@@ -44,6 +50,11 @@ use std::{
 
 /// Every session of one workspace shares this store.
 const STORE_PATH: &str = ".arsy/sessions.sqlite3";
+
+/// No provider credential is available, so the turn cannot dispatch.
+pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
+/// A configuration layer could not be read or does not parse.
+pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
 /// Machine records carry the protocol's schema version.
 const RECORD_SCHEMA: u32 = 1;
 
@@ -52,7 +63,6 @@ const RECORD_SCHEMA: u32 = 1;
 const UNAVAILABLE: &[(&str, u8)] = &[
     ("artifact", 1),
     ("completions", 1),
-    ("config", 1),
     ("gc", 1),
     ("migrate", 1),
     ("model", 2),
@@ -74,10 +84,12 @@ Usage:
   arsy doctor                report platform, sandbox, credential, and config state
   arsy eval <SUITE>          run a pinned evaluation fixture
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
+  arsy config explain [KEY]  show effective configuration and where it came from
   arsy mcp list [--source <KIND>]       inspect imported MCP declarations
   arsy mcp show <NAME> [--source <KIND>] show one MCP declaration
   arsy hook list [--event <NAME>]      inspect imported lifecycle hooks
   arsy auth set <PROVIDER>   store a credential in the OS credential store
+  arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
 
@@ -168,6 +180,11 @@ pub enum Command {
         provider: String,
         handle: Option<String>,
     },
+    /// `arsy auth login <PROVIDER>`: sign in through the provider's OAuth
+    /// client instead of storing an API key.
+    AuthLogin {
+        provider: String,
+    },
     AuthList,
     AuthRemove {
         handle: SecretHandle,
@@ -186,6 +203,10 @@ pub enum Command {
         name: Option<String>,
         source: Option<String>,
         event: Option<String>,
+    },
+    /// `arsy config explain [KEY]`: effective values and where each came from.
+    ConfigExplain {
+        key: Option<String>,
     },
     /// Bare `arsy`: the interactive TUI.
     Tui,
@@ -236,6 +257,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        Some("config") => parse_config(parsed.positional)?,
         Some("mcp" | "hook") => integrations::parse(
             parsed.name.as_deref().unwrap(),
             parsed.positional,
@@ -395,6 +417,18 @@ fn parse_doctor(positional: Vec<String>, strict: bool) -> Result<Command, Diagno
     Ok(Command::Doctor { strict })
 }
 
+/// `config explain [KEY]`. Only `explain` exists; the rest of the documented
+/// `config` surface belongs to a later phase.
+fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
+    match positional.first().map(String::as_str) {
+        Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
+            key: positional.into_iter().nth(1),
+        }),
+        Some("explain") => Err(usage("config explain accepts only [KEY]")),
+        _ => Err(usage("config requires explain")),
+    }
+}
+
 fn parse_auth(
     mut positional: Vec<String>,
     handle: Option<String>,
@@ -408,6 +442,12 @@ fn parse_auth(
                 handle,
             })
         }
+        Some("login") => {
+            positional.remove(0);
+            Ok(Command::AuthLogin {
+                provider: only_argument(positional, "auth login", "<PROVIDER>")?,
+            })
+        }
         Some("list") if positional.len() == 1 => Ok(Command::AuthList),
         Some("remove") => {
             positional.remove(0);
@@ -417,7 +457,7 @@ fn parse_auth(
                 force,
             })
         }
-        _ => Err(usage("auth requires set, list, or remove")),
+        _ => Err(usage("auth requires set, login, list, or remove")),
     }
 }
 
@@ -465,6 +505,8 @@ struct Emitter {
     session: Option<SessionId>,
     sequence: u64,
     redactor: Redactor,
+    /// Whether streamed text is mid-line, so the next output can start clean.
+    streaming: bool,
 }
 
 impl Emitter {
@@ -474,6 +516,7 @@ impl Emitter {
             session: None,
             sequence: 0,
             redactor: Redactor::new(),
+            streaming: false,
         }
     }
 
@@ -540,6 +583,32 @@ impl Emitter {
         });
         if let Ok(record) = self.redactor.sanitize(&record.to_string()) {
             let _ = writeln!(io::stdout(), "{record}");
+        }
+    }
+
+    /// One chunk of streamed model text.
+    ///
+    /// Human output writes it straight through so a reply appears as it is
+    /// produced; machine output makes each chunk its own record, because a
+    /// JSON-lines consumer cannot read a partial line.
+    fn delta(&mut self, text: &str) {
+        match self.output {
+            Output::Json => self.record("model.delta", json!({"text": text})),
+            _ => {
+                let Ok(text) = self.redactor.sanitize(text) else {
+                    return;
+                };
+                let mut stdout = io::stdout();
+                let _ = write!(stdout, "{text}").and_then(|()| stdout.flush());
+                self.streaming = true;
+            }
+        }
+    }
+
+    /// Close a run of streamed text so the next line starts on its own.
+    fn end_deltas(&mut self) {
+        if std::mem::take(&mut self.streaming) {
+            let _ = writeln!(io::stdout());
         }
     }
 
@@ -619,6 +688,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::AuthSet { provider, handle } => {
             auth_set(provider, handle.as_deref(), tty, emitter)
         }
+        Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
         Command::AuthList => auth_list(emitter),
         Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
         Command::Eval { suite, trials, out } => {
@@ -648,6 +718,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             });
             Ok(0)
         }
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
     }
 }
 
@@ -680,6 +751,36 @@ fn compat_explain(
     Ok(0)
 }
 
+fn config_explain(
+    invocation: &Invocation,
+    key: Option<&str>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    emitter.result(load_config(&root, &working)?.explain(key));
+    Ok(0)
+}
+
+/// Read every configuration layer for this workspace.
+///
+/// An invalid file is fatal rather than skipped: continuing with a partly
+/// applied policy would silently run under something the operator never wrote.
+fn load_config(
+    workspace: &Path,
+    working: &Path,
+) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    arsy_kernel::config::Config::load(&arsy_kernel::config::layers(workspace, working)).map_err(
+        |error| {
+            Diagnostic::error(
+                ARSY_CFG_1000,
+                format!("configuration is unusable: {error}"),
+                "fix the reported file, then run `arsy config explain`",
+            )
+        },
+    )
+}
+
 const CATALOG_NAME: &str = "__catalog__";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -688,6 +789,23 @@ struct AuthRecord {
     handle: SecretHandle,
     created_at: u64,
     last_used: Option<u64>,
+    /// How the credential was obtained. Defaulted so a catalog written before
+    /// OAuth existed still reads.
+    #[serde(default)]
+    kind: CredentialKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialKind {
+    #[default]
+    ApiKey,
+    // Spelled out, because the derived snake_case of `OAuth` is `o_auth`,
+    // which is not what an operator reading the catalog expects to see. The
+    // alias keeps a catalog written under the derived name readable, so the
+    // rename cannot turn one into "corrupt".
+    #[serde(rename = "oauth", alias = "o_auth")]
+    OAuth,
 }
 
 fn catalog(store: OsCredentialStore) -> Result<Vec<AuthRecord>, Diagnostic> {
@@ -735,12 +853,14 @@ fn auth_set(
     let now = now()?;
     if let Some(record) = records.iter_mut().find(|record| record.handle == handle) {
         record.provider = provider.to_owned();
+        record.kind = CredentialKind::ApiKey;
     } else {
         records.push(AuthRecord {
             provider: provider.to_owned(),
             handle: handle.clone(),
             created_at: now,
             last_used: None,
+            kind: CredentialKind::ApiKey,
         });
     }
     if let Err(error) = save_catalog(store, &records) {
@@ -753,6 +873,97 @@ fn auth_set(
     }
     emitter.result(json!({"provider": provider, "handle": handle}));
     Ok(0)
+}
+
+/// Sign in to a provider through the OAuth client its configuration names.
+///
+/// The resulting token set is stored under the same handle an API key would
+/// use, so everything downstream — resolution, redaction, `auth remove` —
+/// treats the two the same.
+fn auth_login(
+    invocation: &Invocation,
+    provider: &str,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working)?;
+    let endpoint = config.endpoint(Some(provider)).ok_or_else(|| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!("no provider endpoint named `{provider}` is configured"),
+            "add a `[provider.endpoint.<name>]` table to the user config.toml",
+        )
+    })?;
+    let oauth = endpoint.oauth.as_ref().ok_or_else(|| {
+        Diagnostic::error(
+            ARSY_PRV_1000,
+            format!("provider `{provider}` has no OAuth client configured"),
+            format!(
+                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
+                 with `arsy auth set {provider}`"
+            ),
+        )
+    })?;
+
+    let transport = arsy_kernel::provider::http::HttpTransport::default();
+    let tokens = if arsy_kernel::oauth::uses_device_grant(oauth) {
+        let prompt = arsy_kernel::oauth::begin_device(&transport, oauth).map_err(login_failed)?;
+        // Printed rather than opened: the operator may be on another machine,
+        // and this is the grant that does not need a local browser at all.
+        emitter.result(json!({
+            "provider": provider,
+            "verification_uri": prompt.verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| prompt.verification_uri.clone()),
+            "user_code": prompt.user_code,
+        }));
+        arsy_kernel::oauth::poll_device(&transport, oauth, &prompt, &mut std::thread::sleep)
+            .map_err(login_failed)?
+    } else {
+        let mut url = None;
+        let tokens = arsy_kernel::oauth::authorization_code(&transport, oauth, &mut |authorize| {
+            url = Some(authorize.to_owned());
+            let _ = writeln!(io::stderr(), "Open this URL to sign in:\n  {authorize}");
+        });
+        tokens.map_err(login_failed)?
+    };
+
+    let handle = SecretHandle::new(OS_STORE_ID, provider).map_err(secret_failed)?;
+    let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
+    let store = OsCredentialStore;
+    store.set(handle.name(), &raw).map_err(secret_failed)?;
+    let mut records = catalog(store)?;
+    let now = now()?;
+    match records.iter_mut().find(|record| record.handle == handle) {
+        Some(record) => {
+            record.provider = provider.to_owned();
+            record.kind = CredentialKind::OAuth;
+        }
+        None => records.push(AuthRecord {
+            provider: provider.to_owned(),
+            handle: handle.clone(),
+            created_at: now,
+            last_used: None,
+            kind: CredentialKind::OAuth,
+        }),
+    }
+    save_catalog(store, &records)?;
+    emitter.result(json!({
+        "provider": provider,
+        "handle": handle,
+        "kind": "oauth",
+        "expires_at": tokens.expires_at,
+    }));
+    Ok(0)
+}
+
+fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
+    Diagnostic::error(
+        ARSY_PRV_1000,
+        error.to_string(),
+        "check the OAuth client in `arsy config explain`, then run `arsy auth login` again",
+    )
 }
 
 fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {
@@ -817,14 +1028,57 @@ enum Prompt {
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
-    let detected = tui::detect_model_route();
+
+    // A configured endpoint is preferred, because it is the one ARSY talks to
+    // itself. The Codex CLI stays the fallback for an operator who has not
+    // configured anything, so this session keeps working as it did.
+    //
+    // ponytail: resolved once, so an OAuth access token is the one this
+    // session started with; a session outliving the token's lifetime would
+    // need re-resolving per turn, which costs a credential-store read each
+    // time. An API key does not expire, and `arsy run` resolves per
+    // invocation, so only a long interactive OAuth session is affected.
+    let native = load_config(&workspace, &workspace)
+        .and_then(|config| {
+            let resolved = provider::resolve(&config, None)?;
+            let model = resolved
+                .endpoint
+                .model
+                .clone()
+                .or_else(|| config.model_default().map(str::to_owned))
+                .unwrap_or_default();
+            Ok((resolved, model))
+        })
+        .ok();
+    let detected = match &native {
+        Some((resolved, model)) => Some(tui::ModelRoute {
+            provider: resolved.endpoint.id.clone(),
+            model: model.clone(),
+        }),
+        None => tui::detect_model_route(),
+    };
+    // Nothing configured and no Codex login is not fatal: the session still
+    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
+    // is refused, which `provider_available` gates below.
     let provider_available = detected.is_some();
     let detected = detected.unwrap_or_else(|| tui::ModelRoute {
+        provider: tui::CODEX_PROVIDER.to_owned(),
         model: "default".into(),
     });
+    let native = native.map(|(resolved, _)| resolved);
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
-    let models = tui::available_models();
-    let mut route = saved_model().map_or(detected, |model| tui::ModelRoute { model });
+
+    // The model picker lists what the Codex CLI cached for its account, which
+    // says nothing about a configured endpoint; there, the picker takes a slug
+    // as free text.
+    let models = if detected.is_codex() {
+        tui::available_models()
+    } else {
+        Vec::new()
+    };
+    // A remembered route only applies to the provider it was chosen for.
+    let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
+    let mut route = remembered.clone().unwrap_or(detected);
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
@@ -835,7 +1089,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     )
     .map_err(terminal_failed)?;
     if !provider_available {
-        writeln!(stdout, "Provider unavailable. Inspection is available; install Codex and run codex login to execute tasks.").map_err(terminal_failed)?;
+        writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
 
     // ARSY paints the input line from here on, so it owns the terminal modes
@@ -849,7 +1103,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // A line submitted while a turn was running runs next, before stdin is
     // read again.
     let mut queued = std::collections::VecDeque::new();
-    let mut prompt = if saved_model().is_some() || !provider_available {
+    let mut prompt = if remembered.is_some() || !route.model.is_empty() {
         Prompt::Task
     } else {
         tui::render_model_list(&mut stdout, &models, &route, colour).map_err(terminal_failed)?;
@@ -949,14 +1203,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 stdout.flush().map_err(terminal_failed)?;
                 if !provider_available {
                     emitter.diagnostic(&Diagnostic::error(
-                        "ARSY-PRV-1000",
+                        ARSY_PRV_1000,
                         "provider unavailable",
-                        "run codex login and restart ARSY; /mcp and /hooks remain available",
+                        "configure a `[provider.endpoint.<name>]` table and run `arsy auth set \
+                         <name>`, or run codex login, then restart ARSY; /mcp and /hooks remain \
+                         available",
                     ));
                     continue;
                 }
-                match run_external(
+                match run_turn(
                     invocation,
+                    native.as_ref(),
                     &line,
                     &route,
                     colour,
@@ -1036,7 +1293,7 @@ fn read_line(
 /// choice still applies to this session.
 #[cfg(feature = "tui")]
 fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
-    if let Err(error) = save_model(&route.model) {
+    if let Err(error) = save_route(route) {
         emitter.diagnostic(&Diagnostic::warning(
             "ARSY-UIX-1001",
             format!("the model choice was not remembered: {error}"),
@@ -1049,34 +1306,38 @@ fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
 /// `arsy doctor` already reports.
 #[cfg(feature = "tui")]
 fn model_store() -> Option<PathBuf> {
-    Some(user_config()?.with_file_name("model"))
+    Some(arsy_kernel::config::user_config()?.with_file_name("model"))
 }
 
-/// A remembered model is re-validated on read: a file written by an older build
-/// that accepted anything must not keep selecting an unusable model on every
-/// later start.
+/// The route chosen last time, as `provider/model`.
+///
+/// The model is re-validated on read: a file written by an older build that
+/// accepted anything must not keep selecting an unusable model on every later
+/// start.
 #[cfg(feature = "tui")]
-fn saved_model() -> Option<String> {
-    let model = std::fs::read_to_string(model_store()?).ok()?;
-    let model = model.trim();
-    tui::validate_slug(model).ok()?;
-    Some(model.to_owned())
+fn saved_route() -> Option<tui::ModelRoute> {
+    let raw = std::fs::read_to_string(model_store()?).ok()?;
+    let raw = raw.trim();
+    let route = (!raw.is_empty()).then(|| tui::ModelRoute::parse(raw))?;
+    tui::validate_slug(&route.model).ok()?;
+    Some(route)
 }
 
 #[cfg(feature = "tui")]
-fn save_model(model: &str) -> io::Result<()> {
+fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     let path = model_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, format!("{model}\n"))
+    std::fs::write(path, format!("{route}\n"))
 }
 
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
-fn run_external(
+fn run_turn(
     invocation: &Invocation,
+    native: Option<&provider::Resolved>,
     task: &str,
     route: &tui::ModelRoute,
     colour: bool,
@@ -1087,32 +1348,44 @@ fn run_external(
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
-    let outcome = external_status(
-        &workspace_root(&invocation.workspace)?,
-        &task,
-        route,
-        colour,
-        keys,
-        decoder,
-        composer,
-        &emitter.redactor,
-    );
+    let outcome = match native.filter(|_| !route.is_codex()) {
+        Some(resolved) => native_status(
+            resolved,
+            &task,
+            route,
+            admission.turn,
+            colour,
+            keys,
+            decoder,
+            composer,
+        ),
+        None => external_status(
+            &workspace_root(&invocation.workspace)?,
+            &task,
+            route,
+            colour,
+            keys,
+            decoder,
+            composer,
+            &emitter.redactor,
+        ),
+    };
+    // A turn that never started leaves the composer painted, so it is torn down
+    // here before the diagnostic is written over the input block.
     if outcome.is_err() {
         let mut stdout = io::stdout();
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
     }
-    let (turn, status) = match outcome {
-        Ok(turn) => {
-            let status = turn.status.ok_or(turn.interrupted);
-            (turn, status)
-        }
+    let turn = match outcome {
+        Ok(turn) => turn,
         Err(error) => {
-            fail_external_turn(
+            fail_turn(
                 &service,
                 actor,
                 admission.turn,
                 session,
+                route,
                 format!("could not run {route}: {error}"),
                 emitter,
             )?;
@@ -1141,9 +1414,10 @@ fn run_external(
         );
         return Ok(turn);
     }
-    match status {
-        Ok(status) if status.success() && !turn.provider_failed => {
-            let outcome = json!({"provider": "codex", "model": route.model});
+    match &turn.failure {
+        None => {
+            let mut outcome = json!({"provider": route.provider, "model": route.model});
+            merge(&mut outcome, turn.usage.clone());
             service
                 .complete_turn(actor, admission.turn, &outcome)
                 .map_err(storage_failed)?;
@@ -1157,31 +1431,203 @@ fn run_external(
                 }),
             );
         }
-        Ok(status) => {
-            fail_external_turn(
+        Some(failure) => {
+            fail_turn(
                 &service,
                 actor,
                 admission.turn,
                 session,
-                if turn.provider_failed {
-                    format!("{route} reported a failed turn")
-                } else {
-                    format!("{route} exited with status {status}")
-                },
-                emitter,
-            )?;
-        }
-        Err(_) => {
-            fail_external_turn(
-                &service,
-                actor,
-                admission.turn,
-                session,
-                format!("{route} produced no exit status"),
+                route,
+                failure.clone(),
                 emitter,
             )?;
         }
     }
+    Ok(turn)
+}
+
+/// Stream one turn from a configured provider, keeping the composer alive.
+///
+/// The stream runs on its own thread for the same reason the Codex reader
+/// does: the main loop has to keep watching the key stream, which is what lets
+/// Esc or Ctrl-C stop a turn and keeps the composer typeable meanwhile. The
+/// thread is detached rather than joined, so an interrupt never waits on a
+/// stalled socket; dropping the receiver is what stops it, because the next
+/// send fails and the stream is dropped with the thread.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn native_status(
+    resolved: &provider::Resolved,
+    task: &str,
+    route: &tui::ModelRoute,
+    turn: arsy_kernel::domain::TurnId,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+) -> io::Result<Turn> {
+    let request = CanonicalModelRequest {
+        model: ModelKey {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        },
+        system: None,
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: task.to_owned(),
+            }],
+        }],
+        // As in `arsy run`: operations are not dispatched from here yet, so a
+        // tool offered now would have nowhere to run.
+        tools: Vec::new(),
+        max_output_tokens: resolved.endpoint.max_output_tokens,
+        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(turn.to_string())
+            .map_err(io::Error::other)?,
+    };
+
+    let provider = Arc::clone(&resolved.provider);
+    let (rows, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stream = match arsy_kernel::provider::stream_with_retry(
+            provider.as_ref(),
+            &request,
+            &mut std::thread::sleep,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = rows.send(Err(error.to_string()));
+                return;
+            }
+        };
+        for event in stream {
+            let message = match event {
+                Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
+                Ok(ModelEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                }) => Ok(Streamed::Usage {
+                    input_tokens,
+                    output_tokens,
+                }),
+                Ok(ModelEvent::ToolCallCompleted { name, .. }) => Err(format!(
+                    "the model called the tool `{name}`, which this path cannot run yet"
+                )),
+                Ok(_) => continue,
+                Err(error) => Err(error.to_string()),
+            };
+            let failed = message.is_err();
+            if rows.send(message).is_err() || failed {
+                return;
+            }
+        }
+    });
+
+    let mut outcome = Turn::default();
+    let mut terminal = io::stdout();
+    let working_status = tui::working_row(colour);
+    // Deltas arrive token by token; a row is emitted per line so scrollback
+    // reads like the Codex projection rather than one row per token.
+    let mut pending = String::new();
+    let draw = |terminal: &mut io::Stdout, composer: &mut tui::Composer, row: Option<&str>| {
+        let mut frame = composer.clear();
+        if let Some(row) = row {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        frame.push_str(&composer.render(tui::terminal_width(), colour, &working_status));
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    };
+    draw(&mut terminal, composer, None)?;
+    loop {
+        let mut typed = false;
+        while let Ok(byte) = keys.try_recv() {
+            let Some(key) = decoder.feed(byte) else {
+                continue;
+            };
+            if key == tui::Key::Interrupt {
+                outcome.queued.clear();
+                outcome.interrupted = true;
+                draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                return finish(terminal, composer, outcome);
+            }
+            match composer.press(key) {
+                // Bounded as on the Codex route, so a held Enter cannot grow the
+                // queue without limit; past the bound the draft is handed back.
+                tui::Action::Submit(line) if !line.trim().is_empty() => {
+                    if outcome.queued.len() < 16 {
+                        outcome.queued.push_back(line);
+                    } else {
+                        composer.restore(line);
+                    }
+                }
+                tui::Action::Submit(_) => typed = true,
+                tui::Action::Quit => outcome.quit = true,
+                tui::Action::Redraw => typed = true,
+                tui::Action::None => {}
+            }
+        }
+        if typed {
+            draw(&mut terminal, composer, None)?;
+        }
+        match events.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(Ok(Streamed::Text(text))) => {
+                pending.push_str(&text);
+                while let Some(newline) = pending.find('\n') {
+                    let line: String = pending.drain(..=newline).collect();
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::assistant_row(colour, &line)),
+                    )?;
+                }
+            }
+            Ok(Ok(Streamed::Usage {
+                input_tokens,
+                output_tokens,
+            })) => {
+                outcome.usage =
+                    json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            }
+            Ok(Err(failure)) => {
+                outcome.failure = Some(failure);
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if decoder.flush_escape() == Some(tui::Key::Interrupt) {
+                    outcome.interrupted = true;
+                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                    return finish(terminal, composer, outcome);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !pending.trim().is_empty() {
+        draw(
+            &mut terminal,
+            composer,
+            Some(&tui::assistant_row(colour, &pending)),
+        )?;
+    }
+    finish(terminal, composer, outcome)
+}
+
+/// One streamed fact from a provider, as the terminal needs it.
+#[cfg(feature = "tui")]
+enum Streamed {
+    Text(String),
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+}
+
+/// Tear the composer down so the next thing printed starts on its own line.
+#[cfg(feature = "tui")]
+fn finish(mut terminal: io::Stdout, composer: &mut tui::Composer, turn: Turn) -> io::Result<Turn> {
+    write!(terminal, "{}", composer.clear())?;
+    terminal.flush()?;
     Ok(turn)
 }
 
@@ -1214,13 +1660,17 @@ fn external_status(
     }
     command.arg("-");
     command.current_dir(workspace);
-    drive_provider(command, task, colour, keys, decoder, composer, redactor)
+    drive_provider(
+        command, task, route, colour, keys, decoder, composer, redactor,
+    )
 }
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn drive_provider(
     mut command: std::process::Command,
     task: &str,
+    route: &tui::ModelRoute,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
@@ -1264,6 +1714,7 @@ fn drive_provider(
     let mut last_row = None;
     let mut last_key = std::time::Instant::now();
     let mut exited = None;
+    let mut status: Option<std::process::ExitStatus> = None;
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
     let width = std::cell::Cell::new(tui::terminal_width());
@@ -1307,9 +1758,9 @@ fn drive_provider(
                 result?;
             }
         }
-        if outcome.status.is_none() {
-            outcome.status = child.0.try_wait()?;
-            if outcome.status.is_some() {
+        if status.is_none() {
+            status = child.0.try_wait()?;
+            if status.is_some() {
                 exited = Some(std::time::Instant::now());
                 child.stop(true);
             }
@@ -1329,7 +1780,7 @@ fn drive_provider(
             .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
         {
             child.stop(true);
-            outcome.status = Some(child.0.wait()?);
+            status = Some(child.0.wait()?);
             break;
         }
         let mut typed = false;
@@ -1475,7 +1926,7 @@ fn drive_provider(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stream_closed = true,
         }
         if stream_closed {
-            if outcome.status.is_some() {
+            if status.is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(40));
@@ -1493,14 +1944,32 @@ fn drive_provider(
             terminal_text(detail.trim())
         )));
     }
+    // A zero process exit must not mask a turn the provider itself reported as
+    // failed, so the event stream is checked before the exit status.
+    if !outcome.interrupted {
+        let status = match status {
+            Some(status) => status,
+            None => child.0.wait()?,
+        };
+        outcome.failure = if outcome.provider_failed {
+            Some(format!("{route} reported a failed turn"))
+        } else if status.success() {
+            None
+        } else {
+            Some(format!("{route} exited with status {status}"))
+        };
+    }
     Ok(outcome)
 }
 
-/// What one interactive turn left behind.
+/// What one interactive turn left behind, whichever route ran it.
 #[cfg(feature = "tui")]
 #[derive(Default)]
 struct Turn {
-    status: Option<std::process::ExitStatus>,
+    /// `None` when the turn succeeded; otherwise why it did not.
+    failure: Option<String>,
+    /// Extra facts to record on a completed turn, such as token usage.
+    usage: Value,
     interrupted: bool,
     provider_failed: bool,
     /// A line submitted while this turn was still running.
@@ -1509,21 +1978,36 @@ struct Turn {
 }
 
 #[cfg(feature = "tui")]
-fn fail_external_turn(
+/// Record and report a turn the provider did not complete.
+///
+/// The code and the reason follow the route, because "the CLI failed" is not
+/// something to tell an operator whose turn went straight to an endpoint, and
+/// the recorded reason is what a later audit reads.
+fn fail_turn(
     service: &AgentService,
     actor: Principal,
     turn: arsy_kernel::domain::TurnId,
     session: SessionId,
+    route: &tui::ModelRoute,
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let diagnostic = Diagnostic::error(
-        "ARSY-PRV-1002",
-        message,
-        "verify the selected CLI login and model, then retry",
-    );
+    let (code, reason, remediation) = if route.is_codex() {
+        (
+            "ARSY-PRV-1002",
+            "provider_cli",
+            "verify the selected CLI login and model, then retry",
+        )
+    } else {
+        (
+            ARSY_PRV_1000,
+            "provider",
+            "check the provider endpoint, credential, and model in `arsy config explain`",
+        )
+    };
+    let diagnostic = Diagnostic::error(code, message, remediation);
     service
-        .fail_turn(actor, turn, "provider_cli", diagnostic.message.clone())
+        .fail_turn(actor, turn, reason, diagnostic.message.clone())
         .map_err(storage_failed)?;
     emitter.diagnostic(&diagnostic);
     turn_record(
@@ -1557,31 +2041,146 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         task.to_owned()
     };
     let task = prepare_task(&task, emitter)?;
-    let (service, actor, admission, session) = record_turn(invocation, task, emitter)?;
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
 
-    // ponytail: the turn is durable before dispatch, so this failure is
-    // recoverable by `arsy resume`. Direct provider transport is not wired yet;
-    // the interactive TUI can use a logged-in Codex CLI without copying its token.
-    let diagnostic = Diagnostic::error(
-        "ARSY-PRV-1000",
-        "no provider credential is available, so the turn was not dispatched",
-        "use the interactive TUI with a logged-in Codex CLI",
-    );
-    service
-        .fail_turn(
-            actor,
-            admission.turn,
-            "provider_auth",
-            diagnostic.message.clone(),
-        )
-        .map_err(storage_failed)?;
-    emitter.diagnostic(&diagnostic);
-    emitter.result(json!({
+    // Resolved before the turn is recorded: a misconfiguration is the
+    // operator's to fix, not a failed turn in their session history.
+    let resolved = load_config(&root, &working).and_then(|config| {
+        let resolved = provider::resolve(&config, None)?;
+        let model = resolved
+            .endpoint
+            .model
+            .clone()
+            .or_else(|| config.model_default().map(str::to_owned))
+            .ok_or_else(|| {
+                Diagnostic::error(
+                    ARSY_PRV_1000,
+                    format!(
+                        "provider `{}` does not say which model to use",
+                        resolved.endpoint.id
+                    ),
+                    "set `model` on the provider endpoint, or `model.default`, in config.toml",
+                )
+            })?;
+        Ok((resolved, model))
+    });
+    let (resolved, model) = match resolved {
+        Ok(resolved) => resolved,
+        Err(mut diagnostic) => {
+            if diagnostic.code == ARSY_PRV_1000 {
+                diagnostic.remediation = format!(
+                    "{}; or use the interactive TUI with a logged-in Codex CLI",
+                    diagnostic.remediation
+                );
+            }
+            emitter.diagnostic(&diagnostic);
+            return Ok(diagnostic.exit_code());
+        }
+    };
+
+    let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    let request = CanonicalModelRequest {
+        model: ModelKey {
+            provider: resolved.endpoint.id.clone(),
+            model,
+        },
+        system: None,
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text { text: task }],
+        }],
+        // Operations are not dispatched from this path yet, so offering tools
+        // would invite calls nothing can run.
+        tools: Vec::new(),
+        max_output_tokens: resolved.endpoint.max_output_tokens,
+        // The turn id, so a retried attempt is provably the same request.
+        idempotency_key: IdempotencyKey::new(admission.turn.to_string())
+            .map_err(|error| storage_failed(error.to_string()))?,
+    };
+
+    let outcome = dispatch(resolved.provider.as_ref(), &request, emitter);
+    let record = json!({
         "session": session.to_string(),
         "turn": admission.turn.to_string(),
-        "status": "failed",
-    }));
-    Ok(diagnostic.exit_code())
+        "provider": resolved.endpoint.id,
+        "model": request.model.model,
+    });
+    match outcome {
+        Ok(usage) => {
+            let mut outcome = record.clone();
+            merge(&mut outcome, usage);
+            service
+                .complete_turn(actor, admission.turn, &outcome)
+                .map_err(storage_failed)?;
+            let mut result = outcome;
+            merge(&mut result, json!({"status": "completed"}));
+            emitter.result(result);
+            Ok(0)
+        }
+        Err(error) => {
+            let diagnostic = Diagnostic::error(
+                ARSY_PRV_1000,
+                error.to_string(),
+                "check the provider endpoint, credential, and model in `arsy config explain`",
+            );
+            // The turn is durable before dispatch, so a failure here stays
+            // recoverable through `arsy resume`.
+            service
+                .fail_turn(actor, admission.turn, error.code(), error.to_string())
+                .map_err(storage_failed)?;
+            emitter.diagnostic(&diagnostic);
+            let mut result = record;
+            merge(&mut result, json!({"status": "failed"}));
+            emitter.result(result);
+            Ok(diagnostic.exit_code())
+        }
+    }
+}
+
+/// Stream one turn, rendering it as it arrives, and report what it used.
+///
+/// A tool call cannot be honoured from this path, so one is reported rather
+/// than silently dropped: a caller that sees `stop: tool_use` and no result
+/// would otherwise think the model simply stopped.
+fn dispatch(
+    provider: &dyn ModelProvider,
+    request: &CanonicalModelRequest,
+    emitter: &mut Emitter,
+) -> Result<Value, ProviderError> {
+    let mut usage = json!({});
+    let stream =
+        arsy_kernel::provider::stream_with_retry(provider, request, &mut std::thread::sleep)?;
+    for event in stream {
+        match event? {
+            ModelEvent::TextDelta { text } => emitter.delta(&text),
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            }
+            ModelEvent::ToolCallCompleted { name, .. } => {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "the model called the tool `{name}`, which this path cannot run yet"
+                )))
+            }
+            ModelEvent::Completed { .. }
+            | ModelEvent::ToolCallStarted { .. }
+            | ModelEvent::ToolCallDelta { .. } => {}
+        }
+    }
+    emitter.end_deltas();
+    Ok(usage)
+}
+
+/// Fold `extra`'s fields into `target`, which is always an object here.
+fn merge(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic> {
@@ -1693,7 +2292,8 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
 
     // ponytail: layer discovery only. Merged values and their source trace
     // arrive with `arsy config explain`.
-    let config: Vec<Value> = config_layers(workspace.as_deref().unwrap_or(Path::new(".")))
+    let root = workspace.as_deref().unwrap_or(Path::new("."));
+    let config: Vec<Value> = arsy_kernel::config::layers(root, root)
         .into_iter()
         .map(|(layer, path)| {
             json!({
@@ -1703,6 +2303,27 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
             })
         })
         .collect();
+
+    // A configured endpoint with a reachable credential is what decides
+    // whether a turn can dispatch, so report it as one fact rather than
+    // leaving an operator to infer it from the credential count.
+    let provider = match load_config(root, root) {
+        Err(diagnostic) => {
+            let value = json!({"status": "unusable", "detail": diagnostic.message});
+            warnings.push(diagnostic);
+            value
+        }
+        Ok(config) => match provider::resolve(&config, None) {
+            Ok(resolved) => json!({
+                "status": "ready",
+                "id": resolved.endpoint.id,
+                "kind": resolved.endpoint.kind.as_str(),
+                "base_url": resolved.endpoint.base_url,
+                "credential_source": resolved.source.as_str(),
+            }),
+            Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
+        },
+    };
 
     let sandbox_assurance = installed_sandbox_assurance();
     if sandbox_assurance == arsy_kernel::policy::SandboxAssurance::None {
@@ -1729,6 +2350,7 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
         "version": arsy_code::VERSION,
         "sandbox_assurance": sandbox_assurance.as_str(),
         "provider_auth": if credentials == 0 { "none" } else { "configured" },
+        "provider": provider,
         "storage": storage,
         "config_layers": config,
         "warnings": warnings.len(),
@@ -1807,65 +2429,6 @@ fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Configuration layers in authority order, per `docs/35-configuration.md`.
-fn config_layers(workspace: &Path) -> Vec<(&'static str, PathBuf)> {
-    let mut layers = Vec::new();
-    if let Some(path) = enterprise_config() {
-        layers.push(("enterprise", path));
-    }
-    if let Some(path) = user_config() {
-        layers.push(("user", path));
-    }
-    layers.push(("workspace", workspace.join(".arsy/config.toml")));
-    layers
-}
-
-#[cfg(target_os = "linux")]
-fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from("/etc/arsy/config.toml"))
-}
-
-#[cfg(target_os = "macos")]
-fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from(
-        "/Library/Application Support/ARSY/config.toml",
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn enterprise_config() -> Option<PathBuf> {
-    std::env::var_os("ProgramData").map(|base| Path::new(&base).join("ARSY/config.toml"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn enterprise_config() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .map(|base| base.join("arsy/config.toml"))
-}
-
-#[cfg(target_os = "macos")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join("Library/Application Support/ARSY/config.toml"))
-}
-
-#[cfg(target_os = "windows")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("AppData").map(|base| Path::new(&base).join("ARSY/config.toml"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn user_config() -> Option<PathBuf> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1878,6 +2441,10 @@ mod tests {
     #[test]
     fn interactive_provider_cancellation_and_terminal_failures_are_bounded() {
         use std::time::{Duration, Instant};
+        let route = tui::ModelRoute {
+            provider: tui::CODEX_PROVIDER.to_owned(),
+            model: "default".to_owned(),
+        };
         let (sender, keys) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
@@ -1891,6 +2458,7 @@ mod tests {
         let result = drive_provider(
             command,
             &"x".repeat(131_072),
+            &route,
             false,
             &keys,
             &mut tui::Keys::default(),
@@ -1909,6 +2477,7 @@ mod tests {
         let result = drive_provider(
             command,
             "task\n",
+            &route,
             false,
             &keys,
             &mut tui::Keys::default(),
@@ -1919,6 +2488,42 @@ mod tests {
         assert!(
             result.provider_failed,
             "a zero process exit must not mask a failed turn"
+        );
+        assert!(
+            result.failure.is_some(),
+            "a failed turn is recorded as a failure, not a completion"
+        );
+    }
+
+    /// The catalog is written by one version and read by the next, so a
+    /// record from before logins existed has to keep working.
+    #[test]
+    fn an_older_credential_catalog_still_reads() {
+        let old = r#"[{"provider":"anthropic","handle":"secret://os/anthropic","created_at":1,"last_used":null}]"#;
+        let records: Vec<AuthRecord> = serde_json::from_str(old).unwrap();
+        assert_eq!(records[0].provider, "anthropic");
+        assert_eq!(
+            records[0].kind,
+            CredentialKind::ApiKey,
+            "a record written before logins existed is an API key"
+        );
+
+        // Round-trips under the name the catalog actually stores.
+        let written = serde_json::to_string(&[AuthRecord {
+            kind: CredentialKind::OAuth,
+            ..records[0].clone()
+        }])
+        .unwrap();
+        assert!(written.contains(r#""kind":"oauth""#), "{written}");
+        let back: Vec<AuthRecord> = serde_json::from_str(&written).unwrap();
+        assert_eq!(back[0].kind, CredentialKind::OAuth);
+
+        let derived = written.replace(r#""kind":"oauth""#, r#""kind":"o_auth""#);
+        let back: Vec<AuthRecord> = serde_json::from_str(&derived).unwrap();
+        assert_eq!(
+            back[0].kind,
+            CredentialKind::OAuth,
+            "a catalog written under the derived name must not read as corrupt"
         );
     }
 
@@ -1995,7 +2600,7 @@ mod tests {
         assert!(data.to_string().contains("recover this exact task"));
 
         assert_eq!(doctor(&invocation, false, &mut Emitter::new(Output::Ci)), 0);
-        assert_eq!(Diagnostic::error("ARSY-PRV-1000", "", "").exit_code(), 5);
+        assert_eq!(Diagnostic::error(ARSY_PRV_1000, "", "").exit_code(), 5);
         assert_eq!(Diagnostic::error("ARSY-POL-1000", "", "").exit_code(), 3);
         assert_eq!(
             execute(

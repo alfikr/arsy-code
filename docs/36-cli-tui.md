@@ -121,6 +121,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy auth set <PROVIDER>` | one configured provider ID | `--handle <NAME>` | read a secret from a no-echo prompt, or from stdin when piped, store it in the OS credential store, and print only the resulting handle | 1 |
+| `arsy auth login <PROVIDER>` | one configured provider ID | global flags | sign in through the OAuth client the provider's configuration names, using the device grant when it offers one and the authorization-code grant with PKCE otherwise, and store the resulting token set under the provider's handle | 1 |
 | `arsy auth list` | none | global flags | list stored credential handles with provider, creation time, and last use; never the secret value | 1 |
 | `arsy auth remove <HANDLE>` | one required handle | `--force` | delete a stored credential and report the configuration keys that referenced it | 1 |
 | `arsy provider list` | none | `--all` | list providers resolved as allowed, with the ceiling that narrowed them | 1 |
@@ -174,6 +175,14 @@ A group name used without a subcommand — `arsy mcp`, `arsy session`, `arsy aut
 `arsy artifact`, `arsy config`, `arsy compat`, `arsy policy` — prints its help and exits with usage
 status. `--base` is invalid unless `REVISION` is absent. `resume --follow` is implied in an
 interactive TTY and otherwise defaults off.
+
+Bare `arsy` prefers a configured provider endpoint and falls back to a logged-in Codex CLI when
+nothing is configured, so `/model` offers Codex's cached list on that route and takes a slug as
+free text on a configured one. The remembered choice is stored as `provider/model` and only applies
+to the provider it was chosen for.
+
+`arsy auth login` prints the URL to visit rather than opening a browser, because an operator working
+over SSH is not looking at a browser on the machine that ran the command.
 
 `arsy auth set` never accepts a secret as an argument, because arguments reach the process list and
 shell history. When no credential store is available it fails; it never falls back to plaintext

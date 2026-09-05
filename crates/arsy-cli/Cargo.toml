@@ -19,11 +19,14 @@ remote-transports = ["arsy-code/remote-transports"]
 
 [dependencies]
 arsy-code = { version = "0.1.0", path = "../arsy-code" }
-arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
+arsy-kernel = { version = "0.1.0", path = "../arsy-kernel", features = ["http"] }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unicode-width = "=0.2.2"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

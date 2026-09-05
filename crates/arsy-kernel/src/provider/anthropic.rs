@@ -4,61 +4,18 @@
 //! part that differs per provider — body shape, headers, status mapping, SSE
 //! semantics — is the part that is testable here.
 
+pub use super::wire::{ApiKey, WireRequest, WireResponse, WireTransport};
 use super::{
     CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelProvider, ModelRole,
     ProviderDescriptor, ProviderError, StopReason,
 };
-use crate::secret::{Redactor, SecretValue};
+use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
-use std::{collections::VecDeque, fmt, time::Duration};
+use std::collections::VecDeque;
 
 /// Wire version Anthropic requires on every request.
 pub const API_VERSION: &str = "2023-06-01";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-
-/// One outbound HTTP request, fully formed by the adapter.
-pub struct WireRequest {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: String,
-}
-
-/// Response head plus a line-oriented body, which is what SSE needs.
-pub struct WireResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
-}
-
-/// The HTTP call itself. Injected so the adapter stays dependency-free and the
-/// wire contract is exercised without a network.
-pub trait WireTransport: Send + Sync {
-    fn send(&self, request: WireRequest) -> Result<WireResponse, ProviderError>;
-}
-
-/// API credential. Never printed: `Debug` is redacted so a credential cannot
-/// reach a log through a derived formatter.
-#[derive(Clone)]
-pub struct ApiKey(String);
-
-impl ApiKey {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Credential resolved from a [`SecretHandle`](crate::secret::SecretHandle).
-    /// The broker has already registered the value for redaction, so the key
-    /// exists in cleartext only between here and the wire.
-    pub fn from_secret(secret: &SecretValue) -> Self {
-        Self(secret.expose().to_owned())
-    }
-}
-
-impl fmt::Debug for ApiKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ApiKey(redacted)")
-    }
-}
 
 pub struct AnthropicProvider<T> {
     descriptor: ProviderDescriptor,
@@ -125,7 +82,7 @@ impl<T: WireTransport> AnthropicProvider<T> {
         WireRequest {
             url: format!("{}/v1/messages", self.base_url.trim_end_matches('/')),
             headers: vec![
-                ("x-api-key".to_owned(), self.key.0.clone()),
+                ("x-api-key".to_owned(), self.key.expose().to_owned()),
                 ("anthropic-version".to_owned(), API_VERSION.to_owned()),
                 ("content-type".to_owned(), "application/json".to_owned()),
                 ("accept".to_owned(), "text/event-stream".to_owned()),
@@ -191,26 +148,16 @@ impl<T: WireTransport> ModelProvider for AnthropicProvider<T> {
 /// the same line iterator is drained as the body.
 fn normalize_status(response: WireResponse) -> ProviderError {
     let status = response.status;
+    let retry_after = response.retry_after();
     let body: String = response.lines.filter_map(Result::ok).collect();
     let message = error_message(&body).unwrap_or_else(|| format!("http {status}"));
     match status {
         401 | 403 => ProviderError::Auth(message),
         400 | 413 | 422 => ProviderError::InvalidRequest(message),
         404 => ProviderError::NotFound(message),
-        429 => ProviderError::RateLimited {
-            retry_after: retry_after(&response.headers),
-        },
+        429 => ProviderError::RateLimited { retry_after },
         status => ProviderError::Server { status, message },
     }
-}
-
-/// `retry-after` in whole seconds, the only form Anthropic sends.
-fn retry_after(headers: &[(String, String)]) -> Option<Duration> {
-    headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
-        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
 }
 
 fn error_message(body: &str) -> Option<String> {
