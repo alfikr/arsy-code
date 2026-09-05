@@ -243,6 +243,7 @@ pub enum Action {
 /// The slash commands the composer offers and `/help` prints. One table, so a
 /// command cannot appear in the menu and not in the help, or the reverse.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
     (
@@ -264,6 +265,123 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit"),
 ];
 
+/// The rows `/provider` offers under the list of configured providers.
+pub const PROVIDER_ACTIONS: &[(&str, &str)] = &[
+    (
+        "+new",
+        "add a provider: name, dialect, URL, model, credential",
+    ),
+    ("-remove", "remove a provider from the configuration"),
+];
+
+/// The dialects an endpoint can speak. Same two the configuration accepts.
+pub const PROVIDER_KINDS: &[(&str, &str)] = &[
+    ("openai", "Chat Completions, and anything that speaks it"),
+    ("anthropic", "Anthropic Messages"),
+];
+
+/// Where a credential typed into the TUI is put.
+pub const PROVIDER_STORES: &[(&str, &str)] = &[
+    (
+        "file",
+        "a 0600 file beside the configuration; no unlock prompt",
+    ),
+    ("keychain", "the OS credential store"),
+];
+
+pub const CONFIRM_ROWS: &[(&str, &str)] = &[("no", "keep it"), ("yes", "remove it")];
+
+/// What `/provider` is collecting. One variant per question, so the loop always
+/// knows which answer it is holding and what to ask next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStep {
+    /// Pick a configured provider, or one of the actions under them.
+    Pick,
+    Name,
+    Kind,
+    BaseUrl,
+    Model,
+    Store,
+    /// The credential itself, typed masked.
+    Key,
+    /// Which provider to remove.
+    Remove,
+    /// Confirm that removal, because it rewrites the operator's file.
+    ConfirmRemove,
+}
+
+impl ProviderStep {
+    /// The prompt line shown under the composer while this step collects.
+    pub fn prompt(self, draft: &ProviderDraft, colour: bool) -> String {
+        let text = match self {
+            Self::Pick => "provider · Up/Down then Enter, or a name".to_owned(),
+            Self::Name => "new provider · a short id, letters and dashes".to_owned(),
+            Self::Kind => "dialect · Up/Down then Enter, or a name".to_owned(),
+            Self::BaseUrl => format!("base URL for {} · the API root", draft.name),
+            Self::Model => format!("model for {} · the slug the host knows", draft.name),
+            Self::Store => "where to keep the credential · Up/Down then Enter".to_owned(),
+            Self::Key => format!("credential for {} · not shown as you type", draft.name),
+            Self::Remove => "remove which provider · Up/Down then Enter".to_owned(),
+            Self::ConfirmRemove => {
+                format!("remove `{}` from the configuration?", draft.name)
+            }
+        };
+        paint(colour, DIM, &format!("  {text}"))
+    }
+
+    /// The rows this step offers, or none when it collects free text.
+    pub fn rows(self, providers: &[String]) -> Option<Vec<(String, String)>> {
+        let named = |rows: &[(&str, &str)]| {
+            Some(
+                rows.iter()
+                    .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+                    .collect(),
+            )
+        };
+        match self {
+            Self::Pick => {
+                let mut rows: Vec<(String, String)> = providers
+                    .iter()
+                    .map(|name| (name.clone(), "use this provider".to_owned()))
+                    .collect();
+                for (name, description) in PROVIDER_ACTIONS {
+                    // Nothing to remove until something is configured.
+                    if *name == "-remove" && providers.is_empty() {
+                        continue;
+                    }
+                    rows.push(((*name).to_owned(), (*description).to_owned()));
+                }
+                Some(rows)
+            }
+            Self::Kind => named(PROVIDER_KINDS),
+            Self::Store => named(PROVIDER_STORES),
+            Self::ConfirmRemove => named(CONFIRM_ROWS),
+            Self::Remove => Some(
+                providers
+                    .iter()
+                    .map(|name| (name.clone(), "remove this one".to_owned()))
+                    .collect(),
+            ),
+            Self::Name | Self::BaseUrl | Self::Model | Self::Key => None,
+        }
+    }
+
+    /// Whether the answer to this step is a secret.
+    pub const fn masked(self) -> bool {
+        matches!(self, Self::Key)
+    }
+}
+
+/// What `/provider` has collected so far.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDraft {
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub model: String,
+    pub store: String,
+}
+
 /// The levels the effort picker offers. Rows in the same shape the command menu
 /// takes, so the picker is arrowed and taken with the keys the composer already
 /// answers rather than a second selection mechanism.
@@ -276,7 +394,7 @@ pub const EFFORT_ROWS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 10;
+const MENU_ROWS: usize = 11;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -320,7 +438,10 @@ pub struct Composer {
     selected: usize,
     /// Rows a picker put in front of the reader, offered instead of the command
     /// table for as long as it is collecting an answer.
-    offered: Option<&'static [(&'static str, &'static str)]>,
+    offered: Option<Vec<(String, String)>>,
+    /// Set while the line is a secret being typed: it is painted as bullets,
+    /// never kept in history, and never offered a menu.
+    masked: bool,
     /// Set while the line is a picker answer rather than a task, so the menu
     /// does not offer commands that the picker would not accept.
     picking: bool,
@@ -345,17 +466,31 @@ impl Composer {
         self.selected = 0;
     }
 
+    /// Collect the line as a secret. Nothing about it reaches the screen, the
+    /// scrollback, or the history a later Up would walk back into.
+    pub fn set_masked(&mut self, masked: bool) {
+        self.masked = masked;
+    }
+
     /// Put a picker's rows in the menu, marked at `selected`.
     ///
     /// Called once per line from the prompt state, so a selection never
     /// outlives the answer it was made for.
-    pub fn offer(
-        &mut self,
-        rows: Option<&'static [(&'static str, &'static str)]>,
-        selected: usize,
-    ) {
+    pub fn offer(&mut self, rows: Option<Vec<(String, String)>>, selected: usize) {
         self.offered = rows;
         self.selected = selected;
+    }
+
+    /// The same, for a picker whose rows are a fixed table.
+    pub fn offer_table(&mut self, rows: Option<&[(&str, &str)]>, selected: usize) {
+        self.offer(
+            rows.map(|rows| {
+                rows.iter()
+                    .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+                    .collect()
+            }),
+            selected,
+        );
     }
 
     /// Measured with the width, and on the same schedule.
@@ -363,15 +498,19 @@ impl Composer {
         self.height = rows;
     }
 
-    pub fn menu(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn menu(&self) -> Vec<(String, String)> {
+        // A secret is characters, not a query: nothing narrows against it.
+        if self.masked {
+            return Vec::new();
+        }
         // An offered list wins: it is the question on screen, and it narrows as
         // the answer is typed the same way the command table does.
-        if let Some(rows) = self.offered {
+        if let Some(rows) = &self.offered {
             return rows
                 .iter()
                 .filter(|(name, _)| name.starts_with(&self.buffer))
                 .take(self.menu_capacity())
-                .copied()
+                .cloned()
                 .collect();
         }
         if self.picking || !self.buffer.starts_with('/') || self.buffer.contains(' ') {
@@ -381,7 +520,7 @@ impl Composer {
             .iter()
             .filter(|(name, _)| name.starts_with(&self.buffer))
             .take(self.menu_capacity())
-            .copied()
+            .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
             .collect()
     }
 
@@ -480,7 +619,7 @@ impl Composer {
             }
             Key::Enter => {
                 let line = self.take();
-                if !line.trim().is_empty() && self.history.back() != Some(&line) {
+                if !self.masked && !line.trim().is_empty() && self.history.back() != Some(&line) {
                     self.history.push_back(line.clone());
                     if self.history.len() > 100 {
                         self.history.pop_front();
@@ -501,10 +640,10 @@ impl Composer {
 
     /// The row the mark is on, for a caller that needs to see the selection
     /// without pressing Enter to find out.
-    pub fn marked(&self) -> Option<&'static str> {
+    pub fn marked(&self) -> Option<String> {
         let menu = self.menu();
         menu.get(self.selected.min(menu.len().checked_sub(1)?))
-            .map(|(name, _)| *name)
+            .map(|(name, _)| name.clone())
     }
 
     /// The command Enter would fill in, or `None` when the line is already one
@@ -512,7 +651,7 @@ impl Composer {
     fn completion(&self) -> Option<String> {
         let menu = self.menu();
         let selected = menu.get(self.selected.min(menu.len().checked_sub(1)?))?;
-        (!menu.iter().any(|(name, _)| *name == self.buffer)).then(|| selected.0.to_owned())
+        (!menu.iter().any(|(name, _)| *name == self.buffer)).then(|| selected.0.clone())
     }
 
     fn take(&mut self) -> String {
@@ -626,7 +765,14 @@ impl Composer {
     /// Slide the visible text so the caret stays on the row instead of
     /// wrapping, which would break the block's row count.
     fn window(&self, room: usize) -> (String, usize) {
-        let characters: Vec<char> = self.buffer.chars().collect();
+        // A masked line is one bullet per character, so what is painted is the
+        // same width as what was typed and the caret still lands where the
+        // reader expects it.
+        let characters: Vec<char> = if self.masked {
+            std::iter::repeat_n('•', self.buffer.chars().count()).collect()
+        } else {
+            self.buffer.chars().collect()
+        };
         let budget = room.saturating_sub(1);
         let width = |character: &char| character.width().unwrap_or(0);
         let mut start = self.caret;
@@ -2083,7 +2229,7 @@ mod tests {
         }
         assert_eq!(
             composer.menu(),
-            vec![("/model", "choose the provider model")]
+            vec![("/model".to_owned(), "choose the provider model".to_owned())]
         );
         for character in " x".chars() {
             composer.press(Key::Char(character));
@@ -2108,6 +2254,58 @@ mod tests {
             assert!(help.contains(description), "{name} has no description");
         }
         assert!(help.contains("Up/Down: input history"));
+    }
+
+    /// A typed credential must not survive anywhere a later keystroke or a
+    /// scrollback search could reach it.
+    #[test]
+    fn a_masked_line_is_not_painted_not_remembered_and_offers_no_menu() {
+        let mut composer = Composer::default();
+        composer.history.push_back("an earlier task".into());
+        composer.set_masked(true);
+
+        for character in "sk-secret".chars() {
+            composer.press(Key::Char(character));
+        }
+        let frame = composer.render(80, false, "  status");
+        assert!(!frame.contains("sk-secret"), "the secret was painted");
+        assert!(!frame.contains("sk-"), "part of the secret was painted");
+        assert!(frame.contains("•••••••••"), "one bullet per character");
+
+        // A `/` in a secret is a character, not the start of a command.
+        composer.press(Key::Char('/'));
+        assert!(
+            composer.menu().is_empty(),
+            "a secret opened the command menu"
+        );
+
+        // The line still submits its real value, and leaves no copy behind.
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("sk-secret/".to_owned())
+        );
+        assert_eq!(
+            composer.history.len(),
+            1,
+            "the secret entered history: {:?}",
+            composer.history
+        );
+        assert_eq!(
+            composer.history.back().map(String::as_str),
+            Some("an earlier task")
+        );
+
+        // Unmasking is what returns the line to ordinary behaviour.
+        composer.set_masked(false);
+        for character in "hello".chars() {
+            composer.press(Key::Char(character));
+        }
+        assert!(composer.render(80, false, "  status").contains("hello"));
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("hello".to_owned())
+        );
+        assert_eq!(composer.history.back().map(String::as_str), Some("hello"));
     }
 
     #[test]
@@ -2165,7 +2363,7 @@ mod tests {
             4 + COMMANDS.len(),
             "pad, input, pad, one row per command, status"
         );
-        assert!(rows[3].contains("› /model"), "{:?}", rows[3]);
+        assert!(rows[3].contains("› /provider"), "{:?}", rows[3]);
         assert!(rows[4].starts_with("    "), "only one row is marked");
         for row in &rows {
             assert!(visible_len(row) <= 80, "{row:?}");

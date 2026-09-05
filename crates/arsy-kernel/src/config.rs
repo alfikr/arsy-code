@@ -213,6 +213,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Every configured endpoint id, in configuration order, so a picker can
+    /// offer them without the caller reaching into the map.
+    pub fn endpoint_ids(&self) -> Vec<String> {
+        self.endpoints.keys().cloned().collect()
+    }
+
     /// Which store the credential catalog is kept in.
     pub fn credential_store(&self) -> &str {
         self.credential_store

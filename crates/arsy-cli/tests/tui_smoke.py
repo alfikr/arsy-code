@@ -131,9 +131,9 @@ def main():
             # `/` opens the command menu; Down moves the marker and Enter takes
             # the highlighted command, which a second Enter then sends.
             terminal.send(b"/")
-            terminal.expect("› /model")
-            # Three rows down from /model: /effort, /mcp, then /hooks.
-            terminal.send(b"\x1b[B\x1b[B\x1b[B")
+            terminal.expect("› /provider")
+            # Four rows down: /model, /effort, /mcp, then /hooks.
+            terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B")
             terminal.expect("› /hooks")
             terminal.send(b"\r\r")
             terminal.expect("1 hook declared; none loaded")
@@ -184,6 +184,59 @@ def main():
             terminal.send(b"/effort high\r")
             terminal.expect("Effort: high")
 
+            # `/provider` adds an endpoint without leaving the session: every
+            # field is asked for, the credential is typed masked, and the
+            # configuration ARSY writes is the one it reads back.
+            terminal.send(b"/provider\r")
+            terminal.expect("add a provider")
+            terminal.send(b"+new\r")
+            terminal.expect("new provider")
+            terminal.send(b"acme\r")
+            terminal.expect("dialect")
+            terminal.send(b"openai\r")
+            terminal.expect("base URL for acme")
+            terminal.send(b"https://acme.test/v1\r")
+            terminal.expect("model for acme")
+            terminal.send(b"acme-1\r")
+            terminal.expect("where to keep the credential")
+            terminal.send(b"file\r")
+            terminal.expect("not shown as you type")
+            terminal.send(b"sk-provider-wizard-value\r")
+            terminal.expect("Added provider acme")
+
+            written = (root / "Library/Application Support/ARSY/config.toml")
+            if not written.exists():
+                written = root / "config/arsy/config.toml"
+            body = written.read_text()
+            assert "[provider.endpoint.acme]" in body, body
+            assert 'base_url = "https://acme.test/v1"' in body, body
+            assert 'credential = "secret://file/acme.key"' in body, body
+            assert 'default = "acme"' in body, body
+
+            key = written.parent / "acme.key"
+            assert key.read_text() == "sk-provider-wizard-value", "the credential was mangled"
+            assert oct(key.stat().st_mode & 0o777) == "0o600", oct(key.stat().st_mode)
+            # The credential must not be anywhere the terminal kept.
+            with terminal.lock:
+                assert b"sk-provider-wizard-value" not in terminal.received
+
+            # Removing asks first, and `no` leaves the configuration alone.
+            terminal.send(b"/provider\r")
+            terminal.send(b"-remove\r")
+            terminal.expect("remove which provider")
+            terminal.send(b"acme\r")
+            terminal.expect("remove `acme` from the configuration?")
+            terminal.send(b"no\r")
+            terminal.expect("Provider unchanged")
+            assert "[provider.endpoint.acme]" in written.read_text()
+
+            terminal.send(b"/provider\r")
+            terminal.send(b"-remove\r")
+            terminal.send(b"acme\r")
+            terminal.send(b"yes\r")
+            terminal.expect("Removed provider acme")
+            assert "[provider.endpoint.acme]" not in written.read_text()
+
             terminal.send(b"\x1b[200~/quit\n\x1b[201~")
             time.sleep(0.15)
             assert child.poll() is None, "pasted newline must not submit /quit"
@@ -198,7 +251,7 @@ def main():
             terminal.close()
             os.close(master)
             os.close(slave)
-    print("PASS: JSON success/failure, PTY inspection, filtering, help, model and effort pickers, safe paste, exit, terminal restoration")
+    print("PASS: JSON success/failure, PTY inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration")
 
 
 if __name__ == "__main__":

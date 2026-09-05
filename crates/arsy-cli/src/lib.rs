@@ -18,6 +18,8 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
+#[cfg(feature = "tui")]
+mod config_edit;
 mod eval;
 mod integrations;
 pub mod provider;
@@ -1283,6 +1285,9 @@ enum Prompt {
     Task,
     Model,
     Effort,
+    /// `/provider` is a wizard rather than one question, so the step it is on
+    /// travels with the prompt.
+    Provider(tui::ProviderStep),
 }
 
 #[cfg(feature = "tui")]
@@ -1342,6 +1347,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut route = remembered.clone().unwrap_or(detected);
 
     let mut effort = saved_effort();
+    // What `/provider` is holding between its questions, and the list it offers.
+    let mut draft = tui::ProviderDraft::default();
+    let mut providers = configured_providers(invocation);
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
@@ -1385,16 +1393,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
             Prompt::Effort => tui::effort_prompt(effort, colour),
+            Prompt::Provider(step) => step.prompt(&draft, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
-        composer.set_picking(matches!(prompt, Prompt::Model | Prompt::Effort));
-        // The effort levels are arrowed in the composer block rather than
-        // printed above it, so Up/Down move the mark instead of walking history.
-        composer.offer(
-            matches!(prompt, Prompt::Effort).then_some(tui::EFFORT_ROWS),
-            tui::effort_row(effort),
-        );
+        composer.set_picking(!matches!(prompt, Prompt::Task));
+        // Every list is arrowed in the composer block rather than printed above
+        // it, so Up/Down move the mark instead of walking history.
+        match prompt {
+            Prompt::Effort => {
+                composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
+            }
+            Prompt::Provider(step) => composer.offer(step.rows(&providers), 0),
+            _ => composer.offer(None, 0),
+        }
+        // A credential is typed, never shown, and never remembered.
+        composer.set_masked(matches!(prompt, Prompt::Provider(step) if step.masked()));
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1424,6 +1438,41 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             },
         };
         match prompt {
+            Prompt::Provider(step) => {
+                // `clear` rather than `commit`, so no answer — least of all the
+                // credential — is painted into the scrollback.
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match provider_step(invocation, step, &line, &mut draft, &providers) {
+                    Ok(ProviderNext::Ask(next)) => prompt = Prompt::Provider(next),
+                    Ok(ProviderNext::Done(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        providers = configured_providers(invocation);
+                        // Configuration decides the provider, so the session has
+                        // to be restarted to pick up a change to it rather than
+                        // pretend the running one moved.
+                        writeln!(
+                            stdout,
+                            "{}",
+                            tui::safe_text("Restart ARSY for the change to take effect.")
+                        )
+                        .map_err(terminal_failed)?;
+                        draft = tui::ProviderDraft::default();
+                        prompt = Prompt::Task;
+                    }
+                    Ok(ProviderNext::Cancelled(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        draft = tui::ProviderDraft::default();
+                        prompt = Prompt::Task;
+                    }
+                    // The step stays open so the answer can be retyped against
+                    // the question that is still on screen.
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Effort => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match tui::resolve_effort_answer(&line, effort) {
@@ -1465,6 +1514,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 prompt = Prompt::Model;
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
+            Prompt::Task if line.split_whitespace().next() == Some("/provider") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                providers = configured_providers(invocation);
+                draft = tui::ProviderDraft::default();
+                prompt = Prompt::Provider(tui::ProviderStep::Pick);
+            }
             Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 // A bare `/effort` opens the list, so the levels can be read
@@ -1688,6 +1743,210 @@ fn save_effort(effort: Option<Effort>) -> io::Result<()> {
             result => result,
         },
     }
+}
+
+/// Where `/provider` goes after an answer.
+#[cfg(feature = "tui")]
+enum ProviderNext {
+    Ask(tui::ProviderStep),
+    Done(String),
+    Cancelled(String),
+}
+
+/// The providers configured right now, in the order the configuration lists
+/// them. Read fresh each time `/provider` opens, so an edit made outside ARSY
+/// is not hidden behind a stale list.
+#[cfg(feature = "tui")]
+fn configured_providers(invocation: &Invocation) -> Vec<String> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let Ok(config) = load_config(&root, &working) else {
+        return Vec::new();
+    };
+    config.endpoint_ids()
+}
+
+/// Take one answer and say what to ask next.
+///
+/// Every step validates its own answer and nothing is written until the last
+/// one, so abandoning the wizard leaves the configuration exactly as it was.
+#[cfg(feature = "tui")]
+fn provider_step(
+    invocation: &Invocation,
+    step: tui::ProviderStep,
+    line: &str,
+    draft: &mut tui::ProviderDraft,
+    providers: &[String],
+) -> Result<ProviderNext, String> {
+    use tui::ProviderStep as Step;
+
+    let answer = if step.masked() { line } else { line.trim() };
+    if answer.is_empty() {
+        return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
+    }
+    let one_of = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .any(|(name, _)| *name == answer)
+            .then(|| answer.to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "`{}` is not one of {}",
+                    tui::safe_text(answer),
+                    rows.iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    };
+    let writable = |field: &str| {
+        config_edit::is_writable(answer)
+            .then(|| answer.to_owned())
+            .ok_or_else(|| {
+                format!("a {field} must be plain ASCII with no quotes, backslashes, or padding")
+            })
+    };
+
+    match step {
+        Step::Pick => match answer {
+            "+new" => Ok(ProviderNext::Ask(Step::Name)),
+            "-remove" => Ok(ProviderNext::Ask(Step::Remove)),
+            chosen if providers.iter().any(|name| name == chosen) => {
+                write_config(invocation, |config| {
+                    config_edit::set_default(config, chosen)
+                })?;
+                Ok(ProviderNext::Done(format!("Provider: {chosen}")))
+            }
+            other => Err(format!(
+                "`{}` is not a configured provider",
+                tui::safe_text(other)
+            )),
+        },
+        Step::Name => {
+            let name = writable("provider name")?;
+            if providers.contains(&name) {
+                return Err(format!("`{name}` is already configured"));
+            }
+            if name.starts_with(['+', '-']) {
+                return Err("a provider name cannot start with `+` or `-`".to_owned());
+            }
+            draft.name = name;
+            Ok(ProviderNext::Ask(Step::Kind))
+        }
+        Step::Kind => {
+            draft.kind = one_of(tui::PROVIDER_KINDS)?;
+            Ok(ProviderNext::Ask(Step::BaseUrl))
+        }
+        Step::BaseUrl => {
+            let url = writable("base URL")?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("a base URL starts with http:// or https://".to_owned());
+            }
+            draft.base_url = url;
+            Ok(ProviderNext::Ask(Step::Model))
+        }
+        Step::Model => {
+            draft.model = writable("model slug")?;
+            Ok(ProviderNext::Ask(Step::Store))
+        }
+        Step::Store => {
+            draft.store = one_of(tui::PROVIDER_STORES)?;
+            Ok(ProviderNext::Ask(Step::Key))
+        }
+        Step::Key => {
+            let handle = store_credential(&draft.name, &draft.store, answer)?;
+            let endpoint = config_edit::Endpoint {
+                name: draft.name.clone(),
+                kind: draft.kind.clone(),
+                base_url: draft.base_url.clone(),
+                model: draft.model.clone(),
+                credential: handle,
+            };
+            write_config(invocation, |config| {
+                let config = config_edit::ensure_schema(config);
+                let config = config_edit::append_endpoint(&config, &endpoint);
+                config_edit::set_default(&config, &endpoint.name)
+            })?;
+            Ok(ProviderNext::Done(format!(
+                "Added provider {} and made it the default.",
+                endpoint.name
+            )))
+        }
+        Step::Remove => {
+            if !providers.iter().any(|name| name == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            draft.name = answer.to_owned();
+            Ok(ProviderNext::Ask(Step::ConfirmRemove))
+        }
+        Step::ConfirmRemove => {
+            if one_of(tui::CONFIRM_ROWS)? == "no" {
+                return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
+            }
+            let name = draft.name.clone();
+            write_config(invocation, |config| {
+                config_edit::remove_endpoint(config, &name)
+            })?;
+            Ok(ProviderNext::Done(format!(
+                "Removed provider {name}. Its credential was left in place; \
+                 `arsy auth list` shows it."
+            )))
+        }
+    }
+}
+
+/// Put a typed credential where the operator asked for it, and give back the
+/// handle the configuration should point at.
+#[cfg(feature = "tui")]
+fn store_credential(name: &str, store: &str, secret: &str) -> Result<String, String> {
+    let secret = secret.trim();
+    if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
+        return Err("that credential is too short to redact safely".to_owned());
+    }
+    if store == "keychain" {
+        return OsCredentialStore
+            .set(name, secret)
+            .map(|()| format!("secret://{OS_STORE_ID}/{name}"))
+            .map_err(|error| format!("the credential store refused it: {error}"));
+    }
+    let file = format!("{name}.key");
+    let path = FileCredentialStore::path(&file)
+        .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut handle = owner_only(&path).map_err(|error| error.message)?;
+    handle
+        .write_all(secret.as_bytes())
+        .map_err(|error| error.to_string())?;
+    Ok(format!("secret://{FILE_STORE_ID}/{file}"))
+}
+
+/// Rewrite the user configuration through `edit`.
+///
+/// The file is read and written whole, so `edit` sees exactly what is on disk
+/// and nothing it did not change can move.
+#[cfg(feature = "tui")]
+fn write_config(invocation: &Invocation, edit: impl FnOnce(&str) -> String) -> Result<(), String> {
+    let _ = invocation;
+    let path = arsy_kernel::config::user_config()
+        .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
+    let original = match std::fs::read_to_string(&path) {
+        Ok(original) => original,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("the configuration could not be read: {error}")),
+    };
+    let updated = edit(&original);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(&path, updated)
+        .map_err(|error| format!("the configuration could not be written: {error}"))
 }
 
 /// What to print once an effort answer is accepted.
@@ -2902,6 +3161,116 @@ mod tests {
         }
     }
 
+    /// Every question `/provider` asks validates its own answer, and nothing
+    /// reaches the configuration until the last one.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_provider_wizard_validates_each_answer_before_it_moves_on() {
+        use tui::ProviderStep as Step;
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            output: None,
+            no_color: true,
+            command: Command::Tui,
+        };
+        let providers = vec!["myai".to_owned()];
+        let mut draft = tui::ProviderDraft::default();
+        let step = |step: Step, line: &str, draft: &mut tui::ProviderDraft| {
+            provider_step(&invocation, step, line, draft, &providers)
+        };
+
+        // An empty answer leaves the wizard rather than writing a blank field.
+        assert!(matches!(
+            step(Step::Name, "   ", &mut draft),
+            Ok(ProviderNext::Cancelled(_))
+        ));
+
+        // The two actions are rows, not provider names.
+        assert!(matches!(
+            step(Step::Pick, "+new", &mut draft),
+            Ok(ProviderNext::Ask(Step::Name))
+        ));
+        assert!(matches!(
+            step(Step::Pick, "-remove", &mut draft),
+            Ok(ProviderNext::Ask(Step::Remove))
+        ));
+        assert!(step(Step::Pick, "nothere", &mut draft).is_err());
+
+        // A name has to be new, writable, and not look like an action row.
+        assert!(
+            step(Step::Name, "myai", &mut draft).is_err(),
+            "duplicate name"
+        );
+        assert!(step(Step::Name, "+new", &mut draft).is_err(), "action name");
+        assert!(step(Step::Name, "has \"quote\"", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Name, "acme", &mut draft),
+            Ok(ProviderNext::Ask(Step::Kind))
+        ));
+        assert_eq!(draft.name, "acme");
+
+        // The dialect and the store are closed sets.
+        assert!(step(Step::Kind, "gemini", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Kind, "anthropic", &mut draft),
+            Ok(ProviderNext::Ask(Step::BaseUrl))
+        ));
+
+        // A base URL has to be one.
+        assert!(step(Step::BaseUrl, "acme.test", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::BaseUrl, "https://acme.test/v1", &mut draft),
+            Ok(ProviderNext::Ask(Step::Model))
+        ));
+        assert!(matches!(
+            step(Step::Model, "acme-1", &mut draft),
+            Ok(ProviderNext::Ask(Step::Store))
+        ));
+        assert!(step(Step::Store, "vault", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Store, "file", &mut draft),
+            Ok(ProviderNext::Ask(Step::Key))
+        ));
+
+        // A credential too short to redact safely is refused before it is
+        // stored, so it cannot end up on the wire unredacted.
+        assert!(step(Step::Key, "short", &mut draft).is_err());
+
+        // Removal names a configured provider and is confirmed before it runs.
+        assert!(step(Step::Remove, "nothere", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Remove, "myai", &mut draft),
+            Ok(ProviderNext::Ask(Step::ConfirmRemove))
+        ));
+        assert!(matches!(
+            step(Step::ConfirmRemove, "no", &mut draft),
+            Ok(ProviderNext::Cancelled(_))
+        ));
+
+        // Only the key step is a secret, and only it keeps the answer verbatim.
+        for probe in [
+            Step::Pick,
+            Step::Name,
+            Step::Kind,
+            Step::BaseUrl,
+            Step::Model,
+        ] {
+            assert!(!probe.masked(), "{probe:?} was masked");
+        }
+        assert!(Step::Key.masked());
+
+        // The pick list carries the actions under the providers, and offers
+        // nothing to remove when nothing is configured.
+        let rows = Step::Pick.rows(&providers).expect("a list");
+        assert_eq!(rows[0].0, "myai");
+        assert!(rows.iter().any(|(name, _)| name == "+new"));
+        assert!(rows.iter().any(|(name, _)| name == "-remove"));
+        let empty = Step::Pick.rows(&[]).expect("a list");
+        assert!(empty.iter().all(|(name, _)| name != "-remove"));
+        assert!(Step::Name.rows(&providers).is_none(), "a name is typed");
+    }
+
     /// The catalog is metadata, so where it lives is the operator's choice and
     /// the default costs no unlock prompt.
     #[test]
@@ -3093,16 +3462,20 @@ mod tests {
     fn the_effort_rows_are_arrowed_by_the_composer_that_already_owns_the_keys() {
         let mut composer = tui::Composer::default();
         composer.set_picking(true);
-        composer.offer(Some(tui::EFFORT_ROWS), tui::effort_row(None));
+        composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(None));
 
         // Offered rows beat the command table, so a picker is not answered with
         // slash commands, and Up/Down move the mark rather than walk history.
         assert_eq!(composer.menu().len(), tui::EFFORT_ROWS.len());
-        assert_eq!(composer.marked(), Some("off"));
+        assert_eq!(composer.marked().as_deref(), Some("off"));
         composer.press(tui::Key::Down);
-        assert_eq!(composer.marked(), Some("low"), "the last row wraps");
+        assert_eq!(
+            composer.marked().as_deref(),
+            Some("low"),
+            "the last row wraps"
+        );
         composer.press(tui::Key::Up);
-        assert_eq!(composer.marked(), Some("off"));
+        assert_eq!(composer.marked().as_deref(), Some("off"));
 
         // Enter takes the marked level into the line; a second Enter sends it,
         // and what it sends is an answer the picker accepts.
@@ -3118,15 +3491,15 @@ mod tests {
 
         // Typing narrows the offered rows the way it narrows the commands.
         let mut composer = tui::Composer::default();
-        composer.offer(Some(tui::EFFORT_ROWS), 0);
+        composer.offer_table(Some(tui::EFFORT_ROWS), 0);
         for character in "me".chars() {
             composer.press(tui::Key::Char(character));
         }
         assert_eq!(composer.menu().len(), 1);
-        assert_eq!(composer.marked(), Some("medium"));
+        assert_eq!(composer.marked().as_deref(), Some("medium"));
 
         // Clearing the offer hands the menu back to the command table.
-        composer.offer(None, 0);
+        composer.offer_table(None, 0);
         assert!(composer.menu().is_empty(), "a task line offers no menu");
     }
 
@@ -3164,8 +3537,10 @@ mod tests {
         // itself; every other offered command must be an inspection it knows
         // how to run.
         for (name, _) in tui::COMMANDS {
-            let handled = matches!(*name, "/model" | "/effort" | "/help" | "/quit")
-                || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
+            let handled = matches!(
+                *name,
+                "/model" | "/effort" | "/provider" | "/help" | "/quit"
+            ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
         for (slash, _, _) in INSPECTIONS {

@@ -51,11 +51,26 @@ forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
 
-A bare `/effort` opens a numbered picker, the same shape as the model picker:
-one row per level plus `off`, marked at the current setting, answered with a list
-number, a level name, or an empty line to keep what is set. `/effort high` still
-sets the level outright without opening it. Out-of-range numbers and unknown
-names are rejected with a reason and the picker stays open, because an accepted
+`/provider` opens the configured endpoints in the composer's own menu, with a row
+to add one and, once something is configured, a row to remove one. Choosing an
+endpoint makes it the default. Adding walks one question per field — name,
+dialect, base URL, model, where to keep the credential, then the credential
+itself, which is painted as bullets, kept out of the input history, and never
+written to the scrollback. Each answer is validated as it is given, an empty
+answer leaves the wizard, and nothing reaches the configuration until the last
+answer, so an abandoned wizard changes nothing. Removing is confirmed first and
+leaves the credential in place; `arsy auth list` still shows it. ARSY edits only
+the `[provider.endpoint.*]` tables it owns and the `[provider] default` key, as
+text rather than by reserializing the file, so comments, blank lines, and hand
+alignment survive. A session resolves its provider at startup, so a change asks
+for a restart rather than pretending the running session moved.
+
+A bare `/effort` opens the levels in the composer's own menu, marked at the
+current setting: Up/Down move the mark and Enter takes the marked level into the
+line, the same keys the command menu answers, and typing narrows the list. A
+level name or a list number is still accepted, as is an empty line to keep what
+is set. `/effort high` sets the level outright without opening the list. Unknown
+answers are rejected with a reason and the list stays open, because an accepted
 answer is written to the user configuration. The choice is remembered beside the
 model. Unset is the default and sends no
 reasoning field at all, so a host without such a model sees the request it always
