@@ -915,7 +915,7 @@ fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
 /// `arsy doctor` already reports.
 #[cfg(feature = "tui")]
 fn model_store() -> Option<PathBuf> {
-    Some(user_config()?.with_file_name("model"))
+    Some(arsy_kernel::config::user_config()?.with_file_name("model"))
 }
 
 #[cfg(feature = "tui")]
@@ -1375,7 +1375,8 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
 
     // ponytail: layer discovery only. Merged values and their source trace
     // arrive with `arsy config explain`.
-    let config: Vec<Value> = config_layers(workspace.as_deref().unwrap_or(Path::new(".")))
+    let root = workspace.as_deref().unwrap_or(Path::new("."));
+    let config: Vec<Value> = arsy_kernel::config::layers(root, root)
         .into_iter()
         .map(|(layer, path)| {
             json!({
@@ -1487,65 +1488,6 @@ fn actor() -> Principal {
 
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
-}
-
-/// Configuration layers in authority order, per `docs/35-configuration.md`.
-fn config_layers(workspace: &Path) -> Vec<(&'static str, PathBuf)> {
-    let mut layers = Vec::new();
-    if let Some(path) = enterprise_config() {
-        layers.push(("enterprise", path));
-    }
-    if let Some(path) = user_config() {
-        layers.push(("user", path));
-    }
-    layers.push(("workspace", workspace.join(".arsy/config.toml")));
-    layers
-}
-
-#[cfg(target_os = "linux")]
-fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from("/etc/arsy/config.toml"))
-}
-
-#[cfg(target_os = "macos")]
-fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from(
-        "/Library/Application Support/ARSY/config.toml",
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn enterprise_config() -> Option<PathBuf> {
-    std::env::var_os("ProgramData").map(|base| Path::new(&base).join("ARSY/config.toml"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn enterprise_config() -> Option<PathBuf> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .map(|base| base.join("arsy/config.toml"))
-}
-
-#[cfg(target_os = "macos")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join("Library/Application Support/ARSY/config.toml"))
-}
-
-#[cfg(target_os = "windows")]
-fn user_config() -> Option<PathBuf> {
-    std::env::var_os("AppData").map(|base| Path::new(&base).join("ARSY/config.toml"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn user_config() -> Option<PathBuf> {
-    None
 }
 
 #[cfg(test)]
