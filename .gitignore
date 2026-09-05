@@ -6,3 +6,7 @@ docs/.obsidian
 .agents/
 .forgeguard/
 .arsy/sessions.sqlite3*
+.env
+.idea/
+.vscode/
+.suitest/
