@@ -14,9 +14,15 @@
 //! the store implementation this module deliberately does not hard-code.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 pub const OS_STORE_ID: &str = "os";
+/// Store id for a credential the operator keeps in a file they own.
+pub const FILE_STORE_ID: &str = "file";
 const OS_SERVICE: &str = "arsy";
 
 /// Scheme every handle string carries.
@@ -194,6 +200,93 @@ impl CredentialStore for OsCredentialStore {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         Err(SecretError::UnknownStore(OS_STORE_ID.to_owned()))
+    }
+}
+
+/// A credential kept in a file the operator controls, so `credential` does not
+/// have to mean the OS keychain: a headless host, a container, or an operator
+/// who simply does not want a keychain prompt has somewhere else to put a key.
+///
+/// A bare name resolves beside the user configuration; an absolute path is
+/// taken as given. On Unix the file must be readable by its owner alone — a
+/// mode with any group or other bit set is refused rather than read, because a
+/// secret every account on the machine can read is not one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileCredentialStore;
+
+impl FileCredentialStore {
+    /// Where a handle name points. A bare name lives beside the user
+    /// configuration so a handle stays portable between machines.
+    pub fn path(name: &str) -> Option<PathBuf> {
+        let path = Path::new(name);
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        Some(crate::config::user_config()?.with_file_name(name))
+    }
+
+    fn handle(name: &str) -> SecretHandle {
+        SecretHandle::new(FILE_STORE_ID, name).expect("a resolved name is non-empty")
+    }
+
+    /// Refuse a file anyone but its owner can read.
+    #[cfg(unix)]
+    fn check_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), SecretError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            return Ok(());
+        }
+        Err(SecretError::Store {
+            handle: Self::handle(&path.display().to_string()),
+            message: format!(
+                "the credential file is mode {mode:04o}; make it readable by its owner only                  with `chmod 600 {}`",
+                path.display()
+            ),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn check_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), SecretError> {
+        Ok(())
+    }
+}
+
+impl CredentialStore for FileCredentialStore {
+    fn id(&self) -> &str {
+        FILE_STORE_ID
+    }
+
+    fn resolve(&self, name: &str) -> Result<String, SecretError> {
+        let path = Self::path(name).ok_or_else(|| SecretError::Store {
+            handle: Self::handle(name),
+            message: "this platform has no user configuration directory, so a bare credential \
+                      name has nowhere to resolve; use an absolute path"
+                .to_owned(),
+        })?;
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SecretError::NotFound(Self::handle(name))
+            } else {
+                SecretError::Store {
+                    handle: Self::handle(name),
+                    message: error.to_string(),
+                }
+            }
+        })?;
+        Self::check_permissions(&path, &metadata)?;
+        let value = std::fs::read_to_string(&path).map_err(|error| SecretError::Store {
+            handle: Self::handle(name),
+            message: error.to_string(),
+        })?;
+        // A key written by a shell redirect carries the trailing newline the
+        // producer added, which is not part of the credential.
+        let value = value.trim().to_owned();
+        if value.is_empty() {
+            return Err(SecretError::NotFound(Self::handle(name)));
+        }
+        Ok(value)
     }
 }
 

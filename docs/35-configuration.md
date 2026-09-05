@@ -118,7 +118,16 @@ variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but
 absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
 are told apart by shape, and an expired access token is refreshed and written back before use.
 
-Credential values are handles such as `secret://os/gateway`, never raw secrets. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+Credential values are handles such as `secret://os/gateway`, never raw secrets.
+The half after `secret://` names the store that answers, and a store ARSY does
+not have is refused rather than resolved somewhere else. Two exist: `os` is the
+platform credential store, and `file` is a file the operator owns —
+`secret://file/gateway.key` beside the user configuration, or an absolute path.
+A file credential must be readable by its owner alone; a mode with any group or
+other bit set is refused with the `chmod` that fixes it. `file` is what a
+headless host, a container, or a debug build whose code identity changes on
+every rebuild — and so is asked to unlock the keychain again each time — should
+use. `api_key_env` still takes precedence over both. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 
 ## Six-layer example
 

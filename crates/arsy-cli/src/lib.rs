@@ -33,8 +33,8 @@ use arsy_kernel::{
         ModelRole, ProviderError,
     },
     secret::{
-        CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
-        OS_STORE_ID,
+        CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretBroker,
+        SecretError, SecretHandle, OS_STORE_ID,
     },
     service::AgentService,
     sqlite::{Durability, SqliteEventStore},
@@ -2338,6 +2338,7 @@ fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic>
     }
     let mut broker = SecretBroker::new();
     broker.register_store(Box::new(OsCredentialStore));
+    broker.register_store(Box::new(FileCredentialStore));
     for record in catalog(OsCredentialStore)? {
         broker.resolve(&record.handle).map_err(secret_failed)?;
     }
