@@ -20,6 +20,11 @@ three-OS matrix on every push and pull request, so each push pays the macOS
 multiplier twice, and CI's `dependencies` job builds `cargo-deny` from source
 every run with no cache.
 
+`release.yml` is the one to restore before cutting a release: it builds the
+signed artifacts, and `docs/34-distribution.md` verifies them against
+`.github/workflows/release.yml@refs/tags/` as the certificate identity. Tagging
+while it is parked produces no artifacts and no signature.
+
 Re-enable one by dropping the suffix:
 
     git mv .github/workflows/ci.yml.disabled .github/workflows/ci.yml
