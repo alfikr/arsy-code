@@ -3271,6 +3271,50 @@ mod tests {
         }
     }
 
+    /// The model picker answers a configured endpoint's list the same way it
+    /// answers Codex's: by number, by slug, or not at all.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_model_picker_answers_a_configured_endpoints_list() {
+        let route = tui::ModelRoute {
+            provider: "hari".to_owned(),
+            model: "mimo".to_owned(),
+        };
+        let listed: Vec<tui::ModelChoice> = ["mimo", "mimo-2", "mimo-lite"]
+            .into_iter()
+            .map(|slug| tui::ModelChoice {
+                slug: slug.to_owned(),
+                name: "on hari".to_owned(),
+            })
+            .collect();
+
+        // A number picks from the list, and the provider does not move with it:
+        // choosing a model is not choosing an endpoint.
+        let picked = tui::resolve_model("2", &listed, &route).unwrap();
+        assert_eq!(picked.model, "mimo-2");
+        assert_eq!(picked.provider, "hari");
+
+        // A slug that is not on the list is still accepted, because the list is
+        // what the endpoint advertises, not what it will refuse.
+        assert_eq!(
+            tui::resolve_model("mimo-preview", &listed, &route)
+                .unwrap()
+                .model,
+            "mimo-preview"
+        );
+
+        // Out of range says the range rather than silently keeping the current.
+        let error = tui::resolve_model("9", &listed, &route).unwrap_err();
+        assert!(error.contains("1-3"), "{error}");
+
+        // An empty answer keeps what is set.
+        assert_eq!(tui::resolve_model("  ", &listed, &route).unwrap(), route);
+
+        // An endpoint that lists nothing says so instead of naming a range.
+        let error = tui::resolve_model("1", &[], &route).unwrap_err();
+        assert!(error.contains("no models are listed"), "{error}");
+    }
+
     /// Every question `/provider` asks validates its own answer, and nothing
     /// reaches the configuration until the last one.
     #[cfg(feature = "tui")]

@@ -92,7 +92,10 @@ returns to the task prompt, as at the model picker.
 `/model` lists the models the active endpoint offers, re-read when the picker
 opens so one added since startup appears without a restart. A Codex route lists
 what the CLI cached instead, and an endpoint that lists no models still takes a
-slug as free text.
+slug as free text. A slug that is not on the list is accepted either way: the
+list is what the endpoint advertises, not what it will refuse. Unlike a provider
+change, a model change takes effect on the next turn — the endpoint is the same
+one the session already resolved.
 
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
