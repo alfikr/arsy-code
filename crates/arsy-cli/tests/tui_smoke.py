@@ -161,6 +161,29 @@ def main():
             assert not (root / "Library/Application Support/ARSY/model").exists()
             assert not (root / "config/arsy/model").exists()
 
+            # The effort picker is arrowed and taken like the command menu. It
+            # opens marked at the current setting, which is unset here, and the
+            # ends wrap.
+            terminal.send(b"/effort\r")
+            terminal.expect("least reasoning")
+            terminal.expect("\u203a off")
+            terminal.send(b"\x1b[B")
+            terminal.expect("\u203a low")
+            terminal.send(b"\r\r")
+            terminal.expect("Effort: low")
+            assert (root / "Library/Application Support/ARSY/effort").exists() or (
+                root / "config/arsy/effort"
+            ).exists(), "an accepted effort was not remembered"
+
+            # Leaving the picker cancels the picker, not the session: a command
+            # that was never run before proves the task prompt came back.
+            terminal.send(b"/effort\r")
+            terminal.expect("\u203a low")
+            terminal.send(b"\x03")
+            assert child.poll() is None, "leaving the effort picker ended the session"
+            terminal.send(b"/effort high\r")
+            terminal.expect("Effort: high")
+
             terminal.send(b"\x1b[200~/quit\n\x1b[201~")
             time.sleep(0.15)
             assert child.poll() is None, "pasted newline must not submit /quit"
@@ -175,7 +198,7 @@ def main():
             terminal.close()
             os.close(master)
             os.close(slave)
-    print("PASS: JSON success/failure, PTY inspection, filtering, help, model-picker rejection and cancel, safe paste, exit, terminal restoration")
+    print("PASS: JSON success/failure, PTY inspection, filtering, help, model and effort pickers, safe paste, exit, terminal restoration")
 
 
 if __name__ == "__main__":

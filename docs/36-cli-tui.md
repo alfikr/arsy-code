@@ -66,6 +66,9 @@ output budget cannot hold both the floor and an answer. A scripted `arsy run`
 ignores the remembered level and sends no reasoning field, so a pipeline cannot
 change behaviour because of an interactive choice made elsewhere.
 
+Esc, Ctrl-C, or Ctrl-D at the effort picker leaves the level unchanged and
+returns to the task prompt, as at the model picker.
+
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
 of range number, a slug with whitespace — is rejected with a reason and the

@@ -1181,11 +1181,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 &status,
             )? {
                 Some(line) => line,
-                // Ending input at the picker cancels the picker, not the
-                // session: the model is unchanged and the task prompt returns.
-                None if matches!(prompt, Prompt::Model) => {
+                // Ending input at a picker cancels the picker, not the
+                // session: the setting is unchanged and the task prompt
+                // returns. Every picker has to be listed here, or leaving one
+                // exits ARSY instead.
+                None if matches!(prompt, Prompt::Model | Prompt::Effort) => {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    writeln!(stdout, "Model unchanged: {route}").map_err(terminal_failed)?;
+                    let unchanged = match prompt {
+                        Prompt::Effort => effort_line(effort),
+                        _ => format!("Model unchanged: {route}"),
+                    };
+                    writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
                     prompt = Prompt::Task;
                     continue;
                 }
@@ -2689,6 +2695,54 @@ mod tests {
 
         assert!(effort_line(Some(Effort::High)).contains("high"));
         assert!(effort_line(None).contains("no reasoning setting"));
+
+        // The picker opens marked at what is set, so the first row a reader
+        // sees marked is the answer they already have.
+        assert_eq!(tui::effort_row(Some(Effort::Low)), 0);
+        assert_eq!(tui::effort_row(Some(Effort::High)), 2);
+        assert_eq!(tui::effort_row(None), 3, "an unset level marks `off`");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_effort_rows_are_arrowed_by_the_composer_that_already_owns_the_keys() {
+        let mut composer = tui::Composer::default();
+        composer.set_picking(true);
+        composer.offer(Some(tui::EFFORT_ROWS), tui::effort_row(None));
+
+        // Offered rows beat the command table, so a picker is not answered with
+        // slash commands, and Up/Down move the mark rather than walk history.
+        assert_eq!(composer.menu().len(), tui::EFFORT_ROWS.len());
+        assert_eq!(composer.marked(), Some("off"));
+        composer.press(tui::Key::Down);
+        assert_eq!(composer.marked(), Some("low"), "the last row wraps");
+        composer.press(tui::Key::Up);
+        assert_eq!(composer.marked(), Some("off"));
+
+        // Enter takes the marked level into the line; a second Enter sends it,
+        // and what it sends is an answer the picker accepts.
+        assert_eq!(composer.press(tui::Key::Enter), tui::Action::Redraw);
+        assert_eq!(
+            composer.press(tui::Key::Enter),
+            tui::Action::Submit("off".to_owned())
+        );
+        assert_eq!(
+            tui::resolve_effort_answer("off", Some(Effort::High)),
+            Ok(None)
+        );
+
+        // Typing narrows the offered rows the way it narrows the commands.
+        let mut composer = tui::Composer::default();
+        composer.offer(Some(tui::EFFORT_ROWS), 0);
+        for character in "me".chars() {
+            composer.press(tui::Key::Char(character));
+        }
+        assert_eq!(composer.menu().len(), 1);
+        assert_eq!(composer.marked(), Some("medium"));
+
+        // Clearing the offer hands the menu back to the command table.
+        composer.offer(None, 0);
+        assert!(composer.menu().is_empty(), "a task line offers no menu");
     }
 
     #[cfg(feature = "tui")]
