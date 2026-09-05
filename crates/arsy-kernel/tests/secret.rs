@@ -148,3 +148,84 @@ fn the_protocol_adapter_redacts_before_writing() {
     );
     assert!(line.contains("[redacted:secret://keyring/anthropic]"));
 }
+
+/// A credential the operator keeps in a file, so the OS keychain is one option
+/// rather than the only one. The permission check is the point: a key every
+/// account on the machine can read is not a key.
+#[test]
+fn a_file_credential_resolves_only_when_its_owner_alone_can_read_it() {
+    use arsy_kernel::secret::FileCredentialStore;
+
+    let root = std::env::temp_dir().join(format!("arsy-file-cred-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("myai.key");
+    let name = path.display().to_string();
+
+    // Missing is not found, so resolution can fall through to another source
+    // rather than failing the run outright.
+    assert!(matches!(
+        FileCredentialStore.resolve(&name),
+        Err(SecretError::NotFound(_))
+    ));
+
+    // A shell redirect leaves the newline it added; it is not the credential.
+    std::fs::write(&path, "sk-from-a-file\n").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = FileCredentialStore.resolve(&name).unwrap_err();
+        assert!(
+            format!("{error}").contains("chmod 600"),
+            "a world-readable key was accepted: {error}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    assert_eq!(
+        FileCredentialStore.resolve(&name).unwrap(),
+        "sk-from-a-file"
+    );
+    assert_eq!(FileCredentialStore.id(), "file");
+
+    // An empty file is nothing to send, so it reads as absent rather than as a
+    // credential that authenticates as nobody.
+    std::fs::write(&path, "\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(matches!(
+        FileCredentialStore.resolve(&name),
+        Err(SecretError::NotFound(_))
+    ));
+
+    // The handle names the store it came from, so a redaction placeholder and
+    // a diagnostic both say `file`.
+    let handle = SecretHandle::try_from(format!("secret://file/{name}")).unwrap();
+    assert_eq!(handle.store(), "file");
+
+    // What `auth set` writes, `auth remove` has to be able to delete, or a
+    // catalog that lists a file handle can only ever grow.
+    std::fs::write(&path, "sk-from-a-file\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    FileCredentialStore.remove(&name).unwrap();
+    assert!(!path.exists(), "the credential file survived removal");
+    assert!(
+        matches!(
+            FileCredentialStore.remove(&name),
+            Err(SecretError::NotFound(_))
+        ),
+        "removing what is already gone is not found, not a failure"
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
+}

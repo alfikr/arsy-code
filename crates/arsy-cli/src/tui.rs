@@ -9,6 +9,7 @@ use arsy_kernel::{
     domain::SessionId,
     event::{EventEnvelope, EventPayload},
     policy::{ApprovalRequest, SandboxAssurance},
+    provider::Effort,
 };
 use serde_json::Value;
 use std::{
@@ -242,19 +243,183 @@ pub enum Action {
 /// The slash commands the composer offers and `/help` prints. One table, so a
 /// command cannot appear in the menu and not in the help, or the reverse.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
+    ("/effort", "set reasoning effort; low | medium | high | off"),
     (
         "/mcp",
         "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
     ),
     ("/hooks", "inspect Claude hooks; list, --event NAME"),
+    (
+        "/settings",
+        "show effective configuration and where each value came from; [KEY]",
+    ),
+    ("/doctor", "check workspace, storage, and sandbox assurance"),
+    ("/auth", "list configured provider credentials"),
+    (
+        "/compat",
+        "explain ecosystem mapping; claude | codex | omp | agents",
+    ),
     ("/help", "show these actions"),
     ("/quit", "exit"),
 ];
 
-/// ponytail: the menu is capped rather than scrolled. Five commands never reach
-/// the cap; give it a window over `menu()` if the surface outgrows it.
-const MENU_ROWS: usize = 8;
+/// The rows `/provider` offers under the list of configured providers.
+pub const PROVIDER_ACTIONS: &[(&str, &str)] = &[
+    (
+        "+new",
+        "add a provider: name, dialect, URL, model, credential",
+    ),
+    ("-remove", "remove a provider from the configuration"),
+];
+
+/// The dialects an endpoint can speak. Same two the configuration accepts.
+pub const PROVIDER_KINDS: &[(&str, &str)] = &[
+    ("openai", "Chat Completions, and anything that speaks it"),
+    ("anthropic", "Anthropic Messages"),
+];
+
+/// Where a credential typed into the TUI is put.
+pub const PROVIDER_STORES: &[(&str, &str)] = &[
+    (
+        "file",
+        "a 0600 file beside the configuration; no unlock prompt",
+    ),
+    ("keychain", "the OS credential store"),
+];
+
+pub const CONFIRM_ROWS: &[(&str, &str)] = &[("no", "keep it"), ("yes", "remove it")];
+
+/// What `/provider` is collecting. One variant per question, so the loop always
+/// knows which answer it is holding and what to ask next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStep {
+    /// Pick a configured provider, or one of the actions under them.
+    Pick,
+    Name,
+    Kind,
+    BaseUrl,
+    Model,
+    Store,
+    /// The credential itself, typed masked.
+    Key,
+    /// Which provider to remove.
+    Remove,
+    /// Confirm that removal, because it rewrites the operator's file.
+    ConfirmRemove,
+}
+
+impl ProviderStep {
+    /// The prompt line shown under the composer while this step collects.
+    pub fn prompt(self, draft: &ProviderDraft, colour: bool) -> String {
+        let text = match self {
+            Self::Pick => "provider · Up/Down then Enter, or a name".to_owned(),
+            Self::Name => "new provider · a short id, letters and dashes".to_owned(),
+            Self::Kind => "dialect · Up/Down then Enter, or a name".to_owned(),
+            Self::BaseUrl => format!("base URL for {} · the API root", draft.name),
+            Self::Model => format!(
+                "models for {} · one slug, or several separated by commas",
+                draft.name
+            ),
+            Self::Store => "where to keep the credential · Up/Down then Enter".to_owned(),
+            Self::Key => format!("credential for {} · not shown as you type", draft.name),
+            Self::Remove => "remove which provider · Up/Down then Enter".to_owned(),
+            Self::ConfirmRemove => {
+                format!("remove `{}` from the configuration?", draft.name)
+            }
+        };
+        paint(colour, DIM, &format!("  {text}"))
+    }
+
+    /// The rows this step offers, or none when it collects free text.
+    /// `running` is the provider this session resolved at startup; `default` is
+    /// what the configuration names now. They differ between a switch and the
+    /// restart that picks it up, and saying so is the whole point of the
+    /// marker.
+    pub fn rows(
+        self,
+        providers: &[String],
+        running: &str,
+        default: Option<&str>,
+    ) -> Option<Vec<(String, String)>> {
+        let named = |rows: &[(&str, &str)]| {
+            Some(
+                rows.iter()
+                    .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+                    .collect(),
+            )
+        };
+        match self {
+            Self::Pick => {
+                // Which one is in force has to be on the row: adding a provider
+                // makes it the default, and without a marker the one it
+                // replaced reads as gone rather than as merely not current.
+                let mut rows: Vec<(String, String)> = providers
+                    .iter()
+                    .map(|name| {
+                        let note = if name == running {
+                            "in use"
+                        } else if default == Some(name.as_str()) {
+                            "chosen · in use after a restart"
+                        } else {
+                            "switch to this provider"
+                        };
+                        (name.clone(), note.to_owned())
+                    })
+                    .collect();
+                for (name, description) in PROVIDER_ACTIONS {
+                    // Nothing to remove until something is configured.
+                    if *name == "-remove" && providers.is_empty() {
+                        continue;
+                    }
+                    rows.push(((*name).to_owned(), (*description).to_owned()));
+                }
+                Some(rows)
+            }
+            Self::Kind => named(PROVIDER_KINDS),
+            Self::Store => named(PROVIDER_STORES),
+            Self::ConfirmRemove => named(CONFIRM_ROWS),
+            Self::Remove => Some(
+                providers
+                    .iter()
+                    .map(|name| (name.clone(), "remove this one".to_owned()))
+                    .collect(),
+            ),
+            Self::Name | Self::BaseUrl | Self::Model | Self::Key => None,
+        }
+    }
+
+    /// Whether the answer to this step is a secret.
+    pub const fn masked(self) -> bool {
+        matches!(self, Self::Key)
+    }
+}
+
+/// What `/provider` has collected so far.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderDraft {
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    /// Every model the endpoint offers. The first is its default.
+    pub models: Vec<String>,
+    pub store: String,
+}
+
+/// The levels the effort picker offers. Rows in the same shape the command menu
+/// takes, so the picker is arrowed and taken with the keys the composer already
+/// answers rather than a second selection mechanism.
+pub const EFFORT_ROWS: &[(&str, &str)] = &[
+    ("low", "least reasoning, fastest and cheapest"),
+    ("medium", "balanced"),
+    ("high", "most reasoning, slowest and dearest"),
+    ("off", "send no reasoning setting at all"),
+];
+
+/// ponytail: the menu is capped rather than scrolled. It holds every command
+/// there is; give it a window over `menu()` if the table outgrows the cap.
+const MENU_ROWS: usize = 11;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -296,6 +461,12 @@ pub struct Composer {
     draft: String,
     /// Which menu row Up/Down has landed on, clamped to the matches on use.
     selected: usize,
+    /// Rows a picker put in front of the reader, offered instead of the command
+    /// table for as long as it is collecting an answer.
+    offered: Option<Vec<(String, String)>>,
+    /// Set while the line is a secret being typed: it is painted as bullets,
+    /// never kept in history, and never offered a menu.
+    masked: bool,
     /// Set while the line is a picker answer rather than a task, so the menu
     /// does not offer commands that the picker would not accept.
     picking: bool,
@@ -320,12 +491,53 @@ impl Composer {
         self.selected = 0;
     }
 
+    /// Collect the line as a secret. Nothing about it reaches the screen, the
+    /// scrollback, or the history a later Up would walk back into.
+    pub fn set_masked(&mut self, masked: bool) {
+        self.masked = masked;
+    }
+
+    /// Put a picker's rows in the menu, marked at `selected`.
+    ///
+    /// Called once per line from the prompt state, so a selection never
+    /// outlives the answer it was made for.
+    pub fn offer(&mut self, rows: Option<Vec<(String, String)>>, selected: usize) {
+        self.offered = rows;
+        self.selected = selected;
+    }
+
+    /// The same, for a picker whose rows are a fixed table.
+    pub fn offer_table(&mut self, rows: Option<&[(&str, &str)]>, selected: usize) {
+        self.offer(
+            rows.map(|rows| {
+                rows.iter()
+                    .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+                    .collect()
+            }),
+            selected,
+        );
+    }
+
     /// Measured with the width, and on the same schedule.
     pub fn set_height(&mut self, rows: usize) {
         self.height = rows;
     }
 
-    pub fn menu(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn menu(&self) -> Vec<(String, String)> {
+        // A secret is characters, not a query: nothing narrows against it.
+        if self.masked {
+            return Vec::new();
+        }
+        // An offered list wins: it is the question on screen, and it narrows as
+        // the answer is typed the same way the command table does.
+        if let Some(rows) = &self.offered {
+            return rows
+                .iter()
+                .filter(|(name, _)| name.starts_with(&self.buffer))
+                .take(self.menu_capacity())
+                .cloned()
+                .collect();
+        }
         if self.picking || !self.buffer.starts_with('/') || self.buffer.contains(' ') {
             return Vec::new();
         }
@@ -333,7 +545,7 @@ impl Composer {
             .iter()
             .filter(|(name, _)| name.starts_with(&self.buffer))
             .take(self.menu_capacity())
-            .copied()
+            .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
             .collect()
     }
 
@@ -350,6 +562,49 @@ impl Composer {
             rows => MENU_ROWS.min(rows.saturating_sub(4)),
         }
     }
+    /// Move the mark over the open menu. Both ends wrap, so a short list is
+    /// never a dead end in one direction, and the index is clamped to the
+    /// current matches first: a selection left over from a wider list must not
+    /// step outside a narrowed one.
+    fn mark(&mut self, down: bool) -> Action {
+        let last = self.menu().len().saturating_sub(1);
+        let selected = self.selected.min(last);
+        self.selected = if down {
+            if selected >= last {
+                0
+            } else {
+                selected + 1
+            }
+        } else {
+            selected.checked_sub(1).unwrap_or(last)
+        };
+        Action::Redraw
+    }
+
+    /// Walk the submitted lines. Going back past the newest returns the draft
+    /// that was stashed on the way in, so browsing history cannot lose a line
+    /// that was being typed.
+    fn recall(&mut self, back: bool) -> Action {
+        self.history_index = if back {
+            Some(match self.history_index {
+                Some(index) => index.saturating_sub(1),
+                None => {
+                    self.draft = self.buffer.clone();
+                    self.history.len() - 1
+                }
+            })
+        } else {
+            self.history_index
+                .map(|index| index + 1)
+                .filter(|index| *index < self.history.len())
+        };
+        self.buffer = self
+            .history_index
+            .map_or_else(|| self.draft.clone(), |index| self.history[index].clone());
+        self.caret = self.buffer.chars().count();
+        Action::Redraw
+    }
+
     pub fn press(&mut self, key: Key) -> Action {
         match key {
             Key::Char(character) if !character.is_control() => {
@@ -370,37 +625,12 @@ impl Composer {
                 Action::Redraw
             }
             // An open menu owns Up/Down: it is the list in front of the reader,
-            // and history is still one Escape or Backspace away.
-            Key::Up if !self.menu().is_empty() => {
-                self.selected = self.selected.saturating_sub(1);
-                Action::Redraw
-            }
-            Key::Down if !self.menu().is_empty() => {
-                self.selected = (self.selected + 1).min(self.menu().len() - 1);
-                Action::Redraw
-            }
-            Key::Up if !self.history.is_empty() => {
-                let index = match self.history_index {
-                    Some(index) => index.saturating_sub(1),
-                    None => {
-                        self.draft = self.buffer.clone();
-                        self.history.len() - 1
-                    }
-                };
-                self.history_index = Some(index);
-                self.buffer = self.history[index].clone();
-                self.caret = self.buffer.chars().count();
-                Action::Redraw
-            }
-            Key::Down if self.history_index.is_some() => {
-                let index = self.history_index.unwrap() + 1;
-                self.history_index = (index < self.history.len()).then_some(index);
-                self.buffer = self
-                    .history_index
-                    .map_or_else(|| self.draft.clone(), |index| self.history[index].clone());
-                self.caret = self.buffer.chars().count();
-                Action::Redraw
-            }
+            // and history is still one Escape or Backspace away. The ends wrap,
+            // so a short list is never a dead end in one direction.
+            Key::Up if !self.menu().is_empty() => self.mark(false),
+            Key::Down if !self.menu().is_empty() => self.mark(true),
+            Key::Up if !self.history.is_empty() => self.recall(true),
+            Key::Down if self.history_index.is_some() => self.recall(false),
             Key::Left if self.caret > 0 => {
                 self.caret -= 1;
                 Action::Redraw
@@ -425,7 +655,7 @@ impl Composer {
             }
             Key::Enter => {
                 let line = self.take();
-                if !line.trim().is_empty() && self.history.back() != Some(&line) {
+                if !self.masked && !line.trim().is_empty() && self.history.back() != Some(&line) {
                     self.history.push_back(line.clone());
                     if self.history.len() > 100 {
                         self.history.pop_front();
@@ -444,12 +674,20 @@ impl Composer {
         }
     }
 
+    /// The row the mark is on, for a caller that needs to see the selection
+    /// without pressing Enter to find out.
+    pub fn marked(&self) -> Option<String> {
+        let menu = self.menu();
+        menu.get(self.selected.min(menu.len().checked_sub(1)?))
+            .map(|(name, _)| name.clone())
+    }
+
     /// The command Enter would fill in, or `None` when the line is already one
     /// and Enter should send it.
     fn completion(&self) -> Option<String> {
         let menu = self.menu();
         let selected = menu.get(self.selected.min(menu.len().checked_sub(1)?))?;
-        (!menu.iter().any(|(name, _)| *name == self.buffer)).then(|| selected.0.to_owned())
+        (!menu.iter().any(|(name, _)| *name == self.buffer)).then(|| selected.0.clone())
     }
 
     fn take(&mut self) -> String {
@@ -563,7 +801,14 @@ impl Composer {
     /// Slide the visible text so the caret stays on the row instead of
     /// wrapping, which would break the block's row count.
     fn window(&self, room: usize) -> (String, usize) {
-        let characters: Vec<char> = self.buffer.chars().collect();
+        // A masked line is one bullet per character, so what is painted is the
+        // same width as what was typed and the caret still lands where the
+        // reader expects it.
+        let characters: Vec<char> = if self.masked {
+            std::iter::repeat_n('•', self.buffer.chars().count()).collect()
+        } else {
+            self.buffer.chars().collect()
+        };
         let budget = room.saturating_sub(1);
         let width = |character: &char| character.width().unwrap_or(0);
         let mut start = self.caret;
@@ -704,6 +949,7 @@ pub struct TuiState {
     streaming: Option<String>,
     sandbox_assurance: SandboxAssurance,
     model_route: Option<ModelRoute>,
+    effort: Option<Effort>,
 }
 
 impl TuiState {
@@ -716,6 +962,7 @@ impl TuiState {
             streaming: None,
             sandbox_assurance: SandboxAssurance::None,
             model_route: None,
+            effort: None,
         }
     }
 
@@ -725,6 +972,10 @@ impl TuiState {
 
     pub fn set_model_route(&mut self, route: ModelRoute) {
         self.model_route = Some(route);
+    }
+
+    pub fn set_effort(&mut self, effort: Option<Effort>) {
+        self.effort = effort;
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -819,20 +1070,69 @@ impl TuiState {
         lines.join("\n")
     }
 
-    /// The status row shown under the composer: warm model, green directory.
-    pub fn status_row(&self, width: usize, colour: bool) -> String {
+    /// The status row shown under the composer: warm model, green directory,
+    /// branch at the right edge.
+    ///
+    /// `branch` is passed rather than kept, because it belongs to the checkout
+    /// and can change while the session is open.
+    ///
+    /// A narrow terminal gives up the fields in the order they can be spared:
+    /// the workspace path shrinks to its last segments, then disappears, and
+    /// only then is the branch dropped. The branch is never shortened, because
+    /// half a branch name reads as a different branch — and it is the field a
+    /// reader is least able to reconstruct from anything else on screen.
+    pub fn status_row(&self, width: usize, colour: bool, branch: Option<&str>) -> String {
+        const INDENT: usize = 2;
+        const GAP: usize = 2;
+        /// Below this a path has lost the segments that identify it.
+        const PATH_FLOOR: usize = 6;
+
+        let width = width.max(MIN_WIDTH);
         let route = self
             .model_route
             .as_ref()
             .map_or_else(|| "no model".to_owned(), ModelRoute::to_string);
-        fit(
-            &format!(
-                "  {}  {}",
-                paint(colour, MODEL, &route),
-                paint(colour, CWD, &self.workspace),
-            ),
-            width.max(MIN_WIDTH),
-        )
+        let effort = self.effort.map_or_else(
+            || "effort:—".to_owned(),
+            |effort| format!("effort:{effort}"),
+        );
+        let branch = branch.unwrap_or_default();
+
+        let head = INDENT + visible_len(&route) + GAP + visible_len(&effort);
+        let right = if branch.is_empty() {
+            0
+        } else {
+            GAP + visible_len(branch)
+        };
+
+        // Whatever is left over once the fields that cannot shrink are placed.
+        let budget = width.saturating_sub(head + GAP + right);
+        let workspace = (budget >= PATH_FLOOR).then(|| shrink_path(&self.workspace, budget));
+
+        let mut row = format!(
+            "{}{}{}{}",
+            " ".repeat(INDENT),
+            paint(colour, MODEL, &route),
+            " ".repeat(GAP),
+            paint(colour, DIM, &effort),
+        );
+        let mut used = head;
+        if let Some(workspace) = &workspace {
+            row.push_str(&" ".repeat(GAP));
+            row.push_str(&paint(colour, CWD, workspace));
+            used += GAP + visible_len(workspace);
+        }
+        // Only now is there a final answer on whether the branch fits.
+        if !branch.is_empty() {
+            if let Some(gap) = width.checked_sub(used + visible_len(branch)) {
+                if gap >= GAP {
+                    row.push_str(&" ".repeat(gap));
+                    row.push_str(&paint(colour, ACCENT, branch));
+                    return row;
+                }
+            }
+        }
+        fit(&row, width)
     }
 
     pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
@@ -1218,6 +1518,68 @@ pub fn render_model_list(
 /// A configured endpoint has no list to offer — nothing tells ARSY what a
 /// gateway serves — so there the prompt asks for a slug instead of a number
 /// in a range of none.
+/// The rows the effort picker offers, in the order it numbers them.
+pub fn effort_choices() -> Vec<Option<Effort>> {
+    let mut choices: Vec<Option<Effort>> = Effort::ALL.into_iter().map(Some).collect();
+    choices.push(None);
+    choices
+}
+
+/// Which offered row the mark starts on, so the picker opens on what is set.
+pub fn effort_row(current: Option<Effort>) -> usize {
+    effort_choices()
+        .iter()
+        .position(|choice| *choice == current)
+        .unwrap_or(0)
+}
+
+pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
+    let current = current.map_or_else(|| "off".to_owned(), |effort| effort.to_string());
+    paint(
+        colour,
+        DIM,
+        &format!(
+            "  effort [{current}] · Up/Down then Enter, a name, or 1-{}",
+            effort_choices().len()
+        ),
+    )
+}
+
+/// Take an answer to the effort picker: a list number, a level name, `off`, or
+/// an empty line to keep what is set.
+///
+/// Rejected answers report why, for the same reason the model picker does: an
+/// accepted answer is written to the user configuration.
+pub fn resolve_effort_answer(
+    line: &str,
+    current: Option<Effort>,
+) -> Result<Option<Effort>, String> {
+    let answer = line.trim();
+    if answer.is_empty() {
+        return Ok(current);
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return effort_choices()
+            .get(
+                number
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("`{answer}` is out of range; the list starts at 1"))?,
+            )
+            .copied()
+            .ok_or_else(|| format!("`{answer}` is not on the list"));
+    }
+    match answer {
+        "off" | "none" | "unset" => Ok(None),
+        _ => Effort::parse(answer).map(Some).ok_or_else(|| {
+            format!(
+                "`{}` is not an effort level; use {}, or off",
+                safe_text(answer),
+                Effort::ALL.map(Effort::as_str).join(", "),
+            )
+        }),
+    }
+}
+
 pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) -> String {
     let choices = if models.is_empty() {
         "a slug".to_owned()
@@ -1291,6 +1653,29 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The checked-out branch, read straight from `.git/HEAD`.
+///
+/// ponytail: a file read rather than `git rev-parse`, so the status row costs
+/// no subprocess per prompt. It follows the `gitdir:` pointer a worktree or
+/// submodule leaves behind, and reports a detached head as a short id. It does
+/// not walk up to a parent repository: a workspace that is not itself a
+/// checkout simply has no branch to show.
+pub fn branch(workspace: &std::path::Path) -> Option<String> {
+    let dot_git = workspace.join(".git");
+    let git_dir = match std::fs::read_to_string(&dot_git) {
+        Ok(pointer) => workspace.join(pointer.trim().strip_prefix("gitdir:")?.trim()),
+        Err(_) => dot_git,
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let name = match head.strip_prefix("ref: refs/heads/") {
+        Some(name) => name,
+        // Detached: the file holds the commit id itself.
+        None => head.get(..8)?,
+    };
+    (!name.is_empty()).then(|| safe_text(name))
+}
+
 /// `stty size` is asked first: `COLUMNS` is inherited from the shell and goes
 /// stale as soon as the window is resized.
 pub fn terminal_width() -> usize {
@@ -1336,6 +1721,33 @@ fn visible_len(text: &str) -> usize {
 
 /// Truncate to `width` printed columns, keeping the SGR escapes that styled
 /// the part that survives. A row cut by a narrow card keeps its colours.
+/// Fit a path into `budget` columns by dropping leading segments: the tail is
+/// what tells one checkout from another.
+fn shrink_path(path: &str, budget: usize) -> String {
+    if visible_len(path) <= budget {
+        return path.to_owned();
+    }
+    let mut kept = String::new();
+    for segment in path.rsplit('/').filter(|segment| !segment.is_empty()) {
+        let candidate = if kept.is_empty() {
+            segment.to_owned()
+        } else {
+            format!("{segment}/{kept}")
+        };
+        // Two columns are owed to the `…/` that says something was dropped.
+        if visible_len(&candidate) + 2 > budget {
+            break;
+        }
+        kept = candidate;
+    }
+    if kept.is_empty() {
+        // Not even the last segment fits, so keep its end.
+        let tail: String = path.chars().rev().take(budget.saturating_sub(1)).collect();
+        return format!("…{}", tail.chars().rev().collect::<String>());
+    }
+    format!("…/{kept}")
+}
+
 fn fit(text: &str, width: usize) -> String {
     if visible_len(text) <= width {
         return text.to_owned();
@@ -1414,7 +1826,20 @@ mod tests {
         assert!(first.contains("none · read-only"));
         assert!(!first.contains("\x1b["));
         assert!(first.lines().all(|line| line.chars().count() == 80));
-        assert_eq!(state.status_row(80, false), "  no model  /repo");
+        // No model, no effort, and no checkout: the row still says what is
+        // missing rather than dropping the field.
+        assert_eq!(
+            state.status_row(80, false, None),
+            "  no model  effort:—  /repo"
+        );
+        state.set_effort(Some(Effort::High));
+        // The branch sits at the right edge, so it holds its column while the
+        // fields on the left change length.
+        let row = state.status_row(80, false, Some("feat/x"));
+        assert!(row.starts_with("  no model  effort:high  /repo"), "{row:?}");
+        assert!(row.ends_with("feat/x"), "{row:?}");
+        assert_eq!(visible_len(&row), 80, "{row:?}");
+        state.set_effort(None);
 
         let event = EventEnvelope::new(
             session,
@@ -1803,13 +2228,23 @@ mod tests {
         assert_eq!(composer.press(Key::Up), Action::Redraw);
         assert_eq!(composer.selected, 1);
         assert_eq!(composer.buffer, "/", "history did not replace the line");
-        for _ in 0..COMMANDS.len() + 3 {
+        for _ in 0..COMMANDS.len() - 2 {
             composer.press(Key::Down);
         }
         assert_eq!(
             composer.selected,
             COMMANDS.len() - 1,
-            "the selection stops at the last row"
+            "the selection reaches the last row"
+        );
+
+        // Both ends wrap, so neither direction is a dead end.
+        composer.press(Key::Down);
+        assert_eq!(composer.selected, 0, "the last row wraps to the first");
+        composer.press(Key::Up);
+        assert_eq!(
+            composer.selected,
+            COMMANDS.len() - 1,
+            "the first row wraps to the last"
         );
         composer.press(Key::Up);
 
@@ -1830,7 +2265,7 @@ mod tests {
         }
         assert_eq!(
             composer.menu(),
-            vec![("/model", "choose the provider model")]
+            vec![("/model".to_owned(), "choose the provider model".to_owned())]
         );
         for character in " x".chars() {
             composer.press(Key::Char(character));
@@ -1857,6 +2292,102 @@ mod tests {
         assert!(help.contains("Up/Down: input history"));
     }
 
+    /// A typed credential must not survive anywhere a later keystroke or a
+    /// scrollback search could reach it.
+    #[test]
+    fn a_masked_line_is_not_painted_not_remembered_and_offers_no_menu() {
+        let mut composer = Composer::default();
+        composer.history.push_back("an earlier task".into());
+        composer.set_masked(true);
+
+        for character in "sk-secret".chars() {
+            composer.press(Key::Char(character));
+        }
+        let frame = composer.render(80, false, "  status");
+        assert!(!frame.contains("sk-secret"), "the secret was painted");
+        assert!(!frame.contains("sk-"), "part of the secret was painted");
+        assert!(frame.contains("•••••••••"), "one bullet per character");
+
+        // A `/` in a secret is a character, not the start of a command.
+        composer.press(Key::Char('/'));
+        assert!(
+            composer.menu().is_empty(),
+            "a secret opened the command menu"
+        );
+
+        // The line still submits its real value, and leaves no copy behind.
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("sk-secret/".to_owned())
+        );
+        assert_eq!(
+            composer.history.len(),
+            1,
+            "the secret entered history: {:?}",
+            composer.history
+        );
+        assert_eq!(
+            composer.history.back().map(String::as_str),
+            Some("an earlier task")
+        );
+
+        // Unmasking is what returns the line to ordinary behaviour.
+        composer.set_masked(false);
+        for character in "hello".chars() {
+            composer.press(Key::Char(character));
+        }
+        assert!(composer.render(80, false, "  status").contains("hello"));
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("hello".to_owned())
+        );
+        assert_eq!(composer.history.back().map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn a_narrow_status_row_gives_up_the_path_before_the_branch() {
+        let session = SessionId::new();
+        let mut state = TuiState::new(
+            "/Users/someone/Development/github/acme/arsy-code".into(),
+            session,
+        );
+        state.set_model_route(ModelRoute::parse("myai/suiflex"));
+        state.set_effort(Some(Effort::High));
+
+        // Wide: everything, with the branch at the right edge.
+        let wide = state.status_row(120, false, Some("feat/slash-menu"));
+        assert!(wide.contains("/Users/someone/Development"), "{wide:?}");
+        assert!(wide.ends_with("feat/slash-menu"), "{wide:?}");
+        assert_eq!(visible_len(&wide), 120, "{wide:?}");
+
+        // Narrower: the path loses its leading segments, the branch stays whole.
+        let middle = state.status_row(72, false, Some("feat/slash-menu"));
+        assert!(middle.contains("…/"), "{middle:?}");
+        assert!(!middle.contains("/Users/someone"), "{middle:?}");
+        assert!(middle.ends_with("feat/slash-menu"), "{middle:?}");
+        assert!(visible_len(&middle) <= 72, "{middle:?}");
+
+        // Narrower still: the path goes entirely before the branch is touched.
+        let narrow = state.status_row(48, false, Some("feat/slash-menu"));
+        assert!(!narrow.contains("arsy-code"), "{narrow:?}");
+        assert!(narrow.ends_with("feat/slash-menu"), "{narrow:?}");
+        assert!(visible_len(&narrow) <= 48, "{narrow:?}");
+
+        // Only when even that cannot fit is the branch dropped, never cut.
+        let tiny = state.status_row(30, false, Some("feat/slash-menu"));
+        assert!(!tiny.contains("feat/"), "{tiny:?}");
+        assert!(visible_len(&tiny) <= 30, "{tiny:?}");
+
+        // Every width in between stays inside the terminal.
+        for width in 20..=120 {
+            let row = state.status_row(width, false, Some("feat/slash-menu"));
+            assert!(
+                visible_len(&row) <= width.max(MIN_WIDTH),
+                "width {width}: {row:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_menu_extends_the_block_and_the_caret_still_lands_on_the_input() {
         let mut composer = Composer::default();
@@ -1868,7 +2399,7 @@ mod tests {
             4 + COMMANDS.len(),
             "pad, input, pad, one row per command, status"
         );
-        assert!(rows[3].contains("› /model"), "{:?}", rows[3]);
+        assert!(rows[3].contains("› /provider"), "{:?}", rows[3]);
         assert!(rows[4].starts_with("    "), "only one row is marked");
         for row in &rows {
             assert!(visible_len(row) <= 80, "{row:?}");

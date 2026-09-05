@@ -14,7 +14,10 @@ use arsy_kernel::{
         anthropic::AnthropicProvider, http::HttpTransport, openai::OpenAiProvider, wire::ApiKey,
         ModelProvider,
     },
-    secret::{CredentialStore, OsCredentialStore, Redactor, SecretError, SecretHandle},
+    secret::{
+        CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretError,
+        SecretHandle, FILE_STORE_ID, OS_STORE_ID,
+    },
 };
 use std::sync::Arc;
 
@@ -24,6 +27,7 @@ use std::sync::Arc;
 pub enum CredentialSource {
     ConfiguredEnv,
     Keyring,
+    File,
     OAuth,
     DefaultEnv,
 }
@@ -33,8 +37,18 @@ impl CredentialSource {
         match self {
             Self::ConfiguredEnv => "configured_env",
             Self::Keyring => "keyring",
+            Self::File => "file",
             Self::OAuth => "oauth",
             Self::DefaultEnv => "default_env",
+        }
+    }
+
+    /// Where a stored key actually came from, so `arsy doctor` names the store
+    /// that answered rather than assuming the keychain did.
+    fn stored_in(store: &str) -> Self {
+        match store {
+            FILE_STORE_ID => Self::File,
+            _ => Self::Keyring,
         }
     }
 }
@@ -110,7 +124,16 @@ fn credential(
         }
     }
     if let Some(handle) = &endpoint.credential {
-        match OsCredentialStore.resolve(handle.name()) {
+        // The store half of the handle decides where to look. An unknown one is
+        // an error rather than a quiet fall back to the keychain: a handle that
+        // names a store ARSY does not have must not resolve to a different
+        // credential than it asked for.
+        let resolved = match handle.store() {
+            OS_STORE_ID => OsCredentialStore.resolve(handle.name()),
+            FILE_STORE_ID => FileCredentialStore.resolve(handle.name()),
+            other => Err(SecretError::UnknownStore(other.to_owned())),
+        };
+        match resolved {
             Ok(value) => {
                 if let Some(value) = present(Some(value)) {
                     return stored(endpoint, handle, value);
@@ -188,7 +211,7 @@ fn stored(
     value: String,
 ) -> Result<(String, CredentialSource), Diagnostic> {
     let tokens = match classify(value, oauth::now()) {
-        Stored::ApiKey(value) => return Ok((value, CredentialSource::Keyring)),
+        Stored::ApiKey(value) => return Ok((value, CredentialSource::stored_in(handle.store()))),
         Stored::Token(tokens) => return Ok((tokens.access_token, CredentialSource::OAuth)),
         Stored::Expired(tokens) => tokens,
     };
@@ -277,6 +300,55 @@ mod tests {
     /// An environment holding exactly one variable.
     fn env(name: &'static str, value: &'static str) -> impl Fn(&str) -> Option<String> {
         move |asked| (asked == name).then(|| value.to_owned())
+    }
+
+    /// The keychain is one store among the handle's choices, not the place
+    /// every handle ends up.
+    #[test]
+    fn the_handle_decides_which_store_answers_and_an_unknown_one_is_refused() {
+        use std::io::Write;
+
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("myai.key");
+        let mut file = std::fs::File::create(&key).unwrap();
+        file.write_all(b"sk-from-a-file\n").unwrap();
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let endpoint_config = |handle: String| {
+            config(&format!(
+                r#"
+schema_version = 1
+[provider.endpoint.myai]
+kind = "openai"
+base_url = "https://example.test/v1"
+credential = "{handle}"
+"#
+            ))
+        };
+
+        // A file handle is answered by the file, and reported as the file, so
+        // `arsy doctor` does not claim a keychain that was never opened.
+        let config = endpoint_config(format!("secret://file/{}", key.display()));
+        let endpoint = config.endpoint(None).unwrap();
+        assert_eq!(
+            credential(endpoint, &env("UNUSED", "")).unwrap(),
+            ("sk-from-a-file".to_owned(), CredentialSource::File)
+        );
+
+        // A store ARSY does not have must not quietly become the keychain.
+        let config = endpoint_config("secret://vault/myai".to_owned());
+        let endpoint = config.endpoint(None).unwrap();
+        let error = credential(endpoint, &env("UNUSED", "")).unwrap_err();
+        assert!(
+            error.message.contains("vault"),
+            "an unknown store did not name itself: {}",
+            error.message
+        );
     }
 
     #[test]

@@ -118,7 +118,33 @@ variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but
 absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
 are told apart by shape, and an expired access token is refreshed and written back before use.
 
-Credential values are handles such as `secret://os/gateway`, never raw secrets. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+Credential values are handles such as `secret://os/gateway`, never raw secrets.
+The half after `secret://` names the store that answers, and a store ARSY does
+not have is refused rather than resolved somewhere else. Two exist: `os` is the
+platform credential store, and `file` is a file the operator owns —
+`secret://file/gateway.key` beside the user configuration, or an absolute path.
+A file credential must be readable by its owner alone; a mode with any group or
+other bit set is refused with the `chmod` that fixes it. `file` is what a
+headless host, a container, or a debug build whose code identity changes on
+every rebuild — and so is asked to unlock the keychain again each time — should
+use. `api_key_env` still takes precedence over both.
+
+An endpoint names its default model with `model` and may list the others with
+`models = ["a", "b"]`. One endpoint speaks to one host, and a host serves more
+than one model, so the models belong to the endpoint rather than to a second
+endpoint that would duplicate its URL and credential. The default always leads
+the offered list, duplicates are dropped, and the order is otherwise kept. A
+value that is not an array of non-empty names is refused when the file loads.
+
+`credentials.store` chooses where the credential catalog — the list of handles,
+provider names, and timestamps that `arsy auth list` prints — is kept: `file`
+(the default) beside the user configuration, or `os` in the platform store. The
+catalog holds no secret value, so the default costs no unlock prompt to read it;
+`os` keeps everything in one place for an operator who prefers that. The names
+are the same two the `secret://` handles use. Switching to `file` migrates an
+existing catalog out of the platform store on first read, once. A store that is
+neither is refused when the file loads, so a typo cannot quietly send
+credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 
 ## Six-layer example
 

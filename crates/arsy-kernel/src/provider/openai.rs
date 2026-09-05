@@ -74,6 +74,12 @@ impl<T: WireTransport> OpenAiProvider<T> {
         // does not know the option ignores it.
         body.insert("stream_options".to_owned(), json!({"include_usage": true}));
 
+        // This dialect takes the level by name. A host that has no reasoning
+        // model ignores the field, and an unset effort omits it entirely.
+        if let Some(effort) = request.effort {
+            body.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
+        }
+
         // The system prompt is a message in this dialect, not a field.
         let mut messages: Vec<Value> = request
             .system

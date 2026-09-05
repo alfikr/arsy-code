@@ -5,9 +5,9 @@ use arsy_kernel::{
     protocol::IdempotencyKey,
     provider::{
         anthropic::{AnthropicProvider, ApiKey, WireRequest, WireResponse, WireTransport},
-        stream_with_retry, CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream,
-        ModelKey, ModelMessage, ModelProvider, ModelRole, ProviderDescriptor, ProviderError,
-        StopReason, ToolSchema,
+        stream_with_retry, CanonicalModelRequest, Effort, ModelContent, ModelEvent,
+        ModelEventStream, ModelKey, ModelMessage, ModelProvider, ModelRole, ProviderDescriptor,
+        ProviderError, StopReason, ToolSchema,
     },
     secret::{Redactor, SecretHandle},
 };
@@ -77,6 +77,7 @@ fn request(tools: Vec<ToolSchema>) -> CanonicalModelRequest {
         }],
         tools,
         max_output_tokens: 256,
+        effort: None,
         idempotency_key: IdempotencyKey::new("turn-1").unwrap(),
     }
 }
@@ -351,4 +352,86 @@ fn a_second_provider_needs_no_change_above_the_trait() {
 
 fn collect(stream: ModelEventStream) -> Vec<ModelEvent> {
     stream.map(Result::unwrap).collect()
+}
+
+/// The Messages dialect spends reasoning out of the output budget, so the level
+/// becomes a token count. An unset effort must leave the body exactly as it was
+/// before the knob existed.
+#[test]
+fn effort_becomes_a_thinking_budget_inside_the_output_budget() {
+    const THINKING_FLOOR: u32 = 1024;
+
+    let provider = AnthropicProvider::with_base_url(
+        "https://example.test",
+        ApiKey::new("sk-test"),
+        FakeTransport::streaming(Vec::new()),
+    );
+
+    let unset: serde_json::Value =
+        serde_json::from_str(&provider.encode(&request(Vec::new())).body).unwrap();
+    assert!(
+        unset.get("thinking").is_none(),
+        "an unset effort sends no thinking block"
+    );
+
+    // 256 output tokens cannot hold the 1024-token floor and still leave room
+    // to answer, so the request goes out without a budget it would be rejected
+    // for.
+    for level in Effort::ALL {
+        let small = CanonicalModelRequest {
+            effort: Some(level),
+            ..request(Vec::new())
+        };
+        let body: serde_json::Value = serde_json::from_str(&provider.encode(&small).body).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "{level} fit a budget into 256 output tokens"
+        );
+    }
+
+    let budget = |level: Effort| -> u64 {
+        let large = CanonicalModelRequest {
+            effort: Some(level),
+            max_output_tokens: 20_000,
+            ..request(Vec::new())
+        };
+        let body: serde_json::Value = serde_json::from_str(&provider.encode(&large).body).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        body["thinking"]["budget_tokens"].as_u64().unwrap()
+    };
+
+    // The floor fitting is not the same as an answer fitting: a budget must
+    // leave at least as much room to answer as it takes to think.
+    let smallest_with_thinking = THINKING_FLOOR * 2;
+    for (max_tokens, expected) in [
+        (smallest_with_thinking - 1, None),
+        (smallest_with_thinking, Some(THINKING_FLOOR)),
+    ] {
+        let body: serde_json::Value = serde_json::from_str(
+            &provider
+                .encode(&CanonicalModelRequest {
+                    effort: Some(Effort::Low),
+                    max_output_tokens: max_tokens,
+                    ..request(Vec::new())
+                })
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body.get("thinking")
+                .map(|thinking| thinking["budget_tokens"].as_u64().unwrap() as u32),
+            expected,
+            "at max_tokens {max_tokens}"
+        );
+    }
+
+    assert_eq!(budget(Effort::Low), 5_000);
+    assert_eq!(budget(Effort::Medium), 10_000);
+    assert_eq!(budget(Effort::High), 16_000);
+    for level in Effort::ALL {
+        assert!(
+            budget(level) < 20_000,
+            "{level} left no output budget to answer with"
+        );
+    }
 }

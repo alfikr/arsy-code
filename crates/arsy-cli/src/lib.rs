@@ -18,6 +18,8 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
+#[cfg(feature = "tui")]
+mod config_edit;
 mod eval;
 mod integrations;
 pub mod provider;
@@ -33,8 +35,8 @@ use arsy_kernel::{
         ModelRole, ProviderError,
     },
     secret::{
-        CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
-        OS_STORE_ID,
+        CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretBroker,
+        SecretError, SecretHandle, FILE_STORE_ID, OS_STORE_ID,
     },
     service::AgentService,
     sqlite::{Durability, SqliteEventStore},
@@ -417,6 +419,41 @@ fn parse_doctor(positional: Vec<String>, strict: bool) -> Result<Command, Diagno
     Ok(Command::Doctor { strict })
 }
 
+/// Slash commands that are an existing CLI inspection under another name: the
+/// argv they expand to, and the subcommand to assume when the line carries only
+/// flags. One table, so the composer cannot offer a command the loop below does
+/// not know how to run.
+///
+/// Every entry is read-only. `auth` expands to `auth list` with the user's words
+/// appended, so `set`, `login`, and `remove` cannot be reached from the TUI:
+/// they fail to parse instead of touching stored credentials.
+#[cfg(feature = "tui")]
+const INSPECTIONS: &[(&str, &[&str], Option<&str>)] = &[
+    ("/mcp", &["mcp"], Some("list")),
+    ("/hooks", &["hook"], Some("list")),
+    ("/settings", &["config", "explain"], None),
+    ("/doctor", &["doctor"], None),
+    ("/auth", &["auth", "list"], None),
+    ("/compat", &["compat", "explain"], None),
+];
+
+/// Expand a typed slash line into CLI argv, or `None` when no inspection owns
+/// it. The line is not validated here — `parse` already rejects a bad argument
+/// with the same diagnostic the CLI would give.
+#[cfg(feature = "tui")]
+fn inspection_args(line: &str) -> Option<Vec<String>> {
+    let mut words = line.split_whitespace();
+    let command = words.next()?;
+    let (_, prefix, default) = INSPECTIONS.iter().find(|(name, _, _)| *name == command)?;
+    let mut args: Vec<String> = prefix.iter().map(|word| (*word).to_owned()).collect();
+    let rest: Vec<String> = words.map(str::to_owned).collect();
+    if rest.first().is_none_or(|word| word.starts_with("--")) {
+        args.extend(default.map(str::to_owned));
+    }
+    args.extend(rest);
+    Some(args)
+}
+
 /// `config explain [KEY]`. Only `explain` exists; the rest of the documented
 /// `config` surface belongs to a later phase.
 fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
@@ -686,11 +723,11 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
         Command::AuthSet { provider, handle } => {
-            auth_set(provider, handle.as_deref(), tty, emitter)
+            auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
-        Command::AuthList => auth_list(emitter),
-        Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
+        Command::AuthList => auth_list(invocation, emitter),
+        Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
         Command::Eval { suite, trials, out } => {
             let workspace = workspace_root(&invocation.workspace)?;
             let report = eval::run(&workspace, suite, *trials, out.as_deref())?;
@@ -758,8 +795,62 @@ fn config_explain(
 ) -> Result<i32, Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    emitter.result(load_config(&root, &working)?.explain(key));
+    let report = load_config(&root, &working)?.explain(key);
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        human_config(&report, key)
+    });
     Ok(0)
+}
+
+/// `config explain` for a reader: one row per key with the value it resolved to
+/// and the layer that decided it.
+///
+/// The machine record carries the full path of every source file; a row names
+/// the layer instead and lists the paths once underneath, because the same file
+/// otherwise repeats on every line and pushes the values off the screen.
+fn human_config(report: &Value, key: Option<&str>) -> Value {
+    let Some(values) = report["values"].as_object() else {
+        return report.clone();
+    };
+    if values.is_empty() {
+        return json!({"configuration": match key {
+            Some(key) => format!("No configuration sets `{key}`."),
+            None => "No configuration is set; every value is a built-in default.".to_owned(),
+        }});
+    }
+    let label = values
+        .keys()
+        .map(|key| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut listing = format!(
+        "{} value{} set\n",
+        values.len(),
+        if values.len() == 1 { "" } else { "s" }
+    );
+    let mut paths: Vec<&str> = Vec::new();
+    for (name, entry) in values {
+        let value = entry["value"]
+            .as_str()
+            .map_or_else(|| plain(&entry["value"]), terminal_text);
+        let layer = entry["layer"].as_str().unwrap_or("?");
+        listing.push_str(&format!(
+            "\n  {name}{}  {value}  [{layer}]",
+            " ".repeat(label - name.chars().count()),
+        ));
+        if let Some(path) = entry["path"].as_str() {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    listing.push('\n');
+    for path in paths {
+        listing.push_str(&format!("\n  from {}", terminal_text(path)));
+    }
+    json!({"configuration": listing})
 }
 
 /// Read every configuration layer for this workspace.
@@ -782,6 +873,8 @@ fn load_config(
 }
 
 const CATALOG_NAME: &str = "__catalog__";
+/// The catalog under the `file` store, beside the user configuration.
+const CATALOG_FILE: &str = "credentials.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuthRecord {
@@ -808,22 +901,123 @@ enum CredentialKind {
     OAuth,
 }
 
-fn catalog(store: OsCredentialStore) -> Result<Vec<AuthRecord>, Diagnostic> {
-    match store.resolve(CATALOG_NAME) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|_| secret_failed("credential catalog is corrupt"))
+/// Where the credential catalog is kept, and how to reach it.
+///
+/// The catalog is metadata — handles, provider names, timestamps — and never a
+/// secret value, so keeping it in the platform store costs an unlock prompt for
+/// data that did not need one. `file` is the default for that reason; `os`
+/// stays available for an operator who wants everything in one place, chosen
+/// with `credentials.store`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogStore {
+    File,
+    Os,
+}
+
+impl CatalogStore {
+    /// The configured store, or the default when configuration cannot be read:
+    /// listing credentials must not depend on a config file being valid.
+    fn resolve(invocation: &Invocation) -> Self {
+        workspace_root(&invocation.workspace)
+            .ok()
+            .and_then(|root| {
+                let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+                load_config(&root, &working).ok()
+            })
+            .map_or(Self::File, |config| Self::named(config.credential_store()))
+    }
+
+    fn named(store: &str) -> Self {
+        if store == OS_STORE_ID {
+            Self::Os
+        } else {
+            Self::File
         }
-        Err(SecretError::NotFound(_)) => Ok(Vec::new()),
-        Err(error) => Err(secret_failed(error)),
+    }
+
+    fn read(self) -> Result<Option<String>, Diagnostic> {
+        let resolved = match self {
+            Self::File => FileCredentialStore.resolve(CATALOG_FILE),
+            Self::Os => OsCredentialStore.resolve(CATALOG_NAME),
+        };
+        match resolved {
+            Ok(raw) => Ok(Some(raw)),
+            Err(SecretError::NotFound(_)) => Ok(None),
+            Err(error) => Err(secret_failed(error)),
+        }
+    }
+
+    fn write(self, raw: &str) -> Result<(), Diagnostic> {
+        match self {
+            Self::File => {
+                let path = FileCredentialStore::path(CATALOG_FILE).ok_or_else(|| {
+                    secret_failed("this platform has no user configuration directory")
+                })?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(storage_failed)?;
+                }
+                // Created owner-only rather than created and then narrowed: a
+                // chmod after the write leaves a window where the catalog is
+                // readable by the whole machine.
+                let mut file = owner_only(&path)?;
+                file.write_all(format!("{raw}\n").as_bytes())
+                    .map_err(storage_failed)
+            }
+            Self::Os => OsCredentialStore
+                .set(CATALOG_NAME, raw)
+                .map_err(secret_failed),
+        }
     }
 }
 
-fn save_catalog(store: OsCredentialStore, records: &[AuthRecord]) -> Result<(), Diagnostic> {
+/// A catalog file is not a secret, but it names every provider the operator
+/// has a credential for, so it is not the whole machine's business either.
+/// Truncate or create `path` readable by its owner alone.
+///
+/// The catalog is not a secret, but it names every provider the operator holds
+/// a credential for, which is not the whole machine's business either.
+fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(storage_failed)
+}
+
+fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
+    let raw = match store.read()? {
+        Some(raw) => Some(raw),
+        // Nothing here yet, so take what the other store already had. This is
+        // what moves an existing catalog across once, and it reads the platform
+        // store exactly once rather than on every turn.
+        None if store == CatalogStore::File => {
+            // A platform store that is unavailable, or whose prompt was
+            // declined, means there is nothing to migrate — not that every
+            // later turn should fail on a convenience.
+            let migrated = CatalogStore::Os.read().unwrap_or_default();
+            if let Some(raw) = &migrated {
+                store.write(raw)?;
+            }
+            migrated
+        }
+        None => None,
+    };
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&raw).map_err(|_| secret_failed("credential catalog is corrupt"))
+}
+
+fn save_catalog(store: CatalogStore, records: &[AuthRecord]) -> Result<(), Diagnostic> {
     let raw = serde_json::to_string(records).map_err(|error| secret_failed(error.to_string()))?;
-    store.set(CATALOG_NAME, &raw).map_err(secret_failed)
+    store.write(&raw)
 }
 
 fn auth_set(
+    invocation: &Invocation,
     provider: &str,
     requested: Option<&str>,
     tty: bool,
@@ -842,14 +1036,17 @@ fn auth_set(
     if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
         return Err(secret_failed("credential is too short to redact safely"));
     }
+    // The value belongs in the platform store; the catalog goes wherever the
+    // operator configured, which is not the same question.
     let store = OsCredentialStore;
+    let records_store = CatalogStore::resolve(invocation);
     let previous = match store.resolve(name) {
         Ok(value) => Some(value),
         Err(SecretError::NotFound(_)) => None,
         Err(error) => return Err(secret_failed(error)),
     };
     store.set(name, &secret).map_err(secret_failed)?;
-    let mut records = catalog(store)?;
+    let mut records = catalog(records_store)?;
     let now = now()?;
     if let Some(record) = records.iter_mut().find(|record| record.handle == handle) {
         record.provider = provider.to_owned();
@@ -863,7 +1060,7 @@ fn auth_set(
             kind: CredentialKind::ApiKey,
         });
     }
-    if let Err(error) = save_catalog(store, &records) {
+    if let Err(error) = save_catalog(records_store, &records) {
         if let Some(previous) = previous {
             let _ = store.set(name, &previous);
         } else {
@@ -933,7 +1130,8 @@ fn auth_login(
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
     let store = OsCredentialStore;
     store.set(handle.name(), &raw).map_err(secret_failed)?;
-    let mut records = catalog(store)?;
+    let records_store = CatalogStore::resolve(invocation);
+    let mut records = catalog(records_store)?;
     let now = now()?;
     match records.iter_mut().find(|record| record.handle == handle) {
         Some(record) => {
@@ -948,7 +1146,7 @@ fn auth_login(
             kind: CredentialKind::OAuth,
         }),
     }
-    save_catalog(store, &records)?;
+    save_catalog(records_store, &records)?;
     emitter.result(json!({
         "provider": provider,
         "handle": handle,
@@ -966,27 +1164,91 @@ fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
     )
 }
 
-fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    let records = catalog(OsCredentialStore)?;
-    emitter.result(json!({"credentials": records}));
+fn auth_list(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let records = catalog(CatalogStore::resolve(invocation))?;
+    emitter.result(if emitter.output == Output::Json {
+        json!({"credentials": records})
+    } else {
+        human_credentials(&records)
+    });
     Ok(0)
 }
 
+/// `auth list` for a reader: one row per credential, handle and kind first,
+/// because the handle is what a `credential = ` line has to be pointed at.
+///
+/// Values are never read here, only handles, so nothing on these rows is a
+/// secret.
+fn human_credentials(records: &[AuthRecord]) -> Value {
+    if records.is_empty() {
+        return json!({
+            "credentials": "No credentials are stored. `arsy auth set <PROVIDER>` stores one and \
+                            prints the handle to point `credential` at."
+        });
+    }
+    let handles: Vec<String> = records
+        .iter()
+        .map(|record| record.handle.to_string())
+        .collect();
+    let label = handles
+        .iter()
+        .map(|handle| handle.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut listing = format!(
+        "{} credential{} stored\n",
+        records.len(),
+        if records.len() == 1 { "" } else { "s" }
+    );
+    // `oauth` and `api_key` differ in width, so the column after them only
+    // lines up if the kind is padded too.
+    let kind = |record: &AuthRecord| plain(&json!(record.kind));
+    let kinds = records.iter().map(kind).collect::<Vec<_>>();
+    let kind_label = kinds.iter().map(|kind| kind.len()).max().unwrap_or(0);
+    for ((record, handle), kind) in records.iter().zip(&handles).zip(&kinds) {
+        listing.push_str(&format!(
+            "\n  {handle}{}  {kind}{}  provider {}{}",
+            " ".repeat(label - handle.chars().count()),
+            " ".repeat(kind_label - kind.len()),
+            terminal_text(&record.provider),
+            if record.last_used.is_some() {
+                ""
+            } else {
+                "  · never used"
+            },
+        ));
+    }
+    listing.push('\n');
+    json!({"credentials": listing})
+}
+
 fn auth_remove(
+    invocation: &Invocation,
     handle: &SecretHandle,
     _force: bool,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    if handle.store() != OS_STORE_ID {
-        return Err(secret_failed("only OS credential handles can be removed"));
+    // Both stores can be removed from, because both can be listed: a catalog
+    // that names a handle no command can delete is a catalog that only grows.
+    if !matches!(handle.store(), OS_STORE_ID | FILE_STORE_ID) {
+        return Err(secret_failed(format!(
+            "no credential store `{}` to remove from",
+            handle.store()
+        )));
     }
-    let store = OsCredentialStore;
-    let original = catalog(store)?;
+    let records_store = CatalogStore::resolve(invocation);
+    let original = catalog(records_store)?;
     let mut records = original.clone();
     records.retain(|record| &record.handle != handle);
-    save_catalog(store, &records)?;
-    if let Err(error) = store.remove(handle.name()) {
-        let _ = save_catalog(store, &original);
+    save_catalog(records_store, &records)?;
+    let removed = match handle.store() {
+        FILE_STORE_ID => FileCredentialStore.remove(handle.name()),
+        _ => OsCredentialStore.remove(handle.name()),
+    };
+    if let Err(error) = removed {
+        // The catalog is written first, so a failed delete has to put it back
+        // rather than leave a stored credential nothing lists.
+        let _ = save_catalog(records_store, &original);
         return Err(secret_failed(error));
     }
     emitter.result(json!({"removed": handle, "referenced_by": []}));
@@ -1022,6 +1284,10 @@ fn terminal_failed(error: impl ToString) -> Diagnostic {
 enum Prompt {
     Task,
     Model,
+    Effort,
+    /// `/provider` is a wizard rather than one question, so the step it is on
+    /// travels with the prompt.
+    Provider(tui::ProviderStep),
 }
 
 #[cfg(feature = "tui")]
@@ -1071,17 +1337,29 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // The model picker lists what the Codex CLI cached for its account, which
     // says nothing about a configured endpoint; there, the picker takes a slug
     // as free text.
-    let models = if detected.is_codex() {
+    // A configured endpoint offers the models it lists; Codex offers what its
+    // CLI cached for the account. Either way the picker has rows, and an
+    // endpoint that lists none still takes a slug as free text.
+    let mut models = if detected.is_codex() {
         tui::available_models()
     } else {
-        Vec::new()
+        endpoint_models(invocation, &detected.provider)
     };
     // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
 
+    let mut effort = saved_effort();
+    // What `/provider` is holding between its questions, and the list it offers.
+    let mut draft = tui::ProviderDraft::default();
+    let mut providers = configured_providers(invocation);
+    // What the configuration names now, which is not what this session resolved
+    // once `/provider` has switched and the restart has not happened yet.
+    let mut chosen_provider = configured_default(invocation);
+
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
+    state.set_effort(effort);
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -1112,12 +1390,34 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
 
     loop {
         let status = match prompt {
-            Prompt::Task => state.status_row(tui::terminal_width(), colour),
+            // The branch is read per line rather than kept, so a checkout made
+            // in another terminal shows up on the next prompt.
+            Prompt::Task => state.status_row(
+                tui::terminal_width(),
+                colour,
+                tui::branch(&workspace).as_deref(),
+            ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
+            Prompt::Effort => tui::effort_prompt(effort, colour),
+            Prompt::Provider(step) => step.prompt(&draft, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
-        composer.set_picking(matches!(prompt, Prompt::Model));
+        composer.set_picking(!matches!(prompt, Prompt::Task));
+        // Every list is arrowed in the composer block rather than printed above
+        // it, so Up/Down move the mark instead of walking history.
+        match prompt {
+            Prompt::Effort => {
+                composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
+            }
+            Prompt::Provider(step) => composer.offer(
+                step.rows(&providers, &route.provider, chosen_provider.as_deref()),
+                0,
+            ),
+            _ => composer.offer(None, 0),
+        }
+        // A credential is typed, never shown, and never remembered.
+        composer.set_masked(matches!(prompt, Prompt::Provider(step) if step.masked()));
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1129,11 +1429,21 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 &status,
             )? {
                 Some(line) => line,
-                // Ending input at the picker cancels the picker, not the
-                // session: the model is unchanged and the task prompt returns.
-                None if matches!(prompt, Prompt::Model) => {
+                // Ending input at a picker cancels the picker, not the
+                // session: the setting is unchanged and the task prompt
+                // returns. Every picker has to be listed here, or leaving one
+                // exits ARSY instead.
+                None if matches!(prompt, Prompt::Model | Prompt::Effort | Prompt::Provider(_)) => {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    writeln!(stdout, "Model unchanged: {route}").map_err(terminal_failed)?;
+                    let unchanged = match prompt {
+                        Prompt::Effort => effort_line(effort),
+                        Prompt::Provider(_) => {
+                            draft = tui::ProviderDraft::default();
+                            "Provider unchanged.".to_owned()
+                        }
+                        _ => format!("Model unchanged: {route}"),
+                    };
+                    writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
                     prompt = Prompt::Task;
                     continue;
                 }
@@ -1141,6 +1451,59 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             },
         };
         match prompt {
+            Prompt::Provider(step) => {
+                // `clear` rather than `commit`, so no answer — least of all the
+                // credential — is painted into the scrollback.
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match provider_step(invocation, step, &line, &mut draft, &providers) {
+                    Ok(ProviderNext::Ask(next)) => prompt = Prompt::Provider(next),
+                    Ok(ProviderNext::Done(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        providers = configured_providers(invocation);
+                        chosen_provider = configured_default(invocation);
+                        // Configuration decides the provider, so the session has
+                        // to be restarted to pick up a change to it rather than
+                        // pretend the running one moved.
+                        writeln!(
+                            stdout,
+                            "{}",
+                            tui::safe_text("Restart ARSY for the change to take effect.")
+                        )
+                        .map_err(terminal_failed)?;
+                        draft = tui::ProviderDraft::default();
+                        prompt = Prompt::Task;
+                    }
+                    Ok(ProviderNext::Cancelled(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        draft = tui::ProviderDraft::default();
+                        prompt = Prompt::Task;
+                    }
+                    // The step stays open so the answer can be retyped against
+                    // the question that is still on screen.
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Effort => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match tui::resolve_effort_answer(&line, effort) {
+                    Ok(picked) => {
+                        effort = picked;
+                        state.set_effort(effort);
+                        remember_effort(effort, emitter);
+                        writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
+                        prompt = Prompt::Task;
+                    }
+                    // As with the model picker, the list stays open so the
+                    // answer can be retyped against what is already on screen.
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Model => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match tui::resolve_model(&line, &models, &route) {
@@ -1160,24 +1523,48 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // Re-read, so a model added to the endpoint since startup is
+                // offered without restarting.
+                if !route.is_codex() {
+                    models = endpoint_models(invocation, &route.provider);
+                }
                 tui::render_model_list(&mut stdout, &models, &route, colour)
                     .map_err(terminal_failed)?;
                 prompt = Prompt::Model;
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
+            Prompt::Task if line.split_whitespace().next() == Some("/provider") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                providers = configured_providers(invocation);
+                chosen_provider = configured_default(invocation);
+                draft = tui::ProviderDraft::default();
+                prompt = Prompt::Provider(tui::ProviderStep::Pick);
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // A bare `/effort` opens the list, so the levels can be read
+                // before one is chosen; `/effort high` still sets it outright.
+                match line.split_whitespace().nth(1) {
+                    None => prompt = Prompt::Effort,
+                    Some(answer) => match tui::resolve_effort_answer(answer, effort) {
+                        Ok(picked) => {
+                            effort = picked;
+                            state.set_effort(effort);
+                            remember_effort(effort, emitter);
+                            writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
+                        }
+                        Err(reason) => {
+                            writeln!(stdout, "{}", tui::safe_text(&reason))
+                                .map_err(terminal_failed)?;
+                        }
+                    },
+                }
+            }
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let mut words = line.split_whitespace();
-                let command = words.next().unwrap_or_default();
-                if command == "/help" {
+                if line.split_whitespace().next() == Some("/help") {
                     write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed)?;
-                } else if matches!(command, "/mcp" | "/hooks") {
-                    let kind = if command == "/mcp" { "mcp" } else { "hook" };
-                    let mut args = vec![kind.to_owned()];
-                    args.extend(words.map(str::to_owned));
-                    if args.get(1).is_none_or(|arg| arg.starts_with("--")) {
-                        args.insert(1, "list".into());
-                    }
+                } else if let Some(args) = inspection_args(&line) {
                     match parse(args) {
                         Ok(parsed) => {
                             let inspection = Invocation {
@@ -1216,6 +1603,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     native.as_ref(),
                     &line,
                     &route,
+                    effort,
                     colour,
                     &keys,
                     &mut decoder,
@@ -1302,6 +1690,17 @@ fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
     }
 }
 
+#[cfg(feature = "tui")]
+fn remember_effort(effort: Option<Effort>, emitter: &mut Emitter) {
+    if let Err(error) = save_effort(effort) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-UIX-1001",
+            format!("the effort choice was not remembered: {error}"),
+            "check that the ARSY user configuration directory is writable",
+        ));
+    }
+}
+
 /// The remembered model lives beside the user configuration layer that
 /// `arsy doctor` already reports.
 #[cfg(feature = "tui")]
@@ -1333,6 +1732,342 @@ fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     std::fs::write(path, format!("{route}\n"))
 }
 
+/// The remembered reasoning effort, beside the remembered model.
+#[cfg(feature = "tui")]
+use arsy_kernel::provider::Effort;
+
+#[cfg(feature = "tui")]
+fn effort_store() -> Option<PathBuf> {
+    Some(arsy_kernel::config::user_config()?.with_file_name("effort"))
+}
+
+/// The effort chosen last time, re-validated on read for the same reason the
+/// model is: an unreadable file must not decide what a turn sends.
+#[cfg(feature = "tui")]
+fn saved_effort() -> Option<Effort> {
+    Effort::parse(std::fs::read_to_string(effort_store()?).ok()?.trim())
+}
+
+/// `None` clears the choice, so a turn goes back to carrying no reasoning knob.
+#[cfg(feature = "tui")]
+fn save_effort(effort: Option<Effort>) -> io::Result<()> {
+    let path = effort_store()
+        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match effort {
+        Some(effort) => std::fs::write(path, format!("{effort}\n")),
+        None => match std::fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        },
+    }
+}
+
+/// Where `/provider` goes after an answer.
+#[cfg(feature = "tui")]
+enum ProviderNext {
+    Ask(tui::ProviderStep),
+    Done(String),
+    Cancelled(String),
+}
+
+/// The provider the configuration names right now.
+#[cfg(feature = "tui")]
+fn configured_default(invocation: &Invocation) -> Option<String> {
+    let root = workspace_root(&invocation.workspace).ok()?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    load_config(&root, &working)
+        .ok()?
+        .provider_default()
+        .map(str::to_owned)
+}
+
+/// The models a configured endpoint offers, as picker rows.
+#[cfg(feature = "tui")]
+fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelChoice> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let Ok(config) = load_config(&root, &working) else {
+        return Vec::new();
+    };
+    let Some(endpoint) = config.endpoint(Some(provider)) else {
+        return Vec::new();
+    };
+    endpoint
+        .models
+        .iter()
+        .map(|slug| tui::ModelChoice {
+            slug: slug.clone(),
+            name: format!("on {provider}"),
+        })
+        .collect()
+}
+
+/// The providers configured right now, in the order the configuration lists
+/// them. Read fresh each time `/provider` opens, so an edit made outside ARSY
+/// is not hidden behind a stale list.
+#[cfg(feature = "tui")]
+fn configured_providers(invocation: &Invocation) -> Vec<String> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let Ok(config) = load_config(&root, &working) else {
+        return Vec::new();
+    };
+    config.endpoint_ids()
+}
+
+/// Take one answer and say what to ask next.
+///
+/// Every step validates its own answer and nothing is written until the last
+/// one, so abandoning the wizard leaves the configuration exactly as it was.
+#[cfg(feature = "tui")]
+fn provider_step(
+    invocation: &Invocation,
+    step: tui::ProviderStep,
+    line: &str,
+    draft: &mut tui::ProviderDraft,
+    providers: &[String],
+) -> Result<ProviderNext, String> {
+    use tui::ProviderStep as Step;
+
+    let answer = if step.masked() { line } else { line.trim() };
+    if answer.is_empty() {
+        return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
+    }
+    let one_of = |rows: &[(&str, &str)]| {
+        rows.iter()
+            .any(|(name, _)| *name == answer)
+            .then(|| answer.to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "`{}` is not one of {}",
+                    tui::safe_text(answer),
+                    rows.iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    };
+    let writable = |field: &str| {
+        config_edit::is_writable(answer)
+            .then(|| answer.to_owned())
+            .ok_or_else(|| {
+                format!("a {field} must be plain ASCII with no quotes, backslashes, or padding")
+            })
+    };
+
+    match step {
+        Step::Pick => match answer {
+            "+new" => Ok(ProviderNext::Ask(Step::Name)),
+            "-remove" => Ok(ProviderNext::Ask(Step::Remove)),
+            chosen if providers.iter().any(|name| name == chosen) => {
+                write_config(|config| config_edit::set_default(config, chosen))?;
+                Ok(ProviderNext::Done(format!("Provider: {chosen}")))
+            }
+            other => Err(format!(
+                "`{}` is not a configured provider",
+                tui::safe_text(other)
+            )),
+        },
+        Step::Name => {
+            let name = writable("provider name")?;
+            if providers.contains(&name) {
+                return Err(format!("`{name}` is already configured"));
+            }
+            if name.starts_with(['+', '-']) {
+                return Err("a provider name cannot start with `+` or `-`".to_owned());
+            }
+            draft.name = name;
+            Ok(ProviderNext::Ask(Step::Kind))
+        }
+        Step::Kind => {
+            draft.kind = one_of(tui::PROVIDER_KINDS)?;
+            Ok(ProviderNext::Ask(Step::BaseUrl))
+        }
+        Step::BaseUrl => {
+            let url = writable("base URL")?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err("a base URL starts with http:// or https://".to_owned());
+            }
+            draft.base_url = url;
+            Ok(ProviderNext::Ask(Step::Model))
+        }
+        Step::Model => {
+            draft.models = model_slugs(answer)?;
+            Ok(ProviderNext::Ask(Step::Store))
+        }
+        Step::Store => {
+            draft.store = one_of(tui::PROVIDER_STORES)?;
+            Ok(ProviderNext::Ask(Step::Key))
+        }
+        Step::Key => {
+            let handle = store_credential(invocation, &draft.name, &draft.store, answer)?;
+            let endpoint = config_edit::Endpoint {
+                name: draft.name.clone(),
+                kind: draft.kind.clone(),
+                base_url: draft.base_url.clone(),
+                models: draft.models.clone(),
+                credential: handle,
+            };
+            write_config(|config| {
+                let config = config_edit::ensure_schema(config);
+                let config = config_edit::append_endpoint(&config, &endpoint);
+                config_edit::set_default(&config, &endpoint.name)
+            })?;
+            Ok(ProviderNext::Done(format!(
+                "Added provider {} with {} model{}, and made it the default. The others are \
+                 still configured; `/provider` switches between them.",
+                endpoint.name,
+                endpoint.models.len(),
+                if endpoint.models.len() == 1 { "" } else { "s" },
+            )))
+        }
+        Step::Remove => {
+            if !providers.iter().any(|name| name == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            draft.name = answer.to_owned();
+            Ok(ProviderNext::Ask(Step::ConfirmRemove))
+        }
+        Step::ConfirmRemove => {
+            if one_of(tui::CONFIRM_ROWS)? == "no" {
+                return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
+            }
+            let name = draft.name.clone();
+            write_config(|config| config_edit::remove_endpoint(config, &name))?;
+            Ok(ProviderNext::Done(format!(
+                "Removed provider {name}. Its credential was left in place; \
+                 `arsy auth list` shows it."
+            )))
+        }
+    }
+}
+
+/// One host serves several models, so the model step takes a list. The first is
+/// the endpoint's default; the rest are what `/model` offers beside it.
+#[cfg(feature = "tui")]
+fn model_slugs(answer: &str) -> Result<Vec<String>, String> {
+    let mut models: Vec<String> = Vec::new();
+    for slug in answer
+        .split(',')
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+    {
+        if !config_edit::is_writable(slug) {
+            return Err(format!(
+                "`{}` is not a model slug: plain ASCII, no quotes or backslashes",
+                tui::safe_text(slug)
+            ));
+        }
+        if !models.iter().any(|existing| existing == slug) {
+            models.push(slug.to_owned());
+        }
+    }
+    if models.is_empty() {
+        return Err("name at least one model".to_owned());
+    }
+    Ok(models)
+}
+
+/// Put a typed credential where the operator asked for it, and give back the
+/// handle the configuration should point at.
+#[cfg(feature = "tui")]
+fn store_credential(
+    invocation: &Invocation,
+    name: &str,
+    store: &str,
+    secret: &str,
+) -> Result<String, String> {
+    let secret = secret.trim();
+    if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
+        return Err("that credential is too short to redact safely".to_owned());
+    }
+    let handle = if store == "keychain" {
+        OsCredentialStore
+            .set(name, secret)
+            .map_err(|error| format!("the credential store refused it: {error}"))?;
+        SecretHandle::new(OS_STORE_ID, name)
+    } else {
+        let file = format!("{name}.key");
+        let path = FileCredentialStore::path(&file)
+            .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut written = owner_only(&path).map_err(|error| error.message)?;
+        written
+            .write_all(secret.as_bytes())
+            .map_err(|error| error.to_string())?;
+        SecretHandle::new(FILE_STORE_ID, file)
+    }
+    .map_err(|error| error.to_string())?;
+
+    // Catalogued exactly as `arsy auth set` catalogues one, for two reasons:
+    // `auth list` can show it, and every turn registers the catalogued handles
+    // for redaction — a credential missing from the catalog is one that could
+    // reach output unredacted.
+    let store = CatalogStore::resolve(invocation);
+    let mut records = catalog(store).map_err(|error| error.message)?;
+    // Updated in place when the handle is already known, the way `auth set`
+    // updates it, so re-entering a credential does not reset when it was first
+    // stored.
+    match records.iter_mut().find(|record| record.handle == handle) {
+        Some(record) => {
+            record.provider = name.to_owned();
+            record.kind = CredentialKind::ApiKey;
+        }
+        None => records.push(AuthRecord {
+            provider: name.to_owned(),
+            handle: handle.clone(),
+            created_at: now().map_err(|error| error.message)?,
+            last_used: None,
+            kind: CredentialKind::ApiKey,
+        }),
+    }
+    save_catalog(store, &records).map_err(|error| error.message)?;
+    Ok(handle.to_string())
+}
+
+/// Rewrite the user configuration through `edit`.
+///
+/// The file is read and written whole, so `edit` sees exactly what is on disk
+/// and nothing it did not change can move.
+#[cfg(feature = "tui")]
+fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
+    let path = arsy_kernel::config::user_config()
+        .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
+    let original = match std::fs::read_to_string(&path) {
+        Ok(original) => original,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("the configuration could not be read: {error}")),
+    };
+    let updated = edit(&original);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(&path, updated)
+        .map_err(|error| format!("the configuration could not be written: {error}"))
+}
+
+/// What to print once an effort answer is accepted.
+#[cfg(feature = "tui")]
+fn effort_line(effort: Option<Effort>) -> String {
+    match effort {
+        Some(effort) => format!("Effort: {effort}"),
+        None => "Effort: off, so no reasoning setting is sent".to_owned(),
+    }
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
@@ -1340,19 +2075,21 @@ fn run_turn(
     native: Option<&provider::Resolved>,
     task: &str,
     route: &tui::ModelRoute,
+    effort: Option<Effort>,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
-    let task = prepare_task(task, emitter)?;
+    let task = prepare_task(invocation, task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
     let outcome = match native.filter(|_| !route.is_codex()) {
         Some(resolved) => native_status(
             resolved,
             &task,
             route,
+            effort,
             admission.turn,
             colour,
             keys,
@@ -1460,6 +2197,7 @@ fn native_status(
     resolved: &provider::Resolved,
     task: &str,
     route: &tui::ModelRoute,
+    effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -1482,6 +2220,7 @@ fn native_status(
         // tool offered now would have nowhere to run.
         tools: Vec::new(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
+        effort,
         idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(turn.to_string())
             .map_err(io::Error::other)?,
     };
@@ -2040,7 +2779,7 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
     } else {
         task.to_owned()
     };
-    let task = prepare_task(&task, emitter)?;
+    let task = prepare_task(invocation, &task, emitter)?;
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
 
@@ -2094,6 +2833,10 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         // would invite calls nothing can run.
         tools: Vec::new(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
+        // Reasoning effort is chosen in the TUI with `/effort`. A scripted run
+        // takes the request it always took, so a remembered interactive choice
+        // cannot quietly change what a pipeline sends.
+        effort: None,
         // The turn id, so a retried attempt is provably the same request.
         idempotency_key: IdempotencyKey::new(admission.turn.to_string())
             .map_err(|error| storage_failed(error.to_string()))?,
@@ -2183,13 +2926,18 @@ fn merge(target: &mut Value, extra: Value) {
     }
 }
 
-fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic> {
+fn prepare_task(
+    invocation: &Invocation,
+    task: &str,
+    emitter: &mut Emitter,
+) -> Result<String, Diagnostic> {
     if task.trim().is_empty() {
         return Err(usage("run requires a non-empty task"));
     }
     let mut broker = SecretBroker::new();
     broker.register_store(Box::new(OsCredentialStore));
-    for record in catalog(OsCredentialStore)? {
+    broker.register_store(Box::new(FileCredentialStore));
+    for record in catalog(CatalogStore::resolve(invocation))? {
         broker.resolve(&record.handle).map_err(secret_failed)?;
     }
     let task = broker.redactor().sanitize(task).map_err(secret_failed)?;
@@ -2333,7 +3081,9 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
             "install arsy-sandbox-worker and the platform controls before running effects",
         ));
     }
-    let credentials = catalog(OsCredentialStore).unwrap_or_default().len();
+    let credentials = catalog(CatalogStore::resolve(invocation))
+        .unwrap_or_default()
+        .len();
     if credentials == 0 {
         warnings.push(Diagnostic::warning(
             "ARSY-PRV-1001",
@@ -2436,6 +3186,554 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn slash_commands_expand_to_the_inspection_the_cli_already_parses() {
+        let expansion = |line: &str| inspection_args(line).map(|args| args.join(" "));
+
+        // A bare command takes its default subcommand; a flag is not one, so it
+        // does not suppress the default the way a subcommand does.
+        assert_eq!(expansion("/mcp"), Some("mcp list".to_owned()));
+        assert_eq!(
+            expansion("/mcp --source claude"),
+            Some("mcp list --source claude".to_owned())
+        );
+        assert_eq!(
+            expansion("/mcp show NAME"),
+            Some("mcp show NAME".to_owned()),
+            "an explicit subcommand is not replaced"
+        );
+        assert_eq!(expansion("/hooks"), Some("hook list".to_owned()));
+        assert_eq!(expansion("/settings"), Some("config explain".to_owned()));
+        assert_eq!(
+            expansion("/settings model.route"),
+            Some("config explain model.route".to_owned())
+        );
+        assert_eq!(expansion("/doctor"), Some("doctor".to_owned()));
+        assert_eq!(expansion("/auth"), Some("auth list".to_owned()));
+        assert_eq!(
+            expansion("/compat claude"),
+            Some("compat explain claude".to_owned())
+        );
+        assert_eq!(expansion("/nonsense"), None, "the loop reports it instead");
+
+        // Every expansion is a command the CLI parser already accepts, so the
+        // TUI adds no second argument grammar to keep in step.
+        for line in [
+            "/mcp",
+            "/hooks --event PreToolUse",
+            "/settings",
+            "/doctor",
+            "/auth",
+            "/compat omp",
+        ] {
+            let args = inspection_args(line).expect("mapped");
+            assert!(parse(args).is_ok(), "{line} did not parse");
+        }
+
+        // Credential mutation stays a CLI-only surface: the words land after
+        // `list`, which no `auth` form accepts.
+        for line in ["/auth remove handle", "/auth login codex"] {
+            let args = inspection_args(line).expect("mapped");
+            assert!(parse(args).is_err(), "{line} reached auth mutation");
+        }
+    }
+
+    /// The catalog names every provider the operator holds a credential for, so
+    /// it is created owner-only rather than narrowed after the fact.
+    #[test]
+    fn a_catalog_file_is_never_briefly_world_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+
+        {
+            let mut file = owner_only(&path).unwrap();
+            file.write_all(b"[]\n").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "created as {mode:04o}");
+
+            // Rewriting truncates rather than appending, and does not widen the
+            // mode a second time.
+            let mut file = owner_only(&path).unwrap();
+            file.write_all(b"[]").unwrap();
+            drop(file);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "rewritten as {mode:04o}");
+        }
+    }
+
+    /// The model picker answers a configured endpoint's list the same way it
+    /// answers Codex's: by number, by slug, or not at all.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_model_picker_answers_a_configured_endpoints_list() {
+        let route = tui::ModelRoute {
+            provider: "hari".to_owned(),
+            model: "mimo".to_owned(),
+        };
+        let listed: Vec<tui::ModelChoice> = ["mimo", "mimo-2", "mimo-lite"]
+            .into_iter()
+            .map(|slug| tui::ModelChoice {
+                slug: slug.to_owned(),
+                name: "on hari".to_owned(),
+            })
+            .collect();
+
+        // A number picks from the list, and the provider does not move with it:
+        // choosing a model is not choosing an endpoint.
+        let picked = tui::resolve_model("2", &listed, &route).unwrap();
+        assert_eq!(picked.model, "mimo-2");
+        assert_eq!(picked.provider, "hari");
+
+        // A slug that is not on the list is still accepted, because the list is
+        // what the endpoint advertises, not what it will refuse.
+        assert_eq!(
+            tui::resolve_model("mimo-preview", &listed, &route)
+                .unwrap()
+                .model,
+            "mimo-preview"
+        );
+
+        // Out of range says the range rather than silently keeping the current.
+        let error = tui::resolve_model("9", &listed, &route).unwrap_err();
+        assert!(error.contains("1-3"), "{error}");
+
+        // An empty answer keeps what is set.
+        assert_eq!(tui::resolve_model("  ", &listed, &route).unwrap(), route);
+
+        // An endpoint that lists nothing says so instead of naming a range.
+        let error = tui::resolve_model("1", &[], &route).unwrap_err();
+        assert!(error.contains("no models are listed"), "{error}");
+    }
+
+    /// Every question `/provider` asks validates its own answer, and nothing
+    /// reaches the configuration until the last one.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_provider_wizard_validates_each_answer_before_it_moves_on() {
+        use tui::ProviderStep as Step;
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            output: None,
+            no_color: true,
+            command: Command::Tui,
+        };
+        let providers = vec!["myai".to_owned()];
+        let mut draft = tui::ProviderDraft::default();
+        let step = |step: Step, line: &str, draft: &mut tui::ProviderDraft| {
+            provider_step(&invocation, step, line, draft, &providers)
+        };
+
+        // An empty answer leaves the wizard rather than writing a blank field.
+        assert!(matches!(
+            step(Step::Name, "   ", &mut draft),
+            Ok(ProviderNext::Cancelled(_))
+        ));
+
+        // The two actions are rows, not provider names.
+        assert!(matches!(
+            step(Step::Pick, "+new", &mut draft),
+            Ok(ProviderNext::Ask(Step::Name))
+        ));
+        assert!(matches!(
+            step(Step::Pick, "-remove", &mut draft),
+            Ok(ProviderNext::Ask(Step::Remove))
+        ));
+        assert!(step(Step::Pick, "nothere", &mut draft).is_err());
+
+        // A name has to be new, writable, and not look like an action row.
+        assert!(
+            step(Step::Name, "myai", &mut draft).is_err(),
+            "duplicate name"
+        );
+        assert!(step(Step::Name, "+new", &mut draft).is_err(), "action name");
+        assert!(step(Step::Name, "has \"quote\"", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Name, "acme", &mut draft),
+            Ok(ProviderNext::Ask(Step::Kind))
+        ));
+        assert_eq!(draft.name, "acme");
+
+        // The dialect and the store are closed sets.
+        assert!(step(Step::Kind, "gemini", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Kind, "anthropic", &mut draft),
+            Ok(ProviderNext::Ask(Step::BaseUrl))
+        ));
+
+        // A base URL has to be one.
+        assert!(step(Step::BaseUrl, "acme.test", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::BaseUrl, "https://acme.test/v1", &mut draft),
+            Ok(ProviderNext::Ask(Step::Model))
+        ));
+        // One host serves several models, so the step takes a list; a slug that
+        // could not be written into TOML is refused before any of it is kept.
+        assert!(step(Step::Model, "acme-1, bad\"quote", &mut draft).is_err());
+        assert!(
+            step(Step::Model, " , ", &mut draft).is_err(),
+            "no model named"
+        );
+        assert!(matches!(
+            step(Step::Model, "acme-1, acme-2 , acme-1", &mut draft),
+            Ok(ProviderNext::Ask(Step::Store))
+        ));
+        assert_eq!(
+            draft.models,
+            vec!["acme-1".to_owned(), "acme-2".to_owned()],
+            "duplicates dropped, order kept, padding trimmed"
+        );
+        assert!(step(Step::Store, "vault", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Store, "file", &mut draft),
+            Ok(ProviderNext::Ask(Step::Key))
+        ));
+
+        // A credential too short to redact safely is refused before it is
+        // stored, so it cannot end up on the wire unredacted.
+        assert!(step(Step::Key, "short", &mut draft).is_err());
+
+        // Removal names a configured provider and is confirmed before it runs.
+        assert!(step(Step::Remove, "nothere", &mut draft).is_err());
+        assert!(matches!(
+            step(Step::Remove, "myai", &mut draft),
+            Ok(ProviderNext::Ask(Step::ConfirmRemove))
+        ));
+        assert!(matches!(
+            step(Step::ConfirmRemove, "no", &mut draft),
+            Ok(ProviderNext::Cancelled(_))
+        ));
+
+        // Only the key step is a secret, and only it keeps the answer verbatim.
+        for probe in [
+            Step::Pick,
+            Step::Name,
+            Step::Kind,
+            Step::BaseUrl,
+            Step::Model,
+        ] {
+            assert!(!probe.masked(), "{probe:?} was masked");
+        }
+        assert!(Step::Key.masked());
+
+        // The pick list carries the actions under the providers, and offers
+        // nothing to remove when nothing is configured.
+        let rows = Step::Pick
+            .rows(&providers, "myai", Some("myai"))
+            .expect("a list");
+        assert_eq!(rows[0].0, "myai");
+        // The active one says so, so a provider that is merely not current does
+        // not read as one that was removed.
+        assert_eq!(rows[0].1, "in use");
+        let rows = Step::Pick.rows(&providers, "other", None).expect("a list");
+        assert!(rows[0].1.contains("switch"), "{:?}", rows[0]);
+
+        // Switched but not restarted: the session still runs the old one, and
+        // the row says which is which rather than letting the new choice look
+        // like it did not take.
+        let rows = Step::Pick
+            .rows(&providers, "other", Some("myai"))
+            .expect("a list");
+        assert!(rows[0].1.contains("after a restart"), "{:?}", rows[0]);
+        assert!(rows.iter().any(|(name, _)| name == "+new"));
+        assert!(rows.iter().any(|(name, _)| name == "-remove"));
+        let empty = Step::Pick.rows(&[], "", None).expect("a list");
+        assert!(empty.iter().all(|(name, _)| name != "-remove"));
+        assert!(
+            Step::Name.rows(&providers, "myai", None).is_none(),
+            "a name is typed"
+        );
+    }
+
+    /// The catalog is metadata, so where it lives is the operator's choice and
+    /// the default costs no unlock prompt.
+    #[test]
+    fn the_credential_catalog_store_is_configurable_and_defaults_to_a_file() {
+        use arsy_kernel::config::{Config, Layer, CREDENTIAL_STORES, DEFAULT_CREDENTIAL_STORE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let write = |body: &str| {
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            Config::load(&[(Layer::User, path)])
+        };
+
+        // Unset is the file, so an operator who never asked is not asked to
+        // unlock anything to read a list of handles.
+        assert_eq!(DEFAULT_CREDENTIAL_STORE, "file");
+        assert_eq!(
+            write("schema_version = 1\n").unwrap().credential_store(),
+            "file"
+        );
+
+        // Either store can be chosen, and the choice is traceable like any
+        // other configured value.
+        for store in CREDENTIAL_STORES {
+            let config = write(&format!(
+                "schema_version = 1\n[credentials]\nstore = \"{store}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.credential_store(), *store);
+            assert_eq!(
+                config.explain(Some("credentials.store"))["values"]["credentials.store"]["value"],
+                **store
+            );
+        }
+
+        // A name that is neither is refused at load, not silently defaulted:
+        // a typo must not quietly send credentials somewhere else.
+        let error = write("schema_version = 1\n[credentials]\nstore = \"vault\"\n").unwrap_err();
+        assert!(format!("{error}").contains("vault"), "{error}");
+
+        // The two names match the `secret://` stores, so one vocabulary covers
+        // both the handle and the catalog.
+        assert_eq!(CREDENTIAL_STORES, ["file", "os"]);
+    }
+
+    /// `/settings` and `/auth` print to a reader, not to a parser: the machine
+    /// record is still the one JSON mode emits.
+    #[test]
+    fn configuration_and_credentials_render_as_rows_for_a_reader() {
+        let report = json!({
+            "schema_version": 1,
+            "diagnostics": [],
+            "values": {
+                "provider.default": {"layer": "user", "path": "/cfg/config.toml", "value": "myai"},
+                "provider.endpoint.myai.kind": {
+                    "layer": "workspace", "path": "/ws/.arsy/config.toml", "value": "openai"
+                },
+            },
+        });
+
+        let rendered = human_config(&report, None);
+        let listing = rendered["configuration"].as_str().expect("one string");
+        assert!(listing.starts_with("2 values set"), "{listing}");
+        assert!(
+            listing.contains("provider.default             myai  [user]"),
+            "{listing}"
+        );
+        assert!(listing.contains("openai  [workspace]"), "{listing}");
+        // Each source file is named once, under the rows, rather than repeated
+        // on every one of them.
+        assert_eq!(listing.matches("/cfg/config.toml").count(), 1, "{listing}");
+        assert!(listing.contains("from /ws/.arsy/config.toml"), "{listing}");
+
+        // Nothing set is a sentence, not an empty object.
+        let empty = human_config(&json!({"values": {}}), Some("provider.default"));
+        let listing = empty["configuration"].as_str().expect("one string");
+        assert!(listing.contains("provider.default"), "{listing}");
+        assert!(listing.contains("No configuration"), "{listing}");
+
+        // Credentials list handles, never values, so a row is safe to show.
+        let records = vec![
+            AuthRecord {
+                provider: "myai".to_owned(),
+                handle: SecretHandle::new("os", "myai").unwrap(),
+                created_at: 1,
+                last_used: None,
+                kind: CredentialKind::ApiKey,
+            },
+            AuthRecord {
+                provider: "acme".to_owned(),
+                handle: SecretHandle::new("file", "acme.key").unwrap(),
+                created_at: 2,
+                last_used: Some(9),
+                kind: CredentialKind::OAuth,
+            },
+        ];
+        let rendered = human_credentials(&records);
+        let listing = rendered["credentials"].as_str().expect("one string");
+        assert!(listing.starts_with("2 credentials stored"), "{listing}");
+        assert!(listing.contains("secret://os/myai"), "{listing}");
+        assert!(
+            listing.contains("api_key  provider myai  · never used"),
+            "{listing}"
+        );
+        // The kind column is padded, so what follows it lines up.
+        assert!(listing.contains("oauth    provider acme"), "{listing}");
+        assert_eq!(
+            listing.matches("never used").count(),
+            1,
+            "only the unused credential carries the marker: {listing}"
+        );
+
+        let empty = human_credentials(&[]);
+        assert!(
+            empty["credentials"]
+                .as_str()
+                .expect("one string")
+                .contains("auth set"),
+            "an empty list must say how to add one"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_effort_picker_takes_a_number_a_name_or_the_current_setting() {
+        // The list is numbered the way the model list is, and `off` is a row on
+        // it rather than a word only a typist knows about.
+        assert_eq!(
+            tui::effort_choices(),
+            vec![
+                Some(Effort::Low),
+                Some(Effort::Medium),
+                Some(Effort::High),
+                None
+            ]
+        );
+
+        for (index, expected) in tui::effort_choices().iter().enumerate() {
+            let answer = (index + 1).to_string();
+            assert_eq!(
+                tui::resolve_effort_answer(&answer, None).unwrap(),
+                *expected,
+                "row {answer}"
+            );
+        }
+
+        for level in Effort::ALL {
+            assert_eq!(
+                tui::resolve_effort_answer(level.as_str(), None).unwrap(),
+                Some(level)
+            );
+        }
+        for word in ["off", "none", "unset"] {
+            assert_eq!(
+                tui::resolve_effort_answer(word, Some(Effort::High)).unwrap(),
+                None,
+                "{word} did not clear the level"
+            );
+        }
+
+        // An empty line keeps what is set, so leaving the picker alone is not a
+        // way to lose the setting.
+        assert_eq!(
+            tui::resolve_effort_answer("   ", Some(Effort::Medium)).unwrap(),
+            Some(Effort::Medium)
+        );
+
+        // A rejected answer says why and changes nothing; the caller keeps the
+        // picker open on it.
+        for answer in ["hihg", "0", "5", "-1"] {
+            assert!(
+                tui::resolve_effort_answer(answer, Some(Effort::High)).is_err(),
+                "{answer} was accepted"
+            );
+        }
+
+        assert!(effort_line(Some(Effort::High)).contains("high"));
+        assert!(effort_line(None).contains("no reasoning setting"));
+
+        // The picker opens marked at what is set, so the first row a reader
+        // sees marked is the answer they already have.
+        assert_eq!(tui::effort_row(Some(Effort::Low)), 0);
+        assert_eq!(tui::effort_row(Some(Effort::High)), 2);
+        assert_eq!(tui::effort_row(None), 3, "an unset level marks `off`");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_effort_rows_are_arrowed_by_the_composer_that_already_owns_the_keys() {
+        let mut composer = tui::Composer::default();
+        composer.set_picking(true);
+        composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(None));
+
+        // Offered rows beat the command table, so a picker is not answered with
+        // slash commands, and Up/Down move the mark rather than walk history.
+        assert_eq!(composer.menu().len(), tui::EFFORT_ROWS.len());
+        assert_eq!(composer.marked().as_deref(), Some("off"));
+        composer.press(tui::Key::Down);
+        assert_eq!(
+            composer.marked().as_deref(),
+            Some("low"),
+            "the last row wraps"
+        );
+        composer.press(tui::Key::Up);
+        assert_eq!(composer.marked().as_deref(), Some("off"));
+
+        // Enter takes the marked level into the line; a second Enter sends it,
+        // and what it sends is an answer the picker accepts.
+        assert_eq!(composer.press(tui::Key::Enter), tui::Action::Redraw);
+        assert_eq!(
+            composer.press(tui::Key::Enter),
+            tui::Action::Submit("off".to_owned())
+        );
+        assert_eq!(
+            tui::resolve_effort_answer("off", Some(Effort::High)),
+            Ok(None)
+        );
+
+        // Typing narrows the offered rows the way it narrows the commands.
+        let mut composer = tui::Composer::default();
+        composer.offer_table(Some(tui::EFFORT_ROWS), 0);
+        for character in "me".chars() {
+            composer.press(tui::Key::Char(character));
+        }
+        assert_eq!(composer.menu().len(), 1);
+        assert_eq!(composer.marked().as_deref(), Some("medium"));
+
+        // Clearing the offer hands the menu back to the command table.
+        composer.offer_table(None, 0);
+        assert!(composer.menu().is_empty(), "a task line offers no menu");
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_branch_comes_from_head_including_a_worktree_pointer() {
+        let root = std::env::temp_dir().join(format!("arsy-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        assert_eq!(tui::branch(&root), None, "no checkout, no branch");
+
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/slash-menu\n").unwrap();
+        assert_eq!(tui::branch(&repo).as_deref(), Some("feat/slash-menu"));
+
+        // Detached: HEAD holds the commit id, so the row shows a short one.
+        std::fs::write(repo.join(".git/HEAD"), "3cd02230f0f0f0f0f0f0\n").unwrap();
+        assert_eq!(tui::branch(&repo).as_deref(), Some("3cd02230"));
+
+        // A worktree or submodule leaves a `gitdir:` pointer where the
+        // directory would be.
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: ../repo/.git\n").unwrap();
+        assert_eq!(tui::branch(&linked).as_deref(), Some("3cd02230"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_menu_and_the_dispatch_table_hold_the_same_commands() {
+        // `/model`, `/effort`, `/help`, and `/quit` are answered by the loop
+        // itself; every other offered command must be an inspection it knows
+        // how to run.
+        for (name, _) in tui::COMMANDS {
+            let handled = matches!(
+                *name,
+                "/model" | "/effort" | "/provider" | "/help" | "/quit"
+            ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
+            assert!(handled, "{name} is offered but never dispatched");
+        }
+        for (slash, _, _) in INSPECTIONS {
+            assert!(
+                tui::COMMANDS.iter().any(|(name, _)| name == slash),
+                "{slash} is dispatched but never offered"
+            );
+        }
+    }
 
     #[cfg(all(feature = "tui", unix))]
     #[test]

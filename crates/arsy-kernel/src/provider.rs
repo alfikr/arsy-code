@@ -76,6 +76,57 @@ pub struct ToolSchema {
     pub input_schema: Value,
 }
 
+/// How much reasoning the operator asked a turn to spend.
+///
+/// Three named steps rather than a token count, because the two dialects spend
+/// it differently: one takes a named level, the other a token budget. An unset
+/// effort sends nothing at all, so a model without the knob, and every request
+/// made before this existed, keep the body they already had.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    /// The share of the output budget a dialect that takes a token count should
+    /// hand to reasoning.
+    pub const fn thinking_share(self) -> (u32, u32) {
+        match self {
+            Self::Low => (1, 4),
+            Self::Medium => (1, 2),
+            Self::High => (4, 5),
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Provider-independent request. Every field here has the same meaning for
 /// every adapter; anything that does not is not allowed in this struct.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -87,6 +138,9 @@ pub struct CanonicalModelRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSchema>,
     pub max_output_tokens: u32,
+    /// Unset means the request carries no reasoning knob at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
     /// Carried so a retry is provably the same request, not a second one.
     pub idempotency_key: IdempotencyKey,
 }
@@ -319,6 +373,7 @@ mod tests {
             }],
             tools: Vec::new(),
             max_output_tokens: 64,
+            effort: None,
             idempotency_key: IdempotencyKey::new("turn-1").unwrap(),
         }
     }

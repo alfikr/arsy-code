@@ -25,9 +25,17 @@ effect), and its trust and mapping level. `--output json` carries the full recor
 An empty result names the files that were read and the filters that were applied.
 
 In a TUI build (`cargo build -p arsy-cli --features tui`), use `/help`, `/mcp`,
-`/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. These work even
-without provider authentication. Repeat an inspection to reload its source files.
-Unknown slash commands report an error instead of becoming model prompts.
+`/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. The same route
+carries the other read-only inspections under their own names: `/settings [KEY]`
+for `config explain`, `/doctor`, `/auth` for the credential listing, and
+`/compat claude|codex|omp|agents`. Each expands to the CLI command it stands for
+and is parsed by the same grammar, so an unsupported argument is refused with the
+CLI's diagnostic. Every command on this route is read-only — `auth set`,
+`auth login`, and `auth remove` are not reachable from the TUI — so `/model`,
+which writes the accepted answer to the user configuration, remains the only
+slash command that changes state. These work even without provider
+authentication. Repeat an inspection to reload its source files. Unknown slash
+commands report an error instead of becoming model prompts.
 
 Typing `/` opens a command menu under the composer, one row per command with its
 description, narrowed as the line is typed and closed once an argument follows.
@@ -42,6 +50,52 @@ Use Up/Down for the last 100 submitted lines when no menu is open, Delete for
 forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
+
+`/provider` opens the configured endpoints in the composer's own menu, with a row
+to add one and, once something is configured, a row to remove one. Choosing an
+endpoint makes it the default. The rows say which endpoint is which: the one
+this session resolved at startup is marked in use, and one chosen since then is
+marked as taking effect at the next restart. Adding a provider makes it the
+default, and without those markers the one it replaced reads as removed rather
+than as merely not current. Adding walks one question per field — name,
+dialect, base URL, models (one slug, or several separated by commas, the first
+being the default), where to keep the credential, then the credential
+itself, which is painted as bullets, kept out of the input history, and never
+written to the scrollback. Each answer is validated as it is given, an empty
+answer leaves the wizard, and nothing reaches the configuration until the last
+answer, so an abandoned wizard changes nothing. Removing is confirmed first and
+leaves the credential in place; `arsy auth list` still shows it. ARSY edits only
+the `[provider.endpoint.*]` tables it owns and the `[provider] default` key, as
+text rather than by reserializing the file, so comments, blank lines, and hand
+alignment survive. A session resolves its provider at startup, so a change asks
+for a restart rather than pretending the running session moved.
+
+A bare `/effort` opens the levels in the composer's own menu, marked at the
+current setting: Up/Down move the mark and Enter takes the marked level into the
+line, the same keys the command menu answers, and typing narrows the list. A
+level name or a list number is still accepted, as is an empty line to keep what
+is set. `/effort high` sets the level outright without opening the list. Unknown
+answers are rejected with a reason and the list stays open, because an accepted
+answer is written to the user configuration. The choice is remembered beside the
+model. Unset is the default and sends no
+reasoning field at all, so a host without such a model sees the request it always
+saw. The two dialects spend it differently: Chat Completions takes the level by
+name as `reasoning_effort`, while Messages takes a share of `max_tokens` as a
+thinking budget, floored at the 1024 tokens the API requires and omitted when the
+output budget cannot hold both the floor and an answer. A scripted `arsy run`
+ignores the remembered level and sends no reasoning field, so a pipeline cannot
+change behaviour because of an interactive choice made elsewhere.
+
+Esc, Ctrl-C, or Ctrl-D at the effort picker leaves the level unchanged and
+returns to the task prompt, as at the model picker.
+
+`/model` lists the models the active endpoint offers, re-read when the picker
+opens so one added since startup appears without a restart. A Codex route lists
+what the CLI cached instead, and an endpoint that lists no models still takes a
+slug as free text. A slug that is not on the list is accepted either way: the
+list is what the endpoint advertises, not what it will refuse. Unlike a provider
+change, a model change takes effect on the next turn — the endpoint is the same
+one the session already resolved.
 
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out
@@ -209,6 +263,16 @@ ARSY has no update command. Updates and rollbacks are handled by the installatio
 specified in [distribution](34-distribution.md).
 
 ## TUI behavior
+
+The status line carries the model route, the reasoning effort (`effort:—` when
+unset), and the workspace path, with the checked-out branch right-aligned at the
+far edge so it holds its column while the fields to its left change length. A
+narrow terminal gives the fields up in the order they can be spared: the
+workspace path shrinks to its last segments behind a `…/`, then disappears, and
+only then is the branch dropped. The branch is never shortened, because half a
+branch name reads as a different branch. The branch is read from `.git/HEAD` once per prompt, so a
+checkout made in another terminal appears on the next line rather than at the
+next restart.
 
 The TUI has a session timeline, task input, status line, evidence/diagnostic detail, and an approval view. At startup it detects a logged-in Codex installation through `codex login status`, then asks for a model; an empty selection uses the Codex default. Codex credentials and configuration remain owned by Codex and are never copied into ARSY. Entering a task runs it through Codex in read-only mode and returns to the task prompt; `:quit` or end-of-file exits. It displays the active workspace, model route, session ID, achieved sandbox assurance, token/cost totals, and whether the result is degraded. Keyboard actions and screen-reader labels must expose every action available by pointer.
 

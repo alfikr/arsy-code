@@ -6,8 +6,8 @@ use arsy_kernel::{
     provider::{
         openai::OpenAiProvider,
         wire::{ApiKey, WireRequest, WireResponse, WireTransport},
-        CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelKey, ModelMessage,
-        ModelProvider, ModelRole, ProviderError, StopReason, ToolSchema,
+        CanonicalModelRequest, Effort, ModelContent, ModelEvent, ModelEventStream, ModelKey,
+        ModelMessage, ModelProvider, ModelRole, ProviderError, StopReason, ToolSchema,
     },
     secret::{Redactor, SecretHandle},
 };
@@ -69,6 +69,7 @@ fn request(tools: Vec<ToolSchema>) -> CanonicalModelRequest {
         }],
         tools,
         max_output_tokens: 256,
+        effort: None,
         idempotency_key: IdempotencyKey::new("turn-1").unwrap(),
     }
 }
@@ -405,4 +406,38 @@ fn a_credential_cannot_reach_the_wire_body_through_the_prompt() {
             .any(|(_, value)| value.contains("sk-live-value-1234")),
         "the authorization header is the one place the value legitimately appears"
     );
+}
+
+/// The Chat Completions dialect takes the level by name, so it goes on the wire
+/// as written. An unset effort must leave the body as it was before the knob
+/// existed, because most hosts on this route have no reasoning model at all.
+#[test]
+fn effort_travels_as_a_named_reasoning_level() {
+    let provider = OpenAiProvider::with_base_url(
+        "https://gateway.test/v1",
+        ApiKey::new("sk-test"),
+        FakeTransport::streaming(Vec::new()),
+    );
+
+    let unset: Value = serde_json::from_str(&provider.encode(&request(Vec::new())).body).unwrap();
+    assert!(
+        unset.get("reasoning_effort").is_none(),
+        "an unset effort sends no reasoning field"
+    );
+
+    for level in Effort::ALL {
+        let body: Value = serde_json::from_str(
+            &provider
+                .encode(&CanonicalModelRequest {
+                    effort: Some(level),
+                    ..request(Vec::new())
+                })
+                .body,
+        )
+        .unwrap();
+        assert_eq!(body["reasoning_effort"], level.as_str());
+        // The budget is the host's business on this route, so nothing else in
+        // the body moves with the level.
+        assert_eq!(body["max_tokens"], unset["max_tokens"]);
+    }
 }
