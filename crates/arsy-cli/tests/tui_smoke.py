@@ -196,8 +196,8 @@ def main():
             terminal.send(b"openai\r")
             terminal.expect("base URL for acme")
             terminal.send(b"https://acme.test/v1\r")
-            terminal.expect("model for acme")
-            terminal.send(b"acme-1\r")
+            terminal.expect("models for acme")
+            terminal.send(b"acme-1, acme-2\r")
             terminal.expect("where to keep the credential")
             terminal.send(b"file\r")
             terminal.expect("not shown as you type")
@@ -218,6 +218,10 @@ def main():
             assert 'base_url = "https://acme.test/v1"' in body, body
             assert 'credential = "secret://file/acme.key"' in body, body
             assert 'default = "acme"' in body, body
+            # One host, several models: a list on the endpoint rather than a
+            # second endpoint duplicating its URL and credential.
+            assert 'model = "acme-1"' in body, body
+            assert 'models = ["acme-2"]' in body, body
 
             key = written.parent / "acme.key"
             assert key.read_text() == "sk-provider-wizard-value", "the credential was mangled"

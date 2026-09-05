@@ -53,8 +53,11 @@ single-line composer.
 
 `/provider` opens the configured endpoints in the composer's own menu, with a row
 to add one and, once something is configured, a row to remove one. Choosing an
-endpoint makes it the default. Adding walks one question per field — name,
-dialect, base URL, model, where to keep the credential, then the credential
+endpoint makes it the default. The row for the endpoint in use says so, because
+adding one makes it the default and a provider that is merely not current must
+not read as one that was removed. Adding walks one question per field — name,
+dialect, base URL, models (one slug, or several separated by commas, the first
+being the default), where to keep the credential, then the credential
 itself, which is painted as bullets, kept out of the input history, and never
 written to the scrollback. Each answer is validated as it is given, an empty
 answer leaves the wizard, and nothing reaches the configuration until the last
@@ -83,6 +86,11 @@ change behaviour because of an interactive choice made elsewhere.
 
 Esc, Ctrl-C, or Ctrl-D at the effort picker leaves the level unchanged and
 returns to the task prompt, as at the model picker.
+
+`/model` lists the models the active endpoint offers, re-read when the picker
+opens so one added since startup appears without a restart. A Codex route lists
+what the CLI cached instead, and an endpoint that lists no models still takes a
+slug as free text.
 
 `/model` reopens the picker. It accepts a list number, a model slug, or an empty
 line to keep the current model; anything else — a mistyped slash command, an out

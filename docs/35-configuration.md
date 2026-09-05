@@ -129,6 +129,13 @@ headless host, a container, or a debug build whose code identity changes on
 every rebuild — and so is asked to unlock the keychain again each time — should
 use. `api_key_env` still takes precedence over both.
 
+An endpoint names its default model with `model` and may list the others with
+`models = ["a", "b"]`. One endpoint speaks to one host, and a host serves more
+than one model, so the models belong to the endpoint rather than to a second
+endpoint that would duplicate its URL and credential. The default always leads
+the offered list, duplicates are dropped, and the order is otherwise kept. A
+value that is not an array of non-empty names is refused when the file loads.
+
 `credentials.store` chooses where the credential catalog — the list of handles,
 provider names, and timestamps that `arsy auth list` prints — is kept: `file`
 (the default) beside the user configuration, or `os` in the platform store. The

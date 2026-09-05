@@ -1337,10 +1337,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // The model picker lists what the Codex CLI cached for its account, which
     // says nothing about a configured endpoint; there, the picker takes a slug
     // as free text.
-    let models = if detected.is_codex() {
+    // A configured endpoint offers the models it lists; Codex offers what its
+    // CLI cached for the account. Either way the picker has rows, and an
+    // endpoint that lists none still takes a slug as free text.
+    let mut models = if detected.is_codex() {
         tui::available_models()
     } else {
-        Vec::new()
+        endpoint_models(invocation, &detected.provider)
     };
     // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
@@ -1404,7 +1407,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
             }
-            Prompt::Provider(step) => composer.offer(step.rows(&providers), 0),
+            Prompt::Provider(step) => composer.offer(step.rows(&providers, &route.provider), 0),
             _ => composer.offer(None, 0),
         }
         // A credential is typed, never shown, and never remembered.
@@ -1513,6 +1516,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // Re-read, so a model added to the endpoint since startup is
+                // offered without restarting.
+                if !route.is_codex() {
+                    models = endpoint_models(invocation, &route.provider);
+                }
                 tui::render_model_list(&mut stdout, &models, &route, colour)
                     .map_err(terminal_failed)?;
                 prompt = Prompt::Model;
@@ -1757,6 +1765,29 @@ enum ProviderNext {
     Cancelled(String),
 }
 
+/// The models a configured endpoint offers, as picker rows.
+#[cfg(feature = "tui")]
+fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelChoice> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let Ok(config) = load_config(&root, &working) else {
+        return Vec::new();
+    };
+    let Some(endpoint) = config.endpoint(Some(provider)) else {
+        return Vec::new();
+    };
+    endpoint
+        .models
+        .iter()
+        .map(|slug| tui::ModelChoice {
+            slug: slug.clone(),
+            name: format!("on {provider}"),
+        })
+        .collect()
+}
+
 /// The providers configured right now, in the order the configuration lists
 /// them. Read fresh each time `/provider` opens, so an edit made outside ARSY
 /// is not hidden behind a stale list.
@@ -1850,7 +1881,29 @@ fn provider_step(
             Ok(ProviderNext::Ask(Step::Model))
         }
         Step::Model => {
-            draft.model = writable("model slug")?;
+            // One host serves several models, so the step takes a list. The
+            // first is the endpoint's default; the rest are what `/model`
+            // offers beside it.
+            let mut models = Vec::new();
+            for slug in answer.split(',') {
+                let slug = slug.trim();
+                if slug.is_empty() {
+                    continue;
+                }
+                if !config_edit::is_writable(slug) {
+                    return Err(format!(
+                        "`{}` is not a model slug: plain ASCII, no quotes or backslashes",
+                        tui::safe_text(slug)
+                    ));
+                }
+                if !models.iter().any(|existing| existing == slug) {
+                    models.push(slug.to_owned());
+                }
+            }
+            if models.is_empty() {
+                return Err("name at least one model".to_owned());
+            }
+            draft.models = models;
             Ok(ProviderNext::Ask(Step::Store))
         }
         Step::Store => {
@@ -1863,7 +1916,7 @@ fn provider_step(
                 name: draft.name.clone(),
                 kind: draft.kind.clone(),
                 base_url: draft.base_url.clone(),
-                model: draft.model.clone(),
+                models: draft.models.clone(),
                 credential: handle,
             };
             write_config(|config| {
@@ -1872,8 +1925,11 @@ fn provider_step(
                 config_edit::set_default(&config, &endpoint.name)
             })?;
             Ok(ProviderNext::Done(format!(
-                "Added provider {} and made it the default.",
-                endpoint.name
+                "Added provider {} with {} model{}, and made it the default. The others are \
+                 still configured; `/provider` switches between them.",
+                endpoint.name,
+                endpoint.models.len(),
+                if endpoint.models.len() == 1 { "" } else { "s" },
             )))
         }
         Step::Remove => {
@@ -3254,10 +3310,22 @@ mod tests {
             step(Step::BaseUrl, "https://acme.test/v1", &mut draft),
             Ok(ProviderNext::Ask(Step::Model))
         ));
+        // One host serves several models, so the step takes a list; a slug that
+        // could not be written into TOML is refused before any of it is kept.
+        assert!(step(Step::Model, "acme-1, bad\"quote", &mut draft).is_err());
+        assert!(
+            step(Step::Model, " , ", &mut draft).is_err(),
+            "no model named"
+        );
         assert!(matches!(
-            step(Step::Model, "acme-1", &mut draft),
+            step(Step::Model, "acme-1, acme-2 , acme-1", &mut draft),
             Ok(ProviderNext::Ask(Step::Store))
         ));
+        assert_eq!(
+            draft.models,
+            vec!["acme-1".to_owned(), "acme-2".to_owned()],
+            "duplicates dropped, order kept, padding trimmed"
+        );
         assert!(step(Step::Store, "vault", &mut draft).is_err());
         assert!(matches!(
             step(Step::Store, "file", &mut draft),
@@ -3293,13 +3361,21 @@ mod tests {
 
         // The pick list carries the actions under the providers, and offers
         // nothing to remove when nothing is configured.
-        let rows = Step::Pick.rows(&providers).expect("a list");
+        let rows = Step::Pick.rows(&providers, "myai").expect("a list");
         assert_eq!(rows[0].0, "myai");
+        // The active one says so, so a provider that is merely not current does
+        // not read as one that was removed.
+        assert_eq!(rows[0].1, "in use");
+        let rows = Step::Pick.rows(&providers, "other").expect("a list");
+        assert!(rows[0].1.contains("switch"), "{:?}", rows[0]);
         assert!(rows.iter().any(|(name, _)| name == "+new"));
         assert!(rows.iter().any(|(name, _)| name == "-remove"));
-        let empty = Step::Pick.rows(&[]).expect("a list");
+        let empty = Step::Pick.rows(&[], "").expect("a list");
         assert!(empty.iter().all(|(name, _)| name != "-remove"));
-        assert!(Step::Name.rows(&providers).is_none(), "a name is typed");
+        assert!(
+            Step::Name.rows(&providers, "myai").is_none(),
+            "a name is typed"
+        );
     }
 
     /// The catalog is metadata, so where it lives is the operator's choice and

@@ -157,6 +157,13 @@ pub struct Endpoint {
     pub credential: Option<SecretHandle>,
     pub api_key_env: Option<String>,
     pub model: Option<String>,
+    /// Every model this endpoint offers, in the order the picker should show
+    /// them. One endpoint speaks to one host, and a host serves more than one
+    /// model, so the model is a list rather than a second endpoint that would
+    /// duplicate the URL and the credential.
+    ///
+    /// `model` remains the default; it is always the first entry here.
+    pub models: Vec<String>,
     /// Cap on one response. Providers differ in what they accept and the
     /// Anthropic dialect requires a value, so it is configurable rather than
     /// fixed.
@@ -414,6 +421,7 @@ impl Config {
                     | "credential"
                     | "api_key_env"
                     | "model"
+                    | "models"
                     | "max_output_tokens"
                     | "oauth"
             ) {
@@ -447,6 +455,7 @@ impl Config {
             credential: None,
             api_key_env: None,
             model: None,
+            models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             oauth: None,
         });
@@ -511,6 +520,34 @@ impl Config {
         if let Some(model) = string(table, "model", &format!("{prefix}.model"), path)? {
             self.record(layer, path, &format!("{prefix}.model"), model);
             endpoint.model = Some(model.clone());
+        }
+        if let Some(value) = table.get("models") {
+            let key = format!("{prefix}.models");
+            let listed = value.as_array().ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!("`{key}` must be an array of model names"),
+            })?;
+            let mut models = Vec::with_capacity(listed.len());
+            for entry in listed {
+                let name = entry
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| ConfigError {
+                        path: path.to_path_buf(),
+                        message: format!("`{key}` must hold non-empty model names"),
+                    })?;
+                if !models.iter().any(|existing| existing == name) {
+                    models.push(name.to_owned());
+                }
+            }
+            self.record(layer, path, &key, models.join(", "));
+            endpoint.models = models;
+        }
+        // The default is offered too, and first: a picker that does not list
+        // the model the endpoint is already using cannot show what is in force.
+        if let Some(model) = &endpoint.model {
+            endpoint.models.retain(|listed| listed != model);
+            endpoint.models.insert(0, model.clone());
         }
         if let Some(value) = table.get("max_output_tokens") {
             let key = format!("{prefix}.max_output_tokens");
@@ -767,6 +804,67 @@ fn platform_user_config() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// One endpoint speaks to one host, and a host serves more than one model,
+    /// so the models are a list on the endpoint rather than a second endpoint
+    /// duplicating its URL and credential.
+    #[test]
+    fn an_endpoint_offers_every_model_it_lists_with_its_default_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), "config.toml", body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        // A file written before `models` existed still reads, and offers the
+        // one model it names.
+        let config = read(
+            "schema_version = 1\n[provider.endpoint.a]\nkind = \"openai\"\nbase_url = \
+             \"https://a.test\"\nmodel = \"one\"\n",
+        )
+        .unwrap();
+        let endpoint = config.endpoint(Some("a")).unwrap();
+        assert_eq!(endpoint.model.as_deref(), Some("one"));
+        assert_eq!(endpoint.models, vec!["one".to_owned()]);
+
+        // The default leads the list, and is not repeated in it.
+        let config = read(
+            "schema_version = 1\n[provider.endpoint.a]\nkind = \"openai\"\nbase_url = \
+             \"https://a.test\"\nmodel = \"two\"\nmodels = [\"one\", \"two\", \
+             \"three\", \"one\"]\n",
+        )
+        .unwrap();
+        let endpoint = config.endpoint(Some("a")).unwrap();
+        assert_eq!(
+            endpoint.models,
+            vec!["two".to_owned(), "one".to_owned(), "three".to_owned()],
+            "the default leads, duplicates are dropped, order is otherwise kept"
+        );
+
+        // Listing models without naming a default offers them in order.
+        let config = read(
+            "schema_version = 1\n[provider.endpoint.a]\nkind = \"openai\"\nbase_url = \
+             \"https://a.test\"\nmodels = [\"one\", \"two\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.endpoint(Some("a")).unwrap().models,
+            vec!["one".to_owned(), "two".to_owned()]
+        );
+
+        // A shape that is not a list of names is refused rather than ignored.
+        for bad in ["\"one\"", "[1, 2]", "[\"\"]"] {
+            let error = read(&format!(
+                "schema_version = 1\n[provider.endpoint.a]\nkind = \"openai\"\nbase_url = \
+                 \"https://a.test\"\nmodels = {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error}").contains("models"),
+                "{bad} was accepted: {error}"
+            );
+        }
+    }
+
     use super::*;
 
     fn write(directory: &Path, name: &str, body: &str) -> PathBuf {

@@ -318,7 +318,10 @@ impl ProviderStep {
             Self::Name => "new provider · a short id, letters and dashes".to_owned(),
             Self::Kind => "dialect · Up/Down then Enter, or a name".to_owned(),
             Self::BaseUrl => format!("base URL for {} · the API root", draft.name),
-            Self::Model => format!("model for {} · the slug the host knows", draft.name),
+            Self::Model => format!(
+                "models for {} · one slug, or several separated by commas",
+                draft.name
+            ),
             Self::Store => "where to keep the credential · Up/Down then Enter".to_owned(),
             Self::Key => format!("credential for {} · not shown as you type", draft.name),
             Self::Remove => "remove which provider · Up/Down then Enter".to_owned(),
@@ -330,7 +333,7 @@ impl ProviderStep {
     }
 
     /// The rows this step offers, or none when it collects free text.
-    pub fn rows(self, providers: &[String]) -> Option<Vec<(String, String)>> {
+    pub fn rows(self, providers: &[String], active: &str) -> Option<Vec<(String, String)>> {
         let named = |rows: &[(&str, &str)]| {
             Some(
                 rows.iter()
@@ -340,9 +343,19 @@ impl ProviderStep {
         };
         match self {
             Self::Pick => {
+                // Which one is in force has to be on the row: adding a provider
+                // makes it the default, and without a marker the one it
+                // replaced reads as gone rather than as merely not current.
                 let mut rows: Vec<(String, String)> = providers
                     .iter()
-                    .map(|name| (name.clone(), "use this provider".to_owned()))
+                    .map(|name| {
+                        let note = if name == active {
+                            "in use"
+                        } else {
+                            "switch to this provider"
+                        };
+                        (name.clone(), note.to_owned())
+                    })
                     .collect();
                 for (name, description) in PROVIDER_ACTIONS {
                     // Nothing to remove until something is configured.
@@ -378,7 +391,8 @@ pub struct ProviderDraft {
     pub name: String,
     pub kind: String,
     pub base_url: String,
-    pub model: String,
+    /// Every model the endpoint offers. The first is its default.
+    pub models: Vec<String>,
     pub store: String,
 }
 

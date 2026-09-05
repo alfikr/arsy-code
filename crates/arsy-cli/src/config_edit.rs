@@ -15,18 +15,34 @@ pub struct Endpoint {
     pub name: String,
     pub kind: String,
     pub base_url: String,
-    pub model: String,
+    /// Every model the endpoint offers; the first is written as its default.
+    pub models: Vec<String>,
     /// The `secret://` handle the credential was stored under.
     pub credential: String,
 }
 
 impl Endpoint {
     fn table(&self) -> String {
-        format!(
-            "[provider.endpoint.{}]\nkind = \"{}\"\nbase_url = \"{}\"\nmodel = \"{}\"\ncredential \
-             = \"{}\"\n",
-            self.name, self.kind, self.base_url, self.model, self.credential,
-        )
+        let mut table = format!(
+            "[provider.endpoint.{}]\nkind = \"{}\"\nbase_url = \"{}\"\n",
+            self.name, self.kind, self.base_url,
+        );
+        // The first model is the default; the rest are listed beside it, and
+        // only when there are any, so a single-model endpoint stays as short as
+        // one written by hand.
+        if let Some((default, rest)) = self.models.split_first() {
+            table.push_str(&format!("model = \"{default}\"\n"));
+            if !rest.is_empty() {
+                let listed = rest
+                    .iter()
+                    .map(|model| format!("\"{model}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                table.push_str(&format!("models = [{listed}]\n"));
+            }
+        }
+        table.push_str(&format!("credential = \"{}\"\n", self.credential));
+        table
     }
 }
 
@@ -165,7 +181,7 @@ mod tests {
             name: "acme".to_owned(),
             kind: "openai".to_owned(),
             base_url: "https://acme.test/v1".to_owned(),
-            model: "acme-1".to_owned(),
+            models: vec!["acme-1".to_owned(), "acme-2".to_owned()],
             credential: "secret://file/acme.key".to_owned(),
         }
     }
@@ -194,6 +210,9 @@ color = \"always\"
         assert!(added.starts_with(original), "the original file moved");
         assert!(added.contains("[provider.endpoint.acme]"));
         assert!(added.contains("credential = \"secret://file/acme.key\""));
+        // The first model is the default and the rest are listed beside it.
+        assert!(added.contains("model = \"acme-1\""), "{added}");
+        assert!(added.contains("models = [\"acme-2\"]"), "{added}");
 
         // Removing gives back a file that still has the comment, the hand
         // alignment, and the unrelated table.
