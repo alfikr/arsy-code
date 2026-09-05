@@ -235,9 +235,11 @@ specified in [distribution](34-distribution.md).
 
 The status line carries the model route, the reasoning effort (`effort:—` when
 unset), and the workspace path, with the checked-out branch right-aligned at the
-far edge so it holds its column while the fields to its left change length. A row
-with no room left for the branch drops it rather than truncating it, because half
-a branch name reads as a different branch. The branch is read from `.git/HEAD` once per prompt, so a
+far edge so it holds its column while the fields to its left change length. A
+narrow terminal gives the fields up in the order they can be spared: the
+workspace path shrinks to its last segments behind a `…/`, then disappears, and
+only then is the branch dropped. The branch is never shortened, because half a
+branch name reads as a different branch. The branch is read from `.git/HEAD` once per prompt, so a
 checkout made in another terminal appears on the next line rather than at the
 next restart.
 

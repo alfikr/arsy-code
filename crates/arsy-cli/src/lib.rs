@@ -1164,6 +1164,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(matches!(prompt, Prompt::Model | Prompt::Effort));
+        // The effort levels are arrowed in the composer block rather than
+        // printed above it, so Up/Down move the mark instead of walking history.
+        composer.offer(
+            matches!(prompt, Prompt::Effort).then_some(tui::EFFORT_ROWS),
+            tui::effort_row(effort),
+        );
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1233,11 +1239,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // A bare `/effort` opens the list, so the levels can be read
                 // before one is chosen; `/effort high` still sets it outright.
                 match line.split_whitespace().nth(1) {
-                    None => {
-                        tui::render_effort_list(&mut stdout, effort, colour)
-                            .map_err(terminal_failed)?;
-                        prompt = Prompt::Effort;
-                    }
+                    None => prompt = Prompt::Effort,
                     Some(answer) => match tui::resolve_effort_answer(answer, effort) {
                         Ok(picked) => {
                             effort = picked;

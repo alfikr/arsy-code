@@ -264,6 +264,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit"),
 ];
 
+/// The levels the effort picker offers. Rows in the same shape the command menu
+/// takes, so the picker is arrowed and taken with the keys the composer already
+/// answers rather than a second selection mechanism.
+pub const EFFORT_ROWS: &[(&str, &str)] = &[
+    ("low", "least reasoning, fastest and cheapest"),
+    ("medium", "balanced"),
+    ("high", "most reasoning, slowest and dearest"),
+    ("off", "send no reasoning setting at all"),
+];
+
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
 const MENU_ROWS: usize = 10;
@@ -308,6 +318,9 @@ pub struct Composer {
     draft: String,
     /// Which menu row Up/Down has landed on, clamped to the matches on use.
     selected: usize,
+    /// Rows a picker put in front of the reader, offered instead of the command
+    /// table for as long as it is collecting an answer.
+    offered: Option<&'static [(&'static str, &'static str)]>,
     /// Set while the line is a picker answer rather than a task, so the menu
     /// does not offer commands that the picker would not accept.
     picking: bool,
@@ -332,12 +345,35 @@ impl Composer {
         self.selected = 0;
     }
 
+    /// Put a picker's rows in the menu, marked at `selected`.
+    ///
+    /// Called once per line from the prompt state, so a selection never
+    /// outlives the answer it was made for.
+    pub fn offer(
+        &mut self,
+        rows: Option<&'static [(&'static str, &'static str)]>,
+        selected: usize,
+    ) {
+        self.offered = rows;
+        self.selected = selected;
+    }
+
     /// Measured with the width, and on the same schedule.
     pub fn set_height(&mut self, rows: usize) {
         self.height = rows;
     }
 
     pub fn menu(&self) -> Vec<(&'static str, &'static str)> {
+        // An offered list wins: it is the question on screen, and it narrows as
+        // the answer is typed the same way the command table does.
+        if let Some(rows) = self.offered {
+            return rows
+                .iter()
+                .filter(|(name, _)| name.starts_with(&self.buffer))
+                .take(self.menu_capacity())
+                .copied()
+                .collect();
+        }
         if self.picking || !self.buffer.starts_with('/') || self.buffer.contains(' ') {
             return Vec::new();
         }
@@ -844,46 +880,69 @@ impl TuiState {
         lines.join("\n")
     }
 
-    /// The status row shown under the composer: warm model, green directory.
+    /// The status row shown under the composer: warm model, green directory,
+    /// branch at the right edge.
+    ///
     /// `branch` is passed rather than kept, because it belongs to the checkout
     /// and can change while the session is open.
+    ///
+    /// A narrow terminal gives up the fields in the order they can be spared:
+    /// the workspace path shrinks to its last segments, then disappears, and
+    /// only then is the branch dropped. The branch is never shortened, because
+    /// half a branch name reads as a different branch — and it is the field a
+    /// reader is least able to reconstruct from anything else on screen.
     pub fn status_row(&self, width: usize, colour: bool, branch: Option<&str>) -> String {
+        const INDENT: usize = 2;
+        const GAP: usize = 2;
+        /// Below this a path has lost the segments that identify it.
+        const PATH_FLOOR: usize = 6;
+
+        let width = width.max(MIN_WIDTH);
         let route = self
             .model_route
             .as_ref()
             .map_or_else(|| "no model".to_owned(), ModelRoute::to_string);
-        let mut row = format!("  {}", paint(colour, MODEL, &route));
-        // An unset effort says so, because "no reasoning knob is sent" and
-        // "some level is in force" have to be told apart at a glance.
-        row.push_str(&format!(
-            "  {}",
-            paint(
-                colour,
-                DIM,
-                &self.effort.map_or_else(
-                    || "effort:—".to_owned(),
-                    |effort| format!("effort:{effort}")
-                ),
-            ),
-        ));
-        row.push_str(&format!("  {}", paint(colour, CWD, &self.workspace)));
+        let effort = self.effort.map_or_else(
+            || "effort:—".to_owned(),
+            |effort| format!("effort:{effort}"),
+        );
+        let branch = branch.unwrap_or_default();
 
-        let width = width.max(MIN_WIDTH);
-        let mut row = fit(&row, width);
-        // The branch sits at the right edge, so it stays in one place while the
-        // fields to its left change length. It is dropped rather than shortened
-        // when the row is already full: a truncated branch name is a name that
-        // can be read as the wrong branch.
-        if let Some(branch) = branch {
-            let gap = width
-                .saturating_sub(visible_len(&row))
-                .saturating_sub(visible_len(branch) + 2);
-            if gap > 0 {
-                row.push_str(&" ".repeat(gap + 2));
-                row.push_str(&paint(colour, ACCENT, branch));
+        let head = INDENT + visible_len(&route) + GAP + visible_len(&effort);
+        let right = if branch.is_empty() {
+            0
+        } else {
+            GAP + visible_len(branch)
+        };
+
+        // Whatever is left over once the fields that cannot shrink are placed.
+        let budget = width.saturating_sub(head + GAP + right);
+        let workspace = (budget >= PATH_FLOOR).then(|| shrink_path(&self.workspace, budget));
+
+        let mut row = format!(
+            "{}{}{}{}",
+            " ".repeat(INDENT),
+            paint(colour, MODEL, &route),
+            " ".repeat(GAP),
+            paint(colour, DIM, &effort),
+        );
+        let mut used = head;
+        if let Some(workspace) = &workspace {
+            row.push_str(&" ".repeat(GAP));
+            row.push_str(&paint(colour, CWD, workspace));
+            used += GAP + visible_len(workspace);
+        }
+        // Only now is there a final answer on whether the branch fits.
+        if !branch.is_empty() {
+            if let Some(gap) = width.checked_sub(used + visible_len(branch)) {
+                if gap >= GAP {
+                    row.push_str(&" ".repeat(gap));
+                    row.push_str(&paint(colour, ACCENT, branch));
+                    return row;
+                }
             }
         }
-        row
+        fit(&row, width)
     }
 
     pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
@@ -1269,38 +1328,19 @@ pub fn render_model_list(
 /// A configured endpoint has no list to offer — nothing tells ARSY what a
 /// gateway serves — so there the prompt asks for a slug instead of a number
 /// in a range of none.
-/// The effort levels, numbered like the model list so both pickers are answered
-/// the same way.
-pub fn render_effort_list(
-    writer: &mut impl Write,
-    current: Option<Effort>,
-    colour: bool,
-) -> std::io::Result<()> {
-    for (index, level) in effort_choices().iter().enumerate() {
-        let marker = if *level == current { "›" } else { " " };
-        let (slug, description) = match level {
-            Some(Effort::Low) => ("low", "least reasoning, fastest and cheapest"),
-            Some(Effort::Medium) => ("medium", "balanced"),
-            Some(Effort::High) => ("high", "most reasoning, slowest and dearest"),
-            None => ("off", "send no reasoning setting at all"),
-        };
-        writeln!(
-            writer,
-            "  {} {} {}  {}",
-            paint(colour, ACCENT, marker),
-            paint(colour, DIM, &format!("{}.", index + 1)),
-            paint(colour, MODEL, slug),
-            paint(colour, DIM, description),
-        )?;
-    }
-    Ok(())
-}
-
 /// The rows the effort picker offers, in the order it numbers them.
 pub fn effort_choices() -> Vec<Option<Effort>> {
     let mut choices: Vec<Option<Effort>> = Effort::ALL.into_iter().map(Some).collect();
     choices.push(None);
     choices
+}
+
+/// Which offered row the mark starts on, so the picker opens on what is set.
+pub fn effort_row(current: Option<Effort>) -> usize {
+    effort_choices()
+        .iter()
+        .position(|choice| *choice == current)
+        .unwrap_or(0)
 }
 
 pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
@@ -1309,7 +1349,7 @@ pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
         colour,
         DIM,
         &format!(
-            "  effort [{current}] · 1-{} or a name",
+            "  effort [{current}] · Up/Down then Enter, a name, or 1-{}",
             effort_choices().len()
         ),
     )
@@ -1491,6 +1531,33 @@ fn visible_len(text: &str) -> usize {
 
 /// Truncate to `width` printed columns, keeping the SGR escapes that styled
 /// the part that survives. A row cut by a narrow card keeps its colours.
+/// Fit a path into `budget` columns by dropping leading segments: the tail is
+/// what tells one checkout from another.
+fn shrink_path(path: &str, budget: usize) -> String {
+    if visible_len(path) <= budget {
+        return path.to_owned();
+    }
+    let mut kept = String::new();
+    for segment in path.rsplit('/').filter(|segment| !segment.is_empty()) {
+        let candidate = if kept.is_empty() {
+            segment.to_owned()
+        } else {
+            format!("{segment}/{kept}")
+        };
+        // Two columns are owed to the `…/` that says something was dropped.
+        if visible_len(&candidate) + 2 > budget {
+            break;
+        }
+        kept = candidate;
+    }
+    if kept.is_empty() {
+        // Not even the last segment fits, so keep its end.
+        let tail: String = path.chars().rev().take(budget.saturating_sub(1)).collect();
+        return format!("…{}", tail.chars().rev().collect::<String>());
+    }
+    format!("…/{kept}")
+}
+
 fn fit(text: &str, width: usize) -> String {
     if visible_len(text) <= width {
         return text.to_owned();
@@ -1582,12 +1649,6 @@ mod tests {
         assert!(row.starts_with("  no model  effort:high  /repo"), "{row:?}");
         assert!(row.ends_with("feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
-
-        // Too narrow to hold it: the branch is dropped rather than cut, because
-        // half a branch name reads as a different branch.
-        let narrow = state.status_row(34, false, Some("feat/x"));
-        assert!(!narrow.contains("feat"), "{narrow:?}");
-        assert!(visible_len(&narrow) <= 34, "{narrow:?}");
         state.set_effort(None);
 
         let event = EventEnvelope::new(
@@ -2039,6 +2100,50 @@ mod tests {
             assert!(help.contains(description), "{name} has no description");
         }
         assert!(help.contains("Up/Down: input history"));
+    }
+
+    #[test]
+    fn a_narrow_status_row_gives_up_the_path_before_the_branch() {
+        let session = SessionId::new();
+        let mut state = TuiState::new(
+            "/Users/someone/Development/github/acme/arsy-code".into(),
+            session,
+        );
+        state.set_model_route(ModelRoute::parse("myai/suiflex"));
+        state.set_effort(Some(Effort::High));
+
+        // Wide: everything, with the branch at the right edge.
+        let wide = state.status_row(120, false, Some("feat/slash-menu"));
+        assert!(wide.contains("/Users/someone/Development"), "{wide:?}");
+        assert!(wide.ends_with("feat/slash-menu"), "{wide:?}");
+        assert_eq!(visible_len(&wide), 120, "{wide:?}");
+
+        // Narrower: the path loses its leading segments, the branch stays whole.
+        let middle = state.status_row(72, false, Some("feat/slash-menu"));
+        assert!(middle.contains("…/"), "{middle:?}");
+        assert!(!middle.contains("/Users/someone"), "{middle:?}");
+        assert!(middle.ends_with("feat/slash-menu"), "{middle:?}");
+        assert!(visible_len(&middle) <= 72, "{middle:?}");
+
+        // Narrower still: the path goes entirely before the branch is touched.
+        let narrow = state.status_row(48, false, Some("feat/slash-menu"));
+        assert!(!narrow.contains("arsy-code"), "{narrow:?}");
+        assert!(narrow.ends_with("feat/slash-menu"), "{narrow:?}");
+        assert!(visible_len(&narrow) <= 48, "{narrow:?}");
+
+        // Only when even that cannot fit is the branch dropped, never cut.
+        let tiny = state.status_row(30, false, Some("feat/slash-menu"));
+        assert!(!tiny.contains("feat/"), "{tiny:?}");
+        assert!(visible_len(&tiny) <= 30, "{tiny:?}");
+
+        // Every width in between stays inside the terminal.
+        for width in 20..=120 {
+            let row = state.status_row(width, false, Some("feat/slash-menu"));
+            assert!(
+                visible_len(&row) <= width.max(MIN_WIDTH),
+                "width {width}: {row:?}"
+            );
+        }
     }
 
     #[test]
