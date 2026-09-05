@@ -954,8 +954,12 @@ impl CatalogStore {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(storage_failed)?;
                 }
-                std::fs::write(&path, format!("{raw}\n")).map_err(storage_failed)?;
-                owner_only(&path)
+                // Created owner-only rather than created and then narrowed: a
+                // chmod after the write leaves a window where the catalog is
+                // readable by the whole machine.
+                let mut file = owner_only(&path)?;
+                file.write_all(format!("{raw}\n").as_bytes())
+                    .map_err(storage_failed)
             }
             Self::Os => OsCredentialStore
                 .set(CATALOG_NAME, raw)
@@ -966,16 +970,19 @@ impl CatalogStore {
 
 /// A catalog file is not a secret, but it names every provider the operator
 /// has a credential for, so it is not the whole machine's business either.
-#[cfg(unix)]
-fn owner_only(path: &Path) -> Result<(), Diagnostic> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(storage_failed)
-}
-
-#[cfg(not(unix))]
-fn owner_only(_path: &Path) -> Result<(), Diagnostic> {
-    Ok(())
+/// Truncate or create `path` readable by its owner alone.
+///
+/// The catalog is not a secret, but it names every provider the operator holds
+/// a credential for, which is not the whole machine's business either.
+fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(storage_failed)
 }
 
 fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
@@ -985,7 +992,10 @@ fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
         // what moves an existing catalog across once, and it reads the platform
         // store exactly once rather than on every turn.
         None if store == CatalogStore::File => {
-            let migrated = CatalogStore::Os.read()?;
+            // A platform store that is unavailable, or whose prompt was
+            // declined, means there is nothing to migrate — not that every
+            // later turn should fail on a convenience.
+            let migrated = CatalogStore::Os.read().unwrap_or_default();
             if let Some(raw) = &migrated {
                 store.write(raw)?;
             }
@@ -2858,6 +2868,37 @@ mod tests {
         for line in ["/auth remove handle", "/auth login codex"] {
             let args = inspection_args(line).expect("mapped");
             assert!(parse(args).is_err(), "{line} reached auth mutation");
+        }
+    }
+
+    /// The catalog names every provider the operator holds a credential for, so
+    /// it is created owner-only rather than narrowed after the fact.
+    #[test]
+    fn a_catalog_file_is_never_briefly_world_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.json");
+
+        {
+            let mut file = owner_only(&path).unwrap();
+            file.write_all(b"[]\n").unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "created as {mode:04o}");
+
+            // Rewriting truncates rather than appending, and does not widen the
+            // mode a second time.
+            let mut file = owner_only(&path).unwrap();
+            file.write_all(b"[]").unwrap();
+            drop(file);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "rewritten as {mode:04o}");
         }
     }
 
