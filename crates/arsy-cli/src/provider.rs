@@ -13,7 +13,7 @@ use arsy_kernel::{
         anthropic::AnthropicProvider, http::HttpTransport, openai::OpenAiProvider, wire::ApiKey,
         ModelProvider,
     },
-    secret::{CredentialStore, OsCredentialStore, Redactor, SecretError},
+    secret::{CredentialStore, OsCredentialStore, Redactor, SecretError, SecretHandle},
 };
 
 /// Where a credential came from. Reported by `arsy doctor` so an operator can
@@ -65,14 +65,12 @@ pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Dia
     let (secret, source) = credential(&endpoint, &from_env)?;
     let mut redactor = Redactor::new();
     // Registering here, rather than at the wire, means a key echoed back into
-    // a prompt or an event is already masked.
-    if let Some(handle) = &endpoint.credential {
-        // A value too short to redact safely is refused rather than sent with
-        // a redaction pipeline that would corrupt unrelated text.
-        redactor
-            .register(handle, &secret)
-            .map_err(|error| credential_failed(&endpoint.id, error))?;
-    }
+    // a prompt or an event is already masked — whichever source it came from,
+    // not only the keyring. A value too short to redact safely is refused
+    // rather than sent with a pipeline that would corrupt unrelated text.
+    redactor
+        .register(&redaction_handle(&endpoint, source)?, &secret)
+        .map_err(|error| credential_failed(&endpoint.id, error))?;
     let key = ApiKey::new(secret);
     let transport = HttpTransport::default();
     let provider: Box<dyn ModelProvider> = match endpoint.kind {
@@ -143,6 +141,30 @@ fn present(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// A handle to name the credential in redacted output.
+///
+/// The configured keyring handle when there is one, otherwise a synthetic
+/// handle naming the variable it came from, so `[redacted:secret://env/...]`
+/// still tells an operator which credential was masked.
+fn redaction_handle(
+    endpoint: &Endpoint,
+    source: CredentialSource,
+) -> Result<SecretHandle, Diagnostic> {
+    match (source, &endpoint.credential) {
+        (CredentialSource::Keyring, Some(handle)) => Ok(handle.clone()),
+        (_, _) => {
+            let name = match source {
+                CredentialSource::ConfiguredEnv => endpoint
+                    .api_key_env
+                    .as_deref()
+                    .unwrap_or(endpoint.kind.default_api_key_env()),
+                _ => endpoint.kind.default_api_key_env(),
+            };
+            SecretHandle::new("env", name).map_err(|error| credential_failed(&endpoint.id, error))
+        }
+    }
+}
+
 fn credential_failed(provider: &str, error: impl ToString) -> Diagnostic {
     Diagnostic::error(
         ARSY_PRV_1000,
@@ -204,6 +226,40 @@ api_key_env = "LOCAL_KEY"
             error.remediation.contains("LOCAL_KEY"),
             "the remediation names the variable the operator configured: {}",
             error.remediation
+        );
+    }
+
+    #[test]
+    fn a_credential_is_named_for_redaction_whatever_source_it_came_from() {
+        let config = config(
+            r#"
+schema_version = 1
+[provider.endpoint.local]
+kind = "openai"
+api_key_env = "LOCAL_KEY"
+credential = "secret://os/local"
+"#,
+        );
+        let endpoint = config.endpoint(None).unwrap();
+
+        assert_eq!(
+            redaction_handle(endpoint, CredentialSource::Keyring)
+                .unwrap()
+                .to_string(),
+            "secret://os/local"
+        );
+        assert_eq!(
+            redaction_handle(endpoint, CredentialSource::ConfiguredEnv)
+                .unwrap()
+                .to_string(),
+            "secret://env/LOCAL_KEY",
+            "a key from the environment is masked too, not only a stored one"
+        );
+        assert_eq!(
+            redaction_handle(endpoint, CredentialSource::DefaultEnv)
+                .unwrap()
+                .to_string(),
+            "secret://env/OPENAI_API_KEY"
         );
     }
 
