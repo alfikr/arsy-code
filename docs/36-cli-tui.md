@@ -1,5 +1,71 @@
 # CLI and TUI surface
 
+## Implemented integration workflows
+
+The command tables below include roadmap work. The current build provides
+`arsy mcp list`, `arsy mcp show <NAME>`, and `arsy hook list` as read-only
+inspection commands. MCP inspection reads workspace Claude `.mcp.json`, Codex
+`.codex/config.toml`, and the nearest OMP `.omp/mcp.json`; `--source
+claude|codex|omp` selects one ecosystem and resolves duplicate names. It preserves
+stdio/HTTP transport and explicit enabled state without launching a server.
+Hook inspection reads Claude workspace and local settings, preserves lifecycle
+events and matchers, and accepts `--event <original-or-canonical-name>`.
+Unsupported lifecycle events are labelled unsupported. Other hook ecosystems
+and user/enterprise integration configuration are not yet inspected.
+
+Every declaration is labelled `not_loaded`. Native MCP connection management,
+handshakes, discovery, reconnect/refresh, and executable hooks remain unimplemented;
+these inspection results are not a claim that an integration is running.
+The existing provider subprocess owns its own integrations and permissions.
+
+Human output lists each declaration as a count line and one row per declaration:
+its name, transport or matcher, `not loaded`, its source file and ecosystem, the
+command or URL a connection would run (hooks report lifecycle, handler types, and
+effect), and its trust and mapping level. `--output json` carries the full record.
+An empty result names the files that were read and the filters that were applied.
+
+In a TUI build (`cargo build -p arsy-cli --features tui`), use `/help`, `/mcp`,
+`/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. These work even
+without provider authentication. Repeat an inspection to reload its source files.
+Unknown slash commands report an error instead of becoming model prompts.
+
+Typing `/` opens a command menu under the composer, one row per command with its
+description, narrowed as the line is typed and closed once an argument follows.
+Up/Down move the marked row while it is open, and Enter takes the marked command
+into the line; a line that already is a command is sent instead, so `/quit` never
+has to be chosen from a list. `/help` prints the same table, and both read one
+source, so a command cannot appear in one and not the other. The menu is not
+offered at the model picker, which collects an answer rather than a command, and
+it takes only the rows the terminal has left over the four the composer always
+paints, so the input block never outgrows the screen.
+Use Up/Down for the last 100 submitted lines when no menu is open, Delete for
+forward deletion, and bracketed paste to insert text without submitting pasted
+newlines. History is in memory only; multiline paste becomes spaces in the
+single-line composer.
+
+`/model` reopens the picker. It accepts a list number, a model slug, or an empty
+line to keep the current model; anything else — a mistyped slash command, an out
+of range number, a slug with whitespace — is rejected with a reason and the
+picker stays open, because an accepted answer is also written to the user
+configuration. A remembered model is re-validated on read, so a file written by
+an older build cannot keep selecting an unusable model. Esc, Ctrl-C, or Ctrl-D at
+the picker leaves the model unchanged and returns to the task prompt.
+
+While a turn runs, the composer shows elapsed time and queued follow-ups (up to
+16 per running turn). MCP started/updated/completed events and failure details
+appear above it. Esc/Ctrl-C cancels the turn and clears pending follow-ups;
+Ctrl-D on empty input cancels and exits. Cancellation escalates after two seconds.
+Provider turns currently have a fixed 300-second deadline and a 1 MiB per-event
+limit. The terminal is restored on exit and provider processes are cleaned up on
+I/O errors. JSON/CI output requires an explicit non-interactive command.
+
+Checks: `cargo test -p arsy-cli --features tui`,
+`cargo test -p arsy-code --test compat_golden`, and
+`python3 crates/arsy-cli/tests/tui_smoke.py target/debug/arsy` (Unix, TUI build).
+Any workspace-wide cargo command rebuilds `target/debug/arsy` without the `tui`
+feature, so run `cargo build -p arsy-cli --features tui` immediately before the
+smoke test; it reports a stale binary rather than timing out on it.
+
 ## Invocation
 
 The executable is `arsy`. UTF-8 is required for task text and machine output. Arguments use platform-native paths; internally they are canonicalized before policy evaluation.

@@ -23,6 +23,7 @@ arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+unicode-width = "=0.2.2"
 
 [lints]
 workspace = true

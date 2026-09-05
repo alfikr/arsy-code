@@ -108,6 +108,48 @@ impl CompatibilityImporter {
         }
     }
 
+    /// Inspect only integration declarations; unrelated model/policy settings
+    /// do not need to be importable, and no declaration is activated.
+    pub fn mcp_declarations(
+        &self,
+        ecosystem: Ecosystem,
+        working_directory: &Path,
+    ) -> Result<Vec<Value>, CompatError> {
+        if !fs::canonicalize(working_directory)?.starts_with(fs::canonicalize(&self.root)?) {
+            return Err(CompatError::OutsideRoot);
+        }
+        match ecosystem {
+            Ecosystem::Claude => mcp_json(self, &self.root.join(".mcp.json"), "mapped"),
+            Ecosystem::Codex => {
+                let path = self.root.join(".codex/config.toml");
+                if !path.try_exists()? {
+                    return Ok(Vec::new());
+                }
+                let config: toml::Value = toml::from_str(&self.read(&path)?)
+                    .map_err(|error| CompatError::Parse(error.to_string()))?;
+                mcp_toml(self, &path, config.get("mcp_servers"))
+            }
+            Ecosystem::Omp => match nearest_native(&self.root, working_directory) {
+                Ok(native) => mcp_json(self, &native.join("mcp.json"), "mapped"),
+                Err(CompatError::Missing(_)) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            },
+            Ecosystem::AgentsMd => Ok(Vec::new()),
+        }
+    }
+
+    pub fn hook_declarations(&self) -> Result<Vec<Value>, CompatError> {
+        let source = self.root.join(".claude/settings.json");
+        let local = self.root.join(".claude/settings.local.json");
+        let settings = read_json_or_empty(self, &source)?;
+        let overrides = read_json_or_empty(self, &local)?;
+        if overrides.get("hooks").is_some() {
+            claude_hooks(self, &local, &overrides)
+        } else {
+            claude_hooks(self, &source, &settings)
+        }
+    }
+
     pub fn import(
         &self,
         ecosystem: Ecosystem,
@@ -159,7 +201,13 @@ impl CompatibilityImporter {
         let settings_path = self.root.join(".claude/settings.json");
         let local_path = self.root.join(".claude/settings.local.json");
         let mut settings = read_json_or_empty(self, &settings_path)?;
-        merge_object(&mut settings, read_json_or_empty(self, &local_path)?)?;
+        let local_settings = read_json_or_empty(self, &local_path)?;
+        let hook_source = if local_settings.get("hooks").is_some() {
+            &local_path
+        } else {
+            &settings_path
+        };
+        merge_object(&mut settings, local_settings)?;
         let diagnostics = unknown_keys(
             &settings,
             &["model", "permissions", "hooks"],
@@ -177,7 +225,7 @@ impl CompatibilityImporter {
             map_claude_permission,
         );
         let sources = existing_sources(self, [&settings_path, &local_path])?;
-        let hooks = claude_hooks(self, &settings_path, &settings)?;
+        let hooks = claude_hooks(self, hook_source, &settings)?;
         let agents = markdown_agents(self, &self.root.join(".claude/agents"), None)?;
         let skills = skills(self, &self.root.join(".claude/skills"), "mapped")?;
         let commands = markdown_declarations(self, &self.root.join(".claude/commands"), "mapped")?;
@@ -670,24 +718,63 @@ fn claude_hooks(
     source: &Path,
     settings: &Value,
 ) -> Result<Vec<Value>, CompatError> {
-    let Some(pre) = settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(Value::as_array)
-    else {
+    let Some(hooks) = settings.get("hooks") else {
         return Ok(Vec::new());
     };
-    pre.iter()
-        .map(|entry| {
-            Ok(json!({
+    let hooks = hooks
+        .as_object()
+        .ok_or_else(|| CompatError::Parse("hooks must be an object".into()))?;
+    let mut mapped = Vec::new();
+    for (original_event, entries) in hooks {
+        let event = match original_event.as_str() {
+            "PreToolUse" => "before_operation",
+            "PostToolUse" => "after_operation",
+            "PostToolUseFailure" => "operation_failed",
+            "SessionStart" => "session_started",
+            "SessionEnd" => "session_ended",
+            "UserPromptSubmit" => "before_turn",
+            "Stop" => "after_turn",
+            "PreCompact" => "before_compaction",
+            _ => "unsupported",
+        };
+        let entries = entries
+            .as_array()
+            .ok_or_else(|| CompatError::Parse("hook event must contain an array".into()))?;
+        for entry in entries {
+            let matcher = match entry.get("matcher") {
+                None => "*",
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| CompatError::Parse("hook matcher must be a string".into()))?,
+            };
+            let handlers = entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .ok_or_else(|| CompatError::Parse("hook entry requires a hooks array".into()))?;
+            for handler in handlers {
+                let kind = required_json_string(handler, "type")?;
+                let key = match kind {
+                    "command" => "command",
+                    "prompt" | "agent" => "prompt",
+                    "http" => "url",
+                    _ => continue,
+                };
+                if required_json_string(handler, key)?.trim().is_empty() {
+                    return Err(CompatError::Parse("hook handler must not be empty".into()));
+                }
+            }
+            mapped.push(json!({
                 "source": importer.source(source)?,
-                "event": "before_operation",
-                "matcher": map_tool(required_json_string(entry, "matcher")?).unwrap_or("unknown"),
-                "effect": "external_command",
-                "level": "mapped",
-            }))
-        })
-        .collect()
+                "event": event,
+                "original_event": original_event,
+                "matcher": map_tool(matcher).unwrap_or(matcher),
+                "effect": if handlers.iter().all(|handler| handler["type"] == "command") { "external_command" } else { "external_hook" },
+                "handlers": handlers.iter().map(|handler| json!({"type": handler.get("type"), "status": "not_loaded"})).collect::<Vec<_>>(),
+                "level": if event == "unsupported" { "unsupported" } else { "mapped" },
+            }));
+        }
+    }
+    Ok(mapped)
 }
 
 fn mcp_json(
@@ -699,22 +786,15 @@ fn mcp_json(
         return Ok(Vec::new());
     }
     let value: Value = serde_json::from_str(&importer.read(path)?)?;
-    let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
+    let Some(servers) = value.get("mcpServers") else {
         return Ok(Vec::new());
     };
+    let servers = servers
+        .as_object()
+        .ok_or_else(|| CompatError::Parse("mcpServers must be an object".into()))?;
     servers
         .iter()
-        .map(|(name, server)| {
-            Ok(json!({
-                "source": importer.source(path)?,
-                "name": name,
-                "transport": server.get("type").and_then(Value::as_str).unwrap_or("stdio"),
-                "command": required_json_string(server, "command")?,
-                "args": server.get("args").cloned().unwrap_or_else(|| json!([])),
-                "trust": "untrusted",
-                "level": level,
-            }))
-        })
+        .map(|(name, server)| mcp_definition(importer.source(path)?, name, server, level))
         .collect()
 }
 
@@ -723,35 +803,88 @@ fn mcp_toml(
     source: &Path,
     value: Option<&toml::Value>,
 ) -> Result<Vec<Value>, CompatError> {
-    let Some(servers) = value.and_then(toml::Value::as_table) else {
+    let Some(value) = value else {
         return Ok(Vec::new());
     };
+    let servers = value
+        .as_table()
+        .ok_or_else(|| CompatError::Parse("mcp_servers must be a table".into()))?;
     servers
         .iter()
         .map(|(name, server)| {
-            let server = server
-                .as_table()
-                .ok_or_else(|| CompatError::Parse(format!("MCP server {name} must be a table")))?;
-            let args = server
-                .get("args")
-                .and_then(toml::Value::as_array)
-                .map(|args| {
-                    args.iter()
-                        .filter_map(toml::Value::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            Ok(json!({
-                "source": importer.source(source)?,
-                "name": name,
-                "transport": "stdio",
-                "command": string(server, "command")?,
-                "args": args,
-                "trust": "untrusted",
-                "level": "mapped",
-            }))
+            mcp_definition(
+                importer.source(source)?,
+                name,
+                &serde_json::to_value(server)?,
+                "mapped",
+            )
         })
         .collect()
+}
+
+fn mcp_definition(
+    source: String,
+    name: &str,
+    server: &Value,
+    level: &str,
+) -> Result<Value, CompatError> {
+    if !server.is_object() || name.trim().is_empty() {
+        return Err(CompatError::Parse(
+            "MCP definition requires a name and object".into(),
+        ));
+    }
+    let transport = match server.get("type") {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| CompatError::Parse("MCP type must be a string".into()))?,
+        None if server.get("url").is_some() => "http",
+        None => "stdio",
+    };
+    let mut result = json!({"source": source, "name": name, "transport": transport, "trust": "untrusted", "level": level});
+    match transport {
+        "stdio" => {
+            let command = required_json_string(server, "command")?;
+            if command.trim().is_empty() || server.get("url").is_some() {
+                return Err(CompatError::Parse(
+                    "stdio MCP requires a non-empty command and no URL".into(),
+                ));
+            }
+            let args = server.get("args").cloned().unwrap_or_else(|| json!([]));
+            if !args
+                .as_array()
+                .is_some_and(|args| args.iter().all(Value::is_string))
+            {
+                return Err(CompatError::Parse(
+                    "MCP args must be an array of strings".into(),
+                ));
+            }
+            result["command"] = json!(command);
+            result["args"] = args;
+        }
+        "http" | "sse" => {
+            let url = required_json_string(server, "url")?;
+            if !(url.starts_with("https://") || url.starts_with("http://"))
+                || url.chars().any(char::is_whitespace)
+                || server.get("command").is_some()
+            {
+                return Err(CompatError::Parse(
+                    "HTTP MCP requires an HTTP(S) URL and no command".into(),
+                ));
+            }
+            result["url"] = json!(url);
+            if transport == "sse" {
+                result["level"] = json!("unsupported");
+            }
+        }
+        _ => return Err(CompatError::Parse("unsupported MCP transport".into())),
+    }
+    if let Some(enabled) = server.get("enabled") {
+        if !enabled.is_boolean() {
+            return Err(CompatError::Parse("MCP enabled must be a boolean".into()));
+        }
+        result["enabled"] = enabled.clone();
+    }
+    Ok(result)
 }
 
 fn existing_sources<const N: usize>(
@@ -1000,6 +1133,67 @@ impl From<serde_json::Error> for CompatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_transports_and_arguments_are_validated_without_executing() {
+        let parse = |value| mcp_definition("config".into(), "docs", &value, "mapped");
+        let http = parse(json!({"url": "https://example.test/mcp", "enabled": false, "headers": {"Authorization": "never display"}})).unwrap();
+        assert_eq!(http["transport"], "http");
+        assert_eq!(http["enabled"], false);
+        assert!(http.get("headers").is_none());
+        for bad in [
+            json!({"command": ""}),
+            json!({"command": "node", "args": [1]}),
+            json!({"command": "node", "url": "https://example.test"}),
+            json!({"url": "file:///private"}),
+            json!({"command": "node", "enabled": "yes"}),
+            json!({"type": 4}),
+        ] {
+            assert!(parse(bad).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        fs::write(&config, "").unwrap();
+        let importer = CompatibilityImporter::new(root.path());
+        let bad: toml::Value =
+            toml::from_str("[docs]\ncommand = 'node'\nargs = ['valid', 1]").unwrap();
+        assert!(mcp_toml(&importer, &config, Some(&bad)).is_err());
+    }
+
+    #[test]
+    fn hooks_preserve_events_matchers_and_override_origin_without_executing() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".claude")).unwrap();
+        let local = root.path().join(".claude/settings.local.json");
+        fs::write(&local, json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "never execute"}]}],
+            "PostToolUse": [{"matcher": "Bash|Read", "hooks": [{"type": "prompt", "prompt": "inspect"}]}],
+            "FutureEvent": [{"hooks": [{"type": "future"}]}]
+        }}).to_string()).unwrap();
+        let importer = CompatibilityImporter::new(root.path());
+        let report = importer
+            .import(Ecosystem::Claude, root.path(), "hooks")
+            .unwrap();
+        let hooks = report.canonical["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 3);
+        assert!(hooks.iter().all(|hook| hook["source"]
+            .as_str()
+            .unwrap()
+            .ends_with("settings.local.json")));
+        assert!(hooks
+            .iter()
+            .any(|hook| hook["event"] == "unsupported" && hook["level"] == "unsupported"));
+        assert!(hooks
+            .iter()
+            .any(|hook| hook["matcher"] == "Bash|Read" && hook["effect"] == "external_hook"));
+        for bad in [
+            json!({"hooks": []}),
+            json!({"hooks": {"Stop": {}}}),
+            json!({"hooks": {"Stop": [{"hooks": [{"type": "command"}]}]}}),
+        ] {
+            assert!(claude_hooks(&importer, &local, &bad).is_err());
+        }
+    }
 
     #[test]
     fn sensitive_unknowns_and_unsafe_sandboxes_fail_closed() {

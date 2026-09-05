@@ -23,6 +23,6 @@
     {"source": "input/packages/api/.omp/extensions/audit.ts", "name": "fixture-audit", "code_execution": "quarantined", "level": "parsed"}
   ],
   "mcp": [
-    {"source": "input/packages/api/.omp/mcp.json", "name": "docs", "transport": "stdio", "command": "node", "args": ["docs-server.js"], "trust": "untrusted", "level": "behavior-tested"}
+    {"source": "input/packages/api/.omp/mcp.json", "name": "docs", "transport": "stdio", "command": "node", "args": ["docs-server.js"], "enabled": true, "trust": "untrusted", "level": "behavior-tested"}
   ]
 }

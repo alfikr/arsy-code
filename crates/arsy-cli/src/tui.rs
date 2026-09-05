@@ -16,9 +16,11 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MAX_TIMELINE_EVENTS: usize = 1_000;
 const DEFAULT_WIDTH: usize = 80;
+const DEFAULT_HEIGHT: usize = 24;
 const MIN_WIDTH: usize = 20;
 
 /// brainless palette, as truecolor SGR prefixes.
@@ -53,10 +55,16 @@ pub struct RawTerminal {
 }
 
 impl RawTerminal {
-    pub fn acquire() -> Self {
-        let saved = stty(&["-g"]).map(|mode| mode.trim().to_owned()).ok();
-        let _ = stty(&["-echo", "-icanon", "-isig", "min", "1", "time", "0"]);
-        Self { saved }
+    pub fn acquire() -> std::io::Result<Self> {
+        let saved = stty(&["-g"])?;
+        let terminal = Self {
+            saved: Some(saved.trim().to_owned()),
+        };
+        stty(&["-echo", "-icanon", "-isig", "min", "1", "time", "0"])?;
+        let mut stdout = std::io::stdout();
+        write!(stdout, "\x1b[?2004h")?;
+        stdout.flush()?;
+        Ok(terminal)
     }
 }
 
@@ -64,6 +72,9 @@ impl Drop for RawTerminal {
     /// Runs on every exit path, including unwind, so the shell is never left
     /// in raw mode.
     fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = write!(stdout, "\x1b[?2004l{RESET}");
+        let _ = stdout.flush();
         let _ = match &self.saved {
             Some(mode) => stty(&[mode]),
             None => stty(&["sane"]),
@@ -76,13 +87,18 @@ fn stty(args: &[&str]) -> std::io::Result<String> {
         .args(args)
         .stdin(Stdio::inherit())
         .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(
+            "stty could not configure the terminal",
+        ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Read stdin bytes on a thread, so the main loop can watch keys and provider
 /// output at the same time — that is what makes a turn interruptible.
 pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4096);
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut byte = [0_u8; 1];
@@ -103,6 +119,9 @@ pub enum Key {
     Right,
     Home,
     End,
+    Delete,
+    Up,
+    Down,
     Enter,
     /// Ctrl-C, or Escape once it is known to stand alone.
     Interrupt,
@@ -115,12 +134,22 @@ pub enum Key {
 #[derive(Default)]
 pub struct Keys {
     pending: Vec<u8>,
+    pasting: bool,
 }
 
 impl Keys {
     pub fn feed(&mut self, byte: u8) -> Option<Key> {
         if self.pending.first() == Some(&0x1b) {
             return self.feed_escape(byte);
+        }
+        if self.pasting && matches!(byte, b'\r' | b'\n' | b'\t') {
+            return Some(Key::Char(' '));
+        }
+        if self.pasting && byte != 0x1b && (byte < 0x20 || byte == 0x7f) {
+            return None;
+        }
+        if byte < 0x80 && !self.pending.is_empty() {
+            self.pending.clear();
         }
         match byte {
             0x03 => return Some(Key::Interrupt),
@@ -159,11 +188,29 @@ impl Keys {
             return self.feed(byte).or(Some(Key::Interrupt));
         }
         self.pending.push(byte);
+        if self.pending.len() > 32 {
+            self.pending.clear();
+            return None;
+        }
         if !(0x40..=0x7e).contains(&byte) || self.pending.len() == 2 {
             return None;
         }
         let sequence = std::mem::take(&mut self.pending);
+        if sequence == b"\x1b[200~" {
+            self.pasting = true;
+            return None;
+        }
+        if sequence == b"\x1b[201~" {
+            self.pasting = false;
+            return None;
+        }
+        if self.pasting {
+            return None;
+        }
         match (sequence.last(), sequence.get(2)) {
+            (Some(b'A'), _) => Some(Key::Up),
+            (Some(b'B'), _) => Some(Key::Down),
+            (Some(b'~'), Some(b'3')) => Some(Key::Delete),
             (Some(b'D'), _) => Some(Key::Left),
             (Some(b'C'), _) => Some(Key::Right),
             (Some(b'H'), _) | (Some(b'~'), Some(b'1')) => Some(Key::Home),
@@ -175,10 +222,11 @@ impl Keys {
     /// A lone Escape is only distinguishable from a sequence by the absence of
     /// what would follow it, so the caller reports the pause.
     pub fn flush_escape(&mut self) -> Option<Key> {
-        (self.pending.as_slice() == [0x1b]).then(|| {
+        let interrupt = self.pending.as_slice() == [0x1b] && !self.pasting;
+        if self.pending.first() == Some(&0x1b) && !self.pasting {
             self.pending.clear();
-            Key::Interrupt
-        })
+        }
+        interrupt.then_some(Key::Interrupt)
     }
 }
 
@@ -191,6 +239,51 @@ pub enum Action {
     None,
 }
 
+/// The slash commands the composer offers and `/help` prints. One table, so a
+/// command cannot appear in the menu and not in the help, or the reverse.
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/model", "choose the provider model"),
+    (
+        "/mcp",
+        "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
+    ),
+    ("/hooks", "inspect Claude hooks; list, --event NAME"),
+    ("/help", "show these actions"),
+    ("/quit", "exit"),
+];
+
+/// ponytail: the menu is capped rather than scrolled. Five commands never reach
+/// the cap; give it a window over `menu()` if the surface outgrows it.
+const MENU_ROWS: usize = 8;
+
+/// What `/help` prints, built from the same table the menu offers.
+pub fn help(colour: bool) -> String {
+    let label = COMMANDS
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut text = String::new();
+    for (name, description) in COMMANDS {
+        text.push_str(&format!(
+            "  {}{}{}\n",
+            paint(colour, ACCENT, name),
+            " ".repeat(label - name.chars().count() + 2),
+            paint(colour, DIM, description),
+        ));
+    }
+    for line in [
+        "Type / to open this menu; Up/Down: input history, or the menu while one is open",
+        "Enter: take the highlighted command, or send a line that is already one",
+        "Esc/Ctrl-C: cancel turn · Ctrl-D: exit on empty input",
+        "MCP connections and executable hooks are not loaded by ARSY; imported declarations grant no authority.",
+    ] {
+        text.push_str(&paint(colour, DIM, line));
+        text.push('\n');
+    }
+    text
+}
+
 /// The input line ARSY owns: its text, its caret, and how many rows it last
 /// painted. Nothing else writes to those rows, so redrawing is exact.
 #[derive(Default)]
@@ -198,19 +291,114 @@ pub struct Composer {
     buffer: String,
     caret: usize,
     drawn: bool,
+    history: std::collections::VecDeque<String>,
+    history_index: Option<usize>,
+    draft: String,
+    /// Which menu row Up/Down has landed on, clamped to the matches on use.
+    selected: usize,
+    /// Set while the line is a picker answer rather than a task, so the menu
+    /// does not offer commands that the picker would not accept.
+    picking: bool,
+    /// Terminal rows, refreshed with the width; `0` means not measured yet.
+    height: usize,
 }
 
 impl Composer {
+    pub fn restore(&mut self, text: String) {
+        self.caret = text.chars().count();
+        self.buffer = text;
+        self.selected = 0;
+    }
+
+    /// The commands the line offers right now.
+    ///
+    /// The menu is only open while the line is still one word: once an argument
+    /// is being typed the command is already chosen, and a list of commands
+    /// would cover the terminal for the rest of the line.
+    pub fn set_picking(&mut self, picking: bool) {
+        self.picking = picking;
+        self.selected = 0;
+    }
+
+    /// Measured with the width, and on the same schedule.
+    pub fn set_height(&mut self, rows: usize) {
+        self.height = rows;
+    }
+
+    pub fn menu(&self) -> Vec<(&'static str, &'static str)> {
+        if self.picking || !self.buffer.starts_with('/') || self.buffer.contains(' ') {
+            return Vec::new();
+        }
+        COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(&self.buffer))
+            .take(self.menu_capacity())
+            .copied()
+            .collect()
+    }
+
+    /// How many menu rows the terminal can hold.
+    ///
+    /// The block is four fixed rows — pad, input, pad, status — and the caret is
+    /// returned to the input row by counting rows upward. A block taller than
+    /// the screen scrolls, that count then lands on the wrong row, and the next
+    /// repaint erases scrollback instead of the block. So the menu takes only
+    /// the rows that are left.
+    fn menu_capacity(&self) -> usize {
+        match self.height {
+            0 => MENU_ROWS,
+            rows => MENU_ROWS.min(rows.saturating_sub(4)),
+        }
+    }
     pub fn press(&mut self, key: Key) -> Action {
         match key {
-            Key::Char(character) => {
+            Key::Char(character) if !character.is_control() => {
                 self.buffer.insert(self.byte_at(self.caret), character);
                 self.caret += 1;
+                self.selected = 0;
                 Action::Redraw
             }
             Key::Backspace if self.caret > 0 => {
                 self.buffer.remove(self.byte_at(self.caret - 1));
                 self.caret -= 1;
+                self.selected = 0;
+                Action::Redraw
+            }
+            Key::Delete if self.caret < self.buffer.chars().count() => {
+                self.buffer.remove(self.byte_at(self.caret));
+                self.selected = 0;
+                Action::Redraw
+            }
+            // An open menu owns Up/Down: it is the list in front of the reader,
+            // and history is still one Escape or Backspace away.
+            Key::Up if !self.menu().is_empty() => {
+                self.selected = self.selected.saturating_sub(1);
+                Action::Redraw
+            }
+            Key::Down if !self.menu().is_empty() => {
+                self.selected = (self.selected + 1).min(self.menu().len() - 1);
+                Action::Redraw
+            }
+            Key::Up if !self.history.is_empty() => {
+                let index = match self.history_index {
+                    Some(index) => index.saturating_sub(1),
+                    None => {
+                        self.draft = self.buffer.clone();
+                        self.history.len() - 1
+                    }
+                };
+                self.history_index = Some(index);
+                self.buffer = self.history[index].clone();
+                self.caret = self.buffer.chars().count();
+                Action::Redraw
+            }
+            Key::Down if self.history_index.is_some() => {
+                let index = self.history_index.unwrap() + 1;
+                self.history_index = (index < self.history.len()).then_some(index);
+                self.buffer = self
+                    .history_index
+                    .map_or_else(|| self.draft.clone(), |index| self.history[index].clone());
+                self.caret = self.buffer.chars().count();
                 Action::Redraw
             }
             Key::Left if self.caret > 0 => {
@@ -229,7 +417,22 @@ impl Composer {
                 self.caret = self.buffer.chars().count();
                 Action::Redraw
             }
-            Key::Enter => Action::Submit(self.take()),
+            // Enter takes the highlighted command, unless the line already is
+            // one: otherwise a typed-out `/quit` would refuse to send itself.
+            Key::Enter if self.completion().is_some() => {
+                self.restore(self.completion().unwrap_or_default());
+                Action::Redraw
+            }
+            Key::Enter => {
+                let line = self.take();
+                if !line.trim().is_empty() && self.history.back() != Some(&line) {
+                    self.history.push_back(line.clone());
+                    if self.history.len() > 100 {
+                        self.history.pop_front();
+                    }
+                }
+                Action::Submit(line)
+            }
             // Ctrl-C clears a drafted line first, and only quits once there is
             // nothing left to lose.
             Key::Interrupt if !self.buffer.is_empty() => {
@@ -241,8 +444,19 @@ impl Composer {
         }
     }
 
+    /// The command Enter would fill in, or `None` when the line is already one
+    /// and Enter should send it.
+    fn completion(&self) -> Option<String> {
+        let menu = self.menu();
+        let selected = menu.get(self.selected.min(menu.len().checked_sub(1)?))?;
+        (!menu.iter().any(|(name, _)| *name == self.buffer)).then(|| selected.0.to_owned())
+    }
+
     fn take(&mut self) -> String {
         self.caret = 0;
+        self.history_index = None;
+        self.selected = 0;
+        self.draft.clear();
         std::mem::take(&mut self.buffer)
     }
 
@@ -253,15 +467,18 @@ impl Composer {
             .map_or(self.buffer.len(), |(at, _)| at)
     }
 
-    /// Paint the block — pad, input, pad, status — and leave the caret in the
-    /// input line where the next character belongs.
+    /// Paint the block — pad, input, pad, menu, status — and leave the caret in
+    /// the input line where the next character belongs.
     ///
     /// A previous block is erased first: the caret always rests on the input
-    /// row, one row into the block.
+    /// row, one row into the block, so clearing from the row above removes the
+    /// whole block however tall the menu made it.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
         let width = width.max(MIN_WIDTH);
+        let status = fit(status, width.saturating_sub(1));
         let room = width.saturating_sub(3);
         let (text, caret) = self.window(room);
+        let menu = self.menu_rows(width, colour);
         let mut frame = String::new();
         if self.drawn {
             frame.push_str(RESET);
@@ -276,7 +493,7 @@ impl Composer {
             String::new()
         };
         frame.push_str(&format!(
-            "{surface}\n{surface}{} {text}{}\n{surface}{}\n{status}",
+            "{surface}\n{surface}{} {text}{}\n{surface}{}\n",
             if colour {
                 format!("{INPUT_BG}›")
             } else {
@@ -285,10 +502,44 @@ impl Composer {
             if colour { CLEAR_EOL } else { "" },
             if colour { RESET } else { "" },
         ));
-        // Back onto the input row, then across `› ` and the text before the
-        // caret. Nothing here can wrap: `window` bounded the text to the row.
-        frame.push_str(&format!("\x1b[2A\r\x1b[{}C", caret + 2));
+        for row in &menu {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        frame.push_str(&status);
+        // Back onto the input row, over the pad, the menu, and the status row,
+        // then across `› ` and the text before the caret. Nothing here can wrap:
+        // `window` bounded the text and `fit` bounded every other row.
+        frame.push_str(&format!("\x1b[{}A\r\x1b[{}C", menu.len() + 2, caret + 2));
         frame
+    }
+
+    /// One row per offered command, marked at the selection.
+    fn menu_rows(&self, width: usize, colour: bool) -> Vec<String> {
+        let menu = self.menu();
+        let Some(last) = menu.len().checked_sub(1) else {
+            return Vec::new();
+        };
+        let selected = self.selected.min(last);
+        let label = menu
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        menu.iter()
+            .enumerate()
+            .map(|(index, (name, description))| {
+                let chosen = index == selected;
+                let row = format!(
+                    "  {} {}{}{}",
+                    paint(colour, ACCENT, if chosen { "›" } else { " " }),
+                    paint(colour, if chosen { ACCENT } else { BULLET }, name),
+                    " ".repeat(label - name.chars().count() + 2),
+                    paint(colour, DIM, description),
+                );
+                fit(&row, width)
+            })
+            .collect()
     }
 
     /// Erase the block so turn output starts on a clean row, and keep the
@@ -313,17 +564,23 @@ impl Composer {
     /// wrapping, which would break the block's row count.
     fn window(&self, room: usize) -> (String, usize) {
         let characters: Vec<char> = self.buffer.chars().collect();
-        if characters.len() < room {
-            return (self.buffer.clone(), self.caret);
+        let budget = room.saturating_sub(1);
+        let width = |character: &char| character.width().unwrap_or(0);
+        let mut start = self.caret;
+        let mut caret = 0;
+        while start > 0 && caret + width(&characters[start - 1]) <= budget {
+            start -= 1;
+            caret += width(&characters[start]);
         }
-        let last = room.saturating_sub(1);
-        let start = self.caret.saturating_sub(last);
-        (
-            characters[start..(start + last).min(characters.len())]
-                .iter()
-                .collect(),
-            self.caret - start,
-        )
+        let mut used = 0;
+        let text = characters[start..]
+            .iter()
+            .take_while(|character| {
+                used += width(character);
+                used <= budget
+            })
+            .collect();
+        (text, caret)
     }
 }
 
@@ -350,11 +607,86 @@ const LOGO: [&str; 11] = [
 ];
 
 fn paint(colour: bool, code: &str, text: &str) -> String {
+    let text = safe_text(text);
     if colour {
         format!("{code}{text}{RESET}")
     } else {
         text.to_owned()
     }
+}
+
+/// External text cannot move the cursor, set a title, or access the clipboard.
+pub fn safe_text(text: &str) -> String {
+    crate::terminal_text(text)
+}
+
+/// A provider must be reaped even when rendering or reading its stream fails.
+pub struct ProviderChild(pub std::process::Child);
+
+impl ProviderChild {
+    pub fn stop(&mut self, force: bool) {
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .args([
+                if force { "-KILL" } else { "-TERM" },
+                "--",
+                &format!("-{}", self.0.id()),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("taskkill");
+            command.args(["/PID", &self.0.id().to_string(), "/T"]);
+            if force {
+                command.arg("/F");
+            }
+            let _ = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if force {
+            let _ = self.0.kill();
+        }
+    }
+}
+
+impl Drop for ProviderChild {
+    fn drop(&mut self) {
+        self.stop(true);
+        let _ = self.0.wait();
+    }
+}
+
+pub fn provider_lines(
+    reader: impl std::io::Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    use std::io::{BufRead, Read};
+    let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(reader);
+        loop {
+            let mut bytes = Vec::new();
+            let line = match Read::take(&mut reader, 1_048_577).read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) if bytes.len() > 1_048_576 => {
+                    Err(std::io::Error::other("provider event exceeds 1 MiB"))
+                }
+                Ok(_) => String::from_utf8(bytes)
+                    .map_err(|_| std::io::Error::other("provider event is not UTF-8")),
+                Err(error) => Err(error),
+            };
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -593,13 +925,20 @@ pub fn render_codex_event(line: &str, colour: bool) -> Option<String> {
     match event.get("type")?.as_str()? {
         // Working is transient composer status, not permanent scrollback.
         "turn.started" => None,
-        "item.completed" => render_codex_item(event.get("item")?, colour),
+        "item.started" | "item.updated" | "item.completed" => {
+            render_codex_item(event.get("item")?, colour)
+        }
         "error" => Some(error_row(
             colour,
             event.get("message").and_then(Value::as_str)?,
         )),
-        // `turn.failed` repeats the `error` event verbatim, and a failure with
-        // no `error` still reaches the caller as a non-zero exit status.
+        "turn.failed" => Some(error_row(
+            colour,
+            event
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Turn failed"),
+        )),
         _ => None,
     }
 }
@@ -684,7 +1023,15 @@ fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
             colour,
             item_status(item),
             &format!("{}.{}", text("server"), text("tool")),
-            None,
+            Some(
+                item.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| match item.get("status").and_then(Value::as_str) {
+                        Some("in_progress") => "→ running",
+                        Some("failed") => "→ failed",
+                        _ => "→ done",
+                    }),
+            ),
         )),
         "web_search" => Some(exec_row(
             colour,
@@ -840,27 +1187,80 @@ pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) 
 
 /// Resolve a picker answer: a list index, a slug typed in full, or an empty
 /// line to keep the current model.
-pub fn resolve_model(answer: &str, models: &[ModelChoice], current: &ModelRoute) -> ModelRoute {
+///
+/// A rejected answer is returned as the sentence to show, because the picker is
+/// the only guard before the slug is passed to the provider CLI *and* written to
+/// the user configuration: an accepted typo would otherwise fail every later
+/// turn, in every later session, with a provider error that names the wrong
+/// cause.
+pub fn resolve_model(
+    answer: &str,
+    models: &[ModelChoice],
+    current: &ModelRoute,
+) -> Result<ModelRoute, String> {
     let answer = answer.trim();
-    let model = match answer.parse::<usize>() {
-        Ok(number) => models
-            .get(number.checked_sub(1).unwrap_or(usize::MAX))
-            .map_or_else(|| current.model.clone(), |choice| choice.slug.clone()),
-        Err(_) if answer.is_empty() => current.model.clone(),
-        Err(_) => answer.to_owned(),
-    };
-    ModelRoute { model }
+    if answer.is_empty() {
+        return Ok(current.clone());
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return match number.checked_sub(1).and_then(|index| models.get(index)) {
+            Some(choice) => Ok(ModelRoute {
+                model: choice.slug.clone(),
+            }),
+            None if models.is_empty() => Err("no models are listed; type a model slug".to_owned()),
+            None => Err(format!("no model {number}; choose 1-{}", models.len())),
+        };
+    }
+    validate_slug(answer)?;
+    Ok(ModelRoute {
+        model: answer.to_owned(),
+    })
+}
+
+/// Accept what a provider slug can contain and nothing else. The picker shares
+/// its line with the composer, so a mistyped slash command arrives here as text.
+pub fn validate_slug(slug: &str) -> Result<(), String> {
+    // The length is checked first because the messages below quote the answer,
+    // and a paste arrives here as one line: bracketed paste turns a whole file
+    // into a single composer line, which must not be echoed back in full.
+    if slug.chars().count() > 64 {
+        return Err("a model slug is at most 64 characters".to_owned());
+    }
+    if slug.starts_with('/') {
+        return Err(format!(
+            "`{slug}` is a command, not a model; press Enter to keep the current one"
+        ));
+    }
+    if !slug.chars().any(char::is_alphanumeric)
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/'))
+    {
+        return Err(format!(
+            "`{slug}` is not a model slug; use letters, digits, or - . _ : /"
+        ));
+    }
+    Ok(())
 }
 
 /// `stty size` is asked first: `COLUMNS` is inherited from the shell and goes
 /// stale as soon as the window is resized.
 pub fn terminal_width() -> usize {
+    terminal_size(1, "COLUMNS", DEFAULT_WIDTH)
+}
+
+/// Rows, read the same way and on the same schedule as the width.
+pub fn terminal_rows() -> usize {
+    terminal_size(0, "LINES", DEFAULT_HEIGHT)
+}
+
+fn terminal_size(field: usize, variable: &str, default: usize) -> usize {
     stty(&["size"])
         .ok()
-        .and_then(|size| size.split_whitespace().nth(1)?.parse().ok())
-        .or_else(|| std::env::var("COLUMNS").ok().and_then(|v| v.parse().ok()))
-        .filter(|width| *width > 0)
-        .unwrap_or(DEFAULT_WIDTH)
+        .and_then(|size| size.split_whitespace().nth(field)?.parse().ok())
+        .or_else(|| std::env::var(variable).ok().and_then(|v| v.parse().ok()))
+        .filter(|size| *size > 0)
+        .unwrap_or(default)
 }
 
 /// Strip SGR escapes (`ESC [ ... m`) so padding counts printed columns only.
@@ -883,7 +1283,7 @@ fn strip_sgr(text: &str) -> String {
 }
 
 fn visible_len(text: &str) -> usize {
-    strip_sgr(text).chars().count()
+    UnicodeWidthStr::width(strip_sgr(text).as_str())
 }
 
 /// Truncate to `width` printed columns, keeping the SGR escapes that styled
@@ -907,11 +1307,12 @@ fn fit(text: &str, width: usize) -> String {
             }
             continue;
         }
-        if printed == budget {
+        let columns = character.width().unwrap_or(0);
+        if printed + columns > budget {
             break;
         }
         out.push(character);
-        printed += 1;
+        printed += columns;
     }
     out.push('…');
     if out.contains('\x1b') {
@@ -1043,7 +1444,7 @@ mod tests {
         );
         assert_eq!(
             row(r#"{"type":"turn.failed","error":{"message":"x"}}"#),
-            None
+            Some("  • x".into())
         );
         assert_eq!(
             row(r#"{"type":"error","message":"You've hit your usage limit."}"#).as_deref(),
@@ -1091,18 +1492,45 @@ mod tests {
         let current = ModelRoute {
             model: "gpt-5.6-luna".into(),
         };
-        let pick = |answer: &str| resolve_model(answer, &models, &current).model;
+        let pick = |answer: &str| resolve_model(answer, &models, &current);
 
-        assert_eq!(pick("1"), "gpt-5.6-sol");
-        assert_eq!(pick(""), "gpt-5.6-luna", "empty keeps the current model");
-        assert_eq!(pick("9"), "gpt-5.6-luna", "out of range keeps it");
-        assert_eq!(pick("0"), "gpt-5.6-luna", "zero keeps it");
-        assert_eq!(pick("o3-custom"), "o3-custom", "free text is a slug");
+        assert_eq!(pick("1").unwrap().model, "gpt-5.6-sol");
         assert_eq!(
-            pick("  2  "),
+            pick("").unwrap().model,
+            "gpt-5.6-luna",
+            "empty keeps the current model"
+        );
+        assert_eq!(
+            pick("  2  ").unwrap().model,
             "gpt-5.6-luna",
             "surrounding space is ignored"
         );
+        assert_eq!(pick("o3-custom").unwrap().model, "o3-custom");
+        assert_eq!(
+            pick("openai/gpt-5.6:high").unwrap().model,
+            "openai/gpt-5.6:high"
+        );
+
+        // A rejected answer keeps the current model and says why, because an
+        // accepted one is written to the user configuration and would then
+        // fail every later turn in every later session.
+        for (answer, expected) in [
+            ("9", "choose 1-2"),
+            ("0", "choose 1-2"),
+            ("/model gpt-5.6-luna", "is a command"),
+            ("gpt 5.6", "not a model slug"),
+            ("!!", "not a model slug"),
+        ] {
+            let reason = pick(answer).unwrap_err();
+            assert!(reason.contains(expected), "{answer}: {reason}");
+        }
+        assert!(validate_slug("").is_err(), "an empty slug is not a model");
+        assert!(validate_slug(&"a".repeat(65)).is_err());
+        // A rejection quotes the answer, so an oversized one is refused on its
+        // length before any message can echo it back.
+        let pasted = format!("/{}", "x ".repeat(4096));
+        let reason = validate_slug(&pasted).unwrap_err();
+        assert!(reason.len() < 128, "{} bytes echoed", reason.len());
 
         // Every model is offered, and the current one is marked.
         let mut listing = Vec::new();
@@ -1179,6 +1607,228 @@ mod tests {
         assert_eq!(keys.feed(0x1b), None);
         assert_eq!(keys.flush_escape(), Some(Key::Interrupt));
         assert_eq!(keys.flush_escape(), None, "only fires once");
+    }
+
+    #[test]
+    fn paste_history_delete_and_wide_input_remain_editable() {
+        let mut keys = Keys::default();
+        let mut composer = Composer::default();
+        for byte in b"\x1b[200~first\nsecond\x03\x1b[201~" {
+            if let Some(key) = keys.feed(*byte) {
+                assert_ne!(key, Key::Enter);
+                assert_ne!(key, Key::Interrupt);
+                composer.press(key);
+            }
+        }
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("first second".into())
+        );
+        composer.press(Key::Char('x'));
+        composer.press(Key::Up);
+        assert_eq!(composer.buffer, "first second");
+        composer.press(Key::Down);
+        assert_eq!(composer.buffer, "x");
+        composer.press(Key::Home);
+        composer.press(Key::Delete);
+        assert_eq!(composer.buffer, "");
+        composer.restore("界界界界界界界界界界".into());
+        let (text, caret) = composer.window(10);
+        assert!(UnicodeWidthStr::width(text.as_str()) < 10);
+        assert_eq!(caret, UnicodeWidthStr::width(text.as_str()));
+        let frame = composer.render(
+            20,
+            false,
+            "status that is much longer than the terminal window",
+        );
+        assert!(frame.split('\n').nth(1).unwrap().width() < 20);
+        assert_eq!(
+            safe_text("hello\x1b]52;c;clipboard\x07\rworld"),
+            "hello]52;c;clipboardworld"
+        );
+        keys.feed(0xc3);
+        assert_eq!(keys.feed(b'a'), Some(Key::Char('a')));
+        for byte in b"\x1b[123" {
+            keys.feed(*byte);
+        }
+        keys.flush_escape();
+        assert_eq!(keys.feed(b'b'), Some(Key::Char('b')));
+    }
+
+    #[test]
+    fn mcp_progress_and_failures_are_visible_and_provider_frames_are_bounded() {
+        let progress = render_codex_event(r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"docs","tool":"search","status":"in_progress"}}"#, false).unwrap();
+        assert!(progress.contains("docs.search"));
+        assert!(progress.contains("running"));
+        let failure = render_codex_event(r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"docs","tool":"search","status":"failed","error":{"message":"connection lost"}}}"#, false).unwrap();
+        assert!(failure.contains("connection lost"));
+        let events = provider_lines(std::io::Cursor::new(vec![b'x'; 1_048_577]));
+        assert!(events
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("1 MiB"));
+        let events = provider_lines(std::io::Cursor::new(b"{}\n\xff\n"));
+        assert_eq!(
+            events
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            "{}\n"
+        );
+        assert!(events
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_ignoring_termination_can_be_forced_and_reaped() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("sh")
+            .args([
+                "-c",
+                "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done",
+            ])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child = ProviderChild(child);
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        child.stop(false);
+        assert!(child.0.try_wait().unwrap().is_none());
+        child.stop(true);
+        assert!(!child.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_slash_opens_a_command_menu_that_arrows_select_and_enter_takes() {
+        let mut composer = Composer::default();
+        composer.history.push_back("an earlier task".into());
+        assert!(composer.menu().is_empty(), "a task line offers no menu");
+
+        composer.press(Key::Char('/'));
+        assert_eq!(composer.menu().len(), COMMANDS.len(), "`/` offers them all");
+
+        // Up/Down move the selection, and history stays out of the way while
+        // the menu is the list in front of the reader.
+        assert_eq!(composer.press(Key::Down), Action::Redraw);
+        assert_eq!(composer.press(Key::Down), Action::Redraw);
+        assert_eq!(composer.press(Key::Up), Action::Redraw);
+        assert_eq!(composer.selected, 1);
+        assert_eq!(composer.buffer, "/", "history did not replace the line");
+        for _ in 0..COMMANDS.len() + 3 {
+            composer.press(Key::Down);
+        }
+        assert_eq!(
+            composer.selected,
+            COMMANDS.len() - 1,
+            "the selection stops at the last row"
+        );
+        composer.press(Key::Up);
+
+        // Enter takes the highlighted command; a second Enter sends it, so a
+        // line that is already a command is never held back.
+        let highlighted = COMMANDS[COMMANDS.len() - 2].0;
+        assert_eq!(composer.press(Key::Enter), Action::Redraw);
+        assert_eq!(composer.buffer, highlighted);
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit(highlighted.to_owned())
+        );
+
+        // Typing narrows the list; an argument closes it, so Enter sends the
+        // whole line instead of completing the command again.
+        for character in "/mo".chars() {
+            composer.press(Key::Char(character));
+        }
+        assert_eq!(
+            composer.menu(),
+            vec![("/model", "choose the provider model")]
+        );
+        for character in " x".chars() {
+            composer.press(Key::Char(character));
+        }
+        assert!(composer.menu().is_empty(), "an argument closes the menu");
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("/mo x".to_owned())
+        );
+
+        // The picker collects an answer, not a command, so it offers no menu.
+        composer.set_picking(true);
+        composer.press(Key::Char('/'));
+        assert!(composer.menu().is_empty(), "the picker offers no commands");
+        assert_eq!(composer.press(Key::Enter), Action::Submit("/".to_owned()));
+
+        // `/help` and the menu are the same table, so neither can list a
+        // command the other does not.
+        let help = help(false);
+        for (name, description) in COMMANDS {
+            assert!(help.contains(name), "{name} is missing from /help");
+            assert!(help.contains(description), "{name} has no description");
+        }
+        assert!(help.contains("Up/Down: input history"));
+    }
+
+    #[test]
+    fn the_menu_extends_the_block_and_the_caret_still_lands_on_the_input() {
+        let mut composer = Composer::default();
+        composer.press(Key::Char('/'));
+        let frame = composer.render(80, false, "  status");
+        let rows: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(
+            rows.len(),
+            4 + COMMANDS.len(),
+            "pad, input, pad, one row per command, status"
+        );
+        assert!(rows[3].contains("› /model"), "{:?}", rows[3]);
+        assert!(rows[4].starts_with("    "), "only one row is marked");
+        for row in &rows {
+            assert!(visible_len(row) <= 80, "{row:?}");
+        }
+        // Up over the pad, the menu, and the status row, then across `› /`.
+        assert!(
+            frame.ends_with(&format!("\x1b[{}A\r\x1b[3C", COMMANDS.len() + 2)),
+            "{frame:?}"
+        );
+
+        // A block taller than the screen would scroll, and the caret count back
+        // to the input row would then land on the wrong one, so the menu takes
+        // only the rows the terminal has left after pad, input, pad and status.
+        composer.set_height(7);
+        assert_eq!(composer.menu().len(), 3);
+        assert_eq!(
+            composer.render(80, false, "  status").split('\n').count(),
+            7
+        );
+        composer.set_height(4);
+        assert!(composer.menu().is_empty(), "no room leaves no menu");
+        let frame = composer.render(80, false, "  status");
+        assert_eq!(frame.split('\n').count(), 4);
+        assert!(frame.ends_with("\x1b[2A\r\x1b[3C"), "{frame:?}");
+        composer.set_height(0);
+
+        // A narrowed list shrinks the block, and the previous one is erased
+        // from the row above the input whatever height it had.
+        composer.press(Key::Char('q'));
+        let frame = composer.render(80, false, "  status");
+        assert!(frame.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
+        assert_eq!(
+            frame.split('\n').count(),
+            5,
+            "pad, input, pad, /quit, status"
+        );
+        assert!(frame.ends_with("\x1b[3A\r\x1b[4C"), "{frame:?}");
     }
 
     #[test]

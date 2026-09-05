@@ -18,6 +18,7 @@
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
 mod eval;
+mod integrations;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -53,8 +54,6 @@ const UNAVAILABLE: &[(&str, u8)] = &[
     ("completions", 1),
     ("config", 1),
     ("gc", 1),
-    ("hook", 8),
-    ("mcp", 5),
     ("migrate", 1),
     ("model", 2),
     ("plugin", 8),
@@ -75,6 +74,9 @@ Usage:
   arsy doctor                report platform, sandbox, credential, and config state
   arsy eval <SUITE>          run a pinned evaluation fixture
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
+  arsy mcp list [--source <KIND>]       inspect imported MCP declarations
+  arsy mcp show <NAME> [--source <KIND>] show one MCP declaration
+  arsy hook list [--event <NAME>]      inspect imported lifecycle hooks
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
@@ -179,6 +181,12 @@ pub enum Command {
     CompatExplain {
         ecosystem: arsy_code::compat::Ecosystem,
     },
+    Inspect {
+        kind: String,
+        name: Option<String>,
+        source: Option<String>,
+        event: Option<String>,
+    },
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -205,6 +213,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             command,
         ));
     }
+    if (parsed.source.is_some() || parsed.event.is_some())
+        && !matches!(parsed.name.as_deref(), Some("mcp" | "hook"))
+    {
+        return Err(usage(
+            "--source and --event apply only to MCP/hook inspection",
+        ));
+    }
     let command = match parsed.name.as_deref() {
         None => Command::Tui,
         Some("run") => Command::Run {
@@ -221,6 +236,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        Some("mcp" | "hook") => integrations::parse(
+            parsed.name.as_deref().unwrap(),
+            parsed.positional,
+            parsed.source,
+            parsed.event,
+        )?,
         Some(other) => return Err(unknown_command(other)),
     };
     Ok(invocation(
@@ -242,6 +263,8 @@ struct ParsedArguments {
     handle: Option<String>,
     trials: Option<u32>,
     out: Option<PathBuf>,
+    source: Option<String>,
+    event: Option<String>,
     name: Option<String>,
     positional: Vec<String>,
     early: Option<Command>,
@@ -305,6 +328,8 @@ fn apply_value_flag(
             );
         }
         "--out" => parsed.out = Some(PathBuf::from(value(arguments, argument)?)),
+        "--source" => parsed.source = Some(value(arguments, argument)?),
+        "--event" => parsed.event = Some(value(arguments, argument)?),
         _ => return Ok(false),
     }
     Ok(true)
@@ -479,8 +504,8 @@ impl Emitter {
                     io::stderr(),
                     "ARSY {severity} {} {}\n  {}",
                     diagnostic.code,
-                    message,
-                    remediation
+                    terminal_text(&message),
+                    terminal_text(&remediation)
                 );
             }
         }
@@ -525,9 +550,15 @@ impl Emitter {
 
 fn plain(value: &Value) -> String {
     match value {
-        Value::String(text) => text.clone(),
+        Value::String(text) => terminal_text(text),
         other => other.to_string(),
     }
+}
+
+fn terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
 }
 
 /// Parse and execute one invocation, returning the process exit code.
@@ -548,6 +579,9 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I, tty: bool) -> i32 {
         Ok(code) => code,
         Err(diagnostic) => {
             emitter.diagnostic(&diagnostic);
+            if emitter.output == Output::Json {
+                emitter.result(json!({"status": "failed", "code": diagnostic.code}));
+            }
             diagnostic.exit_code()
         }
     }
@@ -567,6 +601,9 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             "ARSY-SCH-1003",
             "the interactive TUI requires a terminal",
             "there is no terminal; use `arsy run <TASK>`",
+        )),
+        Command::Tui if emitter.output != Output::Human => Err(usage(
+            "the TUI requires human output; use an explicit command with --output json or ci",
         )),
         #[cfg(feature = "tui")]
         Command::Tui => run_tui(invocation, emitter),
@@ -591,6 +628,26 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             Ok(0)
         }
         Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
+        Command::Inspect {
+            kind,
+            name,
+            source,
+            event,
+        } => {
+            let report = integrations::inspect(
+                &workspace_root(&invocation.workspace)?,
+                kind,
+                name.as_deref(),
+                source.as_deref(),
+                event.as_deref(),
+            )?;
+            emitter.result(if emitter.output == Output::Json {
+                report
+            } else {
+                integrations::human_report(&report, kind, source.as_deref(), event.as_deref())
+            });
+            Ok(0)
+        }
     }
 }
 
@@ -760,13 +817,11 @@ enum Prompt {
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
-    let Some(detected) = tui::detect_model_route() else {
-        return Err(Diagnostic::error(
-            "ARSY-PRV-1000",
-            "no logged-in Codex CLI was detected",
-            "install Codex and run `codex login`, then retry",
-        ));
-    };
+    let detected = tui::detect_model_route();
+    let provider_available = detected.is_some();
+    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
+        model: "default".into(),
+    });
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
     let models = tui::available_models();
     let mut route = saved_model().map_or(detected, |model| tui::ModelRoute { model });
@@ -774,10 +829,18 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+    writeln!(
+        stdout,
+        "Use /help for commands, /mcp and /hooks to inspect integrations."
+    )
+    .map_err(terminal_failed)?;
+    if !provider_available {
+        writeln!(stdout, "Provider unavailable. Inspection is available; install Codex and run codex login to execute tasks.").map_err(terminal_failed)?;
+    }
 
     // ARSY paints the input line from here on, so it owns the terminal modes
     // and is the only reader of stdin.
-    let _raw = tui::RawTerminal::acquire();
+    let _raw = tui::RawTerminal::acquire().map_err(terminal_failed)?;
     let keys = tui::spawn_key_reader();
     let mut decoder = tui::Keys::default();
     let mut composer = tui::Composer::default();
@@ -785,8 +848,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // A remembered model skips the picker; `/model` reopens it.
     // A line submitted while a turn was running runs next, before stdin is
     // read again.
-    let mut queued: Option<String> = None;
-    let mut prompt = if saved_model().is_some() {
+    let mut queued = std::collections::VecDeque::new();
+    let mut prompt = if saved_model().is_some() || !provider_available {
         Prompt::Task
     } else {
         tui::render_model_list(&mut stdout, &models, &route, colour).map_err(terminal_failed)?;
@@ -798,30 +861,48 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task => state.status_row(tui::terminal_width(), colour),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
         };
-        let line = match queued.take() {
+        // Derived from the prompt once per line, so the command menu can never
+        // drift out of step with which prompt is collecting the answer.
+        composer.set_picking(matches!(prompt, Prompt::Model));
+        let line = match queued.pop_front() {
             Some(line) => line,
-            None => {
-                let Some(line) = read_line(
-                    &keys,
-                    &mut decoder,
-                    &mut composer,
-                    &mut stdout,
-                    colour,
-                    &status,
-                )?
-                else {
-                    break;
-                };
-                line
-            }
+            None => match read_line(
+                &keys,
+                &mut decoder,
+                &mut composer,
+                &mut stdout,
+                colour,
+                &status,
+            )? {
+                Some(line) => line,
+                // Ending input at the picker cancels the picker, not the
+                // session: the model is unchanged and the task prompt returns.
+                None if matches!(prompt, Prompt::Model) => {
+                    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                    writeln!(stdout, "Model unchanged: {route}").map_err(terminal_failed)?;
+                    prompt = Prompt::Task;
+                    continue;
+                }
+                None => break,
+            },
         };
         match prompt {
             Prompt::Model => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                route = tui::resolve_model(&line, &models, &route);
-                remember_model(&route, emitter);
-                state.set_model_route(route.clone());
-                prompt = Prompt::Task;
+                match tui::resolve_model(&line, &models, &route) {
+                    Ok(picked) => {
+                        route = picked;
+                        remember_model(&route, emitter);
+                        state.set_model_route(route.clone());
+                        writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
+                        prompt = Prompt::Task;
+                    }
+                    // The picker stays open so the answer can be retyped
+                    // against the list that is already on screen.
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
             }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -829,13 +910,51 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     .map_err(terminal_failed)?;
                 prompt = Prompt::Model;
             }
-            Prompt::Task if line.trim() == ":quit" => break,
+            Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
+            Prompt::Task if line.trim().starts_with('/') => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let mut words = line.split_whitespace();
+                let command = words.next().unwrap_or_default();
+                if command == "/help" {
+                    write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed)?;
+                } else if matches!(command, "/mcp" | "/hooks") {
+                    let kind = if command == "/mcp" { "mcp" } else { "hook" };
+                    let mut args = vec![kind.to_owned()];
+                    args.extend(words.map(str::to_owned));
+                    if args.get(1).is_none_or(|arg| arg.starts_with("--")) {
+                        args.insert(1, "list".into());
+                    }
+                    match parse(args) {
+                        Ok(parsed) => {
+                            let inspection = Invocation {
+                                command: parsed.command,
+                                ..invocation.clone()
+                            };
+                            if let Err(diagnostic) = execute(&inspection, false, emitter) {
+                                emitter.diagnostic(&diagnostic);
+                            }
+                        }
+                        Err(diagnostic) => emitter.diagnostic(&diagnostic),
+                    }
+                } else {
+                    writeln!(stdout, "Unknown command. Use /help for available actions.")
+                        .map_err(terminal_failed)?;
+                }
+            }
             Prompt::Task if line.trim().is_empty() => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
             }
             Prompt::Task => {
                 write!(stdout, "{}", composer.commit(&line, colour)).map_err(terminal_failed)?;
                 stdout.flush().map_err(terminal_failed)?;
+                if !provider_available {
+                    emitter.diagnostic(&Diagnostic::error(
+                        "ARSY-PRV-1000",
+                        "provider unavailable",
+                        "run codex login and restart ARSY; /mcp and /hooks remain available",
+                    ));
+                    continue;
+                }
                 match run_external(
                     invocation,
                     &line,
@@ -847,7 +966,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     emitter,
                 ) {
                     Ok(turn) if turn.quit => break,
-                    Ok(turn) => queued = turn.queued,
+                    Ok(turn) => {
+                        if turn.interrupted {
+                            queued.clear();
+                        }
+                        queued.extend(turn.queued);
+                    }
                     Err(diagnostic) => emitter.diagnostic(&diagnostic),
                 }
             }
@@ -871,20 +995,30 @@ fn read_line(
     colour: bool,
     status: &str,
 ) -> Result<Option<String>, Diagnostic> {
+    let mut width = tui::terminal_width();
+    composer.set_height(tui::terminal_rows());
+    let mut measured = std::time::Instant::now();
     loop {
-        write!(
-            stdout,
-            "{}",
-            composer.render(tui::terminal_width(), colour, status)
-        )
-        .map_err(terminal_failed)?;
+        let refreshed = std::time::Instant::now();
+        if measured.elapsed() >= std::time::Duration::from_secs(1) {
+            width = tui::terminal_width();
+            composer.set_height(tui::terminal_rows());
+            measured = std::time::Instant::now();
+        }
+        write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
         loop {
             // The timeout is what tells a lone Escape apart from the start of
             // an arrow-key sequence.
             let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
                 Ok(byte) => decoder.feed(byte),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let key = decoder.flush_escape();
+                    if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_secs(1) {
+                        break;
+                    }
+                    key
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
             };
             let Some(key) = key else { continue };
@@ -918,11 +1052,15 @@ fn model_store() -> Option<PathBuf> {
     Some(user_config()?.with_file_name("model"))
 }
 
+/// A remembered model is re-validated on read: a file written by an older build
+/// that accepted anything must not keep selecting an unusable model on every
+/// later start.
 #[cfg(feature = "tui")]
 fn saved_model() -> Option<String> {
     let model = std::fs::read_to_string(model_store()?).ok()?;
     let model = model.trim();
-    (!model.is_empty()).then(|| model.to_owned())
+    tui::validate_slug(model).ok()?;
+    Some(model.to_owned())
 }
 
 #[cfg(feature = "tui")]
@@ -957,7 +1095,13 @@ fn run_external(
         keys,
         decoder,
         composer,
+        &emitter.redactor,
     );
+    if outcome.is_err() {
+        let mut stdout = io::stdout();
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+    }
     let (turn, status) = match outcome {
         Ok(turn) => {
             let status = turn.status.ok_or(turn.interrupted);
@@ -998,7 +1142,7 @@ fn run_external(
         return Ok(turn);
     }
     match status {
-        Ok(status) if status.success() => {
+        Ok(status) if status.success() && !turn.provider_failed => {
             let outcome = json!({"provider": "codex", "model": route.model});
             service
                 .complete_turn(actor, admission.turn, &outcome)
@@ -1019,7 +1163,11 @@ fn run_external(
                 actor,
                 admission.turn,
                 session,
-                format!("{route} exited with status {status}"),
+                if turn.provider_failed {
+                    format!("{route} reported a failed turn")
+                } else {
+                    format!("{route} exited with status {status}")
+                },
                 emitter,
             )?;
         }
@@ -1049,6 +1197,7 @@ fn external_status(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    redactor: &Redactor,
 ) -> io::Result<Turn> {
     let mut command = std::process::Command::new("codex");
     command.args([
@@ -1064,43 +1213,66 @@ fn external_status(
         command.args(["--model", &route.model]);
     }
     command.arg("-");
-    let mut child = command
-        .current_dir(workspace)
+    command.current_dir(workspace);
+    drive_provider(command, task, colour, keys, decoder, composer, redactor)
+}
+
+#[cfg(feature = "tui")]
+fn drive_provider(
+    mut command: std::process::Command,
+    task: &str,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    redactor: &Redactor,
+) -> io::Result<Turn> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        // `--json` reports failures as `error` events, so the human-formatted
-        // copy on stderr would only duplicate them inside the rendered turn.
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    if let Err(error) = child
-        .stdin
-        .take()
-        .expect("piped stdin is available")
-        .write_all(task.as_bytes())
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
+    let mut child = tui::ProviderChild(child);
+    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
+    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
+        let _ = io::copy(&mut stderr, &mut io::sink());
+        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
+    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
+    let task = task.to_owned();
+    let (sent, input) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sent.send(stdin.write_all(task.as_bytes()));
+    });
     // The event stream is read on a thread so the main loop can also watch the
     // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
     // the composer alive and typeable while the provider works.
-    let stdout = child.stdout.take().expect("piped stdout is available");
-    let (rows, events) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in io::BufRead::lines(io::BufReader::new(stdout)) {
-            let Ok(line) = line else { break };
-            if rows.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let pid = child.id();
+    let stdout = child.0.stdout.take().expect("piped stdout is available");
+    let events = tui::provider_lines(stdout);
+    let started = std::time::Instant::now();
+    let mut cancelling = None;
+    let mut stream_closed = false;
+    let mut finished = false;
+    let mut last_row = None;
+    let mut last_key = std::time::Instant::now();
+    let mut exited = None;
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
-    let working_status = tui::working_row(colour);
-    let draw = |terminal: &mut io::Stdout, composer: &mut tui::Composer, row: Option<&str>| {
+    let width = std::cell::Cell::new(tui::terminal_width());
+    composer.set_height(tui::terminal_rows());
+    let draw = |terminal: &mut io::Stdout,
+                composer: &mut tui::Composer,
+                row: Option<&str>,
+                cancelling: bool,
+                queued: usize| {
         // Rows land above the composer, which is torn down and repainted around
         // each one so the input block is never overwritten.
         let mut frame = composer.clear();
@@ -1108,13 +1280,75 @@ fn external_status(
             frame.push_str(row);
             frame.push('\n');
         }
-        frame.push_str(&composer.render(tui::terminal_width(), colour, &working_status));
+        // The queue is only mentioned once there is one: a permanent `0 queued`
+        // is noise on the line the terminal shows for the whole turn.
+        let status = format!(
+            "{} · {}s{} · Esc cancel",
+            if cancelling {
+                "  Cancelling…".to_owned()
+            } else {
+                tui::working_row(colour)
+            },
+            started.elapsed().as_secs(),
+            if queued == 0 {
+                String::new()
+            } else {
+                format!(" · {queued} queued")
+            }
+        );
+        frame.push_str(&composer.render(width.get(), colour, &status));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
-    draw(&mut terminal, composer, None)?;
+    draw(&mut terminal, composer, None, false, 0)?;
+    let mut refreshed = std::time::Instant::now();
     loop {
+        if let Ok(result) = input.try_recv() {
+            if !outcome.interrupted {
+                result?;
+            }
+        }
+        if outcome.status.is_none() {
+            outcome.status = child.0.try_wait()?;
+            if outcome.status.is_some() {
+                exited = Some(std::time::Instant::now());
+                child.stop(true);
+            }
+        }
+        if exited
+            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            break;
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(300) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "provider exceeded the 300-second turn deadline",
+            ));
+        }
+        if cancelling
+            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            child.stop(true);
+            outcome.status = Some(child.0.wait()?);
+            break;
+        }
         let mut typed = false;
-        while let Ok(byte) = keys.try_recv() {
+        for _ in 0..256 {
+            let byte = match keys.try_recv() {
+                Ok(byte) => byte,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    outcome.quit = true;
+                    if cancelling.is_none() {
+                        cancelling = Some(std::time::Instant::now());
+                        child.stop(false);
+                        outcome.interrupted = true;
+                        outcome.queued.clear();
+                    }
+                    break;
+                }
+            };
+            last_key = std::time::Instant::now();
             let Some(key) = decoder.feed(byte) else {
                 continue;
             };
@@ -1122,49 +1356,143 @@ fn external_status(
             // never the composer or the session — and it drops a queued
             // follow-up, which was only queued to run after this turn.
             if key == tui::Key::Interrupt {
-                outcome.queued = None;
+                outcome.queued.clear();
                 if !outcome.interrupted {
                     outcome.interrupted = true;
-                    terminate(pid);
-                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                    cancelling = Some(std::time::Instant::now());
+                    child.stop(false);
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::interrupted_row(colour)),
+                        true,
+                        0,
+                    )?;
                 }
                 continue;
             }
             match composer.press(key) {
                 // A line sent while the provider is busy runs as soon as this
                 // turn ends, rather than being dropped or blocking.
-                tui::Action::Submit(line) => outcome.queued = Some(line),
-                tui::Action::Quit => outcome.quit = true,
+                tui::Action::Submit(line) if !line.trim().is_empty() => {
+                    if outcome.queued.len() < 16 {
+                        outcome.queued.push_back(line);
+                        draw(
+                            &mut terminal,
+                            composer,
+                            Some("  Follow-up queued."),
+                            cancelling.is_some(),
+                            outcome.queued.len(),
+                        )?;
+                    } else {
+                        composer.restore(line);
+                        draw(
+                            &mut terminal,
+                            composer,
+                            Some("  Queue full; draft retained."),
+                            cancelling.is_some(),
+                            outcome.queued.len(),
+                        )?;
+                    }
+                }
+                tui::Action::Submit(_) => typed = true,
+                tui::Action::Quit => {
+                    outcome.quit = true;
+                    outcome.interrupted = true;
+                    outcome.queued.clear();
+                    if cancelling.is_none() {
+                        cancelling = Some(std::time::Instant::now());
+                        child.stop(false);
+                    }
+                }
                 tui::Action::Redraw => typed = true,
                 tui::Action::None => {}
             }
         }
-        if typed {
-            draw(&mut terminal, composer, None)?;
+        if last_key.elapsed() >= std::time::Duration::from_millis(40)
+            && decoder.flush_escape() == Some(tui::Key::Interrupt)
+            && !outcome.interrupted
+        {
+            outcome.interrupted = true;
+            outcome.queued.clear();
+            cancelling = Some(std::time::Instant::now());
+            child.stop(false);
+            draw(
+                &mut terminal,
+                composer,
+                Some(&tui::interrupted_row(colour)),
+                true,
+                0,
+            )?;
+        }
+        let resize_tick = refreshed.elapsed() >= std::time::Duration::from_secs(1);
+        if resize_tick {
+            width.set(tui::terminal_width());
+            composer.set_height(tui::terminal_rows());
+            refreshed = std::time::Instant::now();
+        }
+        if typed || resize_tick {
+            draw(
+                &mut terminal,
+                composer,
+                None,
+                cancelling.is_some(),
+                outcome.queued.len(),
+            )?;
         }
         match events.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(_) if outcome.interrupted => {}
             Ok(line) => {
+                let line = line?;
+                let line = redactor.sanitize(&line).map_err(io::Error::other)?;
+                let event = serde_json::from_str::<Value>(&line)
+                    .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
+                if matches!(
+                    event["type"].as_str(),
+                    Some("turn.completed" | "turn.failed")
+                ) {
+                    finished = true;
+                }
+                outcome.provider_failed |= event["type"] == "turn.failed";
                 // A killed provider still flushes buffered events; showing them
                 // after the interrupt notice would contradict it.
                 if !outcome.interrupted {
                     if let Some(row) = tui::render_codex_event(&line, colour) {
-                        draw(&mut terminal, composer, Some(&row))?;
+                        if last_row.as_ref() != Some(&row) {
+                            draw(
+                                &mut terminal,
+                                composer,
+                                Some(&row),
+                                false,
+                                outcome.queued.len(),
+                            )?;
+                        }
+                        last_row = Some(row);
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if decoder.flush_escape() == Some(tui::Key::Interrupt) && !outcome.interrupted {
-                    outcome.interrupted = true;
-                    terminate(pid);
-                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
-                }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stream_closed = true,
+        }
+        if stream_closed {
+            if outcome.status.is_some() {
+                break;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
     write!(terminal, "{}", composer.clear())?;
     terminal.flush()?;
-    outcome.status = Some(child.wait()?);
+    if !outcome.interrupted && !finished {
+        let detail = error_output
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap_or_default();
+        let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
+        return Err(io::Error::other(format!(
+            "provider closed its stream without a terminal turn event: {}",
+            terminal_text(detail.trim())
+        )));
+    }
     Ok(outcome)
 }
 
@@ -1174,20 +1502,10 @@ fn external_status(
 struct Turn {
     status: Option<std::process::ExitStatus>,
     interrupted: bool,
+    provider_failed: bool,
     /// A line submitted while this turn was still running.
-    queued: Option<String>,
+    queued: std::collections::VecDeque<String>,
     quit: bool,
-}
-
-/// Ask the provider to stop. `SIGTERM` first is enough for the Codex CLI; the
-/// wait that follows reaps it either way.
-#[cfg(feature = "tui")]
-fn terminate(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
 }
 
 #[cfg(feature = "tui")]
@@ -1555,6 +1873,54 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    #[cfg(all(feature = "tui", unix))]
+    #[test]
+    fn interactive_provider_cancellation_and_terminal_failures_are_bounded() {
+        use std::time::{Duration, Instant};
+        let (sender, keys) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            sender.send(0x1b).unwrap();
+            // Keep input open until cancellation has had time to finish.
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "trap '' TERM; while :; do printf '%s\\n' '{\"type\":\"turn.started\"}'; sleep 0.01; done"]);
+        let started = Instant::now();
+        let result = drive_provider(
+            command,
+            &"x".repeat(131_072),
+            false,
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+        assert!(result.interrupted);
+        assert!(!result.quit, "Escape cancels the turn, not the session");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        worker.join().unwrap();
+
+        let (_sender, keys) = std::sync::mpsc::channel();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "read task; printf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"test failure\"}}'"]);
+        let result = drive_provider(
+            command,
+            "task\n",
+            false,
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+        assert!(
+            result.provider_failed,
+            "a zero process exit must not mask a failed turn"
+        );
+    }
 
     #[test]
     fn auth_entry_points_parse_without_accepting_a_secret_argument() {
