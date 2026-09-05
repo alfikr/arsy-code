@@ -25,9 +25,15 @@ effect), and its trust and mapping level. `--output json` carries the full recor
 An empty result names the files that were read and the filters that were applied.
 
 In a TUI build (`cargo build -p arsy-cli --features tui`), use `/help`, `/mcp`,
-`/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. These work even
-without provider authentication. Repeat an inspection to reload its source files.
-Unknown slash commands report an error instead of becoming model prompts.
+`/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. The same route
+carries the other read-only inspections under their own names: `/settings [KEY]`
+for `config explain`, `/doctor`, `/auth` for the credential listing, and
+`/compat claude|codex|omp|agents`. Each expands to the CLI command it stands for
+and is parsed by the same grammar, so an unsupported argument is refused with the
+CLI's diagnostic. No slash command mutates state: `auth set`, `auth login`, and
+`auth remove` are not reachable from the TUI. These work even without provider
+authentication. Repeat an inspection to reload its source files. Unknown slash
+commands report an error instead of becoming model prompts.
 
 Typing `/` opens a command menu under the composer, one row per command with its
 description, narrowed as the line is typed and closed once an argument follows.
