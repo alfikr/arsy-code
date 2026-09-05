@@ -26,7 +26,11 @@ pub mod tui;
 use arsy_kernel::{
     domain::{Principal, SessionId},
     event::EventStore,
-    protocol::{ClientRequest, Extensions, ProtocolEnvelope, TurnStart},
+    protocol::{ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope, TurnStart},
+    provider::{
+        CanonicalModelRequest, ModelContent, ModelEvent, ModelKey, ModelMessage, ModelProvider,
+        ModelRole, ProviderError,
+    },
     secret::{
         CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
         OS_STORE_ID,
@@ -464,6 +468,8 @@ struct Emitter {
     session: Option<SessionId>,
     sequence: u64,
     redactor: Redactor,
+    /// Whether streamed text is mid-line, so the next output can start clean.
+    streaming: bool,
 }
 
 impl Emitter {
@@ -473,6 +479,7 @@ impl Emitter {
             session: None,
             sequence: 0,
             redactor: Redactor::new(),
+            streaming: false,
         }
     }
 
@@ -539,6 +546,32 @@ impl Emitter {
         });
         if let Ok(record) = self.redactor.sanitize(&record.to_string()) {
             let _ = writeln!(io::stdout(), "{record}");
+        }
+    }
+
+    /// One chunk of streamed model text.
+    ///
+    /// Human output writes it straight through so a reply appears as it is
+    /// produced; machine output makes each chunk its own record, because a
+    /// JSON-lines consumer cannot read a partial line.
+    fn delta(&mut self, text: &str) {
+        match self.output {
+            Output::Json => self.record("model.delta", json!({"text": text})),
+            _ => {
+                let Ok(text) = self.redactor.sanitize(text) else {
+                    return;
+                };
+                let mut stdout = io::stdout();
+                let _ = write!(stdout, "{text}").and_then(|()| stdout.flush());
+                self.streaming = true;
+            }
+        }
+    }
+
+    /// Close a run of streamed text so the next line starts on its own.
+    fn end_deltas(&mut self) {
+        if std::mem::take(&mut self.streaming) {
+            let _ = writeln!(io::stdout());
         }
     }
 
@@ -1294,31 +1327,146 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         task.to_owned()
     };
     let task = prepare_task(&task, emitter)?;
-    let (service, actor, admission, session) = record_turn(invocation, task, emitter)?;
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
 
-    // ponytail: the turn is durable before dispatch, so this failure is
-    // recoverable by `arsy resume`. Direct provider transport is not wired yet;
-    // the interactive TUI can use a logged-in Codex CLI without copying its token.
-    let diagnostic = Diagnostic::error(
-        ARSY_PRV_1000,
-        "no provider credential is available, so the turn was not dispatched",
-        "use the interactive TUI with a logged-in Codex CLI",
-    );
-    service
-        .fail_turn(
-            actor,
-            admission.turn,
-            "provider_auth",
-            diagnostic.message.clone(),
-        )
-        .map_err(storage_failed)?;
-    emitter.diagnostic(&diagnostic);
-    emitter.result(json!({
+    // Resolved before the turn is recorded: a misconfiguration is the
+    // operator's to fix, not a failed turn in their session history.
+    let resolved = load_config(&root, &working).and_then(|config| {
+        let resolved = provider::resolve(&config, None)?;
+        let model = resolved
+            .endpoint
+            .model
+            .clone()
+            .or_else(|| config.model_default().map(str::to_owned))
+            .ok_or_else(|| {
+                Diagnostic::error(
+                    ARSY_PRV_1000,
+                    format!(
+                        "provider `{}` does not say which model to use",
+                        resolved.endpoint.id
+                    ),
+                    "set `model` on the provider endpoint, or `model.default`, in config.toml",
+                )
+            })?;
+        Ok((resolved, model))
+    });
+    let (resolved, model) = match resolved {
+        Ok(resolved) => resolved,
+        Err(mut diagnostic) => {
+            if diagnostic.code == ARSY_PRV_1000 {
+                diagnostic.remediation = format!(
+                    "{}; or use the interactive TUI with a logged-in Codex CLI",
+                    diagnostic.remediation
+                );
+            }
+            emitter.diagnostic(&diagnostic);
+            return Ok(diagnostic.exit_code());
+        }
+    };
+
+    let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    let request = CanonicalModelRequest {
+        model: ModelKey {
+            provider: resolved.endpoint.id.clone(),
+            model,
+        },
+        system: None,
+        messages: vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text { text: task }],
+        }],
+        // Operations are not dispatched from this path yet, so offering tools
+        // would invite calls nothing can run.
+        tools: Vec::new(),
+        max_output_tokens: resolved.endpoint.max_output_tokens,
+        // The turn id, so a retried attempt is provably the same request.
+        idempotency_key: IdempotencyKey::new(admission.turn.to_string())
+            .map_err(|error| storage_failed(error.to_string()))?,
+    };
+
+    let outcome = dispatch(resolved.provider.as_ref(), &request, emitter);
+    let record = json!({
         "session": session.to_string(),
         "turn": admission.turn.to_string(),
-        "status": "failed",
-    }));
-    Ok(diagnostic.exit_code())
+        "provider": resolved.endpoint.id,
+        "model": request.model.model,
+    });
+    match outcome {
+        Ok(usage) => {
+            let mut outcome = record.clone();
+            merge(&mut outcome, usage);
+            service
+                .complete_turn(actor, admission.turn, &outcome)
+                .map_err(storage_failed)?;
+            let mut result = outcome;
+            merge(&mut result, json!({"status": "completed"}));
+            emitter.result(result);
+            Ok(0)
+        }
+        Err(error) => {
+            let diagnostic = Diagnostic::error(
+                ARSY_PRV_1000,
+                error.to_string(),
+                "check the provider endpoint, credential, and model in `arsy config explain`",
+            );
+            // The turn is durable before dispatch, so a failure here stays
+            // recoverable through `arsy resume`.
+            service
+                .fail_turn(actor, admission.turn, error.code(), error.to_string())
+                .map_err(storage_failed)?;
+            emitter.diagnostic(&diagnostic);
+            let mut result = record;
+            merge(&mut result, json!({"status": "failed"}));
+            emitter.result(result);
+            Ok(diagnostic.exit_code())
+        }
+    }
+}
+
+/// Stream one turn, rendering it as it arrives, and report what it used.
+///
+/// A tool call cannot be honoured from this path, so one is reported rather
+/// than silently dropped: a caller that sees `stop: tool_use` and no result
+/// would otherwise think the model simply stopped.
+fn dispatch(
+    provider: &dyn ModelProvider,
+    request: &CanonicalModelRequest,
+    emitter: &mut Emitter,
+) -> Result<Value, ProviderError> {
+    let mut usage = json!({});
+    let stream =
+        arsy_kernel::provider::stream_with_retry(provider, request, &mut std::thread::sleep)?;
+    for event in stream {
+        match event? {
+            ModelEvent::TextDelta { text } => emitter.delta(&text),
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+            }
+            ModelEvent::ToolCallCompleted { name, .. } => {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "the model called the tool `{name}`, which this path cannot run yet"
+                )))
+            }
+            ModelEvent::Completed { .. }
+            | ModelEvent::ToolCallStarted { .. }
+            | ModelEvent::ToolCallDelta { .. } => {}
+        }
+    }
+    emitter.end_deltas();
+    Ok(usage)
+}
+
+/// Fold `extra`'s fields into `target`, which is always an object here.
+fn merge(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic> {
