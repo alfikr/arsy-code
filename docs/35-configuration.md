@@ -4,6 +4,9 @@
 
 ARSY native configuration is UTF-8 TOML named `config.toml`. Native files require `schema_version = 1`; unknown keys are errors, and unknown keys under `policy`, `sandbox`, `secrets`, or `telemetry` fail closed.
 
+The user layer's directory can be replaced with `ARSY_CONFIG_HOME`, which points a run at a
+throwaway configuration without editing the operator's own file.
+
 The resolver reads these six layers in authority order, then returns the effective value and a source trace for every key, which [`arsy config explain`](36-cli-tui.md) prints:
 
 1. enterprise `config.toml`: `/etc/arsy/` on Linux, `/Library/Application Support/ARSY/` on macOS, or `%ProgramData%\ARSY\` on Windows;
@@ -38,6 +41,17 @@ Authority classes are:
 | `provider.allowed` | array of provider IDs | all configured | intersection | ceiling |
 | `provider.residency` | array of region IDs | none | intersection | ceiling |
 | `provider.credential` | secret-handle string | none | replace | user |
+| `provider.endpoint.<id>.kind` | `"anthropic"` or `"openai"` | required | replace | user |
+| `provider.endpoint.<id>.base_url` | http/https API root | the dialect's own API | replace | user |
+| `provider.endpoint.<id>.credential` | secret-handle string | none | replace | user |
+| `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | user |
+| `provider.endpoint.<id>.model` | string | none | replace | user |
+| `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | user |
+| `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
+| `provider.endpoint.<id>.oauth.token_url` | HTTPS URL | none | replace | user |
+| `provider.endpoint.<id>.oauth.device_authorization_url` | HTTPS URL | none | replace | user |
+| `provider.endpoint.<id>.oauth.client_id` | string | none | replace | user |
+| `provider.endpoint.<id>.oauth.scopes` | array of strings | `[]` | replace | user |
 | `model.default` | string or `"auto"` | `"auto"` | replace | intent |
 | `model.allowed` | array of model IDs | all profiled | intersection | ceiling |
 | `context.max_tokens` | positive integer | `65536` | min | ceiling |
@@ -66,7 +80,45 @@ Authority classes are:
 
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
 
-Credential values are handles such as `keyring:anthropic/default`, never raw secrets. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+## Provider endpoints
+
+An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
+gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:
+
+```toml
+schema_version = 1
+
+[provider]
+default = "gateway"
+
+[provider.endpoint.gateway]
+kind        = "openai"
+base_url    = "https://gateway.internal/v1"
+credential  = "secret://os/gateway"
+model       = "qwen3-coder"
+
+[provider.endpoint.gateway.oauth]           # optional; `arsy auth login` uses it
+authorize_url            = "https://issuer.internal/authorize"
+token_url                = "https://issuer.internal/token"
+device_authorization_url = "https://issuer.internal/device"
+client_id                = "arsy"
+scopes                   = ["offline_access"]
+```
+
+`provider.endpoint.*` keys carry **user** authority and are accepted from the enterprise and user
+layers only. A `base_url` decides where prompts and a credential are sent, so a repository file
+that set one would make cloning a repository enough to redirect the model call; such a table is
+ignored with a diagnostic that `arsy config explain` prints. The transport refuses to send a
+credential over plaintext `http` unless the host is loopback, which is how a local runtime is
+reached without opening a cleartext path to the internet.
+
+A credential is looked for in the order an operator would expect to override it: the variable
+`api_key_env` names, then the keyring entry `credential` names, then the dialect's conventional
+variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but blank counts as
+absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
+are told apart by shape, and an expired access token is refreshed and written back before use.
+
+Credential values are handles such as `secret://os/gateway`, never raw secrets. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 
 ## Six-layer example
 

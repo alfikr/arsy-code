@@ -9,6 +9,10 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "Unicode-3.0",
+    # rustls and its dependencies: permissive, and equivalent in effect to MIT.
+    "ISC",
+    # webpki-roots ships the Mozilla CA set as data, not code.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
