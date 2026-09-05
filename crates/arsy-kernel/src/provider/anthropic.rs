@@ -59,13 +59,14 @@ impl<T: WireTransport> AnthropicProvider<T> {
         body.insert("stream".to_owned(), json!(true));
 
         // This dialect spends reasoning from the output budget, so the level is
-        // a share of `max_tokens`. The budget has a floor of 1024 and must stay
-        // under the budget it is taken from, so a request too small to hold both
-        // carries no thinking block rather than an argument the host rejects.
+        // a share of `max_tokens`. The budget has a floor of 1024, and thinking
+        // that consumes the whole budget leaves nothing to answer with, so the
+        // answer keeps at least that same floor and a request too small to hold
+        // both carries no thinking block at all.
         if let Some(budget) = request.effort.and_then(|effort| {
             let (numerator, denominator) = effort.thinking_share();
             let share = request.max_output_tokens / denominator * numerator;
-            let ceiling = request.max_output_tokens.checked_sub(1)?;
+            let ceiling = request.max_output_tokens.checked_sub(THINKING_FLOOR)?;
             (ceiling >= THINKING_FLOOR).then(|| share.clamp(THINKING_FLOOR, ceiling))
         }) {
             body.insert(

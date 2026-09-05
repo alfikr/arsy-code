@@ -359,6 +359,8 @@ fn collect(stream: ModelEventStream) -> Vec<ModelEvent> {
 /// before the knob existed.
 #[test]
 fn effort_becomes_a_thinking_budget_inside_the_output_budget() {
+    const THINKING_FLOOR: u32 = 1024;
+
     let provider = AnthropicProvider::with_base_url(
         "https://example.test",
         ApiKey::new("sk-test"),
@@ -397,6 +399,31 @@ fn effort_becomes_a_thinking_budget_inside_the_output_budget() {
         assert_eq!(body["thinking"]["type"], "enabled");
         body["thinking"]["budget_tokens"].as_u64().unwrap()
     };
+
+    // The floor fitting is not the same as an answer fitting: a budget must
+    // leave at least as much room to answer as it takes to think.
+    let smallest_with_thinking = (THINKING_FLOOR * 2) as u32;
+    for (max_tokens, expected) in [
+        (smallest_with_thinking - 1, None),
+        (smallest_with_thinking, Some(THINKING_FLOOR)),
+    ] {
+        let body: serde_json::Value = serde_json::from_str(
+            &provider
+                .encode(&CanonicalModelRequest {
+                    effort: Some(Effort::Low),
+                    max_output_tokens: max_tokens,
+                    ..request(Vec::new())
+                })
+                .body,
+        )
+        .unwrap();
+        assert_eq!(
+            body.get("thinking")
+                .map(|thinking| thinking["budget_tokens"].as_u64().unwrap() as u32),
+            expected,
+            "at max_tokens {max_tokens}"
+        );
+    }
 
     assert_eq!(budget(Effort::Low), 5_000);
     assert_eq!(budget(Effort::Medium), 10_000);
