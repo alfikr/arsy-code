@@ -448,8 +448,16 @@ impl Config {
             );
         }
         if let Some(raw) = string(table, "credential", &format!("{prefix}.credential"), path)? {
-            let handle = SecretHandle::try_from(raw.clone())
-                .map_err(|error| reject(format!("`{prefix}.credential` {error}")))?;
+            // The rejected value is never quoted back. This key is where an
+            // operator is most likely to paste a real API key by mistake, and
+            // a diagnostic travels to stdout, logs, and CI output long before
+            // any redaction pipeline is holding that value.
+            let handle = SecretHandle::try_from(raw.clone()).map_err(|_| {
+                reject(format!(
+                    "`{prefix}.credential` must be a handle such as \"secret://os/{id}\", not a \
+                     credential; store the value with `arsy auth set {id}` instead"
+                ))
+            })?;
             self.record(
                 layer,
                 path,
@@ -786,6 +794,31 @@ base_url = "https://user.test/v1/"
     /// The source trace exists to name the file a value came from, so a later
     /// layer that merely mentions an endpoint must not take credit for keys it
     /// never set.
+    /// A rejected credential must not be quoted back: this is the key an
+    /// operator is most likely to paste a real secret into, and a diagnostic
+    /// reaches stdout and CI logs with no redaction in front of it.
+    #[test]
+    fn a_rejected_credential_is_never_echoed() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = "sk-not-a-handle-0123456789";
+        let path = write(
+            directory.path(),
+            "user.toml",
+            &format!(
+                "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\ncredential = \"{secret}\"\n"
+            ),
+        );
+
+        let error = Config::load(&[(Layer::User, path)]).unwrap_err();
+
+        assert!(
+            !error.message.contains(secret),
+            "the diagnostic leaked the value: {}",
+            error.message
+        );
+        assert!(error.message.contains("arsy auth set p"));
+    }
+
     #[test]
     fn a_layer_only_claims_the_keys_it_set() {
         let directory = tempfile::tempdir().unwrap();
@@ -916,7 +949,7 @@ credential = "secret://os/official"
             ),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\ncredential = \"os/p\"\n",
-                "malformed",
+                "must be a handle such as \"secret://os/p\"",
             ),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\nport = 1\n",
