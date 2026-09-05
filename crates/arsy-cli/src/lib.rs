@@ -11,6 +11,7 @@
 //! | `ARSY-SCH-1003` | bare `arsy`: no terminal, or TUI disabled at build time |
 //! | `ARSY-SCH-1004` | `resume` named a session with no recorded events |
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
+//! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
@@ -18,6 +19,7 @@
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
 mod eval;
+pub mod provider;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -43,6 +45,11 @@ use std::{
 
 /// Every session of one workspace shares this store.
 const STORE_PATH: &str = ".arsy/sessions.sqlite3";
+
+/// No provider credential is available, so the turn cannot dispatch.
+pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
+/// A configuration layer could not be read or does not parse.
+pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
 /// Machine records carry the protocol's schema version.
 const RECORD_SCHEMA: u32 = 1;
 
@@ -51,7 +58,6 @@ const RECORD_SCHEMA: u32 = 1;
 const UNAVAILABLE: &[(&str, u8)] = &[
     ("artifact", 1),
     ("completions", 1),
-    ("config", 1),
     ("gc", 1),
     ("hook", 8),
     ("mcp", 5),
@@ -75,6 +81,7 @@ Usage:
   arsy doctor                report platform, sandbox, credential, and config state
   arsy eval <SUITE>          run a pinned evaluation fixture
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
+  arsy config explain [KEY]  show effective configuration and where it came from
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
@@ -179,6 +186,10 @@ pub enum Command {
     CompatExplain {
         ecosystem: arsy_code::compat::Ecosystem,
     },
+    /// `arsy config explain [KEY]`: effective values and where each came from.
+    ConfigExplain {
+        key: Option<String>,
+    },
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -221,6 +232,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             ecosystem: compatibility_kind(parsed.positional)?,
         },
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        Some("config") => parse_config(parsed.positional)?,
         Some(other) => return Err(unknown_command(other)),
     };
     Ok(invocation(
@@ -368,6 +380,18 @@ fn parse_doctor(positional: Vec<String>, strict: bool) -> Result<Command, Diagno
         return Err(usage("doctor takes no positional argument"));
     }
     Ok(Command::Doctor { strict })
+}
+
+/// `config explain [KEY]`. Only `explain` exists; the rest of the documented
+/// `config` surface belongs to a later phase.
+fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
+    match positional.first().map(String::as_str) {
+        Some("explain") if positional.len() <= 2 => Ok(Command::ConfigExplain {
+            key: positional.into_iter().nth(1),
+        }),
+        Some("explain") => Err(usage("config explain accepts only [KEY]")),
+        _ => Err(usage("config requires explain")),
+    }
 }
 
 fn parse_auth(
@@ -591,6 +615,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             Ok(0)
         }
         Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
     }
 }
 
@@ -621,6 +646,36 @@ fn compat_explain(
         })?;
     emitter.result(report.explain());
     Ok(0)
+}
+
+fn config_explain(
+    invocation: &Invocation,
+    key: Option<&str>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    emitter.result(load_config(&root, &working)?.explain(key));
+    Ok(0)
+}
+
+/// Read every configuration layer for this workspace.
+///
+/// An invalid file is fatal rather than skipped: continuing with a partly
+/// applied policy would silently run under something the operator never wrote.
+fn load_config(
+    workspace: &Path,
+    working: &Path,
+) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    arsy_kernel::config::Config::load(&arsy_kernel::config::layers(workspace, working)).map_err(
+        |error| {
+            Diagnostic::error(
+                ARSY_CFG_1000,
+                format!("configuration is unusable: {error}"),
+                "fix the reported file, then run `arsy config explain`",
+            )
+        },
+    )
 }
 
 const CATALOG_NAME: &str = "__catalog__";
@@ -762,7 +817,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut stdout = io::stdout();
     let Some(detected) = tui::detect_model_route() else {
         return Err(Diagnostic::error(
-            "ARSY-PRV-1000",
+            ARSY_PRV_1000,
             "no logged-in Codex CLI was detected",
             "install Codex and run `codex login`, then retry",
         ));
@@ -1245,7 +1300,7 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
     // recoverable by `arsy resume`. Direct provider transport is not wired yet;
     // the interactive TUI can use a logged-in Codex CLI without copying its token.
     let diagnostic = Diagnostic::error(
-        "ARSY-PRV-1000",
+        ARSY_PRV_1000,
         "no provider credential is available, so the turn was not dispatched",
         "use the interactive TUI with a logged-in Codex CLI",
     );
@@ -1387,6 +1442,27 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
         })
         .collect();
 
+    // A configured endpoint with a reachable credential is what decides
+    // whether a turn can dispatch, so report it as one fact rather than
+    // leaving an operator to infer it from the credential count.
+    let provider = match load_config(root, root) {
+        Err(diagnostic) => {
+            let value = json!({"status": "unusable", "detail": diagnostic.message});
+            warnings.push(diagnostic);
+            value
+        }
+        Ok(config) => match provider::resolve(&config, None) {
+            Ok(resolved) => json!({
+                "status": "ready",
+                "id": resolved.endpoint.id,
+                "kind": resolved.endpoint.kind.as_str(),
+                "base_url": resolved.endpoint.base_url,
+                "credential_source": resolved.source.as_str(),
+            }),
+            Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
+        },
+    };
+
     let sandbox_assurance = installed_sandbox_assurance();
     if sandbox_assurance == arsy_kernel::policy::SandboxAssurance::None {
         warnings.push(Diagnostic::warning(
@@ -1412,6 +1488,7 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
         "version": arsy_code::VERSION,
         "sandbox_assurance": sandbox_assurance.as_str(),
         "provider_auth": if credentials == 0 { "none" } else { "configured" },
+        "provider": provider,
         "storage": storage,
         "config_layers": config,
         "warnings": warnings.len(),
@@ -1571,7 +1648,7 @@ mod tests {
         assert!(data.to_string().contains("recover this exact task"));
 
         assert_eq!(doctor(&invocation, false, &mut Emitter::new(Output::Ci)), 0);
-        assert_eq!(Diagnostic::error("ARSY-PRV-1000", "", "").exit_code(), 5);
+        assert_eq!(Diagnostic::error(ARSY_PRV_1000, "", "").exit_code(), 5);
         assert_eq!(Diagnostic::error("ARSY-POL-1000", "", "").exit_code(), 3);
         assert_eq!(
             execute(
