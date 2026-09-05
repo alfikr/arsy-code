@@ -537,6 +537,49 @@ impl Composer {
             rows => MENU_ROWS.min(rows.saturating_sub(4)),
         }
     }
+    /// Move the mark over the open menu. Both ends wrap, so a short list is
+    /// never a dead end in one direction, and the index is clamped to the
+    /// current matches first: a selection left over from a wider list must not
+    /// step outside a narrowed one.
+    fn mark(&mut self, down: bool) -> Action {
+        let last = self.menu().len().saturating_sub(1);
+        let selected = self.selected.min(last);
+        self.selected = if down {
+            if selected >= last {
+                0
+            } else {
+                selected + 1
+            }
+        } else {
+            selected.checked_sub(1).unwrap_or(last)
+        };
+        Action::Redraw
+    }
+
+    /// Walk the submitted lines. Going back past the newest returns the draft
+    /// that was stashed on the way in, so browsing history cannot lose a line
+    /// that was being typed.
+    fn recall(&mut self, back: bool) -> Action {
+        self.history_index = if back {
+            Some(match self.history_index {
+                Some(index) => index.saturating_sub(1),
+                None => {
+                    self.draft = self.buffer.clone();
+                    self.history.len() - 1
+                }
+            })
+        } else {
+            self.history_index
+                .map(|index| index + 1)
+                .filter(|index| *index < self.history.len())
+        };
+        self.buffer = self
+            .history_index
+            .map_or_else(|| self.draft.clone(), |index| self.history[index].clone());
+        self.caret = self.buffer.chars().count();
+        Action::Redraw
+    }
+
     pub fn press(&mut self, key: Key) -> Action {
         match key {
             Key::Char(character) if !character.is_control() => {
@@ -559,42 +602,10 @@ impl Composer {
             // An open menu owns Up/Down: it is the list in front of the reader,
             // and history is still one Escape or Backspace away. The ends wrap,
             // so a short list is never a dead end in one direction.
-            Key::Up if !self.menu().is_empty() => {
-                let last = self.menu().len() - 1;
-                self.selected = self.selected.min(last).checked_sub(1).unwrap_or(last);
-                Action::Redraw
-            }
-            Key::Down if !self.menu().is_empty() => {
-                let last = self.menu().len() - 1;
-                self.selected = if self.selected >= last {
-                    0
-                } else {
-                    self.selected + 1
-                };
-                Action::Redraw
-            }
-            Key::Up if !self.history.is_empty() => {
-                let index = match self.history_index {
-                    Some(index) => index.saturating_sub(1),
-                    None => {
-                        self.draft = self.buffer.clone();
-                        self.history.len() - 1
-                    }
-                };
-                self.history_index = Some(index);
-                self.buffer = self.history[index].clone();
-                self.caret = self.buffer.chars().count();
-                Action::Redraw
-            }
-            Key::Down if self.history_index.is_some() => {
-                let index = self.history_index.unwrap() + 1;
-                self.history_index = (index < self.history.len()).then_some(index);
-                self.buffer = self
-                    .history_index
-                    .map_or_else(|| self.draft.clone(), |index| self.history[index].clone());
-                self.caret = self.buffer.chars().count();
-                Action::Redraw
-            }
+            Key::Up if !self.menu().is_empty() => self.mark(false),
+            Key::Down if !self.menu().is_empty() => self.mark(true),
+            Key::Up if !self.history.is_empty() => self.recall(true),
+            Key::Down if self.history_index.is_some() => self.recall(false),
             Key::Left if self.caret > 0 => {
                 self.caret -= 1;
                 Action::Redraw
