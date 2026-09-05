@@ -721,11 +721,11 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
         Command::AuthSet { provider, handle } => {
-            auth_set(provider, handle.as_deref(), tty, emitter)
+            auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
-        Command::AuthList => auth_list(emitter),
-        Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
+        Command::AuthList => auth_list(invocation, emitter),
+        Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
         Command::Eval { suite, trials, out } => {
             let workspace = workspace_root(&invocation.workspace)?;
             let report = eval::run(&workspace, suite, *trials, out.as_deref())?;
@@ -871,6 +871,8 @@ fn load_config(
 }
 
 const CATALOG_NAME: &str = "__catalog__";
+/// The catalog under the `file` store, beside the user configuration.
+const CATALOG_FILE: &str = "credentials.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AuthRecord {
@@ -897,22 +899,113 @@ enum CredentialKind {
     OAuth,
 }
 
-fn catalog(store: OsCredentialStore) -> Result<Vec<AuthRecord>, Diagnostic> {
-    match store.resolve(CATALOG_NAME) {
-        Ok(raw) => {
-            serde_json::from_str(&raw).map_err(|_| secret_failed("credential catalog is corrupt"))
+/// Where the credential catalog is kept, and how to reach it.
+///
+/// The catalog is metadata — handles, provider names, timestamps — and never a
+/// secret value, so keeping it in the platform store costs an unlock prompt for
+/// data that did not need one. `file` is the default for that reason; `os`
+/// stays available for an operator who wants everything in one place, chosen
+/// with `credentials.store`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogStore {
+    File,
+    Os,
+}
+
+impl CatalogStore {
+    /// The configured store, or the default when configuration cannot be read:
+    /// listing credentials must not depend on a config file being valid.
+    fn resolve(invocation: &Invocation) -> Self {
+        workspace_root(&invocation.workspace)
+            .ok()
+            .and_then(|root| {
+                let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+                load_config(&root, &working).ok()
+            })
+            .map_or(Self::File, |config| Self::named(config.credential_store()))
+    }
+
+    fn named(store: &str) -> Self {
+        if store == OS_STORE_ID {
+            Self::Os
+        } else {
+            Self::File
         }
-        Err(SecretError::NotFound(_)) => Ok(Vec::new()),
-        Err(error) => Err(secret_failed(error)),
+    }
+
+    fn read(self) -> Result<Option<String>, Diagnostic> {
+        let resolved = match self {
+            Self::File => FileCredentialStore.resolve(CATALOG_FILE),
+            Self::Os => OsCredentialStore.resolve(CATALOG_NAME),
+        };
+        match resolved {
+            Ok(raw) => Ok(Some(raw)),
+            Err(SecretError::NotFound(_)) => Ok(None),
+            Err(error) => Err(secret_failed(error)),
+        }
+    }
+
+    fn write(self, raw: &str) -> Result<(), Diagnostic> {
+        match self {
+            Self::File => {
+                let path = FileCredentialStore::path(CATALOG_FILE).ok_or_else(|| {
+                    secret_failed("this platform has no user configuration directory")
+                })?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(storage_failed)?;
+                }
+                std::fs::write(&path, format!("{raw}\n")).map_err(storage_failed)?;
+                owner_only(&path)
+            }
+            Self::Os => OsCredentialStore
+                .set(CATALOG_NAME, raw)
+                .map_err(secret_failed),
+        }
     }
 }
 
-fn save_catalog(store: OsCredentialStore, records: &[AuthRecord]) -> Result<(), Diagnostic> {
+/// A catalog file is not a secret, but it names every provider the operator
+/// has a credential for, so it is not the whole machine's business either.
+#[cfg(unix)]
+fn owner_only(path: &Path) -> Result<(), Diagnostic> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(storage_failed)
+}
+
+#[cfg(not(unix))]
+fn owner_only(_path: &Path) -> Result<(), Diagnostic> {
+    Ok(())
+}
+
+fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
+    let raw = match store.read()? {
+        Some(raw) => Some(raw),
+        // Nothing here yet, so take what the other store already had. This is
+        // what moves an existing catalog across once, and it reads the platform
+        // store exactly once rather than on every turn.
+        None if store == CatalogStore::File => {
+            let migrated = CatalogStore::Os.read()?;
+            if let Some(raw) = &migrated {
+                store.write(raw)?;
+            }
+            migrated
+        }
+        None => None,
+    };
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&raw).map_err(|_| secret_failed("credential catalog is corrupt"))
+}
+
+fn save_catalog(store: CatalogStore, records: &[AuthRecord]) -> Result<(), Diagnostic> {
     let raw = serde_json::to_string(records).map_err(|error| secret_failed(error.to_string()))?;
-    store.set(CATALOG_NAME, &raw).map_err(secret_failed)
+    store.write(&raw)
 }
 
 fn auth_set(
+    invocation: &Invocation,
     provider: &str,
     requested: Option<&str>,
     tty: bool,
@@ -931,14 +1024,17 @@ fn auth_set(
     if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
         return Err(secret_failed("credential is too short to redact safely"));
     }
+    // The value belongs in the platform store; the catalog goes wherever the
+    // operator configured, which is not the same question.
     let store = OsCredentialStore;
+    let records_store = CatalogStore::resolve(invocation);
     let previous = match store.resolve(name) {
         Ok(value) => Some(value),
         Err(SecretError::NotFound(_)) => None,
         Err(error) => return Err(secret_failed(error)),
     };
     store.set(name, &secret).map_err(secret_failed)?;
-    let mut records = catalog(store)?;
+    let mut records = catalog(records_store)?;
     let now = now()?;
     if let Some(record) = records.iter_mut().find(|record| record.handle == handle) {
         record.provider = provider.to_owned();
@@ -952,7 +1048,7 @@ fn auth_set(
             kind: CredentialKind::ApiKey,
         });
     }
-    if let Err(error) = save_catalog(store, &records) {
+    if let Err(error) = save_catalog(records_store, &records) {
         if let Some(previous) = previous {
             let _ = store.set(name, &previous);
         } else {
@@ -1022,7 +1118,8 @@ fn auth_login(
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
     let store = OsCredentialStore;
     store.set(handle.name(), &raw).map_err(secret_failed)?;
-    let mut records = catalog(store)?;
+    let records_store = CatalogStore::resolve(invocation);
+    let mut records = catalog(records_store)?;
     let now = now()?;
     match records.iter_mut().find(|record| record.handle == handle) {
         Some(record) => {
@@ -1037,7 +1134,7 @@ fn auth_login(
             kind: CredentialKind::OAuth,
         }),
     }
-    save_catalog(store, &records)?;
+    save_catalog(records_store, &records)?;
     emitter.result(json!({
         "provider": provider,
         "handle": handle,
@@ -1055,8 +1152,8 @@ fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
     )
 }
 
-fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    let records = catalog(OsCredentialStore)?;
+fn auth_list(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let records = catalog(CatalogStore::resolve(invocation))?;
     emitter.result(if emitter.output == Output::Json {
         json!({"credentials": records})
     } else {
@@ -1114,6 +1211,7 @@ fn human_credentials(records: &[AuthRecord]) -> Value {
 }
 
 fn auth_remove(
+    invocation: &Invocation,
     handle: &SecretHandle,
     _force: bool,
     emitter: &mut Emitter,
@@ -1122,12 +1220,13 @@ fn auth_remove(
         return Err(secret_failed("only OS credential handles can be removed"));
     }
     let store = OsCredentialStore;
-    let original = catalog(store)?;
+    let records_store = CatalogStore::resolve(invocation);
+    let original = catalog(records_store)?;
     let mut records = original.clone();
     records.retain(|record| &record.handle != handle);
-    save_catalog(store, &records)?;
+    save_catalog(records_store, &records)?;
     if let Err(error) = store.remove(handle.name()) {
-        let _ = save_catalog(store, &original);
+        let _ = save_catalog(records_store, &original);
         return Err(secret_failed(error));
     }
     emitter.result(json!({"removed": handle, "referenced_by": []}));
@@ -1594,7 +1693,7 @@ fn run_turn(
     composer: &mut tui::Composer,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
-    let task = prepare_task(task, emitter)?;
+    let task = prepare_task(invocation, task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
     let outcome = match native.filter(|_| !route.is_codex()) {
         Some(resolved) => native_status(
@@ -2291,7 +2390,7 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
     } else {
         task.to_owned()
     };
-    let task = prepare_task(&task, emitter)?;
+    let task = prepare_task(invocation, &task, emitter)?;
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
 
@@ -2438,14 +2537,18 @@ fn merge(target: &mut Value, extra: Value) {
     }
 }
 
-fn prepare_task(task: &str, emitter: &mut Emitter) -> Result<String, Diagnostic> {
+fn prepare_task(
+    invocation: &Invocation,
+    task: &str,
+    emitter: &mut Emitter,
+) -> Result<String, Diagnostic> {
     if task.trim().is_empty() {
         return Err(usage("run requires a non-empty task"));
     }
     let mut broker = SecretBroker::new();
     broker.register_store(Box::new(OsCredentialStore));
     broker.register_store(Box::new(FileCredentialStore));
-    for record in catalog(OsCredentialStore)? {
+    for record in catalog(CatalogStore::resolve(invocation))? {
         broker.resolve(&record.handle).map_err(secret_failed)?;
     }
     let task = broker.redactor().sanitize(task).map_err(secret_failed)?;
@@ -2589,7 +2692,9 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
             "install arsy-sandbox-worker and the platform controls before running effects",
         ));
     }
-    let credentials = catalog(OsCredentialStore).unwrap_or_default().len();
+    let credentials = catalog(CatalogStore::resolve(invocation))
+        .unwrap_or_default()
+        .len();
     if credentials == 0 {
         warnings.push(Diagnostic::warning(
             "ARSY-PRV-1001",
@@ -2744,6 +2849,51 @@ mod tests {
             let args = inspection_args(line).expect("mapped");
             assert!(parse(args).is_err(), "{line} reached auth mutation");
         }
+    }
+
+    /// The catalog is metadata, so where it lives is the operator's choice and
+    /// the default costs no unlock prompt.
+    #[test]
+    fn the_credential_catalog_store_is_configurable_and_defaults_to_a_file() {
+        use arsy_kernel::config::{Config, Layer, CREDENTIAL_STORES, DEFAULT_CREDENTIAL_STORE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let write = |body: &str| {
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            Config::load(&[(Layer::User, path)])
+        };
+
+        // Unset is the file, so an operator who never asked is not asked to
+        // unlock anything to read a list of handles.
+        assert_eq!(DEFAULT_CREDENTIAL_STORE, "file");
+        assert_eq!(
+            write("schema_version = 1\n").unwrap().credential_store(),
+            "file"
+        );
+
+        // Either store can be chosen, and the choice is traceable like any
+        // other configured value.
+        for store in CREDENTIAL_STORES {
+            let config = write(&format!(
+                "schema_version = 1\n[credentials]\nstore = \"{store}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(config.credential_store(), *store);
+            assert_eq!(
+                config.explain(Some("credentials.store"))["values"]["credentials.store"]["value"],
+                **store
+            );
+        }
+
+        // A name that is neither is refused at load, not silently defaulted:
+        // a typo must not quietly send credentials somewhere else.
+        let error = write("schema_version = 1\n[credentials]\nstore = \"vault\"\n").unwrap_err();
+        assert!(format!("{error}").contains("vault"), "{error}");
+
+        // The two names match the `secret://` stores, so one vocabulary covers
+        // both the handle and the catalog.
+        assert_eq!(CREDENTIAL_STORES, ["file", "os"]);
     }
 
     /// `/settings` and `/auth` print to a reader, not to a parser: the machine

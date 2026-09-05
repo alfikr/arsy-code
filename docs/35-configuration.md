@@ -127,7 +127,17 @@ A file credential must be readable by its owner alone; a mode with any group or
 other bit set is refused with the `chmod` that fixes it. `file` is what a
 headless host, a container, or a debug build whose code identity changes on
 every rebuild — and so is asked to unlock the keychain again each time — should
-use. `api_key_env` still takes precedence over both. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+use. `api_key_env` still takes precedence over both.
+
+`credentials.store` chooses where the credential catalog — the list of handles,
+provider names, and timestamps that `arsy auth list` prints — is kept: `file`
+(the default) beside the user configuration, or `os` in the platform store. The
+catalog holds no secret value, so the default costs no unlock prompt to read it;
+`os` keeps everything in one place for an operator who prefers that. The names
+are the same two the `secret://` handles use. Switching to `file` migrates an
+existing catalog out of the platform store on first read, once. A store that is
+neither is refused when the file loads, so a typo cannot quietly send
+credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 
 ## Six-layer example
 

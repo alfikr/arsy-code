@@ -29,6 +29,16 @@ pub const CONFIG_FILE: &str = "config.toml";
 /// Documented sections that parse but have no runtime effect yet. Listing them
 /// keeps "unknown keys are errors" true without rejecting a forward-looking
 /// file.
+/// Where the credential catalog lives. `file` keeps it beside the user
+/// configuration; `os` keeps it in the platform credential store.
+///
+/// The catalog holds handles, provider names, and timestamps — no secret value
+/// — so an operator who does not want a keychain unlock on every turn can keep
+/// it in a file without putting a key on disk.
+pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
+/// What an operator gets without saying: no unlock prompt to read metadata.
+pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
+
 const INERT_SECTIONS: &[&str] = &[
     "compat",
     "context",
@@ -196,12 +206,20 @@ impl std::error::Error for ConfigError {}
 pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
+    credential_store: Option<String>,
     endpoints: BTreeMap<String, Endpoint>,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Config {
+    /// Which store the credential catalog is kept in.
+    pub fn credential_store(&self) -> &str {
+        self.credential_store
+            .as_deref()
+            .unwrap_or(DEFAULT_CREDENTIAL_STORE)
+    }
+
     /// Read every layer in authority order. A missing file is not an error;
     /// an unreadable or invalid one is.
     pub fn load(layers: &[(Layer, PathBuf)]) -> Result<Self, ConfigError> {
@@ -292,6 +310,20 @@ impl Config {
                     if let Some(default) = string(table, "default", "model.default", path)? {
                         self.model_default = Some(default.clone());
                         self.record(layer, path, "model.default", default);
+                    }
+                }
+                "credentials" => {
+                    let table = as_table(value, "credentials", path)?;
+                    if let Some(store) = string(table, "store", "credentials.store", path)?.cloned()
+                    {
+                        if !CREDENTIAL_STORES.contains(&store.as_str()) {
+                            return Err(reject(format!(
+                                "credentials.store must be one of {}, not `{store}`",
+                                CREDENTIAL_STORES.join(", ")
+                            )));
+                        }
+                        self.credential_store = Some(store.clone());
+                        self.record(layer, path, "credentials.store", store);
                     }
                 }
                 section if INERT_SECTIONS.contains(&section) => {}
