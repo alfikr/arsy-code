@@ -2464,6 +2464,77 @@ mod tests {
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
 
+    #[cfg(feature = "tui")]
+    #[test]
+    fn slash_commands_expand_to_the_inspection_the_cli_already_parses() {
+        let expansion = |line: &str| inspection_args(line).map(|args| args.join(" "));
+
+        // A bare command takes its default subcommand; a flag is not one, so it
+        // does not suppress the default the way a subcommand does.
+        assert_eq!(expansion("/mcp"), Some("mcp list".to_owned()));
+        assert_eq!(
+            expansion("/mcp --source claude"),
+            Some("mcp list --source claude".to_owned())
+        );
+        assert_eq!(
+            expansion("/mcp show NAME"),
+            Some("mcp show NAME".to_owned()),
+            "an explicit subcommand is not replaced"
+        );
+        assert_eq!(expansion("/hooks"), Some("hook list".to_owned()));
+        assert_eq!(expansion("/settings"), Some("config explain".to_owned()));
+        assert_eq!(
+            expansion("/settings model.route"),
+            Some("config explain model.route".to_owned())
+        );
+        assert_eq!(expansion("/doctor"), Some("doctor".to_owned()));
+        assert_eq!(expansion("/auth"), Some("auth list".to_owned()));
+        assert_eq!(
+            expansion("/compat claude"),
+            Some("compat explain claude".to_owned())
+        );
+        assert_eq!(expansion("/nonsense"), None, "the loop reports it instead");
+
+        // Every expansion is a command the CLI parser already accepts, so the
+        // TUI adds no second argument grammar to keep in step.
+        for line in [
+            "/mcp",
+            "/hooks --event PreToolUse",
+            "/settings",
+            "/doctor",
+            "/auth",
+            "/compat omp",
+        ] {
+            let args = inspection_args(line).expect("mapped");
+            assert!(parse(args).is_ok(), "{line} did not parse");
+        }
+
+        // Credential mutation stays a CLI-only surface: the words land after
+        // `list`, which no `auth` form accepts.
+        for line in ["/auth remove handle", "/auth login codex"] {
+            let args = inspection_args(line).expect("mapped");
+            assert!(parse(args).is_err(), "{line} reached auth mutation");
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_menu_and_the_dispatch_table_hold_the_same_commands() {
+        // `/model`, `/help`, and `/quit` are answered by the loop itself; every
+        // other offered command must be an inspection it knows how to run.
+        for (name, _) in tui::COMMANDS {
+            let handled = matches!(*name, "/model" | "/help" | "/quit")
+                || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
+            assert!(handled, "{name} is offered but never dispatched");
+        }
+        for (slash, _, _) in INSPECTIONS {
+            assert!(
+                tui::COMMANDS.iter().any(|(name, _)| name == slash),
+                "{slash} is dispatched but never offered"
+            );
+        }
+    }
+
     #[cfg(all(feature = "tui", unix))]
     #[test]
     fn interactive_provider_cancellation_and_terminal_failures_are_bounded() {
