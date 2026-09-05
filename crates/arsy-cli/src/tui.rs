@@ -612,6 +612,12 @@ pub fn working_row(colour: bool) -> String {
     )
 }
 
+/// One line of streamed model text, styled as the Codex projection styles an
+/// assistant message, so both routes read the same in scrollback.
+pub fn assistant_row(colour: bool, text: &str) -> String {
+    paint(colour, ASSISTANT, text.trim_end())
+}
+
 /// Shown when a turn is stopped from the keyboard.
 pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
@@ -727,14 +733,44 @@ fn first_line(text: &str) -> &str {
     text.trim().lines().next().unwrap_or_default()
 }
 
+/// Which provider serves a turn, and with which model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelRoute {
+    /// A configured provider endpoint, or [`CODEX_PROVIDER`] for the
+    /// subprocess fallback.
+    pub provider: String,
     pub model: String,
+}
+
+/// The provider id that means "hand the turn to the logged-in Codex CLI".
+pub const CODEX_PROVIDER: &str = "codex";
+
+impl ModelRoute {
+    /// Whether this turn goes to the Codex CLI rather than to a provider ARSY
+    /// talks to itself.
+    pub fn is_codex(&self) -> bool {
+        self.provider == CODEX_PROVIDER
+    }
+
+    /// `provider/model`, the form remembered between sessions. A bare model
+    /// name is a file written before routes named a provider, and meant Codex.
+    pub fn parse(raw: &str) -> Self {
+        match raw.split_once('/') {
+            Some((provider, model)) => Self {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            },
+            None => Self {
+                provider: CODEX_PROVIDER.to_owned(),
+                model: raw.to_owned(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for ModelRoute {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "codex/{}", self.model)
+        write!(formatter, "{}/{}", self.provider, self.model)
     }
 }
 
@@ -747,6 +783,7 @@ pub fn detect_model_route() -> Option<ModelRoute> {
         .status()
         .is_ok_and(|status| status.success())
         .then(|| ModelRoute {
+            provider: CODEX_PROVIDER.to_owned(),
             model: "default".to_owned(),
         })
 }
@@ -830,11 +867,20 @@ pub fn render_model_list(
 }
 
 /// The status row shown under the composer while a model is being picked.
+///
+/// A configured endpoint has no list to offer — nothing tells ARSY what a
+/// gateway serves — so there the prompt asks for a slug instead of a number
+/// in a range of none.
 pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) -> String {
+    let choices = if models.is_empty() {
+        "a slug".to_owned()
+    } else {
+        format!("1-{} or a slug", models.len())
+    };
     paint(
         colour,
         DIM,
-        &format!("  model [{}] · 1-{} or a slug", current.model, models.len()),
+        &format!("  model [{}] · {choices}", current.model),
     )
 }
 
@@ -849,7 +895,10 @@ pub fn resolve_model(answer: &str, models: &[ModelChoice], current: &ModelRoute)
         Err(_) if answer.is_empty() => current.model.clone(),
         Err(_) => answer.to_owned(),
     };
-    ModelRoute { model }
+    ModelRoute {
+        provider: current.provider.clone(),
+        model,
+    }
 }
 
 /// `stty size` is asked first: `COLUMNS` is inherited from the shell and goes
@@ -1089,9 +1138,15 @@ mod tests {
             },
         ];
         let current = ModelRoute {
+            provider: CODEX_PROVIDER.into(),
             model: "gpt-5.6-luna".into(),
         };
         let pick = |answer: &str| resolve_model(answer, &models, &current).model;
+        assert_eq!(
+            resolve_model("o3-custom", &models, &current).provider,
+            CODEX_PROVIDER,
+            "picking a model never moves the turn to another provider"
+        );
 
         assert_eq!(pick("1"), "gpt-5.6-sol");
         assert_eq!(pick(""), "gpt-5.6-luna", "empty keeps the current model");
@@ -1111,6 +1166,26 @@ mod tests {
         assert!(listing.contains("1. gpt-5.6-sol  GPT-5.6-Sol"));
         assert!(listing.contains("› 2. gpt-5.6-luna"));
         assert!(model_prompt(&models, &current, false).contains("model [gpt-5.6-luna] · 1-2"));
+        assert!(
+            model_prompt(&[], &current, false).contains("model [gpt-5.6-luna] · a slug"),
+            "a configured endpoint offers no list, so it asks for a slug"
+        );
+    }
+
+    #[test]
+    fn a_remembered_route_names_its_provider_and_older_files_still_read() {
+        let native = ModelRoute::parse("gateway/qwen3-coder");
+        assert_eq!(native.provider, "gateway");
+        assert_eq!(native.model, "qwen3-coder");
+        assert!(!native.is_codex());
+        assert_eq!(native.to_string(), "gateway/qwen3-coder");
+
+        let legacy = ModelRoute::parse("gpt-5.6-luna");
+        assert!(
+            legacy.is_codex(),
+            "a file written before routes named a provider meant Codex"
+        );
+        assert_eq!(legacy.model, "gpt-5.6-luna");
     }
 
     #[test]
@@ -1120,6 +1195,7 @@ mod tests {
             SessionId::new(),
         );
         state.set_model_route(ModelRoute {
+            provider: CODEX_PROVIDER.into(),
             model: "gpt-5.6-luna".into(),
         });
 

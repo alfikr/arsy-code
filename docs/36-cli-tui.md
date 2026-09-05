@@ -110,6 +110,11 @@ A group name used without a subcommand — `arsy mcp`, `arsy session`, `arsy aut
 status. `--base` is invalid unless `REVISION` is absent. `resume --follow` is implied in an
 interactive TTY and otherwise defaults off.
 
+Bare `arsy` prefers a configured provider endpoint and falls back to a logged-in Codex CLI when
+nothing is configured, so `/model` offers Codex's cached list on that route and takes a slug as
+free text on a configured one. The remembered choice is stored as `provider/model` and only applies
+to the provider it was chosen for.
+
 `arsy auth login` prints the URL to visit rather than opening a browser, because an operator working
 over SSH is not looking at a browser on the machine that ran the command.
 

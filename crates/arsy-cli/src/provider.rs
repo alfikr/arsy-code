@@ -16,6 +16,7 @@ use arsy_kernel::{
     },
     secret::{CredentialStore, OsCredentialStore, Redactor, SecretError, SecretHandle},
 };
+use std::sync::Arc;
 
 /// Where a credential came from. Reported by `arsy doctor` so an operator can
 /// tell a keyring entry from an inherited environment variable.
@@ -39,8 +40,11 @@ impl CredentialSource {
 }
 
 /// The provider a turn will use, plus how it was assembled.
+///
+/// The adapter is shared rather than owned so a turn can be streamed on its
+/// own thread while the terminal keeps repainting.
 pub struct Resolved {
-    pub provider: Box<dyn ModelProvider>,
+    pub provider: Arc<dyn ModelProvider>,
     pub endpoint: Endpoint,
     pub source: CredentialSource,
 }
@@ -76,12 +80,12 @@ pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Dia
         .map_err(|error| credential_failed(&endpoint.id, error))?;
     let key = ApiKey::new(secret);
     let transport = HttpTransport::default();
-    let provider: Box<dyn ModelProvider> = match endpoint.kind {
-        Dialect::Anthropic => Box::new(
+    let provider: Arc<dyn ModelProvider> = match endpoint.kind {
+        Dialect::Anthropic => Arc::new(
             AnthropicProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_redactor(redactor),
         ),
-        Dialect::Openai => Box::new(
+        Dialect::Openai => Arc::new(
             OpenAiProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_id(&endpoint.id)
                 .with_redactor(redactor),
