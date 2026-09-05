@@ -417,6 +417,41 @@ fn parse_doctor(positional: Vec<String>, strict: bool) -> Result<Command, Diagno
     Ok(Command::Doctor { strict })
 }
 
+/// Slash commands that are an existing CLI inspection under another name: the
+/// argv they expand to, and the subcommand to assume when the line carries only
+/// flags. One table, so the composer cannot offer a command the loop below does
+/// not know how to run.
+///
+/// Every entry is read-only. `auth` expands to `auth list` with the user's words
+/// appended, so `set`, `login`, and `remove` cannot be reached from the TUI:
+/// they fail to parse instead of touching stored credentials.
+#[cfg(feature = "tui")]
+const INSPECTIONS: &[(&str, &[&str], Option<&str>)] = &[
+    ("/mcp", &["mcp"], Some("list")),
+    ("/hooks", &["hook"], Some("list")),
+    ("/settings", &["config", "explain"], None),
+    ("/doctor", &["doctor"], None),
+    ("/auth", &["auth", "list"], None),
+    ("/compat", &["compat", "explain"], None),
+];
+
+/// Expand a typed slash line into CLI argv, or `None` when no inspection owns
+/// it. The line is not validated here — `parse` already rejects a bad argument
+/// with the same diagnostic the CLI would give.
+#[cfg(feature = "tui")]
+fn inspection_args(line: &str) -> Option<Vec<String>> {
+    let mut words = line.split_whitespace();
+    let command = words.next()?;
+    let (_, prefix, default) = INSPECTIONS.iter().find(|(name, _, _)| *name == command)?;
+    let mut args: Vec<String> = prefix.iter().map(|word| (*word).to_owned()).collect();
+    let rest: Vec<String> = words.map(str::to_owned).collect();
+    if rest.first().is_none_or(|word| word.starts_with("--")) {
+        args.extend(default.map(str::to_owned));
+    }
+    args.extend(rest);
+    Some(args)
+}
+
 /// `config explain [KEY]`. Only `explain` exists; the rest of the documented
 /// `config` surface belongs to a later phase.
 fn parse_config(positional: Vec<String>) -> Result<Command, Diagnostic> {
@@ -1167,17 +1202,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let mut words = line.split_whitespace();
-                let command = words.next().unwrap_or_default();
-                if command == "/help" {
+                if line.split_whitespace().next() == Some("/help") {
                     write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed)?;
-                } else if matches!(command, "/mcp" | "/hooks") {
-                    let kind = if command == "/mcp" { "mcp" } else { "hook" };
-                    let mut args = vec![kind.to_owned()];
-                    args.extend(words.map(str::to_owned));
-                    if args.get(1).is_none_or(|arg| arg.starts_with("--")) {
-                        args.insert(1, "list".into());
-                    }
+                } else if let Some(args) = inspection_args(&line) {
                     match parse(args) {
                         Ok(parsed) => {
                             let inspection = Invocation {

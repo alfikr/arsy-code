@@ -248,13 +248,23 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
     ),
     ("/hooks", "inspect Claude hooks; list, --event NAME"),
+    (
+        "/settings",
+        "show effective configuration and where each value came from; [KEY]",
+    ),
+    ("/doctor", "check workspace, storage, and sandbox assurance"),
+    ("/auth", "list configured provider credentials"),
+    (
+        "/compat",
+        "explain ecosystem mapping; claude | codex | omp | agents",
+    ),
     ("/help", "show these actions"),
     ("/quit", "exit"),
 ];
 
-/// ponytail: the menu is capped rather than scrolled. Five commands never reach
-/// the cap; give it a window over `menu()` if the surface outgrows it.
-const MENU_ROWS: usize = 8;
+/// ponytail: the menu is capped rather than scrolled. It holds every command
+/// there is; give it a window over `menu()` if the table outgrows the cap.
+const MENU_ROWS: usize = 9;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
