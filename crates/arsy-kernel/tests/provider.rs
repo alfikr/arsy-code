@@ -402,7 +402,7 @@ fn effort_becomes_a_thinking_budget_inside_the_output_budget() {
 
     // The floor fitting is not the same as an answer fitting: a budget must
     // leave at least as much room to answer as it takes to think.
-    let smallest_with_thinking = (THINKING_FLOOR * 2) as u32;
+    let smallest_with_thinking = THINKING_FLOOR * 2;
     for (max_tokens, expected) in [
         (smallest_with_thinking - 1, None),
         (smallest_with_thinking, Some(THINKING_FLOOR)),

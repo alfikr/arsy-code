@@ -1057,6 +1057,7 @@ fn terminal_failed(error: impl ToString) -> Diagnostic {
 enum Prompt {
     Task,
     Model,
+    Effort,
 }
 
 #[cfg(feature = "tui")]
@@ -1158,10 +1159,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 tui::branch(&workspace).as_deref(),
             ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
+            Prompt::Effort => tui::effort_prompt(effort, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
-        composer.set_picking(matches!(prompt, Prompt::Model));
+        composer.set_picking(matches!(prompt, Prompt::Model | Prompt::Effort));
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1185,6 +1187,23 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             },
         };
         match prompt {
+            Prompt::Effort => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match tui::resolve_effort_answer(&line, effort) {
+                    Ok(picked) => {
+                        effort = picked;
+                        state.set_effort(effort);
+                        remember_effort(effort, emitter);
+                        writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
+                        prompt = Prompt::Task;
+                    }
+                    // As with the model picker, the list stays open so the
+                    // answer can be retyped against what is already on screen.
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Model => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match tui::resolve_model(&line, &models, &route) {
@@ -1211,13 +1230,27 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
             Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let (picked, changed, message) = resolve_effort(&line, effort);
-                if changed {
-                    effort = picked;
-                    state.set_effort(effort);
-                    remember_effort(effort, emitter);
+                // A bare `/effort` opens the list, so the levels can be read
+                // before one is chosen; `/effort high` still sets it outright.
+                match line.split_whitespace().nth(1) {
+                    None => {
+                        tui::render_effort_list(&mut stdout, effort, colour)
+                            .map_err(terminal_failed)?;
+                        prompt = Prompt::Effort;
+                    }
+                    Some(answer) => match tui::resolve_effort_answer(answer, effort) {
+                        Ok(picked) => {
+                            effort = picked;
+                            state.set_effort(effort);
+                            remember_effort(effort, emitter);
+                            writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
+                        }
+                        Err(reason) => {
+                            writeln!(stdout, "{}", tui::safe_text(&reason))
+                                .map_err(terminal_failed)?;
+                        }
+                    },
                 }
-                writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
             }
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -1424,33 +1457,12 @@ fn save_effort(effort: Option<Effort>) -> io::Result<()> {
     }
 }
 
-/// Take `/effort [low|medium|high|off]` and report what to say about it.
-///
-/// Returns the new setting and the line to print. A bare `/effort` reports the
-/// current one rather than changing it, because a command that silently cycles
-/// a setting is a command whose result has to be read back out of the status
-/// row to be trusted.
+/// What to print once an effort answer is accepted.
 #[cfg(feature = "tui")]
-fn resolve_effort(line: &str, current: Option<Effort>) -> (Option<Effort>, bool, String) {
-    let levels = Effort::ALL.map(Effort::as_str).join(", ");
-    match line.split_whitespace().nth(1) {
-        None => (
-            current,
-            false,
-            match current {
-                Some(effort) => format!("Effort: {effort} ({levels}, or off)"),
-                None => format!("Effort: unset, so no reasoning knob is sent ({levels}, or off)"),
-            },
-        ),
-        Some("off" | "none" | "unset") => (None, true, "Effort: unset".to_owned()),
-        Some(word) => match Effort::parse(word) {
-            Some(effort) => (Some(effort), true, format!("Effort: {effort}")),
-            None => (
-                current,
-                false,
-                format!("`{word}` is not an effort level. Use {levels}, or off."),
-            ),
-        },
+fn effort_line(effort: Option<Effort>) -> String {
+    match effort {
+        Some(effort) => format!("Effort: {effort}"),
+        None => "Effort: off, so no reasoning setting is sent".to_owned(),
     }
 }
 
@@ -2621,41 +2633,60 @@ mod tests {
 
     #[cfg(feature = "tui")]
     #[test]
-    fn effort_is_set_reported_and_cleared_from_one_line() {
-        // A bare `/effort` reports rather than changes, so the status row is
-        // never the only place the current level can be read.
-        let (picked, changed, message) = resolve_effort("/effort", None);
-        assert_eq!(picked, None);
-        assert!(!changed, "a report is not a change");
-        assert!(message.contains("unset"), "{message}");
-        assert!(message.contains("low, medium, high"), "{message}");
+    fn the_effort_picker_takes_a_number_a_name_or_the_current_setting() {
+        // The list is numbered the way the model list is, and `off` is a row on
+        // it rather than a word only a typist knows about.
+        assert_eq!(
+            tui::effort_choices(),
+            vec![
+                Some(Effort::Low),
+                Some(Effort::Medium),
+                Some(Effort::High),
+                None
+            ]
+        );
 
-        let (picked, changed, message) = resolve_effort("/effort", Some(Effort::Medium));
-        assert_eq!(picked, Some(Effort::Medium));
-        assert!(!changed);
-        assert!(message.contains("medium"), "{message}");
+        for (index, expected) in tui::effort_choices().iter().enumerate() {
+            let answer = (index + 1).to_string();
+            assert_eq!(
+                tui::resolve_effort_answer(&answer, None).unwrap(),
+                *expected,
+                "row {answer}"
+            );
+        }
 
         for level in Effort::ALL {
-            let (picked, changed, message) = resolve_effort(&format!("/effort {level}"), None);
-            assert_eq!(picked, Some(level));
-            assert!(changed);
-            assert!(message.contains(level.as_str()), "{message}");
+            assert_eq!(
+                tui::resolve_effort_answer(level.as_str(), None).unwrap(),
+                Some(level)
+            );
         }
-
-        // `off` clears it, which is how a turn goes back to sending no
-        // reasoning knob at all.
         for word in ["off", "none", "unset"] {
-            let (picked, changed, _) =
-                resolve_effort(&format!("/effort {word}"), Some(Effort::High));
-            assert_eq!(picked, None, "{word} did not clear the level");
-            assert!(changed);
+            assert_eq!(
+                tui::resolve_effort_answer(word, Some(Effort::High)).unwrap(),
+                None,
+                "{word} did not clear the level"
+            );
         }
 
-        // A typo keeps the current level instead of silently clearing it.
-        let (picked, changed, message) = resolve_effort("/effort hihg", Some(Effort::High));
-        assert_eq!(picked, Some(Effort::High));
-        assert!(!changed, "a rejected word must not change the setting");
-        assert!(message.contains("hihg"), "{message}");
+        // An empty line keeps what is set, so leaving the picker alone is not a
+        // way to lose the setting.
+        assert_eq!(
+            tui::resolve_effort_answer("   ", Some(Effort::Medium)).unwrap(),
+            Some(Effort::Medium)
+        );
+
+        // A rejected answer says why and changes nothing; the caller keeps the
+        // picker open on it.
+        for answer in ["hihg", "0", "5", "-1"] {
+            assert!(
+                tui::resolve_effort_answer(answer, Some(Effort::High)).is_err(),
+                "{answer} was accepted"
+            );
+        }
+
+        assert!(effort_line(Some(Effort::High)).contains("high"));
+        assert!(effort_line(None).contains("no reasoning setting"));
     }
 
     #[cfg(feature = "tui")]

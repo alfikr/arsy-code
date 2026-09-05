@@ -866,11 +866,24 @@ impl TuiState {
                 ),
             ),
         ));
-        if let Some(branch) = branch {
-            row.push_str(&format!("  {}", paint(colour, ACCENT, branch)));
-        }
         row.push_str(&format!("  {}", paint(colour, CWD, &self.workspace)));
-        fit(&row, width.max(MIN_WIDTH))
+
+        let width = width.max(MIN_WIDTH);
+        let mut row = fit(&row, width);
+        // The branch sits at the right edge, so it stays in one place while the
+        // fields to its left change length. It is dropped rather than shortened
+        // when the row is already full: a truncated branch name is a name that
+        // can be read as the wrong branch.
+        if let Some(branch) = branch {
+            let gap = width
+                .saturating_sub(visible_len(&row))
+                .saturating_sub(visible_len(branch) + 2);
+            if gap > 0 {
+                row.push_str(&" ".repeat(gap + 2));
+                row.push_str(&paint(colour, ACCENT, branch));
+            }
+        }
+        row
     }
 
     pub fn render_approval(request: &ApprovalRequest, width: usize) -> String {
@@ -1256,6 +1269,87 @@ pub fn render_model_list(
 /// A configured endpoint has no list to offer — nothing tells ARSY what a
 /// gateway serves — so there the prompt asks for a slug instead of a number
 /// in a range of none.
+/// The effort levels, numbered like the model list so both pickers are answered
+/// the same way.
+pub fn render_effort_list(
+    writer: &mut impl Write,
+    current: Option<Effort>,
+    colour: bool,
+) -> std::io::Result<()> {
+    for (index, level) in effort_choices().iter().enumerate() {
+        let marker = if *level == current { "›" } else { " " };
+        let (slug, description) = match level {
+            Some(Effort::Low) => ("low", "least reasoning, fastest and cheapest"),
+            Some(Effort::Medium) => ("medium", "balanced"),
+            Some(Effort::High) => ("high", "most reasoning, slowest and dearest"),
+            None => ("off", "send no reasoning setting at all"),
+        };
+        writeln!(
+            writer,
+            "  {} {} {}  {}",
+            paint(colour, ACCENT, marker),
+            paint(colour, DIM, &format!("{}.", index + 1)),
+            paint(colour, MODEL, slug),
+            paint(colour, DIM, description),
+        )?;
+    }
+    Ok(())
+}
+
+/// The rows the effort picker offers, in the order it numbers them.
+pub fn effort_choices() -> Vec<Option<Effort>> {
+    let mut choices: Vec<Option<Effort>> = Effort::ALL.into_iter().map(Some).collect();
+    choices.push(None);
+    choices
+}
+
+pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
+    let current = current.map_or_else(|| "off".to_owned(), |effort| effort.to_string());
+    paint(
+        colour,
+        DIM,
+        &format!(
+            "  effort [{current}] · 1-{} or a name",
+            effort_choices().len()
+        ),
+    )
+}
+
+/// Take an answer to the effort picker: a list number, a level name, `off`, or
+/// an empty line to keep what is set.
+///
+/// Rejected answers report why, for the same reason the model picker does: an
+/// accepted answer is written to the user configuration.
+pub fn resolve_effort_answer(
+    line: &str,
+    current: Option<Effort>,
+) -> Result<Option<Effort>, String> {
+    let answer = line.trim();
+    if answer.is_empty() {
+        return Ok(current);
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return effort_choices()
+            .get(
+                number
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("`{answer}` is out of range; the list starts at 1"))?,
+            )
+            .copied()
+            .ok_or_else(|| format!("`{answer}` is not on the list"));
+    }
+    match answer {
+        "off" | "none" | "unset" => Ok(None),
+        _ => Effort::parse(answer).map(Some).ok_or_else(|| {
+            format!(
+                "`{}` is not an effort level; use {}, or off",
+                safe_text(answer),
+                Effort::ALL.map(Effort::as_str).join(", "),
+            )
+        }),
+    }
+}
+
 pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) -> String {
     let choices = if models.is_empty() {
         "a slug".to_owned()
@@ -1482,10 +1576,18 @@ mod tests {
             "  no model  effort:—  /repo"
         );
         state.set_effort(Some(Effort::High));
-        assert_eq!(
-            state.status_row(80, false, Some("feat/x")),
-            "  no model  effort:high  feat/x  /repo"
-        );
+        // The branch sits at the right edge, so it holds its column while the
+        // fields on the left change length.
+        let row = state.status_row(80, false, Some("feat/x"));
+        assert!(row.starts_with("  no model  effort:high  /repo"), "{row:?}");
+        assert!(row.ends_with("feat/x"), "{row:?}");
+        assert_eq!(visible_len(&row), 80, "{row:?}");
+
+        // Too narrow to hold it: the branch is dropped rather than cut, because
+        // half a branch name reads as a different branch.
+        let narrow = state.status_row(34, false, Some("feat/x"));
+        assert!(!narrow.contains("feat"), "{narrow:?}");
+        assert!(visible_len(&narrow) <= 34, "{narrow:?}");
         state.set_effort(None);
 
         let event = EventEnvelope::new(

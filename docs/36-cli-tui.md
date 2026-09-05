@@ -51,9 +51,13 @@ forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
 
-`/effort low|medium|high` sets how much reasoning a turn asks for, `/effort off`
-clears it, and a bare `/effort` reports the current level without changing it.
-The choice is remembered beside the model. Unset is the default and sends no
+A bare `/effort` opens a numbered picker, the same shape as the model picker:
+one row per level plus `off`, marked at the current setting, answered with a list
+number, a level name, or an empty line to keep what is set. `/effort high` still
+sets the level outright without opening it. Out-of-range numbers and unknown
+names are rejected with a reason and the picker stays open, because an accepted
+answer is written to the user configuration. The choice is remembered beside the
+model. Unset is the default and sends no
 reasoning field at all, so a host without such a model sees the request it always
 saw. The two dialects spend it differently: Chat Completions takes the level by
 name as `reasoning_effort`, while Messages takes a share of `max_tokens` as a
@@ -230,8 +234,10 @@ specified in [distribution](34-distribution.md).
 ## TUI behavior
 
 The status line carries the model route, the reasoning effort (`effort:—` when
-unset), the checked-out branch when the workspace is a Git checkout, and the
-workspace path. The branch is read from `.git/HEAD` once per prompt, so a
+unset), and the workspace path, with the checked-out branch right-aligned at the
+far edge so it holds its column while the fields to its left change length. A row
+with no room left for the branch drops it rather than truncating it, because half
+a branch name reads as a different branch. The branch is read from `.git/HEAD` once per prompt, so a
 checkout made in another terminal appears on the next line rather than at the
 next restart.
 
