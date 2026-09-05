@@ -1939,15 +1939,22 @@ fn store_credential(
     // reach output unredacted.
     let store = CatalogStore::resolve(invocation);
     let mut records = catalog(store).map_err(|error| error.message)?;
-    let now = now().map_err(|error| error.message)?;
-    records.retain(|record| record.handle != handle);
-    records.push(AuthRecord {
-        provider: name.to_owned(),
-        handle: handle.clone(),
-        created_at: now,
-        last_used: None,
-        kind: CredentialKind::ApiKey,
-    });
+    // Updated in place when the handle is already known, the way `auth set`
+    // updates it, so re-entering a credential does not reset when it was first
+    // stored.
+    match records.iter_mut().find(|record| record.handle == handle) {
+        Some(record) => {
+            record.provider = name.to_owned();
+            record.kind = CredentialKind::ApiKey;
+        }
+        None => records.push(AuthRecord {
+            provider: name.to_owned(),
+            handle: handle.clone(),
+            created_at: now().map_err(|error| error.message)?,
+            last_used: None,
+            kind: CredentialKind::ApiKey,
+        }),
+    }
     save_catalog(store, &records).map_err(|error| error.message)?;
     Ok(handle.to_string())
 }
