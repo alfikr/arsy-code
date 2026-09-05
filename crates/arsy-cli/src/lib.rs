@@ -189,6 +189,8 @@ pub enum Command {
 pub struct Invocation {
     pub workspace: PathBuf,
     pub output: Option<Output>,
+    /// `--no-color`; `NO_COLOR` in the environment disables styling as well.
+    pub no_color: bool,
     pub command: Command,
 }
 
@@ -196,7 +198,12 @@ pub struct Invocation {
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diagnostic> {
     let parsed = collect_arguments(args)?;
     if let Some(command) = parsed.early {
-        return Ok(invocation(parsed.workspace, parsed.output, command));
+        return Ok(invocation(
+            parsed.workspace,
+            parsed.output,
+            parsed.no_color,
+            command,
+        ));
     }
     let command = match parsed.name.as_deref() {
         None => Command::Tui,
@@ -216,13 +223,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
         Some(other) => return Err(unknown_command(other)),
     };
-    Ok(invocation(parsed.workspace, parsed.output, command))
+    Ok(invocation(
+        parsed.workspace,
+        parsed.output,
+        parsed.no_color,
+        command,
+    ))
 }
 
 #[derive(Default)]
 struct ParsedArguments {
     workspace: Option<PathBuf>,
     output: Option<Output>,
+    no_color: bool,
     follow: bool,
     strict: bool,
     force: bool,
@@ -266,7 +279,7 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
     match argument {
         "--help" | "-h" => parsed.early = Some(Command::Help),
         "--version" | "-V" => parsed.early = Some(Command::Version),
-        "--no-color" => {}
+        "--no-color" => parsed.no_color = true,
         "--follow" => parsed.follow = true,
         "--strict" => parsed.strict = true,
         "--force" => parsed.force = true,
@@ -312,10 +325,16 @@ fn unknown_command(command: &str) -> Diagnostic {
     }
 }
 
-fn invocation(workspace: Option<PathBuf>, output: Option<Output>, command: Command) -> Invocation {
+fn invocation(
+    workspace: Option<PathBuf>,
+    output: Option<Output>,
+    no_color: bool,
+    command: Command,
+) -> Invocation {
     Invocation {
         workspace: workspace.unwrap_or_else(|| PathBuf::from(".")),
         output,
+        no_color,
         command,
     }
 }
@@ -730,12 +749,17 @@ fn terminal_failed(error: impl ToString) -> Diagnostic {
     )
 }
 
+/// What the composer is currently collecting a line for.
+#[cfg(feature = "tui")]
+enum Prompt {
+    Task,
+    Model,
+}
+
 #[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
     let Some(detected) = tui::detect_model_route() else {
         return Err(Diagnostic::error(
             "ARSY-PRV-1000",
@@ -743,82 +767,298 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             "install Codex and run `codex login`, then retry",
         ));
     };
-    let Some(route) =
-        tui::select_model_route(&mut stdin, &mut stdout, &detected).map_err(terminal_failed)?
-    else {
-        return Ok(0);
-    };
+    let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
+    let models = tui::available_models();
+    let mut route = saved_model().map_or(detected, |model| tui::ModelRoute { model });
+
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_model_route(route.clone());
-    let frame = state.render(
-        tui::terminal_width(),
-        std::env::var_os("NO_COLOR").is_none(),
-    );
-    write!(stdout, "{frame}").map_err(terminal_failed)?;
-    stdout.flush().map_err(terminal_failed)?;
-    while let Some(task) = tui::read_task(&mut stdin).map_err(terminal_failed)? {
-        if !task.is_empty() {
-            if let Err(diagnostic) = run_external(invocation, &task, &route, emitter) {
-                emitter.diagnostic(&diagnostic);
+    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+
+    // ARSY paints the input line from here on, so it owns the terminal modes
+    // and is the only reader of stdin.
+    let _raw = tui::RawTerminal::acquire();
+    let keys = tui::spawn_key_reader();
+    let mut decoder = tui::Keys::default();
+    let mut composer = tui::Composer::default();
+
+    // A remembered model skips the picker; `/model` reopens it.
+    // A line submitted while a turn was running runs next, before stdin is
+    // read again.
+    let mut queued: Option<String> = None;
+    let mut prompt = if saved_model().is_some() {
+        Prompt::Task
+    } else {
+        tui::render_model_list(&mut stdout, &models, &route, colour).map_err(terminal_failed)?;
+        Prompt::Model
+    };
+
+    loop {
+        let status = match prompt {
+            Prompt::Task => state.status_row(tui::terminal_width(), colour),
+            Prompt::Model => tui::model_prompt(&models, &route, colour),
+        };
+        let line = match queued.take() {
+            Some(line) => line,
+            None => {
+                let Some(line) = read_line(
+                    &keys,
+                    &mut decoder,
+                    &mut composer,
+                    &mut stdout,
+                    colour,
+                    &status,
+                )?
+                else {
+                    break;
+                };
+                line
+            }
+        };
+        match prompt {
+            Prompt::Model => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                route = tui::resolve_model(&line, &models, &route);
+                remember_model(&route, emitter);
+                state.set_model_route(route.clone());
+                prompt = Prompt::Task;
+            }
+            Prompt::Task if line.trim() == "/model" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                tui::render_model_list(&mut stdout, &models, &route, colour)
+                    .map_err(terminal_failed)?;
+                prompt = Prompt::Model;
+            }
+            Prompt::Task if line.trim() == ":quit" => break,
+            Prompt::Task if line.trim().is_empty() => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+            }
+            Prompt::Task => {
+                write!(stdout, "{}", composer.commit(&line, colour)).map_err(terminal_failed)?;
+                stdout.flush().map_err(terminal_failed)?;
+                match run_external(
+                    invocation,
+                    &line,
+                    &route,
+                    colour,
+                    &keys,
+                    &mut decoder,
+                    &mut composer,
+                    emitter,
+                ) {
+                    Ok(turn) if turn.quit => break,
+                    Ok(turn) => queued = turn.queued,
+                    Err(diagnostic) => emitter.diagnostic(&diagnostic),
+                }
             }
         }
-        write!(stdout, "task> ").map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
     }
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
     Ok(0)
 }
 
+/// Collect one line, repainting the composer after every key that changes it.
+///
+/// Returns `None` when the session should end (Ctrl-D, or Ctrl-C on an empty
+/// line), which mirrors what a shell does.
 #[cfg(feature = "tui")]
+fn read_line(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    stdout: &mut impl Write,
+    colour: bool,
+    status: &str,
+) -> Result<Option<String>, Diagnostic> {
+    loop {
+        write!(
+            stdout,
+            "{}",
+            composer.render(tui::terminal_width(), colour, status)
+        )
+        .map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+        loop {
+            // The timeout is what tells a lone Escape apart from the start of
+            // an arrow-key sequence.
+            let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+                Ok(byte) => decoder.feed(byte),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            };
+            let Some(key) = key else { continue };
+            match composer.press(key) {
+                tui::Action::Submit(line) => return Ok(Some(line)),
+                tui::Action::Quit => return Ok(None),
+                tui::Action::Redraw => break,
+                tui::Action::None => {}
+            }
+        }
+    }
+}
+
+/// Persist the picked model, reporting only that persistence failed — the
+/// choice still applies to this session.
+#[cfg(feature = "tui")]
+fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
+    if let Err(error) = save_model(&route.model) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-UIX-1001",
+            format!("the model choice was not remembered: {error}"),
+            "check that the ARSY user configuration directory is writable",
+        ));
+    }
+}
+
+/// The remembered model lives beside the user configuration layer that
+/// `arsy doctor` already reports.
+#[cfg(feature = "tui")]
+fn model_store() -> Option<PathBuf> {
+    Some(user_config()?.with_file_name("model"))
+}
+
+#[cfg(feature = "tui")]
+fn saved_model() -> Option<String> {
+    let model = std::fs::read_to_string(model_store()?).ok()?;
+    let model = model.trim();
+    (!model.is_empty()).then(|| model.to_owned())
+}
+
+#[cfg(feature = "tui")]
+fn save_model(model: &str) -> io::Result<()> {
+    let path = model_store()
+        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{model}\n"))
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn run_external(
     invocation: &Invocation,
     task: &str,
     route: &tui::ModelRoute,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
     emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
+) -> Result<Turn, Diagnostic> {
     let task = prepare_task(task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
-    let status = external_status(&workspace_root(&invocation.workspace)?, &task, route);
+    let outcome = external_status(
+        &workspace_root(&invocation.workspace)?,
+        &task,
+        route,
+        colour,
+        keys,
+        decoder,
+        composer,
+    );
+    let (turn, status) = match outcome {
+        Ok(turn) => {
+            let status = turn.status.ok_or(turn.interrupted);
+            (turn, status)
+        }
+        Err(error) => {
+            fail_external_turn(
+                &service,
+                actor,
+                admission.turn,
+                session,
+                format!("could not run {route}: {error}"),
+                emitter,
+            )?;
+            return Ok(Turn::default());
+        }
+    };
+    if turn.interrupted {
+        // Stopping a turn is a decision, not a fault: the turn is recorded as
+        // failed for the audit trail, but the terminal already said so with an
+        // `Interrupted` row and does not need a diagnostic on top.
+        service
+            .fail_turn(
+                actor,
+                admission.turn,
+                "user_interrupt",
+                format!("{route} was interrupted"),
+            )
+            .map_err(storage_failed)?;
+        turn_record(
+            emitter,
+            json!({
+                "session": session.to_string(),
+                "turn": admission.turn.to_string(),
+                "status": "interrupted",
+            }),
+        );
+        return Ok(turn);
+    }
     match status {
         Ok(status) if status.success() => {
             let outcome = json!({"provider": "codex", "model": route.model});
             service
                 .complete_turn(actor, admission.turn, &outcome)
                 .map_err(storage_failed)?;
-            emitter.result(json!({
-                "session": session.to_string(),
-                "turn": admission.turn.to_string(),
-                "status": "completed",
-                "model": route.to_string(),
-            }));
-            Ok(0)
+            turn_record(
+                emitter,
+                json!({
+                    "session": session.to_string(),
+                    "turn": admission.turn.to_string(),
+                    "status": "completed",
+                    "model": route.to_string(),
+                }),
+            );
         }
-        Ok(status) => fail_external_turn(
-            &service,
-            actor,
-            admission.turn,
-            session,
-            format!("{route} exited with status {status}"),
-            emitter,
-        ),
-        Err(error) => fail_external_turn(
-            &service,
-            actor,
-            admission.turn,
-            session,
-            format!("could not run {route}: {error}"),
-            emitter,
-        ),
+        Ok(status) => {
+            fail_external_turn(
+                &service,
+                actor,
+                admission.turn,
+                session,
+                format!("{route} exited with status {status}"),
+                emitter,
+            )?;
+        }
+        Err(_) => {
+            fail_external_turn(
+                &service,
+                actor,
+                admission.turn,
+                session,
+                format!("{route} produced no exit status"),
+                emitter,
+            )?;
+        }
     }
+    Ok(turn)
 }
 
 #[cfg(feature = "tui")]
+/// Run the task through the logged-in Codex CLI and project its JSONL event
+/// stream as ARSY rows, so the terminal shows one interface, not two.
+#[allow(clippy::too_many_arguments)]
 fn external_status(
     workspace: &Path,
     task: &str,
     route: &tui::ModelRoute,
-) -> io::Result<std::process::ExitStatus> {
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+) -> io::Result<Turn> {
     let mut command = std::process::Command::new("codex");
-    command.args(["exec", "--ephemeral", "--sandbox", "read-only", "--cd"]);
+    command.args([
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--sandbox",
+        "read-only",
+        "--cd",
+    ]);
     command.arg(workspace);
     if route.model != "default" {
         command.args(["--model", &route.model]);
@@ -827,6 +1067,10 @@ fn external_status(
     let mut child = command
         .current_dir(workspace)
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // `--json` reports failures as `error` events, so the human-formatted
+        // copy on stderr would only duplicate them inside the rendered turn.
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     if let Err(error) = child
         .stdin
@@ -838,7 +1082,112 @@ fn external_status(
         let _ = child.wait();
         return Err(error);
     }
-    child.wait()
+    // The event stream is read on a thread so the main loop can also watch the
+    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
+    // the composer alive and typeable while the provider works.
+    let stdout = child.stdout.take().expect("piped stdout is available");
+    let (rows, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::BufRead::lines(io::BufReader::new(stdout)) {
+            let Ok(line) = line else { break };
+            if rows.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let pid = child.id();
+    let mut outcome = Turn::default();
+    let mut terminal = io::stdout();
+    let working_status = tui::working_row(colour);
+    let draw = |terminal: &mut io::Stdout, composer: &mut tui::Composer, row: Option<&str>| {
+        // Rows land above the composer, which is torn down and repainted around
+        // each one so the input block is never overwritten.
+        let mut frame = composer.clear();
+        if let Some(row) = row {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        frame.push_str(&composer.render(tui::terminal_width(), colour, &working_status));
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    };
+    draw(&mut terminal, composer, None)?;
+    loop {
+        let mut typed = false;
+        while let Ok(byte) = keys.try_recv() {
+            let Some(key) = decoder.feed(byte) else {
+                continue;
+            };
+            // While the provider is running, Interrupt always means the turn,
+            // never the composer or the session — and it drops a queued
+            // follow-up, which was only queued to run after this turn.
+            if key == tui::Key::Interrupt {
+                outcome.queued = None;
+                if !outcome.interrupted {
+                    outcome.interrupted = true;
+                    terminate(pid);
+                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                }
+                continue;
+            }
+            match composer.press(key) {
+                // A line sent while the provider is busy runs as soon as this
+                // turn ends, rather than being dropped or blocking.
+                tui::Action::Submit(line) => outcome.queued = Some(line),
+                tui::Action::Quit => outcome.quit = true,
+                tui::Action::Redraw => typed = true,
+                tui::Action::None => {}
+            }
+        }
+        if typed {
+            draw(&mut terminal, composer, None)?;
+        }
+        match events.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(line) => {
+                // A killed provider still flushes buffered events; showing them
+                // after the interrupt notice would contradict it.
+                if !outcome.interrupted {
+                    if let Some(row) = tui::render_codex_event(&line, colour) {
+                        draw(&mut terminal, composer, Some(&row))?;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if decoder.flush_escape() == Some(tui::Key::Interrupt) && !outcome.interrupted {
+                    outcome.interrupted = true;
+                    terminate(pid);
+                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    write!(terminal, "{}", composer.clear())?;
+    terminal.flush()?;
+    outcome.status = Some(child.wait()?);
+    Ok(outcome)
+}
+
+/// What one interactive turn left behind.
+#[cfg(feature = "tui")]
+#[derive(Default)]
+struct Turn {
+    status: Option<std::process::ExitStatus>,
+    interrupted: bool,
+    /// A line submitted while this turn was still running.
+    queued: Option<String>,
+    quit: bool,
+}
+
+/// Ask the provider to stop. `SIGTERM` first is enough for the Codex CLI; the
+/// wait that follows reaps it either way.
+#[cfg(feature = "tui")]
+fn terminate(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(feature = "tui")]
@@ -859,12 +1208,28 @@ fn fail_external_turn(
         .fail_turn(actor, turn, "provider_cli", diagnostic.message.clone())
         .map_err(storage_failed)?;
     emitter.diagnostic(&diagnostic);
-    emitter.result(json!({
-        "session": session.to_string(),
-        "turn": turn.to_string(),
-        "status": "failed",
-    }));
+    turn_record(
+        emitter,
+        json!({
+            "session": session.to_string(),
+            "turn": turn.to_string(),
+            "status": "failed",
+        }),
+    );
     Ok(diagnostic.exit_code())
+}
+
+/// Emit the machine record for one interactive turn.
+///
+/// The record is the audit trail machines read, so `--output json` and `ci`
+/// keep it. Printing it after every reply in the interactive terminal only
+/// buries the reply, and the same evidence is already durable in the session
+/// store, reachable with `arsy resume`.
+#[cfg(feature = "tui")]
+fn turn_record(emitter: &mut Emitter, payload: Value) {
+    if emitter.output != Output::Human {
+        emitter.result(payload);
+    }
 }
 
 fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
@@ -1243,6 +1608,7 @@ mod tests {
         let invocation = Invocation {
             workspace: workspace.clone(),
             output: Some(Output::Ci),
+            no_color: false,
             command: Command::Resume {
                 session,
                 follow: false,
