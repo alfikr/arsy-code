@@ -29,8 +29,8 @@ use arsy_kernel::{
     event::EventStore,
     protocol::{ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope, TurnStart},
     provider::{
-        CanonicalModelRequest, Effort, ModelContent, ModelEvent, ModelKey, ModelMessage,
-        ModelProvider, ModelRole, ProviderError,
+        CanonicalModelRequest, ModelContent, ModelEvent, ModelKey, ModelMessage, ModelProvider,
+        ModelRole, ProviderError,
     },
     secret::{
         CredentialStore, OsCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
@@ -1392,6 +1392,9 @@ fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
 }
 
 /// The remembered reasoning effort, beside the remembered model.
+#[cfg(feature = "tui")]
+use arsy_kernel::provider::Effort;
+
 #[cfg(feature = "tui")]
 fn effort_store() -> Option<PathBuf> {
     Some(arsy_kernel::config::user_config()?.with_file_name("effort"))
