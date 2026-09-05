@@ -9,6 +9,7 @@
 //! observing model behavior stays separate from provider wire execution.
 
 pub mod anthropic;
+pub mod wire;
 
 use crate::protocol::IdempotencyKey;
 use serde::{Deserialize, Serialize};
