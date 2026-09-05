@@ -209,5 +209,23 @@ fn a_file_credential_resolves_only_when_its_owner_alone_can_read_it() {
     let handle = SecretHandle::try_from(format!("secret://file/{name}")).unwrap();
     assert_eq!(handle.store(), "file");
 
+    // What `auth set` writes, `auth remove` has to be able to delete, or a
+    // catalog that lists a file handle can only ever grow.
+    std::fs::write(&path, "sk-from-a-file\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    FileCredentialStore.remove(&name).unwrap();
+    assert!(!path.exists(), "the credential file survived removal");
+    assert!(
+        matches!(
+            FileCredentialStore.remove(&name),
+            Err(SecretError::NotFound(_))
+        ),
+        "removing what is already gone is not found, not a failure"
+    );
+
     std::fs::remove_dir_all(&root).unwrap();
 }

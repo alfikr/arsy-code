@@ -34,7 +34,7 @@ use arsy_kernel::{
     },
     secret::{
         CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretBroker,
-        SecretError, SecretHandle, OS_STORE_ID,
+        SecretError, SecretHandle, FILE_STORE_ID, OS_STORE_ID,
     },
     service::AgentService,
     sqlite::{Durability, SqliteEventStore},
@@ -1216,16 +1216,26 @@ fn auth_remove(
     _force: bool,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    if handle.store() != OS_STORE_ID {
-        return Err(secret_failed("only OS credential handles can be removed"));
+    // Both stores can be removed from, because both can be listed: a catalog
+    // that names a handle no command can delete is a catalog that only grows.
+    if !matches!(handle.store(), OS_STORE_ID | FILE_STORE_ID) {
+        return Err(secret_failed(format!(
+            "no credential store `{}` to remove from",
+            handle.store()
+        )));
     }
-    let store = OsCredentialStore;
     let records_store = CatalogStore::resolve(invocation);
     let original = catalog(records_store)?;
     let mut records = original.clone();
     records.retain(|record| &record.handle != handle);
     save_catalog(records_store, &records)?;
-    if let Err(error) = store.remove(handle.name()) {
+    let removed = match handle.store() {
+        FILE_STORE_ID => FileCredentialStore.remove(handle.name()),
+        _ => OsCredentialStore.remove(handle.name()),
+    };
+    if let Err(error) = removed {
+        // The catalog is written first, so a failed delete has to put it back
+        // rather than leave a stored credential nothing lists.
         let _ = save_catalog(records_store, &original);
         return Err(secret_failed(error));
     }

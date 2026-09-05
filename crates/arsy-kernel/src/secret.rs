@@ -251,6 +251,25 @@ impl FileCredentialStore {
     fn check_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), SecretError> {
         Ok(())
     }
+
+    /// Delete the file a handle names, so `auth remove` means the same thing
+    /// for both stores rather than leaving a file store one-way.
+    pub fn remove(&self, name: &str) -> Result<(), SecretError> {
+        let path = Self::path(name).ok_or_else(|| SecretError::Store {
+            handle: Self::handle(name),
+            message: "this platform has no user configuration directory".to_owned(),
+        })?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(SecretError::NotFound(Self::handle(name)))
+            }
+            Err(error) => Err(SecretError::Store {
+                handle: Self::handle(name),
+                message: error.to_string(),
+            }),
+        }
+    }
 }
 
 impl CredentialStore for FileCredentialStore {
