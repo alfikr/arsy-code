@@ -499,8 +499,6 @@ impl Composer {
         }
     }
 
-    /// The command Enter would fill in, or `None` when the line is already one
-    /// and Enter should send it.
     /// The row the mark is on, for a caller that needs to see the selection
     /// without pressing Enter to find out.
     pub fn marked(&self) -> Option<&'static str> {
@@ -509,6 +507,8 @@ impl Composer {
             .map(|(name, _)| *name)
     }
 
+    /// The command Enter would fill in, or `None` when the line is already one
+    /// and Enter should send it.
     fn completion(&self) -> Option<String> {
         let menu = self.menu();
         let selected = menu.get(self.selected.min(menu.len().checked_sub(1)?))?;
