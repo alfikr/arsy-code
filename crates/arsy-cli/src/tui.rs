@@ -380,13 +380,20 @@ impl Composer {
                 Action::Redraw
             }
             // An open menu owns Up/Down: it is the list in front of the reader,
-            // and history is still one Escape or Backspace away.
+            // and history is still one Escape or Backspace away. The ends wrap,
+            // so a short list is never a dead end in one direction.
             Key::Up if !self.menu().is_empty() => {
-                self.selected = self.selected.saturating_sub(1);
+                let last = self.menu().len() - 1;
+                self.selected = self.selected.min(last).checked_sub(1).unwrap_or(last);
                 Action::Redraw
             }
             Key::Down if !self.menu().is_empty() => {
-                self.selected = (self.selected + 1).min(self.menu().len() - 1);
+                let last = self.menu().len() - 1;
+                self.selected = if self.selected >= last {
+                    0
+                } else {
+                    self.selected + 1
+                };
                 Action::Redraw
             }
             Key::Up if !self.history.is_empty() => {
@@ -1813,13 +1820,23 @@ mod tests {
         assert_eq!(composer.press(Key::Up), Action::Redraw);
         assert_eq!(composer.selected, 1);
         assert_eq!(composer.buffer, "/", "history did not replace the line");
-        for _ in 0..COMMANDS.len() + 3 {
+        for _ in 0..COMMANDS.len() - 2 {
             composer.press(Key::Down);
         }
         assert_eq!(
             composer.selected,
             COMMANDS.len() - 1,
-            "the selection stops at the last row"
+            "the selection reaches the last row"
+        );
+
+        // Both ends wrap, so neither direction is a dead end.
+        composer.press(Key::Down);
+        assert_eq!(composer.selected, 0, "the last row wraps to the first");
+        composer.press(Key::Up);
+        assert_eq!(
+            composer.selected,
+            COMMANDS.len() - 1,
+            "the first row wraps to the last"
         );
         composer.press(Key::Up);
 
