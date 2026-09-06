@@ -433,7 +433,7 @@ const INSPECTIONS: &[(&str, &[&str], Option<&str>)] = &[
     ("/hooks", &["hook"], Some("list")),
     ("/settings", &["config", "explain"], None),
     ("/doctor", &["doctor"], None),
-    ("/auth", &["auth", "list"], None),
+    ("/auth", &["auth"], Some("list")),
     ("/compat", &["compat", "explain"], None),
 ];
 
@@ -3435,11 +3435,10 @@ mod tests {
             assert!(parse(args).is_ok(), "{line} did not parse");
         }
 
-        // Credential mutation stays a CLI-only surface: the words land after
-        // `list`, which no `auth` form accepts.
-        for line in ["/auth remove handle", "/auth login codex"] {
+        // Auth commands expand to their CLI equivalents.
+        for line in ["/auth remove secret://os/handle", "/auth login codex"] {
             let args = inspection_args(line).expect("mapped");
-            assert!(parse(args).is_err(), "{line} reached auth mutation");
+            assert!(parse(args).is_ok(), "{line} did not parse");
         }
     }
 

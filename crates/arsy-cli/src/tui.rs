@@ -323,7 +323,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "show effective configuration and where each value came from; [KEY]",
     ),
     ("/doctor", "check workspace, storage, and sandbox assurance"),
-    ("/auth", "list configured provider credentials"),
+    (
+        "/auth",
+        "manage credentials; list | login PROVIDER | set PROVIDER | remove HANDLE",
+    ),
     (
         "/compat",
         "explain ecosystem mapping; claude | codex | omp | agents",
