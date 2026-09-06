@@ -147,6 +147,42 @@ fn partial_tool_arguments_are_streamed_but_never_executable_until_complete() {
     );
 }
 
+/// A thinking block streams its text as display-only deltas, before the answer
+/// the reasoning produced.
+#[test]
+fn thinking_blocks_stream_as_display_only_deltas() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"consider the layout"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events = collect(provider.stream(&request(Vec::new())).unwrap());
+
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::ThinkingDelta {
+                text: "consider the layout".to_owned(),
+            },
+            ModelEvent::TextDelta {
+                text: "answer".to_owned(),
+            },
+            ModelEvent::Completed {
+                stop: StopReason::EndTurn
+            },
+        ],
+        "a signature authenticates the block without becoming thinking text"
+    );
+}
+
 /// A stream cut off mid-arguments must not produce an executable call.
 #[test]
 fn a_truncated_tool_call_yields_no_completed_call() {

@@ -433,7 +433,7 @@ const INSPECTIONS: &[(&str, &[&str], Option<&str>)] = &[
     ("/hooks", &["hook"], Some("list")),
     ("/settings", &["config", "explain"], None),
     ("/doctor", &["doctor"], None),
-    ("/auth", &["auth", "list"], None),
+    ("/auth", &["auth"], Some("list")),
     ("/compat", &["compat", "explain"], None),
 ];
 
@@ -820,35 +820,80 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
             None => "No configuration is set; every value is a built-in default.".to_owned(),
         }});
     }
-    let label = values
-        .keys()
-        .map(|key| key.chars().count())
-        .max()
-        .unwrap_or(0);
+
     let mut listing = format!(
         "{} value{} set\n",
         values.len(),
         if values.len() == 1 { "" } else { "s" }
     );
+
+    let mut default_provider = None;
+    let mut endpoints: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut others: Vec<(String, String, String)> = Vec::new();
     let mut paths: Vec<&str> = Vec::new();
+
     for (name, entry) in values {
         let value = entry["value"]
             .as_str()
             .map_or_else(|| plain(&entry["value"]), terminal_text);
         let layer = entry["layer"].as_str().unwrap_or("?");
-        listing.push_str(&format!(
-            "\n  {name}{}  {value}  [{layer}]",
-            " ".repeat(label - name.chars().count()),
-        ));
         if let Some(path) = entry["path"].as_str() {
             if !paths.contains(&path) {
                 paths.push(path);
             }
         }
+
+        if name == "provider.default" {
+            default_provider = Some((value, layer.to_owned()));
+        } else if let Some(rest) = name.strip_prefix("provider.endpoint.") {
+            if let Some((endpoint_id, field)) = rest.split_once('.') {
+                endpoints.entry(endpoint_id.to_owned()).or_default().push((
+                    field.to_owned(),
+                    value,
+                    layer.to_owned(),
+                ));
+            } else {
+                others.push((name.clone(), value, layer.to_owned()));
+            }
+        } else {
+            others.push((name.clone(), value, layer.to_owned()));
+        }
     }
+
+    if let Some((val, layer)) = default_provider {
+        listing.push_str(&format!("\n  • default provider: {val}  [{layer}]\n"));
+    }
+
+    for (endpoint_id, fields) in endpoints {
+        listing.push_str(&format!("\n  [{endpoint_id}]\n"));
+        let label_width = fields
+            .iter()
+            .map(|(f, _, _)| f.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (field, val, layer) in fields {
+            let pad = " ".repeat(label_width.saturating_sub(field.chars().count()));
+            listing.push_str(&format!("    • {field}:{pad}  {val}  [{layer}]\n"));
+        }
+    }
+
+    if !others.is_empty() {
+        listing.push_str("\n  [other]\n");
+        let label_width = others
+            .iter()
+            .map(|(k, _, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, val, layer) in others {
+            let pad = " ".repeat(label_width.saturating_sub(name.chars().count()));
+            listing.push_str(&format!("    • {name}:{pad}  {val}  [{layer}]\n"));
+        }
+    }
+
     listing.push('\n');
     for path in paths {
-        listing.push_str(&format!("\n  from {}", terminal_text(path)));
+        listing.push_str(&format!("  from {}\n", terminal_text(path)));
     }
     json!({"configuration": listing})
 }
@@ -1288,6 +1333,8 @@ enum Prompt {
     /// `/provider` is a wizard rather than one question, so the step it is on
     /// travels with the prompt.
     Provider(tui::ProviderStep),
+    /// `/auth` is an interactive credential manager.
+    Auth(tui::AuthStep),
 }
 
 #[cfg(feature = "tui")]
@@ -1334,16 +1381,14 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let native = native.map(|(resolved, _)| resolved);
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
-    // The model picker lists what the Codex CLI cached for its account, which
-    // says nothing about a configured endpoint; there, the picker takes a slug
-    // as free text.
-    // A configured endpoint offers the models it lists; Codex offers what its
-    // CLI cached for the account. Either way the picker has rows, and an
-    // endpoint that lists none still takes a slug as free text.
-    let mut models = if detected.is_codex() {
-        tui::available_models()
-    } else {
-        endpoint_models(invocation, &detected.provider)
+    // The picker lists every provider's models in one place: configured
+    // endpoints offer what they list, and a Codex login offers what its CLI
+    // cached for the account. An empty list still takes a slug as free text,
+    // which always worked.
+    let mut models = {
+        let mut models = endpoint_models(invocation);
+        models.extend(tui::available_models());
+        models
     };
     // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
@@ -1356,9 +1401,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // What the configuration names now, which is not what this session resolved
     // once `/provider` has switched and the restart has not happened yet.
     let mut chosen_provider = configured_default(invocation);
+    let mut conversation: Vec<ModelMessage> = Vec::new();
+    let mut auth_draft = String::new();
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
-    state.set_model_route(route.clone());
     state.set_effort(effort);
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
@@ -1384,7 +1430,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut prompt = if remembered.is_some() || !route.model.is_empty() {
         Prompt::Task
     } else {
-        tui::render_model_list(&mut stdout, &models, &route, colour).map_err(terminal_failed)?;
         Prompt::Model
     };
 
@@ -1400,13 +1445,16 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Model => tui::model_prompt(&models, &route, colour),
             Prompt::Effort => tui::effort_prompt(effort, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
+            Prompt::Auth(step) => step.prompt(&auth_draft, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
-        // Every list is arrowed in the composer block rather than printed above
-        // it, so Up/Down move the mark instead of walking history.
         match prompt {
+            Prompt::Model => {
+                let (rows, selected) = tui::model_rows(&models, &route);
+                composer.offer(rows, selected);
+            }
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
             }
@@ -1414,10 +1462,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 step.rows(&providers, &route.provider, chosen_provider.as_deref()),
                 0,
             ),
+            Prompt::Auth(step) => {
+                let handles = catalog_handles(invocation);
+                composer.offer(step.rows(&providers, &handles), 0);
+            }
             _ => composer.offer(None, 0),
         }
         // A credential is typed, never shown, and never remembered.
-        composer.set_masked(matches!(prompt, Prompt::Provider(step) if step.masked()));
+        composer.set_masked(
+            matches!(prompt, Prompt::Provider(step) if step.masked())
+                || matches!(prompt, Prompt::Auth(step) if step.masked()),
+        );
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1433,13 +1488,21 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // session: the setting is unchanged and the task prompt
                 // returns. Every picker has to be listed here, or leaving one
                 // exits ARSY instead.
-                None if matches!(prompt, Prompt::Model | Prompt::Effort | Prompt::Provider(_)) => {
+                None if matches!(
+                    prompt,
+                    Prompt::Model | Prompt::Effort | Prompt::Provider(_) | Prompt::Auth(_)
+                ) =>
+                {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
                         Prompt::Provider(_) => {
                             draft = tui::ProviderDraft::default();
                             "Provider unchanged.".to_owned()
+                        }
+                        Prompt::Auth(_) => {
+                            auth_draft.clear();
+                            "Auth unchanged.".to_owned()
                         }
                         _ => format!("Model unchanged: {route}"),
                     };
@@ -1521,15 +1584,49 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Auth(step) => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match auth_step(
+                    invocation,
+                    step,
+                    &line,
+                    &mut auth_draft,
+                    &providers,
+                    emitter,
+                ) {
+                    Ok(AuthNext::Ask(next)) => prompt = Prompt::Auth(next),
+                    Ok(AuthNext::Done(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        auth_draft.clear();
+                        prompt = Prompt::Task;
+                    }
+                    Ok(AuthNext::Cancelled(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        auth_draft.clear();
+                        prompt = Prompt::Task;
+                    }
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Task if line.trim() == "/auth" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                providers = configured_providers(invocation);
+                auth_draft.clear();
+                prompt = Prompt::Auth(tui::AuthStep::Pick);
+            }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Re-read, so a model added to the endpoint since startup is
+                // Re-read, so a model added to any endpoint since startup is
                 // offered without restarting.
-                if !route.is_codex() {
-                    models = endpoint_models(invocation, &route.provider);
-                }
-                tui::render_model_list(&mut stdout, &models, &route, colour)
-                    .map_err(terminal_failed)?;
+                models = {
+                    let mut models = endpoint_models(invocation);
+                    models.extend(tui::available_models());
+                    models
+                };
                 prompt = Prompt::Model;
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
@@ -1598,6 +1695,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     ));
                     continue;
                 }
+                let footer = state.status_row(
+                    tui::terminal_width(),
+                    colour,
+                    tui::branch(&workspace).as_deref(),
+                );
                 match run_turn(
                     invocation,
                     native.as_ref(),
@@ -1605,6 +1707,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &route,
                     effort,
                     colour,
+                    &footer,
+                    &mut conversation,
                     &keys,
                     &mut decoder,
                     &mut composer,
@@ -1784,9 +1888,13 @@ fn configured_default(invocation: &Invocation) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The models a configured endpoint offers, as picker rows.
+/// The models every configured endpoint offers, as picker rows grouped by
+/// provider, so `/model` shows the whole catalog and one answer can move the
+/// turn to another provider as well as to another model. Read fresh each time
+/// the picker opens, so a configuration edit made outside ARSY is offered
+/// without a restart.
 #[cfg(feature = "tui")]
-fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelChoice> {
+fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     let Ok(root) = workspace_root(&invocation.workspace) else {
         return Vec::new();
     };
@@ -1794,17 +1902,15 @@ fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelCho
     let Ok(config) = load_config(&root, &working) else {
         return Vec::new();
     };
-    let Some(endpoint) = config.endpoint(Some(provider)) else {
-        return Vec::new();
-    };
-    endpoint
-        .models
-        .iter()
-        .map(|slug| tui::ModelChoice {
+    let mut choices = Vec::new();
+    for endpoint in config.endpoints() {
+        choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
+            provider: endpoint.id.clone(),
             slug: slug.clone(),
-            name: format!("on {provider}"),
-        })
-        .collect()
+            name: format!("on {}", endpoint.id),
+        }));
+    }
+    choices
 }
 
 /// The providers configured right now, in the order the configuration lists
@@ -1953,6 +2059,114 @@ fn provider_step(
     }
 }
 
+#[cfg(feature = "tui")]
+enum AuthNext {
+    Ask(tui::AuthStep),
+    Done(String),
+    Cancelled(String),
+}
+
+#[cfg(feature = "tui")]
+fn catalog_handles(invocation: &Invocation) -> Vec<String> {
+    catalog(CatalogStore::resolve(invocation))
+        .map(|records| records.into_iter().map(|r| r.handle.to_string()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "tui")]
+fn auth_step(
+    invocation: &Invocation,
+    step: tui::AuthStep,
+    line: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let answer = if step.masked() { line } else { line.trim() };
+    if answer.is_empty() {
+        return Ok(AuthNext::Cancelled("Auth unchanged.".to_owned()));
+    }
+    match step {
+        tui::AuthStep::Pick => match answer {
+            "login" => {
+                if providers.is_empty() {
+                    return Err(
+                        "no providers are configured; configure a provider endpoint first"
+                            .to_owned(),
+                    );
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::LoginProvider))
+            }
+            "list" => {
+                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+                let human = human_credentials(&records);
+                let rendered = human
+                    .get("credentials")
+                    .and_then(Value::as_str)
+                    .unwrap_or("No credentials catalogued.");
+                Ok(AuthNext::Done(rendered.to_owned()))
+            }
+            "set" => {
+                if providers.is_empty() {
+                    return Err(
+                        "no providers are configured; configure a provider endpoint first"
+                            .to_owned(),
+                    );
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
+            }
+            "remove" => {
+                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+                if records.is_empty() {
+                    return Err("no credentials are saved in the catalog".to_owned());
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
+            }
+            other => Err(format!(
+                "`{}` is not one of login, list, set, remove",
+                tui::safe_text(other)
+            )),
+        },
+        tui::AuthStep::LoginProvider => {
+            if !providers.iter().any(|p| p == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
+            Ok(AuthNext::Done(format!(
+                "Signed in to `{answer}` with OAuth."
+            )))
+        }
+        tui::AuthStep::SetProvider => {
+            if !providers.iter().any(|p| p == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            *draft_provider = answer.to_owned();
+            Ok(AuthNext::Ask(tui::AuthStep::SetKey))
+        }
+        tui::AuthStep::SetKey => {
+            store_credential(invocation, draft_provider, "keychain", answer)
+                .map_err(|e| e.to_string())?;
+            Ok(AuthNext::Done(format!(
+                "Stored API key for `{draft_provider}` in the credential store."
+            )))
+        }
+        tui::AuthStep::RemoveHandle => {
+            let handle: SecretHandle =
+                SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
+            let store = CatalogStore::resolve(invocation);
+            let mut records = catalog(store).map_err(|e| e.message)?;
+            records.retain(|r| r.handle != handle);
+            save_catalog(store, &records).map_err(|e| e.message)?;
+            Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
+        }
+    }
+}
 /// One host serves several models, so the model step takes a list. The first is
 /// the endpoint's default; the rest are what `/model` offers beside it.
 #[cfg(feature = "tui")]
@@ -2077,6 +2291,8 @@ fn run_turn(
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     colour: bool,
+    footer: &str,
+    conversation: &mut Vec<ModelMessage>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2084,14 +2300,19 @@ fn run_turn(
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    conversation.push(ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text { text: task.clone() }],
+    });
     let outcome = match native.filter(|_| !route.is_codex()) {
         Some(resolved) => native_status(
             resolved,
-            &task,
+            conversation,
             route,
             effort,
             admission.turn,
             colour,
+            footer,
             keys,
             decoder,
             composer,
@@ -2101,6 +2322,7 @@ fn run_turn(
             &task,
             route,
             colour,
+            footer,
             keys,
             decoder,
             composer,
@@ -2130,6 +2352,7 @@ fn run_turn(
         }
     };
     if turn.interrupted {
+        conversation.pop();
         // Stopping a turn is a decision, not a fault: the turn is recorded as
         // failed for the audit trail, but the terminal already said so with an
         // `Interrupted` row and does not need a diagnostic on top.
@@ -2153,6 +2376,14 @@ fn run_turn(
     }
     match &turn.failure {
         None => {
+            if !turn.response.trim().is_empty() {
+                conversation.push(ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::Text {
+                        text: turn.response.clone(),
+                    }],
+                });
+            }
             let mut outcome = json!({"provider": route.provider, "model": route.model});
             merge(&mut outcome, turn.usage.clone());
             service
@@ -2169,6 +2400,7 @@ fn run_turn(
             );
         }
         Some(failure) => {
+            conversation.pop();
             fail_turn(
                 &service,
                 actor,
@@ -2195,11 +2427,12 @@ fn run_turn(
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
-    task: &str,
+    conversation: &[ModelMessage],
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2210,12 +2443,7 @@ fn native_status(
             model: route.model.clone(),
         },
         system: None,
-        messages: vec![ModelMessage {
-            role: ModelRole::User,
-            content: vec![ModelContent::Text {
-                text: task.to_owned(),
-            }],
-        }],
+        messages: conversation.to_vec(),
         // As in `arsy run`: operations are not dispatched from here yet, so a
         // tool offered now would have nowhere to run.
         tools: Vec::new(),
@@ -2242,6 +2470,7 @@ fn native_status(
         for event in stream {
             let message = match event {
                 Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
+                Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
                 Ok(ModelEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -2264,20 +2493,47 @@ fn native_status(
 
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
-    let working_status = tui::working_row(colour);
     // Deltas arrive token by token; a row is emitted per line so scrollback
     // reads like the Codex projection rather than one row per token.
+    //
+    // Thinking and the answer hold separate buffers, and each thinking section
+    // is announced once with its own header row, so the verbose stream reads as
+    // distinct parts of the turn rather than one grey blur.
     let mut pending = String::new();
-    let draw = |terminal: &mut io::Stdout, composer: &mut tui::Composer, row: Option<&str>| {
+    let mut thinking = String::new();
+    let mut thinking_open = false;
+
+    let started = std::time::Instant::now();
+    let mut tick = 0usize;
+    // A static `Working…` line cannot tell a slow connect from a hang; the
+    // status is rebuilt on every timer pass instead of captured once.
+    let status_line = |first_event: bool, tick: usize| {
+        tui::turn_status(
+            colour,
+            if first_event {
+                tui::TurnPhase::Working
+            } else {
+                tui::TurnPhase::Connecting
+            },
+            started.elapsed(),
+            tick,
+            0,
+        )
+    };
+    let mut first_event = false;
+    let draw = |terminal: &mut io::Stdout,
+                composer: &mut tui::Composer,
+                row: Option<&str>,
+                status: &str| {
         let mut frame = composer.clear();
         if let Some(row) = row {
             frame.push_str(row);
             frame.push('\n');
         }
-        frame.push_str(&composer.render(tui::terminal_width(), colour, &working_status));
+        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
-    draw(&mut terminal, composer, None)?;
+    draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
         let mut typed = false;
         while let Ok(byte) = keys.try_recv() {
@@ -2287,7 +2543,12 @@ fn native_status(
             if key == tui::Key::Interrupt {
                 outcome.queued.clear();
                 outcome.interrupted = true;
-                draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                draw(
+                    &mut terminal,
+                    composer,
+                    Some(&tui::interrupted_row(colour)),
+                    &status_line(first_event, tick),
+                )?;
                 return finish(terminal, composer, outcome);
             }
             match composer.press(key) {
@@ -2306,11 +2567,66 @@ fn native_status(
                 tui::Action::None => {}
             }
         }
+        // The status is alive: the spinner advances and the seconds climb even
+        // while the provider sends nothing, so a silent turn never reads as a
+        // frozen one.
+        tick = tick.wrapping_add(1);
         if typed {
-            draw(&mut terminal, composer, None)?;
+            draw(
+                &mut terminal,
+                composer,
+                None,
+                &status_line(first_event, tick),
+            )?;
         }
-        match events.recv_timeout(std::time::Duration::from_millis(40)) {
+        match events.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(Streamed::Thinking(text))) => {
+                let width = tui::terminal_width();
+                // A thinking section opens its own bordered box so reasoning
+                // is visually framed apart from the answer it precedes.
+                if !thinking_open {
+                    thinking_open = true;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_top(width, colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
+                thinking.push_str(&text);
+                while let Some(newline) = thinking.find('\n') {
+                    let line: String = thinking.drain(..=newline).collect();
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_row(width, colour, &line)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
+                first_event = true;
+            }
             Ok(Ok(Streamed::Text(text))) => {
+                outcome.response.push_str(&text);
+                let width = tui::terminal_width();
+                // Answer text closes the thinking box cleanly before the prose starts.
+                if thinking_open {
+                    thinking_open = false;
+                    if !thinking.trim().is_empty() {
+                        let line = std::mem::take(&mut thinking);
+                        draw(
+                            &mut terminal,
+                            composer,
+                            Some(&tui::thinking_box_row(width, colour, &line)),
+                            &status_line(first_event, tick),
+                        )?;
+                    }
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_bottom(width, colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
                     let line: String = pending.drain(..=newline).collect();
@@ -2318,8 +2634,10 @@ fn native_status(
                         &mut terminal,
                         composer,
                         Some(&tui::assistant_row(colour, &line)),
+                        &status_line(first_event, tick),
                     )?;
                 }
+                first_event = true;
             }
             Ok(Ok(Streamed::Usage {
                 input_tokens,
@@ -2335,18 +2653,49 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
-                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::interrupted_row(colour)),
+                        &status_line(first_event, tick),
+                    )?;
                     return finish(terminal, composer, outcome);
                 }
+                // Repaint the live status on every idle pass.
+                draw(
+                    &mut terminal,
+                    composer,
+                    None,
+                    &status_line(first_event, tick),
+                )?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    let width = tui::terminal_width();
+    if thinking_open {
+        if !thinking.trim().is_empty() {
+            let line = std::mem::take(&mut thinking);
+            draw(
+                &mut terminal,
+                composer,
+                Some(&tui::thinking_box_row(width, colour, &line)),
+                &status_line(first_event, tick),
+            )?;
+        }
+        draw(
+            &mut terminal,
+            composer,
+            Some(&tui::thinking_box_bottom(width, colour)),
+            &status_line(first_event, tick),
+        )?;
     }
     if !pending.trim().is_empty() {
         draw(
             &mut terminal,
             composer,
             Some(&tui::assistant_row(colour, &pending)),
+            &status_line(first_event, tick),
         )?;
     }
     finish(terminal, composer, outcome)
@@ -2356,6 +2705,7 @@ fn native_status(
 #[cfg(feature = "tui")]
 enum Streamed {
     Text(String),
+    Thinking(String),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -2379,6 +2729,7 @@ fn external_status(
     task: &str,
     route: &tui::ModelRoute,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2400,7 +2751,7 @@ fn external_status(
     command.arg("-");
     command.current_dir(workspace);
     drive_provider(
-        command, task, route, colour, keys, decoder, composer, redactor,
+        command, task, route, colour, footer, keys, decoder, composer, redactor,
     )
 }
 
@@ -2411,12 +2762,12 @@ fn drive_provider(
     task: &str,
     route: &tui::ModelRoute,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -2462,7 +2813,8 @@ fn drive_provider(
                 composer: &mut tui::Composer,
                 row: Option<&str>,
                 cancelling: bool,
-                queued: usize| {
+                queued: usize,
+                tick: usize| {
         // Rows land above the composer, which is torn down and repainted around
         // each one so the input block is never overwritten.
         let mut frame = composer.clear();
@@ -2470,28 +2822,19 @@ fn drive_provider(
             frame.push_str(row);
             frame.push('\n');
         }
-        // The queue is only mentioned once there is one: a permanent `0 queued`
-        // is noise on the line the terminal shows for the whole turn.
-        let status = format!(
-            "{} · {}s{} · Esc cancel",
-            if cancelling {
-                "  Cancelling…".to_owned()
-            } else {
-                tui::working_row(colour)
-            },
-            started.elapsed().as_secs(),
-            if queued == 0 {
-                String::new()
-            } else {
-                format!(" · {queued} queued")
-            }
-        );
-        frame.push_str(&composer.render(width.get(), colour, &status));
+        let phase = if cancelling {
+            tui::TurnPhase::Cancelling
+        } else {
+            tui::TurnPhase::Working
+        };
+        let status = tui::turn_status(colour, phase, started.elapsed(), tick, queued);
+        frame.push_str(&composer.render_turn(width.get(), colour, &status, footer));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
-    draw(&mut terminal, composer, None, false, 0)?;
+    draw(&mut terminal, composer, None, false, 0, 0)?;
     let mut refreshed = std::time::Instant::now();
     loop {
+        let tick = (started.elapsed().as_millis() / 100) as usize;
         if let Ok(result) = input.try_recv() {
             if !outcome.interrupted {
                 result?;
@@ -2557,6 +2900,7 @@ fn drive_provider(
                         Some(&tui::interrupted_row(colour)),
                         true,
                         0,
+                        tick,
                     )?;
                 }
                 continue;
@@ -2566,13 +2910,13 @@ fn drive_provider(
                 // turn ends, rather than being dropped or blocking.
                 tui::Action::Submit(line) if !line.trim().is_empty() => {
                     if outcome.queued.len() < 16 {
-                        outcome.queued.push_back(line);
                         draw(
                             &mut terminal,
                             composer,
                             Some("  Follow-up queued."),
                             cancelling.is_some(),
                             outcome.queued.len(),
+                            tick,
                         )?;
                     } else {
                         composer.restore(line);
@@ -2582,6 +2926,7 @@ fn drive_provider(
                             Some("  Queue full; draft retained."),
                             cancelling.is_some(),
                             outcome.queued.len(),
+                            tick,
                         )?;
                     }
                 }
@@ -2613,6 +2958,7 @@ fn drive_provider(
                 Some(&tui::interrupted_row(colour)),
                 true,
                 0,
+                tick,
             )?;
         }
         let resize_tick = refreshed.elapsed() >= std::time::Duration::from_secs(1);
@@ -2628,6 +2974,7 @@ fn drive_provider(
                 None,
                 cancelling.is_some(),
                 outcome.queued.len(),
+                tick,
             )?;
         }
         match events.recv_timeout(std::time::Duration::from_millis(40)) {
@@ -2655,13 +3002,25 @@ fn drive_provider(
                                 Some(&row),
                                 false,
                                 outcome.queued.len(),
+                                tick,
                             )?;
                         }
                         last_row = Some(row);
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Repaint so the spinner and clock stay alive while the
+                // provider is quiet, not just when an event or a key arrives.
+                draw(
+                    &mut terminal,
+                    composer,
+                    None,
+                    cancelling.is_some(),
+                    outcome.queued.len(),
+                    tick,
+                )?;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stream_closed = true,
         }
         if stream_closed {
@@ -2707,6 +3066,9 @@ fn drive_provider(
 struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     failure: Option<String>,
+    /// The full text of the model's answer, kept so follow-up turns in the
+    /// same session know what the model said.
+    response: String,
     /// Extra facts to record on a completed turn, such as token usage.
     usage: Value,
     interrupted: bool,
@@ -2715,7 +3077,6 @@ struct Turn {
     queued: std::collections::VecDeque<String>,
     quit: bool,
 }
-
 #[cfg(feature = "tui")]
 /// Record and report a turn the provider did not complete.
 ///
@@ -2910,7 +3271,10 @@ fn dispatch(
             }
             ModelEvent::Completed { .. }
             | ModelEvent::ToolCallStarted { .. }
-            | ModelEvent::ToolCallDelta { .. } => {}
+            | ModelEvent::ToolCallDelta { .. }
+            // `arsy run` is a scriptable surface: reasoning is for the
+            // operator watching a stream, not for a pipeline's stdout.
+            | ModelEvent::ThinkingDelta { .. } => {}
         }
     }
     emitter.end_deltas();
@@ -3232,11 +3596,10 @@ mod tests {
             assert!(parse(args).is_ok(), "{line} did not parse");
         }
 
-        // Credential mutation stays a CLI-only surface: the words land after
-        // `list`, which no `auth` form accepts.
-        for line in ["/auth remove handle", "/auth login codex"] {
+        // Auth commands expand to their CLI equivalents.
+        for line in ["/auth remove secret://os/handle", "/auth login codex"] {
             let args = inspection_args(line).expect("mapped");
-            assert!(parse(args).is_err(), "{line} reached auth mutation");
+            assert!(parse(args).is_ok(), "{line} did not parse");
         }
     }
 
@@ -3283,13 +3646,14 @@ mod tests {
         let listed: Vec<tui::ModelChoice> = ["mimo", "mimo-2", "mimo-lite"]
             .into_iter()
             .map(|slug| tui::ModelChoice {
+                provider: "hari".to_owned(),
                 slug: slug.to_owned(),
                 name: "on hari".to_owned(),
             })
             .collect();
 
-        // A number picks from the list, and the provider does not move with it:
-        // choosing a model is not choosing an endpoint.
+        // A number picks from the list; the row names the provider it serves,
+        // so the route follows the row rather than the current provider.
         let picked = tui::resolve_model("2", &listed, &route).unwrap();
         assert_eq!(picked.model, "mimo-2");
         assert_eq!(picked.provider, "hari");
@@ -3455,6 +3819,79 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_auth_wizard_routes_actions_and_lists_providers() {
+        use tui::AuthStep as Step;
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            command: Command::Tui,
+            no_color: true,
+            output: Some(Output::Human),
+        };
+        let mut emitter = Emitter::new(Output::Human);
+        let providers = vec!["antigravity".to_owned(), "chatgpt".to_owned()];
+        let mut draft = String::new();
+
+        // An empty answer leaves the wizard without touching anything.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "  ",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Cancelled(_)
+        ));
+
+        // Picking login moves to the provider picker.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "login",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::LoginProvider)
+        ));
+
+        // Picking set moves to the provider picker.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "set",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::SetProvider)
+        ));
+
+        // Choosing a provider to set asks for its key.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::SetProvider,
+                "antigravity",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::SetKey)
+        ));
+        assert_eq!(draft, "antigravity");
+    }
+
     /// The catalog is metadata, so where it lives is the operator's choice and
     /// the default costs no unlock prompt.
     #[test]
@@ -3519,10 +3956,10 @@ mod tests {
         let listing = rendered["configuration"].as_str().expect("one string");
         assert!(listing.starts_with("2 values set"), "{listing}");
         assert!(
-            listing.contains("provider.default             myai  [user]"),
+            listing.contains("default provider: myai  [user]"),
             "{listing}"
         );
-        assert!(listing.contains("openai  [workspace]"), "{listing}");
+        assert!(listing.contains("kind:  openai  [workspace]"), "{listing}");
         // Each source file is named once, under the rows, rather than repeated
         // on every one of them.
         assert_eq!(listing.matches("/cfg/config.toml").count(), 1, "{listing}");
@@ -3758,6 +4195,7 @@ mod tests {
             &"x".repeat(131_072),
             &route,
             false,
+            "  footer",
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -3777,6 +4215,7 @@ mod tests {
             "task\n",
             &route,
             false,
+            "  footer",
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),

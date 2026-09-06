@@ -303,6 +303,17 @@ impl EventDecoder {
                     self.tool_call_delta(call)?;
                 }
             }
+            // Reasoning models surface their thinking in a sibling field of
+            // the same delta, before the answer text it produced.
+            if let Some(thinking) = delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                self.queue.push_back(ModelEvent::ThinkingDelta {
+                    text: thinking.to_owned(),
+                });
+            }
         }
         if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
             // Every buffered call must parse as a whole here, or it is

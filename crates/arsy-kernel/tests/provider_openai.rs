@@ -314,6 +314,37 @@ fn text_streams_as_deltas_and_a_length_stop_is_normalized() {
     );
 }
 
+/// Reasoning models surface their thinking in `reasoning_content` before the
+/// answer it produced, so the verbose stream can show the two apart.
+#[test]
+fn reasoning_content_streams_as_thinking_deltas_before_the_answer() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"first thought"}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":null}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the answer"}}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    ]);
+    let provider = OpenAiProvider::new(ApiKey::new("sk-test-value"), transport);
+
+    let events = collect(provider.stream(&request(Vec::new())).unwrap());
+
+    assert_eq!(
+        events,
+        [
+            ModelEvent::ThinkingDelta {
+                text: "first thought".to_owned(),
+            },
+            ModelEvent::TextDelta {
+                text: "the answer".to_owned(),
+            },
+            ModelEvent::Completed {
+                stop: StopReason::EndTurn
+            },
+        ],
+        "an empty or null reasoning field carries no thinking event"
+    );
+}
+
 #[test]
 fn statuses_and_stream_errors_map_onto_the_shared_error_classes() {
     /// Whether the normalized error is the class the status should produce.
