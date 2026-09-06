@@ -119,8 +119,11 @@ pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
 pub enum Key {
     Char(char),
     Backspace,
+    WordBackspace,
     Left,
     Right,
+    WordLeft,
+    WordRight,
     Home,
     End,
     Delete,
@@ -158,8 +161,11 @@ impl Keys {
             self.pending.clear();
         }
         match byte {
+            0x01 => return Some(Key::Home),
             0x03 => return Some(Key::Interrupt),
             0x04 => return Some(Key::Eof),
+            0x05 => return Some(Key::End),
+            0x17 => return Some(Key::WordBackspace),
             b'\r' | b'\n' => return Some(Key::Enter),
             0x7f | 0x08 => return Some(Key::Backspace),
             0x1b => {
@@ -188,15 +194,30 @@ impl Keys {
     }
 
     fn feed_escape(&mut self, byte: u8) -> Option<Key> {
-        if self.pending.len() == 1 && matches!(byte, b'\r' | b'\n') {
-            // Option/Alt+Enter on macOS/Linux.
-            self.pending.clear();
-            return Some(Key::Newline);
-        }
-        if self.pending.len() == 1 && !matches!(byte, b'[' | b'O') {
-            // Escape did not introduce a sequence, so it was its own key.
-            self.pending.clear();
-            return self.feed(byte).or(Some(Key::Interrupt));
+        if self.pending.len() == 1 {
+            match byte {
+                b'\r' | b'\n' => {
+                    self.pending.clear();
+                    return Some(Key::Newline);
+                }
+                b'b' | b'B' => {
+                    self.pending.clear();
+                    return Some(Key::WordLeft);
+                }
+                b'f' | b'F' => {
+                    self.pending.clear();
+                    return Some(Key::WordRight);
+                }
+                0x7f | 0x08 => {
+                    self.pending.clear();
+                    return Some(Key::WordBackspace);
+                }
+                b if !matches!(b, b'[' | b'O') => {
+                    self.pending.clear();
+                    return self.feed(byte).or(Some(Key::Interrupt));
+                }
+                _ => {}
+            }
         }
         self.pending.push(byte);
         if self.pending.len() > 32 {
@@ -229,14 +250,39 @@ impl Keys {
         {
             return Some(Key::Newline);
         }
+        if sequence == b"\x1b[1;3D"
+            || sequence == b"\x1b[1;5D"
+            || sequence == b"\x1b[5D"
+            || sequence == b"\x1b[1;4D"
+        {
+            return Some(Key::WordLeft);
+        }
+        if sequence == b"\x1b[1;3C"
+            || sequence == b"\x1b[1;5C"
+            || sequence == b"\x1b[5C"
+            || sequence == b"\x1b[1;4C"
+        {
+            return Some(Key::WordRight);
+        }
+        if sequence == b"\x1b[1;9D" || sequence == b"\x1b[1;2D" {
+            return Some(Key::Home);
+        }
+        if sequence == b"\x1b[1;9C" || sequence == b"\x1b[1;2C" {
+            return Some(Key::End);
+        }
+        if sequence == b"\x1b[3;3~" || sequence == b"\x1b[3;5~" {
+            return Some(Key::WordBackspace);
+        }
         match (sequence.last(), sequence.get(2)) {
             (Some(b'A'), _) => Some(Key::Up),
             (Some(b'B'), _) => Some(Key::Down),
             (Some(b'~'), Some(b'3')) => Some(Key::Delete),
             (Some(b'D'), _) => Some(Key::Left),
             (Some(b'C'), _) => Some(Key::Right),
-            (Some(b'H'), _) | (Some(b'~'), Some(b'1')) => Some(Key::Home),
-            (Some(b'F'), _) | (Some(b'~'), Some(b'4')) => Some(Key::End),
+            (Some(b'H'), _) | (Some(b'~'), Some(b'1')) | (Some(b'~'), Some(b'7')) => {
+                Some(Key::Home)
+            }
+            (Some(b'F'), _) | (Some(b'~'), Some(b'4')) | (Some(b'~'), Some(b'8')) => Some(Key::End),
             _ => None,
         }
     }
@@ -666,6 +712,18 @@ impl Composer {
                 self.caret += 1;
                 Action::Redraw
             }
+            Key::WordLeft => {
+                self.word_left();
+                Action::Redraw
+            }
+            Key::WordRight => {
+                self.word_right();
+                Action::Redraw
+            }
+            Key::WordBackspace => {
+                self.word_backspace();
+                Action::Redraw
+            }
             Key::Home => {
                 self.caret = 0;
                 Action::Redraw
@@ -730,6 +788,48 @@ impl Composer {
             .char_indices()
             .nth(caret)
             .map_or(self.buffer.len(), |(at, _)| at)
+    }
+
+    fn word_left(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let mut idx = self.caret.min(chars.len());
+        while idx > 0 && !chars[idx - 1].is_alphanumeric() {
+            idx -= 1;
+        }
+        while idx > 0 && chars[idx - 1].is_alphanumeric() {
+            idx -= 1;
+        }
+        self.caret = idx;
+    }
+
+    fn word_right(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let len = chars.len();
+        let mut idx = self.caret.min(len);
+        while idx < len && chars[idx].is_alphanumeric() {
+            idx += 1;
+        }
+        while idx < len && !chars[idx].is_alphanumeric() {
+            idx += 1;
+        }
+        self.caret = idx;
+    }
+
+    fn word_backspace(&mut self) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let old_caret = self.caret.min(chars.len());
+        let mut idx = old_caret;
+        while idx > 0 && !chars[idx - 1].is_alphanumeric() {
+            idx -= 1;
+        }
+        while idx > 0 && chars[idx - 1].is_alphanumeric() {
+            idx -= 1;
+        }
+        let start_byte = self.byte_at(idx);
+        let end_byte = self.byte_at(old_caret);
+        self.buffer.drain(start_byte..end_byte);
+        self.caret = idx;
+        self.selected = 0;
     }
 
     fn caret_line_col(&self) -> (usize, usize, usize) {
@@ -1289,14 +1389,15 @@ impl TuiState {
             .model_route
             .as_ref()
             .map_or_else(|| "no model".to_owned(), ModelRoute::to_string);
-        let effort = self.effort.map_or_else(
-            || "effort:—".to_owned(),
-            |effort| format!("effort:{effort}"),
-        );
+        let effort_label = match self.effort {
+            None => "○ off".to_owned(),
+            Some(Effort::Low) => "◔ low".to_owned(),
+            Some(Effort::Medium) => "◑ medium".to_owned(),
+            Some(Effort::High) => "● high".to_owned(),
+        };
         let branch = branch.unwrap_or_default();
 
         let model_label = format!("✦ {route}");
-        let effort_label = format!("✻ {effort}");
         let head = INDENT + visible_len(&model_label) + GAP + visible_len(&effort_label);
         let branch_label = if branch.is_empty() {
             String::new()
@@ -2208,16 +2309,13 @@ mod tests {
         // missing rather than dropping the field.
         assert_eq!(
             state.status_row(80, false, None),
-            "  ✦ no model  ✻ effort:—  📁 /repo"
+            "  ✦ no model  ○ off  📁 /repo"
         );
         state.set_effort(Some(Effort::High));
         // The branch sits at the right edge, so it holds its column while the
         // fields on the left change length.
         let row = state.status_row(80, false, Some("feat/x"));
-        assert!(
-            row.starts_with("  ✦ no model  ✻ effort:high  📁 /repo"),
-            "{row:?}"
-        );
+        assert!(row.starts_with("  ✦ no model  ● high  📁 /repo"), "{row:?}");
         assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
         state.set_effort(None);
@@ -2779,10 +2877,10 @@ mod tests {
         assert!(visible_len(&middle) <= 72, "{middle:?}");
 
         // Narrower still: the path goes entirely before the branch is touched.
-        let narrow = state.status_row(56, false, Some("feat/slash-menu"));
+        let narrow = state.status_row(48, false, Some("feat/slash-menu"));
         assert!(!narrow.contains("arsy-code"), "{narrow:?}");
         assert!(narrow.ends_with("feat/slash-menu"), "{narrow:?}");
-        assert!(visible_len(&narrow) <= 56, "{narrow:?}");
+        assert!(visible_len(&narrow) <= 48, "{narrow:?}");
 
         // Only when even that cannot fit is the branch dropped, never cut.
         let tiny = state.status_row(30, false, Some("feat/slash-menu"));
@@ -3003,5 +3101,58 @@ mod tests {
 
         let committed = composer.commit("first\nsecond", false);
         assert!(committed.contains("› first\n· second\n"));
+    }
+
+    #[test]
+    fn option_and_command_arrow_word_navigation() {
+        let mut keys = Keys::default();
+        // Option+Left (ESC b)
+        assert_eq!(keys.feed(0x1b), None);
+        assert_eq!(keys.feed(b'b'), Some(Key::WordLeft));
+
+        // Option+Right (ESC f)
+        assert_eq!(keys.feed(0x1b), None);
+        assert_eq!(keys.feed(b'f'), Some(Key::WordRight));
+
+        // Option+Backspace (ESC DEL)
+        assert_eq!(keys.feed(0x1b), None);
+        assert_eq!(keys.feed(0x7f), Some(Key::WordBackspace));
+
+        // Ctrl+W
+        assert_eq!(keys.feed(0x17), Some(Key::WordBackspace));
+
+        // xterm Alt+Left (\x1b[1;3D)
+        for b in b"\x1b[1;3" {
+            assert_eq!(keys.feed(*b), None);
+        }
+        assert_eq!(keys.feed(b'D'), Some(Key::WordLeft));
+
+        // Command+Left / Home (\x1b[1;9D)
+        for b in b"\x1b[1;9" {
+            assert_eq!(keys.feed(*b), None);
+        }
+        assert_eq!(keys.feed(b'D'), Some(Key::Home));
+
+        let mut composer = Composer::default();
+        for ch in "hello world arsy".chars() {
+            composer.press(Key::Char(ch));
+        }
+        assert_eq!(composer.caret, 16);
+
+        // WordLeft moves back by word
+        composer.press(Key::WordLeft);
+        assert_eq!(composer.caret, 12); // start of "arsy"
+
+        composer.press(Key::WordLeft);
+        assert_eq!(composer.caret, 6); // start of "world"
+
+        // WordRight moves forward by word
+        composer.press(Key::WordRight);
+        assert_eq!(composer.caret, 12); // start of "arsy"
+
+        // WordBackspace deletes word backward
+        composer.press(Key::WordBackspace);
+        assert_eq!(composer.buffer, "hello arsy");
+        assert_eq!(composer.caret, 6);
     }
 }
