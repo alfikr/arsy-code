@@ -1334,16 +1334,14 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let native = native.map(|(resolved, _)| resolved);
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
-    // The model picker lists what the Codex CLI cached for its account, which
-    // says nothing about a configured endpoint; there, the picker takes a slug
-    // as free text.
-    // A configured endpoint offers the models it lists; Codex offers what its
-    // CLI cached for the account. Either way the picker has rows, and an
-    // endpoint that lists none still takes a slug as free text.
-    let mut models = if detected.is_codex() {
-        tui::available_models()
-    } else {
-        endpoint_models(invocation, &detected.provider)
+    // The picker lists every provider's models in one place: configured
+    // endpoints offer what they list, and a Codex login offers what its CLI
+    // cached for the account. An empty list still takes a slug as free text,
+    // which always worked.
+    let mut models = {
+        let mut models = endpoint_models(invocation);
+        models.extend(tui::available_models());
+        models
     };
     // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
@@ -1384,7 +1382,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut prompt = if remembered.is_some() || !route.model.is_empty() {
         Prompt::Task
     } else {
-        tui::render_model_list(&mut stdout, &models, &route, colour).map_err(terminal_failed)?;
         Prompt::Model
     };
 
@@ -1404,9 +1401,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
-        // Every list is arrowed in the composer block rather than printed above
-        // it, so Up/Down move the mark instead of walking history.
         match prompt {
+            Prompt::Model => {
+                let (rows, selected) = tui::model_rows(&models, &route);
+                composer.offer(rows, selected);
+            }
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
             }
@@ -1523,13 +1522,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Re-read, so a model added to the endpoint since startup is
+                // Re-read, so a model added to any endpoint since startup is
                 // offered without restarting.
-                if !route.is_codex() {
-                    models = endpoint_models(invocation, &route.provider);
-                }
-                tui::render_model_list(&mut stdout, &models, &route, colour)
-                    .map_err(terminal_failed)?;
+                models = {
+                    let mut models = endpoint_models(invocation);
+                    models.extend(tui::available_models());
+                    models
+                };
                 prompt = Prompt::Model;
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
@@ -1598,6 +1597,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     ));
                     continue;
                 }
+                let footer = state.status_row(
+                    tui::terminal_width(),
+                    colour,
+                    tui::branch(&workspace).as_deref(),
+                );
                 match run_turn(
                     invocation,
                     native.as_ref(),
@@ -1605,12 +1609,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &route,
                     effort,
                     colour,
+                    &footer,
                     &keys,
                     &mut decoder,
                     &mut composer,
                     emitter,
                 ) {
-                    Ok(turn) if turn.quit => break,
                     Ok(turn) => {
                         if turn.interrupted {
                             queued.clear();
@@ -1784,9 +1788,13 @@ fn configured_default(invocation: &Invocation) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The models a configured endpoint offers, as picker rows.
+/// The models every configured endpoint offers, as picker rows grouped by
+/// provider, so `/model` shows the whole catalog and one answer can move the
+/// turn to another provider as well as to another model. Read fresh each time
+/// the picker opens, so a configuration edit made outside ARSY is offered
+/// without a restart.
 #[cfg(feature = "tui")]
-fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelChoice> {
+fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     let Ok(root) = workspace_root(&invocation.workspace) else {
         return Vec::new();
     };
@@ -1794,17 +1802,15 @@ fn endpoint_models(invocation: &Invocation, provider: &str) -> Vec<tui::ModelCho
     let Ok(config) = load_config(&root, &working) else {
         return Vec::new();
     };
-    let Some(endpoint) = config.endpoint(Some(provider)) else {
-        return Vec::new();
-    };
-    endpoint
-        .models
-        .iter()
-        .map(|slug| tui::ModelChoice {
+    let mut choices = Vec::new();
+    for endpoint in config.endpoints() {
+        choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
+            provider: endpoint.id.clone(),
             slug: slug.clone(),
-            name: format!("on {provider}"),
-        })
-        .collect()
+            name: format!("on {}", endpoint.id),
+        }));
+    }
+    choices
 }
 
 /// The providers configured right now, in the order the configuration lists
@@ -2077,6 +2083,7 @@ fn run_turn(
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2092,6 +2099,7 @@ fn run_turn(
             effort,
             admission.turn,
             colour,
+            footer,
             keys,
             decoder,
             composer,
@@ -2101,6 +2109,7 @@ fn run_turn(
             &task,
             route,
             colour,
+            footer,
             keys,
             decoder,
             composer,
@@ -2200,6 +2209,7 @@ fn native_status(
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2242,6 +2252,7 @@ fn native_status(
         for event in stream {
             let message = match event {
                 Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
+                Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
                 Ok(ModelEvent::Usage {
                     input_tokens,
                     output_tokens,
@@ -2264,20 +2275,47 @@ fn native_status(
 
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
-    let working_status = tui::working_row(colour);
     // Deltas arrive token by token; a row is emitted per line so scrollback
     // reads like the Codex projection rather than one row per token.
+    //
+    // Thinking and the answer hold separate buffers, and each thinking section
+    // is announced once with its own header row, so the verbose stream reads as
+    // distinct parts of the turn rather than one grey blur.
     let mut pending = String::new();
-    let draw = |terminal: &mut io::Stdout, composer: &mut tui::Composer, row: Option<&str>| {
+    let mut thinking = String::new();
+    let mut thinking_open = false;
+
+    let started = std::time::Instant::now();
+    let mut tick = 0usize;
+    // A static `Working…` line cannot tell a slow connect from a hang; the
+    // status is rebuilt on every timer pass instead of captured once.
+    let status_line = |first_event: bool, tick: usize| {
+        tui::turn_status(
+            colour,
+            if first_event {
+                tui::TurnPhase::Working
+            } else {
+                tui::TurnPhase::Connecting
+            },
+            started.elapsed(),
+            tick,
+            0,
+        )
+    };
+    let mut first_event = false;
+    let draw = |terminal: &mut io::Stdout,
+                composer: &mut tui::Composer,
+                row: Option<&str>,
+                status: &str| {
         let mut frame = composer.clear();
         if let Some(row) = row {
             frame.push_str(row);
             frame.push('\n');
         }
-        frame.push_str(&composer.render(tui::terminal_width(), colour, &working_status));
+        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
-    draw(&mut terminal, composer, None)?;
+    draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
         let mut typed = false;
         while let Ok(byte) = keys.try_recv() {
@@ -2287,7 +2325,12 @@ fn native_status(
             if key == tui::Key::Interrupt {
                 outcome.queued.clear();
                 outcome.interrupted = true;
-                draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                draw(
+                    &mut terminal,
+                    composer,
+                    Some(&tui::interrupted_row(colour)),
+                    &status_line(first_event, tick),
+                )?;
                 return finish(terminal, composer, outcome);
             }
             match composer.press(key) {
@@ -2306,11 +2349,65 @@ fn native_status(
                 tui::Action::None => {}
             }
         }
+        // The status is alive: the spinner advances and the seconds climb even
+        // while the provider sends nothing, so a silent turn never reads as a
+        // frozen one.
+        tick = tick.wrapping_add(1);
         if typed {
-            draw(&mut terminal, composer, None)?;
+            draw(
+                &mut terminal,
+                composer,
+                None,
+                &status_line(first_event, tick),
+            )?;
         }
-        match events.recv_timeout(std::time::Duration::from_millis(40)) {
+        match events.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(Streamed::Thinking(text))) => {
+                let width = tui::terminal_width();
+                // A thinking section opens its own bordered box so reasoning
+                // is visually framed apart from the answer it precedes.
+                if !thinking_open {
+                    thinking_open = true;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_top(width, colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
+                thinking.push_str(&text);
+                while let Some(newline) = thinking.find('\n') {
+                    let line: String = thinking.drain(..=newline).collect();
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_row(width, colour, &line)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
+                first_event = true;
+            }
             Ok(Ok(Streamed::Text(text))) => {
+                let width = tui::terminal_width();
+                // Answer text closes the thinking box cleanly before the prose starts.
+                if thinking_open {
+                    thinking_open = false;
+                    if !thinking.trim().is_empty() {
+                        let line = std::mem::take(&mut thinking);
+                        draw(
+                            &mut terminal,
+                            composer,
+                            Some(&tui::thinking_box_row(width, colour, &line)),
+                            &status_line(first_event, tick),
+                        )?;
+                    }
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::thinking_box_bottom(width, colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
                     let line: String = pending.drain(..=newline).collect();
@@ -2318,8 +2415,10 @@ fn native_status(
                         &mut terminal,
                         composer,
                         Some(&tui::assistant_row(colour, &line)),
+                        &status_line(first_event, tick),
                     )?;
                 }
+                first_event = true;
             }
             Ok(Ok(Streamed::Usage {
                 input_tokens,
@@ -2335,18 +2434,49 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
-                    draw(&mut terminal, composer, Some(&tui::interrupted_row(colour)))?;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::interrupted_row(colour)),
+                        &status_line(first_event, tick),
+                    )?;
                     return finish(terminal, composer, outcome);
                 }
+                // Repaint the live status on every idle pass.
+                draw(
+                    &mut terminal,
+                    composer,
+                    None,
+                    &status_line(first_event, tick),
+                )?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    let width = tui::terminal_width();
+    if thinking_open {
+        if !thinking.trim().is_empty() {
+            let line = std::mem::take(&mut thinking);
+            draw(
+                &mut terminal,
+                composer,
+                Some(&tui::thinking_box_row(width, colour, &line)),
+                &status_line(first_event, tick),
+            )?;
+        }
+        draw(
+            &mut terminal,
+            composer,
+            Some(&tui::thinking_box_bottom(width, colour)),
+            &status_line(first_event, tick),
+        )?;
     }
     if !pending.trim().is_empty() {
         draw(
             &mut terminal,
             composer,
             Some(&tui::assistant_row(colour, &pending)),
+            &status_line(first_event, tick),
         )?;
     }
     finish(terminal, composer, outcome)
@@ -2356,6 +2486,7 @@ fn native_status(
 #[cfg(feature = "tui")]
 enum Streamed {
     Text(String),
+    Thinking(String),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -2379,6 +2510,7 @@ fn external_status(
     task: &str,
     route: &tui::ModelRoute,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2400,7 +2532,7 @@ fn external_status(
     command.arg("-");
     command.current_dir(workspace);
     drive_provider(
-        command, task, route, colour, keys, decoder, composer, redactor,
+        command, task, route, colour, footer, keys, decoder, composer, redactor,
     )
 }
 
@@ -2411,12 +2543,12 @@ fn drive_provider(
     task: &str,
     route: &tui::ModelRoute,
     colour: bool,
+    footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -2462,7 +2594,8 @@ fn drive_provider(
                 composer: &mut tui::Composer,
                 row: Option<&str>,
                 cancelling: bool,
-                queued: usize| {
+                queued: usize,
+                tick: usize| {
         // Rows land above the composer, which is torn down and repainted around
         // each one so the input block is never overwritten.
         let mut frame = composer.clear();
@@ -2470,28 +2603,19 @@ fn drive_provider(
             frame.push_str(row);
             frame.push('\n');
         }
-        // The queue is only mentioned once there is one: a permanent `0 queued`
-        // is noise on the line the terminal shows for the whole turn.
-        let status = format!(
-            "{} · {}s{} · Esc cancel",
-            if cancelling {
-                "  Cancelling…".to_owned()
-            } else {
-                tui::working_row(colour)
-            },
-            started.elapsed().as_secs(),
-            if queued == 0 {
-                String::new()
-            } else {
-                format!(" · {queued} queued")
-            }
-        );
-        frame.push_str(&composer.render(width.get(), colour, &status));
+        let phase = if cancelling {
+            tui::TurnPhase::Cancelling
+        } else {
+            tui::TurnPhase::Working
+        };
+        let status = tui::turn_status(colour, phase, started.elapsed(), tick, queued);
+        frame.push_str(&composer.render_turn(width.get(), colour, &status, footer));
         write!(terminal, "{frame}").and_then(|()| terminal.flush())
     };
-    draw(&mut terminal, composer, None, false, 0)?;
+    draw(&mut terminal, composer, None, false, 0, 0)?;
     let mut refreshed = std::time::Instant::now();
     loop {
+        let tick = (started.elapsed().as_millis() / 100) as usize;
         if let Ok(result) = input.try_recv() {
             if !outcome.interrupted {
                 result?;
@@ -2557,6 +2681,7 @@ fn drive_provider(
                         Some(&tui::interrupted_row(colour)),
                         true,
                         0,
+                        tick,
                     )?;
                 }
                 continue;
@@ -2566,13 +2691,13 @@ fn drive_provider(
                 // turn ends, rather than being dropped or blocking.
                 tui::Action::Submit(line) if !line.trim().is_empty() => {
                     if outcome.queued.len() < 16 {
-                        outcome.queued.push_back(line);
                         draw(
                             &mut terminal,
                             composer,
                             Some("  Follow-up queued."),
                             cancelling.is_some(),
                             outcome.queued.len(),
+                            tick,
                         )?;
                     } else {
                         composer.restore(line);
@@ -2582,6 +2707,7 @@ fn drive_provider(
                             Some("  Queue full; draft retained."),
                             cancelling.is_some(),
                             outcome.queued.len(),
+                            tick,
                         )?;
                     }
                 }
@@ -2613,6 +2739,7 @@ fn drive_provider(
                 Some(&tui::interrupted_row(colour)),
                 true,
                 0,
+                tick,
             )?;
         }
         let resize_tick = refreshed.elapsed() >= std::time::Duration::from_secs(1);
@@ -2628,6 +2755,7 @@ fn drive_provider(
                 None,
                 cancelling.is_some(),
                 outcome.queued.len(),
+                tick,
             )?;
         }
         match events.recv_timeout(std::time::Duration::from_millis(40)) {
@@ -2655,13 +2783,25 @@ fn drive_provider(
                                 Some(&row),
                                 false,
                                 outcome.queued.len(),
+                                tick,
                             )?;
                         }
                         last_row = Some(row);
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Repaint so the spinner and clock stay alive while the
+                // provider is quiet, not just when an event or a key arrives.
+                draw(
+                    &mut terminal,
+                    composer,
+                    None,
+                    cancelling.is_some(),
+                    outcome.queued.len(),
+                    tick,
+                )?;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stream_closed = true,
         }
         if stream_closed {
@@ -2910,7 +3050,10 @@ fn dispatch(
             }
             ModelEvent::Completed { .. }
             | ModelEvent::ToolCallStarted { .. }
-            | ModelEvent::ToolCallDelta { .. } => {}
+            | ModelEvent::ToolCallDelta { .. }
+            // `arsy run` is a scriptable surface: reasoning is for the
+            // operator watching a stream, not for a pipeline's stdout.
+            | ModelEvent::ThinkingDelta { .. } => {}
         }
     }
     emitter.end_deltas();
@@ -3283,13 +3426,14 @@ mod tests {
         let listed: Vec<tui::ModelChoice> = ["mimo", "mimo-2", "mimo-lite"]
             .into_iter()
             .map(|slug| tui::ModelChoice {
+                provider: "hari".to_owned(),
                 slug: slug.to_owned(),
                 name: "on hari".to_owned(),
             })
             .collect();
 
-        // A number picks from the list, and the provider does not move with it:
-        // choosing a model is not choosing an endpoint.
+        // A number picks from the list; the row names the provider it serves,
+        // so the route follows the row rather than the current provider.
         let picked = tui::resolve_model("2", &listed, &route).unwrap();
         assert_eq!(picked.model, "mimo-2");
         assert_eq!(picked.provider, "hari");
@@ -3758,6 +3902,7 @@ mod tests {
             &"x".repeat(131_072),
             &route,
             false,
+            "  footer",
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
@@ -3777,6 +3922,7 @@ mod tests {
             "task\n",
             &route,
             false,
+            "  footer",
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
