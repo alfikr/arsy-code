@@ -40,7 +40,9 @@ const RESET: &str = "\x1b[0m";
 /// Codex `user_message_bg`: white at 12% over the `#1a1a1a` terminal surface.
 const INPUT_BG: &str = "\x1b[48;2;53;53;53m";
 const CLEAR_EOL: &str = "\x1b[K";
+#[cfg(test)]
 const CARET_UP_1: &str = "\x1b[1A";
+#[cfg(test)]
 const CARET_UP_2: &str = "\x1b[2A";
 const CLEAR_BELOW: &str = "\x1b[J";
 
@@ -125,6 +127,8 @@ pub enum Key {
     Up,
     Down,
     Enter,
+    /// Shift+Enter or Alt+Enter to insert a newline without submitting.
+    Newline,
     /// Ctrl-C, or Escape once it is known to stand alone.
     Interrupt,
     /// Ctrl-D on an empty line.
@@ -184,6 +188,11 @@ impl Keys {
     }
 
     fn feed_escape(&mut self, byte: u8) -> Option<Key> {
+        if self.pending.len() == 1 && matches!(byte, b'\r' | b'\n') {
+            // Option/Alt+Enter on macOS/Linux.
+            self.pending.clear();
+            return Some(Key::Newline);
+        }
         if self.pending.len() == 1 && !matches!(byte, b'[' | b'O') {
             // Escape did not introduce a sequence, so it was its own key.
             self.pending.clear();
@@ -208,6 +217,17 @@ impl Keys {
         }
         if self.pasting {
             return None;
+        }
+        if sequence == b"\x1b[13;2u"
+            || sequence == b"\x1b[13;3u"
+            || sequence == b"\x1b[13;5u"
+            || sequence == b"\x1b[27;2;13~"
+            || sequence == b"\x1b[27;3;13~"
+            || sequence == b"\x1b[27;5;13~"
+            || sequence == b"\x1bOM"
+            || sequence == b"\x1b[13~"
+        {
+            return Some(Key::Newline);
         }
         match (sequence.last(), sequence.get(2)) {
             (Some(b'A'), _) => Some(Key::Up),
@@ -614,6 +634,12 @@ impl Composer {
                 self.selected = 0;
                 Action::Redraw
             }
+            Key::Newline => {
+                self.buffer.insert(self.byte_at(self.caret), '\n');
+                self.caret += 1;
+                self.selected = 0;
+                Action::Redraw
+            }
             Key::Backspace if self.caret > 0 => {
                 self.buffer.remove(self.byte_at(self.caret - 1));
                 self.caret -= 1;
@@ -706,27 +732,37 @@ impl Composer {
             .map_or(self.buffer.len(), |(at, _)| at)
     }
 
-    /// Paint the block — status, pad, input, pad, menu — and leave the caret in
-    /// the input line where the next character belongs.
-    ///
-    /// A previous block is erased first: the caret rests on the input row, two
-    /// rows into the block, so clearing from two rows above removes the whole
+    fn caret_line_col(&self) -> (usize, usize, usize) {
+        let chars: Vec<char> = self.buffer.chars().collect();
+        let total_chars = chars.len();
+        let caret = self.caret.min(total_chars);
+        let mut line_idx = 0;
+        let mut col_offset = 0;
+        for &ch in &chars[..caret] {
+            if ch == '\n' {
+                line_idx += 1;
+                col_offset = 0;
+            } else {
+                col_offset += 1;
+            }
+        }
+        let total_lines = self.buffer.split('\n').count().max(1);
+        (line_idx, col_offset, total_lines)
+    }
+
     /// Paint the block — pad, input, pad, menu, status — with the status row
     /// at the bottom, so model, effort, directory and branch anchor the prompt.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width.saturating_sub(1));
         let room = width.saturating_sub(3);
-        let (text, caret) = self.window(room);
         let menu = self.menu_rows(width, colour);
+        let (line_idx, col_offset, total_lines) = self.caret_line_col();
         let mut frame = String::new();
         if self.drawn {
             frame.push_str(RESET);
-            frame.push_str(if self.top_status {
-                CARET_UP_2
-            } else {
-                CARET_UP_1
-            });
+            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
+            frame.push_str(&format!("\x1b[{}A", lines_above));
             frame.push('\r');
             frame.push_str(CLEAR_BELOW);
         }
@@ -737,24 +773,60 @@ impl Composer {
         } else {
             String::new()
         };
-        frame.push_str(&format!(
-            "{surface}\n{surface}{} {text}{}\n{surface}{}\n",
-            if colour {
-                format!("{INPUT_BG}›")
-            } else {
-                "›".to_owned()
-            },
-            if colour { CLEAR_EOL } else { "" },
-            if colour { RESET } else { "" },
-        ));
+        // Top surface pad
+        frame.push_str(&surface);
+        frame.push('\n');
+        // Input lines
+        let mut active_caret_col = col_offset;
+        if self.masked {
+            let (text, caret) = self.window(room);
+            active_caret_col = caret;
+            frame.push_str(&format!(
+                "{surface}{} {text}{}\n",
+                if colour {
+                    format!("{INPUT_BG}›")
+                } else {
+                    "›".to_owned()
+                },
+                if colour { CLEAR_EOL } else { "" },
+            ));
+        } else {
+            for (idx, line) in self.buffer.split('\n').enumerate() {
+                let prompt_char = if idx == 0 { "›" } else { "·" };
+                let prompt_str = if colour {
+                    format!("{INPUT_BG}{prompt_char}")
+                } else {
+                    prompt_char.to_owned()
+                };
+                let chars: Vec<char> = line.chars().collect();
+                let is_active = idx == line_idx;
+                let (fitted_line, _) = if is_active {
+                    let (w_text, w_caret) = Self::window_line(&chars, col_offset, room);
+                    active_caret_col = w_caret;
+                    (w_text, w_caret)
+                } else {
+                    Self::window_line(&chars, 0, room)
+                };
+                frame.push_str(&format!(
+                    "{surface}{prompt_str} {fitted_line}{}\n",
+                    if colour { CLEAR_EOL } else { "" },
+                ));
+            }
+        }
+        // Bottom surface pad
+        frame.push_str(&format!("{surface}{}\n", if colour { RESET } else { "" }));
         for row in &menu {
             frame.push_str(row);
             frame.push('\n');
         }
         frame.push_str(&status);
-        // Back onto the input row, over the bottom pad, the menu, and the status row,
-        // then across `› ` and the text before the caret.
-        frame.push_str(&format!("\x1b[{}A\r\x1b[{}C", menu.len() + 2, caret + 2));
+        // Back onto the active input row, over the bottom pad, the menu, and the status row
+        let lines_below = (total_lines.saturating_sub(1 + line_idx)) + 1 + menu.len() + 1;
+        frame.push_str(&format!(
+            "\x1b[{}A\r\x1b[{}C",
+            lines_below,
+            active_caret_col + 2
+        ));
         frame
     }
 
@@ -772,16 +844,13 @@ impl Composer {
         let status = fit(status, width.saturating_sub(1));
         let footer = fit(footer, width.saturating_sub(1));
         let room = width.saturating_sub(3);
-        let (text, caret) = self.window(room);
         let menu = self.menu_rows(width, colour);
+        let (line_idx, col_offset, total_lines) = self.caret_line_col();
         let mut frame = String::new();
         if self.drawn {
             frame.push_str(RESET);
-            frame.push_str(if self.top_status {
-                CARET_UP_2
-            } else {
-                CARET_UP_1
-            });
+            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
+            frame.push_str(&format!("\x1b[{}A", lines_above));
             frame.push('\r');
             frame.push_str(CLEAR_BELOW);
         }
@@ -794,24 +863,81 @@ impl Composer {
         };
         frame.push_str(&status);
         frame.push('\n');
-        frame.push_str(&format!(
-            "{surface}\n{surface}{} {text}{}\n{surface}{}\n",
-            if colour {
-                format!("{INPUT_BG}›")
-            } else {
-                "›".to_owned()
-            },
-            if colour { CLEAR_EOL } else { "" },
-            if colour { RESET } else { "" },
-        ));
+        // Top surface pad
+        frame.push_str(&surface);
+        frame.push('\n');
+        // Input lines
+        let mut active_caret_col = col_offset;
+        if self.masked {
+            let (text, caret) = self.window(room);
+            active_caret_col = caret;
+            frame.push_str(&format!(
+                "{surface}{} {text}{}\n",
+                if colour {
+                    format!("{INPUT_BG}›")
+                } else {
+                    "›".to_owned()
+                },
+                if colour { CLEAR_EOL } else { "" },
+            ));
+        } else {
+            for (idx, line) in self.buffer.split('\n').enumerate() {
+                let prompt_char = if idx == 0 { "›" } else { "·" };
+                let prompt_str = if colour {
+                    format!("{INPUT_BG}{prompt_char}")
+                } else {
+                    prompt_char.to_owned()
+                };
+                let chars: Vec<char> = line.chars().collect();
+                let is_active = idx == line_idx;
+                let (fitted_line, _) = if is_active {
+                    let (w_text, w_caret) = Self::window_line(&chars, col_offset, room);
+                    active_caret_col = w_caret;
+                    (w_text, w_caret)
+                } else {
+                    Self::window_line(&chars, 0, room)
+                };
+                frame.push_str(&format!(
+                    "{surface}{prompt_str} {fitted_line}{}\n",
+                    if colour { CLEAR_EOL } else { "" },
+                ));
+            }
+        }
+        // Bottom surface pad
+        frame.push_str(&format!("{surface}{}\n", if colour { RESET } else { "" }));
         for row in &menu {
             frame.push_str(row);
             frame.push('\n');
         }
         frame.push_str(&footer);
-        // Back onto the input row, over the bottom pad, the menu rows, and the footer.
-        frame.push_str(&format!("\x1b[{}A\r\x1b[{}C", menu.len() + 2, caret + 2));
+        // Back onto the active input row, over the bottom pad, the menu, and the footer
+        let lines_below = (total_lines.saturating_sub(1 + line_idx)) + 1 + menu.len() + 1;
+        frame.push_str(&format!(
+            "\x1b[{}A\r\x1b[{}C",
+            lines_below,
+            active_caret_col + 2
+        ));
         frame
+    }
+
+    fn window_line(chars: &[char], caret_in_line: usize, room: usize) -> (String, usize) {
+        let budget = room.saturating_sub(1);
+        let width = |character: &char| character.width().unwrap_or(0);
+        let mut start = caret_in_line.min(chars.len());
+        let mut caret = 0;
+        while start > 0 && caret + width(&chars[start - 1]) <= budget {
+            start -= 1;
+            caret += width(&chars[start]);
+        }
+        let mut used = 0;
+        let text = chars[start..]
+            .iter()
+            .take_while(|character| {
+                used += width(character);
+                used <= budget
+            })
+            .collect();
+        (text, caret)
     }
 
     /// One row per offered command, marked at the selection.
@@ -845,24 +971,28 @@ impl Composer {
     /// Erase the block so turn output starts on a clean row, and keep the
     /// submitted line in the scrollback the way a shell would.
     pub fn commit(&mut self, submitted: &str, colour: bool) -> String {
-        format!(
-            "{}{} {}\n",
-            self.clear(),
-            paint(colour, BOLD, "›"),
-            paint(colour, ASSISTANT, submitted),
-        )
+        let mut out = self.clear();
+        for (i, line) in submitted.lines().enumerate() {
+            let prompt = if i == 0 { "›" } else { "·" };
+            out.push_str(&format!(
+                "{} {}\n",
+                paint(colour, BOLD, prompt),
+                paint(colour, ASSISTANT, line),
+            ));
+        }
+        if submitted.trim().is_empty() {
+            out.push('\n');
+        }
+        out
     }
 
     pub fn clear(&mut self) -> String {
         if !std::mem::take(&mut self.drawn) {
             return String::new();
         }
-        let up = if self.top_status {
-            CARET_UP_2
-        } else {
-            CARET_UP_1
-        };
-        format!("{RESET}{up}\r{CLEAR_BELOW}")
+        let (line_idx, _, _) = self.caret_line_col();
+        let lines_above = line_idx + if self.top_status { 2 } else { 1 };
+        format!("{RESET}\x1b[{}A\r{CLEAR_BELOW}", lines_above)
     }
 
     /// Slide the visible text so the caret stays on the row instead of
@@ -1165,23 +1295,33 @@ impl TuiState {
         );
         let branch = branch.unwrap_or_default();
 
-        let head = INDENT + visible_len(&route) + GAP + visible_len(&effort);
-        let right = if branch.is_empty() {
+        let model_label = format!("✦ {route}");
+        let effort_label = format!("✻ {effort}");
+        let head = INDENT + visible_len(&model_label) + GAP + visible_len(&effort_label);
+        let branch_label = if branch.is_empty() {
+            String::new()
+        } else {
+            format!("⎇ {branch}")
+        };
+        let right = if branch_label.is_empty() {
             0
         } else {
-            GAP + visible_len(branch)
+            GAP + visible_len(&branch_label)
         };
 
         // Whatever is left over once the fields that cannot shrink are placed.
         let budget = width.saturating_sub(head + GAP + right);
-        let workspace = (budget >= PATH_FLOOR).then(|| shrink_path(&self.workspace, budget));
+        let ws_icon_len = visible_len("📁 ");
+        let path_budget = budget.saturating_sub(ws_icon_len);
+        let workspace = (path_budget >= PATH_FLOOR)
+            .then(|| format!("📁 {}", shrink_path(&self.workspace, path_budget)));
 
         let mut row = format!(
             "{}{}{}{}",
             " ".repeat(INDENT),
-            paint(colour, MODEL, &route),
+            paint(colour, MODEL, &model_label),
             " ".repeat(GAP),
-            paint(colour, DIM, &effort),
+            paint(colour, DIM, &effort_label),
         );
         let mut used = head;
         if let Some(workspace) = &workspace {
@@ -1190,11 +1330,11 @@ impl TuiState {
             used += GAP + visible_len(workspace);
         }
         // Only now is there a final answer on whether the branch fits.
-        if !branch.is_empty() {
-            if let Some(gap) = width.checked_sub(used + visible_len(branch)) {
+        if !branch_label.is_empty() {
+            if let Some(gap) = width.checked_sub(used + visible_len(&branch_label)) {
                 if gap >= GAP {
                     row.push_str(&" ".repeat(gap));
-                    row.push_str(&paint(colour, ACCENT, branch));
+                    row.push_str(&paint(colour, ACCENT, &branch_label));
                     return row;
                 }
             }
@@ -1666,13 +1806,17 @@ pub fn render_model_list(
     let mut last_provider: Option<&str> = None;
     for (index, choice) in models.iter().enumerate() {
         if last_provider != Some(choice.provider.as_str()) {
-            writeln!(writer, "{}", paint(colour, ACCENT, &choice.provider))?;
+            writeln!(
+                writer,
+                "{}",
+                paint(colour, ACCENT, &format!("  [{}]", choice.provider))
+            )?;
             last_provider = Some(&choice.provider);
         }
         let marker = if Some(index) == selected { "›" } else { " " };
         writeln!(
             writer,
-            "  {} {} {}  {}",
+            "    {} {} {}  {}",
             paint(colour, ACCENT, marker),
             paint(colour, DIM, &format!("{}.", index + 1)),
             paint(colour, MODEL, &choice.slug),
@@ -1759,15 +1903,13 @@ pub fn model_rows(
     let rows = models
         .iter()
         .map(|choice| {
-            let label = if choice.provider == CODEX_PROVIDER {
-                choice.slug.clone()
-            } else {
-                format!("{}/{}", choice.provider, choice.slug)
-            };
+            let label = format!("[{}] {}", choice.provider, choice.slug);
             let desc = if choice.name.is_empty() || choice.name == choice.slug {
                 format!("on {}", choice.provider)
+            } else if choice.provider == CODEX_PROVIDER {
+                format!("{} · codex", choice.name)
             } else {
-                choice.name.clone()
+                format!("{} · on {}", choice.name, choice.provider)
             };
             (label, desc)
         })
@@ -1813,6 +1955,26 @@ pub fn resolve_model(
             None => Err(format!("no model {number}; choose 1-{}", models.len())),
         };
     }
+    // `[provider] model` bracketed notation from the interactive picker.
+    if let Some(rest) = answer.strip_prefix('[') {
+        if let Some((provider, model_part)) = rest.split_once(']') {
+            let model_slug = model_part.trim();
+            if let Some(choice) = models
+                .iter()
+                .find(|c| c.provider == provider && c.slug == model_slug)
+            {
+                return Ok(ModelRoute {
+                    provider: choice.provider.clone(),
+                    model: choice.slug.clone(),
+                });
+            }
+            validate_slug(model_slug)?;
+            return Ok(ModelRoute {
+                provider: provider.to_owned(),
+                model: model_slug.to_owned(),
+            });
+        }
+    }
     validate_slug(answer)?;
     // `provider/model` when answering with a qualified name.
     if let Some((provider, slug)) = answer.split_once('/') {
@@ -1843,7 +2005,6 @@ pub fn resolve_model(
         model: answer.to_owned(),
     })
 }
-
 /// Accept what a provider slug can contain and nothing else. The picker shares
 /// its line with the composer, so a mistyped slash command arrives here as text.
 pub fn validate_slug(slug: &str) -> Result<(), String> {
@@ -2047,14 +2208,17 @@ mod tests {
         // missing rather than dropping the field.
         assert_eq!(
             state.status_row(80, false, None),
-            "  no model  effort:—  /repo"
+            "  ✦ no model  ✻ effort:—  📁 /repo"
         );
         state.set_effort(Some(Effort::High));
         // The branch sits at the right edge, so it holds its column while the
         // fields on the left change length.
         let row = state.status_row(80, false, Some("feat/x"));
-        assert!(row.starts_with("  no model  effort:high  /repo"), "{row:?}");
-        assert!(row.ends_with("feat/x"), "{row:?}");
+        assert!(
+            row.starts_with("  ✦ no model  ✻ effort:high  📁 /repo"),
+            "{row:?}"
+        );
+        assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
         state.set_effort(None);
 
@@ -2214,6 +2378,17 @@ mod tests {
                 model: "mimo".into(),
             }
         );
+        // `[provider] model` bracketed notation from the interactive picker.
+        assert_eq!(
+            pick("[hari] mimo").unwrap(),
+            ModelRoute {
+                provider: "hari".into(),
+                model: "mimo".into(),
+            }
+        );
+        // A free-text slug stays on the current provider.
+        assert_eq!(pick("o3-custom").unwrap().provider, CODEX_PROVIDER);
+        assert_eq!(pick("o3-custom").unwrap().model, "o3-custom");
         // Qualified provider/model names switch provider.
         assert_eq!(
             pick("openai/gpt-5.6:high").unwrap(),
@@ -2249,8 +2424,8 @@ mod tests {
         let mut listing = Vec::new();
         render_model_list(&mut listing, &models, &current, false).unwrap();
         let listing = String::from_utf8(listing).unwrap();
-        assert!(listing.contains("codex\n"));
-        assert!(listing.contains("hari\n"));
+        assert!(listing.contains("[codex]"));
+        assert!(listing.contains("[hari]"));
         assert!(listing.contains("1. gpt-5.6-sol  GPT-5.6-Sol"));
         assert!(listing.contains("› 2. gpt-5.6-luna"));
         assert!(listing.contains("3. mimo  on hari"));
@@ -2604,10 +2779,10 @@ mod tests {
         assert!(visible_len(&middle) <= 72, "{middle:?}");
 
         // Narrower still: the path goes entirely before the branch is touched.
-        let narrow = state.status_row(48, false, Some("feat/slash-menu"));
+        let narrow = state.status_row(56, false, Some("feat/slash-menu"));
         assert!(!narrow.contains("arsy-code"), "{narrow:?}");
         assert!(narrow.ends_with("feat/slash-menu"), "{narrow:?}");
-        assert!(visible_len(&narrow) <= 48, "{narrow:?}");
+        assert!(visible_len(&narrow) <= 56, "{narrow:?}");
 
         // Only when even that cannot fit is the branch dropped, never cut.
         let tiny = state.status_row(30, false, Some("feat/slash-menu"));
@@ -2789,5 +2964,44 @@ mod tests {
         for line in &lines {
             assert_eq!(visible_len(line), 80, "{line:?}");
         }
+    }
+
+    #[test]
+    fn shift_enter_and_multiline_composer_input() {
+        let mut keys = Keys::default();
+        // Alt+Enter / Option+Enter (\x1b\r)
+        assert_eq!(keys.feed(0x1b), None);
+        assert_eq!(keys.feed(b'\r'), Some(Key::Newline));
+
+        // CSI u Shift+Enter (\x1b[13;2u)
+        for b in b"\x1b[13;2" {
+            assert_eq!(keys.feed(*b), None);
+        }
+        assert_eq!(keys.feed(b'u'), Some(Key::Newline));
+
+        // xterm Shift+Enter (\x1b[27;2;13~)
+        for b in b"\x1b[27;2;13" {
+            assert_eq!(keys.feed(*b), None);
+        }
+        assert_eq!(keys.feed(b'~'), Some(Key::Newline));
+
+        let mut composer = Composer::default();
+        for ch in "first".chars() {
+            composer.press(Key::Char(ch));
+        }
+        composer.press(Key::Newline);
+        for ch in "second".chars() {
+            composer.press(Key::Char(ch));
+        }
+        assert_eq!(composer.buffer, "first\nsecond");
+
+        let frame = composer.render(80, false, "  status");
+        let rows: Vec<&str> = frame.split('\n').collect();
+        assert_eq!(rows.len(), 5, "top pad, line 1, line 2, bottom pad, status");
+        assert!(rows[1].contains("› first"));
+        assert!(rows[2].contains("· second"));
+
+        let committed = composer.commit("first\nsecond", false);
+        assert!(committed.contains("› first\n· second\n"));
     }
 }

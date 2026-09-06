@@ -820,35 +820,80 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
             None => "No configuration is set; every value is a built-in default.".to_owned(),
         }});
     }
-    let label = values
-        .keys()
-        .map(|key| key.chars().count())
-        .max()
-        .unwrap_or(0);
+
     let mut listing = format!(
         "{} value{} set\n",
         values.len(),
         if values.len() == 1 { "" } else { "s" }
     );
+
+    let mut default_provider = None;
+    let mut endpoints: std::collections::BTreeMap<String, Vec<(String, String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut others: Vec<(String, String, String)> = Vec::new();
     let mut paths: Vec<&str> = Vec::new();
+
     for (name, entry) in values {
         let value = entry["value"]
             .as_str()
             .map_or_else(|| plain(&entry["value"]), terminal_text);
         let layer = entry["layer"].as_str().unwrap_or("?");
-        listing.push_str(&format!(
-            "\n  {name}{}  {value}  [{layer}]",
-            " ".repeat(label - name.chars().count()),
-        ));
         if let Some(path) = entry["path"].as_str() {
             if !paths.contains(&path) {
                 paths.push(path);
             }
         }
+
+        if name == "provider.default" {
+            default_provider = Some((value, layer.to_owned()));
+        } else if let Some(rest) = name.strip_prefix("provider.endpoint.") {
+            if let Some((endpoint_id, field)) = rest.split_once('.') {
+                endpoints.entry(endpoint_id.to_owned()).or_default().push((
+                    field.to_owned(),
+                    value,
+                    layer.to_owned(),
+                ));
+            } else {
+                others.push((name.clone(), value, layer.to_owned()));
+            }
+        } else {
+            others.push((name.clone(), value, layer.to_owned()));
+        }
     }
+
+    if let Some((val, layer)) = default_provider {
+        listing.push_str(&format!("\n  • default provider: {val}  [{layer}]\n"));
+    }
+
+    for (endpoint_id, fields) in endpoints {
+        listing.push_str(&format!("\n  [{endpoint_id}]\n"));
+        let label_width = fields
+            .iter()
+            .map(|(f, _, _)| f.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (field, val, layer) in fields {
+            let pad = " ".repeat(label_width.saturating_sub(field.chars().count()));
+            listing.push_str(&format!("    • {field}:{pad}  {val}  [{layer}]\n"));
+        }
+    }
+
+    if !others.is_empty() {
+        listing.push_str("\n  [other]\n");
+        let label_width = others
+            .iter()
+            .map(|(k, _, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, val, layer) in others {
+            let pad = " ".repeat(label_width.saturating_sub(name.chars().count()));
+            listing.push_str(&format!("    • {name}:{pad}  {val}  [{layer}]\n"));
+        }
+    }
+
     listing.push('\n');
     for path in paths {
-        listing.push_str(&format!("\n  from {}", terminal_text(path)));
+        listing.push_str(&format!("  from {}\n", terminal_text(path)));
     }
     json!({"configuration": listing})
 }
@@ -1354,9 +1399,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // What the configuration names now, which is not what this session resolved
     // once `/provider` has switched and the restart has not happened yet.
     let mut chosen_provider = configured_default(invocation);
+    let mut conversation: Vec<ModelMessage> = Vec::new();
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
-    state.set_model_route(route.clone());
     state.set_effort(effort);
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
@@ -1610,11 +1655,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     effort,
                     colour,
                     &footer,
+                    &mut conversation,
                     &keys,
                     &mut decoder,
                     &mut composer,
                     emitter,
                 ) {
+                    Ok(turn) if turn.quit => break,
                     Ok(turn) => {
                         if turn.interrupted {
                             queued.clear();
@@ -2084,6 +2131,7 @@ fn run_turn(
     effort: Option<Effort>,
     colour: bool,
     footer: &str,
+    conversation: &mut Vec<ModelMessage>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -2091,10 +2139,14 @@ fn run_turn(
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    conversation.push(ModelMessage {
+        role: ModelRole::User,
+        content: vec![ModelContent::Text { text: task.clone() }],
+    });
     let outcome = match native.filter(|_| !route.is_codex()) {
         Some(resolved) => native_status(
             resolved,
-            &task,
+            conversation,
             route,
             effort,
             admission.turn,
@@ -2139,6 +2191,7 @@ fn run_turn(
         }
     };
     if turn.interrupted {
+        conversation.pop();
         // Stopping a turn is a decision, not a fault: the turn is recorded as
         // failed for the audit trail, but the terminal already said so with an
         // `Interrupted` row and does not need a diagnostic on top.
@@ -2162,6 +2215,14 @@ fn run_turn(
     }
     match &turn.failure {
         None => {
+            if !turn.response.trim().is_empty() {
+                conversation.push(ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::Text {
+                        text: turn.response.clone(),
+                    }],
+                });
+            }
             let mut outcome = json!({"provider": route.provider, "model": route.model});
             merge(&mut outcome, turn.usage.clone());
             service
@@ -2178,6 +2239,7 @@ fn run_turn(
             );
         }
         Some(failure) => {
+            conversation.pop();
             fail_turn(
                 &service,
                 actor,
@@ -2204,7 +2266,7 @@ fn run_turn(
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
-    task: &str,
+    conversation: &[ModelMessage],
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
@@ -2220,12 +2282,7 @@ fn native_status(
             model: route.model.clone(),
         },
         system: None,
-        messages: vec![ModelMessage {
-            role: ModelRole::User,
-            content: vec![ModelContent::Text {
-                text: task.to_owned(),
-            }],
-        }],
+        messages: conversation.to_vec(),
         // As in `arsy run`: operations are not dispatched from here yet, so a
         // tool offered now would have nowhere to run.
         tools: Vec::new(),
@@ -2388,6 +2445,7 @@ fn native_status(
                 first_event = true;
             }
             Ok(Ok(Streamed::Text(text))) => {
+                outcome.response.push_str(&text);
                 let width = tui::terminal_width();
                 // Answer text closes the thinking box cleanly before the prose starts.
                 if thinking_open {
@@ -2847,6 +2905,9 @@ fn drive_provider(
 struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     failure: Option<String>,
+    /// The full text of the model's answer, kept so follow-up turns in the
+    /// same session know what the model said.
+    response: String,
     /// Extra facts to record on a completed turn, such as token usage.
     usage: Value,
     interrupted: bool,
@@ -2855,7 +2916,6 @@ struct Turn {
     queued: std::collections::VecDeque<String>,
     quit: bool,
 }
-
 #[cfg(feature = "tui")]
 /// Record and report a turn the provider did not complete.
 ///
@@ -3663,10 +3723,10 @@ mod tests {
         let listing = rendered["configuration"].as_str().expect("one string");
         assert!(listing.starts_with("2 values set"), "{listing}");
         assert!(
-            listing.contains("provider.default             myai  [user]"),
+            listing.contains("default provider: myai  [user]"),
             "{listing}"
         );
-        assert!(listing.contains("openai  [workspace]"), "{listing}");
+        assert!(listing.contains("kind:  openai  [workspace]"), "{listing}");
         // Each source file is named once, under the rows, rather than repeated
         // on every one of them.
         assert_eq!(listing.matches("/cfg/config.toml").count(), 1, "{listing}");
