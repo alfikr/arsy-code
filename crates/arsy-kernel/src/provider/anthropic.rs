@@ -295,6 +295,9 @@ impl EventDecoder {
             Some("text_delta") => self.queue.push_back(ModelEvent::TextDelta {
                 text: field(delta, "text")?.to_owned(),
             }),
+            Some("thinking_delta") => self.queue.push_back(ModelEvent::ThinkingDelta {
+                text: field(delta, "thinking")?.to_owned(),
+            }),
             Some("input_json_delta") => {
                 let fragment = field(delta, "partial_json")?.to_owned();
                 let block = self.blocks.get_mut(index).ok_or_else(|| {
@@ -304,7 +307,8 @@ impl EventDecoder {
                 self.queue
                     .push_back(ModelEvent::ToolCallDelta { index, fragment });
             }
-            // Thinking and signature deltas carry nothing canonical yet.
+            // Signature deltas authenticate a thinking block without being
+            // part of it; anything else carries nothing canonical.
             _ => {}
         }
         Ok(())

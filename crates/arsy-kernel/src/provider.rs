@@ -163,6 +163,15 @@ pub enum ModelEvent {
     TextDelta {
         text: String,
     },
+    /// One fragment of model reasoning, as the provider chose to expose it.
+    ///
+    /// Reasoning is display-only: it is never recorded as an answer and never
+    /// replayed as history, because a provider that hides its reasoning sends
+    /// none of these and the request a caller builds stays identical either
+    /// way. Identical fragments from both dialects arrive here.
+    ThinkingDelta {
+        text: String,
+    },
     /// A tool call has started. Arguments are not known yet and the call is not
     /// runnable at this point.
     ToolCallStarted {
