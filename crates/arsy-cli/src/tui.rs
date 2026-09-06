@@ -344,6 +344,68 @@ pub const PROVIDER_ACTIONS: &[(&str, &str)] = &[
     ("-remove", "remove a provider from the configuration"),
 ];
 
+pub const AUTH_ACTIONS: &[(&str, &str)] = &[
+    (
+        "login",
+        "sign in to a provider with OAuth (browser / device flow)",
+    ),
+    ("list", "show saved credentials in catalog"),
+    ("set", "store an API key for a provider"),
+    ("remove", "delete a credential from catalog"),
+];
+
+/// What `/auth` is collecting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthStep {
+    Pick,
+    LoginProvider,
+    SetProvider,
+    SetKey,
+    RemoveHandle,
+}
+
+impl AuthStep {
+    pub fn prompt(self, draft: &str, colour: bool) -> String {
+        let text = match self {
+            Self::Pick => "auth · Up/Down then Enter, or an action".to_owned(),
+            Self::LoginProvider => "sign in to which provider · Up/Down then Enter".to_owned(),
+            Self::SetProvider => "store key for which provider · Up/Down then Enter".to_owned(),
+            Self::SetKey => format!("credential for {draft} · not shown as you type"),
+            Self::RemoveHandle => "remove which credential · Up/Down then Enter".to_owned(),
+        };
+        paint(colour, DIM, &format!("  {text}"))
+    }
+
+    pub fn rows(self, providers: &[String], handles: &[String]) -> Option<Vec<(String, String)>> {
+        let named = |rows: &[(&str, &str)]| {
+            Some(
+                rows.iter()
+                    .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
+                    .collect(),
+            )
+        };
+        match self {
+            Self::Pick => named(AUTH_ACTIONS),
+            Self::LoginProvider | Self::SetProvider => Some(
+                providers
+                    .iter()
+                    .map(|p| (p.clone(), format!("configured endpoint `{p}`")))
+                    .collect(),
+            ),
+            Self::RemoveHandle => Some(
+                handles
+                    .iter()
+                    .map(|h| (h.clone(), "saved credential".to_owned()))
+                    .collect(),
+            ),
+            Self::SetKey => None,
+        }
+    }
+
+    pub fn masked(self) -> bool {
+        matches!(self, Self::SetKey)
+    }
+}
 /// The dialects an endpoint can speak. Same two the configuration accepts.
 pub const PROVIDER_KINDS: &[(&str, &str)] = &[
     ("openai", "Chat Completions, and anything that speaks it"),

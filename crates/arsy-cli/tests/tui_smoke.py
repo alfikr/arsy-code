@@ -205,11 +205,11 @@ def main():
             terminal.expect("Added provider acme")
 
             # A credential the wizard stored is catalogued like one `auth set`
-            # stores: `auth list` shows it, and every turn registers catalogued
-            # handles for redaction.
+            # stores: `/auth` menu offers `list` to show it.
             terminal.send(b"/auth\r")
+            terminal.expect("sign in to a provider with OAuth")
+            terminal.send(b"list\r")
             terminal.expect("secret://file/acme.key")
-
             written = (root / "Library/Application Support/ARSY/config.toml")
             if not written.exists():
                 written = root / "config/arsy/config.toml"

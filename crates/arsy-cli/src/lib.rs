@@ -1333,6 +1333,8 @@ enum Prompt {
     /// `/provider` is a wizard rather than one question, so the step it is on
     /// travels with the prompt.
     Provider(tui::ProviderStep),
+    /// `/auth` is an interactive credential manager.
+    Auth(tui::AuthStep),
 }
 
 #[cfg(feature = "tui")]
@@ -1400,6 +1402,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // once `/provider` has switched and the restart has not happened yet.
     let mut chosen_provider = configured_default(invocation);
     let mut conversation: Vec<ModelMessage> = Vec::new();
+    let mut auth_draft = String::new();
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
@@ -1442,6 +1445,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Model => tui::model_prompt(&models, &route, colour),
             Prompt::Effort => tui::effort_prompt(effort, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
+            Prompt::Auth(step) => step.prompt(&auth_draft, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
@@ -1458,10 +1462,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 step.rows(&providers, &route.provider, chosen_provider.as_deref()),
                 0,
             ),
+            Prompt::Auth(step) => {
+                let handles = catalog_handles(invocation);
+                composer.offer(step.rows(&providers, &handles), 0);
+            }
             _ => composer.offer(None, 0),
         }
         // A credential is typed, never shown, and never remembered.
-        composer.set_masked(matches!(prompt, Prompt::Provider(step) if step.masked()));
+        composer.set_masked(
+            matches!(prompt, Prompt::Provider(step) if step.masked())
+                || matches!(prompt, Prompt::Auth(step) if step.masked()),
+        );
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1477,13 +1488,21 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // session: the setting is unchanged and the task prompt
                 // returns. Every picker has to be listed here, or leaving one
                 // exits ARSY instead.
-                None if matches!(prompt, Prompt::Model | Prompt::Effort | Prompt::Provider(_)) => {
+                None if matches!(
+                    prompt,
+                    Prompt::Model | Prompt::Effort | Prompt::Provider(_) | Prompt::Auth(_)
+                ) =>
+                {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
                         Prompt::Provider(_) => {
                             draft = tui::ProviderDraft::default();
                             "Provider unchanged.".to_owned()
+                        }
+                        Prompt::Auth(_) => {
+                            auth_draft.clear();
+                            "Auth unchanged.".to_owned()
                         }
                         _ => format!("Model unchanged: {route}"),
                     };
@@ -1564,6 +1583,40 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
                     }
                 }
+            }
+            Prompt::Auth(step) => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match auth_step(
+                    invocation,
+                    step,
+                    &line,
+                    &mut auth_draft,
+                    &providers,
+                    emitter,
+                ) {
+                    Ok(AuthNext::Ask(next)) => prompt = Prompt::Auth(next),
+                    Ok(AuthNext::Done(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        auth_draft.clear();
+                        prompt = Prompt::Task;
+                    }
+                    Ok(AuthNext::Cancelled(message)) => {
+                        writeln!(stdout, "{}", tui::safe_text(&message))
+                            .map_err(terminal_failed)?;
+                        auth_draft.clear();
+                        prompt = Prompt::Task;
+                    }
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Task if line.trim() == "/auth" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                providers = configured_providers(invocation);
+                auth_draft.clear();
+                prompt = Prompt::Auth(tui::AuthStep::Pick);
             }
             Prompt::Task if line.trim() == "/model" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -2006,6 +2059,114 @@ fn provider_step(
     }
 }
 
+#[cfg(feature = "tui")]
+enum AuthNext {
+    Ask(tui::AuthStep),
+    Done(String),
+    Cancelled(String),
+}
+
+#[cfg(feature = "tui")]
+fn catalog_handles(invocation: &Invocation) -> Vec<String> {
+    catalog(CatalogStore::resolve(invocation))
+        .map(|records| records.into_iter().map(|r| r.handle.to_string()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "tui")]
+fn auth_step(
+    invocation: &Invocation,
+    step: tui::AuthStep,
+    line: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let answer = if step.masked() { line } else { line.trim() };
+    if answer.is_empty() {
+        return Ok(AuthNext::Cancelled("Auth unchanged.".to_owned()));
+    }
+    match step {
+        tui::AuthStep::Pick => match answer {
+            "login" => {
+                if providers.is_empty() {
+                    return Err(
+                        "no providers are configured; configure a provider endpoint first"
+                            .to_owned(),
+                    );
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::LoginProvider))
+            }
+            "list" => {
+                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+                let human = human_credentials(&records);
+                let rendered = human
+                    .get("credentials")
+                    .and_then(Value::as_str)
+                    .unwrap_or("No credentials catalogued.");
+                Ok(AuthNext::Done(rendered.to_owned()))
+            }
+            "set" => {
+                if providers.is_empty() {
+                    return Err(
+                        "no providers are configured; configure a provider endpoint first"
+                            .to_owned(),
+                    );
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
+            }
+            "remove" => {
+                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+                if records.is_empty() {
+                    return Err("no credentials are saved in the catalog".to_owned());
+                }
+                Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
+            }
+            other => Err(format!(
+                "`{}` is not one of login, list, set, remove",
+                tui::safe_text(other)
+            )),
+        },
+        tui::AuthStep::LoginProvider => {
+            if !providers.iter().any(|p| p == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
+            Ok(AuthNext::Done(format!(
+                "Signed in to `{answer}` with OAuth."
+            )))
+        }
+        tui::AuthStep::SetProvider => {
+            if !providers.iter().any(|p| p == answer) {
+                return Err(format!(
+                    "`{}` is not a configured provider",
+                    tui::safe_text(answer)
+                ));
+            }
+            *draft_provider = answer.to_owned();
+            Ok(AuthNext::Ask(tui::AuthStep::SetKey))
+        }
+        tui::AuthStep::SetKey => {
+            store_credential(invocation, draft_provider, "keychain", answer)
+                .map_err(|e| e.to_string())?;
+            Ok(AuthNext::Done(format!(
+                "Stored API key for `{draft_provider}` in the credential store."
+            )))
+        }
+        tui::AuthStep::RemoveHandle => {
+            let handle: SecretHandle =
+                SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
+            let store = CatalogStore::resolve(invocation);
+            let mut records = catalog(store).map_err(|e| e.message)?;
+            records.retain(|r| r.handle != handle);
+            save_catalog(store, &records).map_err(|e| e.message)?;
+            Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
+        }
+    }
+}
 /// One host serves several models, so the model step takes a list. The first is
 /// the endpoint's default; the rest are what `/model` offers beside it.
 #[cfg(feature = "tui")]
@@ -3656,6 +3817,79 @@ mod tests {
             Step::Name.rows(&providers, "myai", None).is_none(),
             "a name is typed"
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_auth_wizard_routes_actions_and_lists_providers() {
+        use tui::AuthStep as Step;
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            command: Command::Tui,
+            no_color: true,
+            output: Some(Output::Human),
+        };
+        let mut emitter = Emitter::new(Output::Human);
+        let providers = vec!["antigravity".to_owned(), "chatgpt".to_owned()];
+        let mut draft = String::new();
+
+        // An empty answer leaves the wizard without touching anything.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "  ",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Cancelled(_)
+        ));
+
+        // Picking login moves to the provider picker.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "login",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::LoginProvider)
+        ));
+
+        // Picking set moves to the provider picker.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::Pick,
+                "set",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::SetProvider)
+        ));
+
+        // Choosing a provider to set asks for its key.
+        assert!(matches!(
+            auth_step(
+                &invocation,
+                Step::SetProvider,
+                "antigravity",
+                &mut draft,
+                &providers,
+                &mut emitter
+            )
+            .unwrap(),
+            AuthNext::Ask(Step::SetKey)
+        ));
+        assert_eq!(draft, "antigravity");
     }
 
     /// The catalog is metadata, so where it lives is the operator's choice and
