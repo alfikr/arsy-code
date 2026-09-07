@@ -9,9 +9,11 @@
 //! observing model behavior stays separate from provider wire execution.
 
 pub mod anthropic;
+pub mod google_code_assist;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod openai;
+pub mod openai_responses;
 pub mod wire;
 
 use crate::protocol::IdempotencyKey;

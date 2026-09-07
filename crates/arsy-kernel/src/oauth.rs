@@ -65,27 +65,31 @@ impl TokenSet {
             .is_some_and(|at| now.saturating_add(EXPIRY_MARGIN.as_secs()) >= at)
     }
 
-    /// A string claim from the `id_token` payload, without verifying the
-    /// signature: the token came straight from the issuer over TLS in the same
-    /// exchange, and the claim only picks which account to address, never
-    /// grants anything.
+    /// A string claim from the `id_token` payload. See [`jwt_claim`].
     pub fn id_token_claim(&self, name: &str) -> Option<String> {
-        let payload = self.id_token.as_deref()?.split('.').nth(1)?;
-        let bytes = base64url_decode(payload)?;
-        let value: Value = serde_json::from_slice(&bytes).ok()?;
-        // A claim can sit at the top level or one level in (`.../auth`).
-        value
-            .get(name)
-            .or_else(|| {
-                value
-                    .as_object()?
-                    .values()
-                    .filter_map(Value::as_object)
-                    .find_map(|nested| nested.get(name))
-            })
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+        jwt_claim(self.id_token.as_deref()?, name)
     }
+}
+
+/// A string claim from a JWT payload, without verifying the signature: the
+/// token came straight from the issuer over TLS in the same exchange, and the
+/// claims read here only pick which account to address, never grant anything.
+/// The claim may sit at the top level or one object deep (OpenAI nests account
+/// details under a `https://api.openai.com/auth` key).
+pub fn jwt_claim(token: &str, name: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let value: Value = serde_json::from_slice(&base64url_decode(payload)?).ok()?;
+    value
+        .get(name)
+        .or_else(|| {
+            value
+                .as_object()?
+                .values()
+                .filter_map(Value::as_object)
+                .find_map(|nested| nested.get(name))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// What the operator has to do to finish a device login.
@@ -605,6 +609,110 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
             (percent_decode(name), percent_decode(value))
         })
         .collect()
+}
+
+/// Built-in OAuth clients for the vendors ARSY can sign in to directly.
+///
+/// A preset is the same shape a hand-written `[provider.endpoint.<id>.oauth]`
+/// would take, plus the endpoint facts a login has to know to make the result
+/// usable: which wire dialect it speaks, its API root, and the models to offer.
+/// `arsy auth login <id>` uses one when `<id>` names no configured endpoint.
+///
+/// The client identifiers here are public (they ship in the vendors' own
+/// clients); the Google entry also carries the non-confidential "secret" its
+/// desktop client type still requires in the token exchange.
+pub mod presets {
+    use crate::config::{Dialect, OAuth};
+
+    /// One built-in login target.
+    pub struct Preset {
+        pub id: &'static str,
+        /// One line for the `/auth` picker.
+        pub label: &'static str,
+        pub dialect: Dialect,
+        pub base_url: &'static str,
+        /// Offered by `/model` after the login; the first is the default.
+        pub models: &'static [&'static str],
+        /// Built fresh because [`OAuth`] owns its strings.
+        build_oauth: fn() -> OAuth,
+    }
+
+    impl Preset {
+        pub fn oauth(&self) -> OAuth {
+            (self.build_oauth)()
+        }
+    }
+
+    /// Every preset, in the order the picker should list them.
+    pub fn all() -> &'static [Preset] {
+        PRESETS
+    }
+
+    /// The preset `id` names, if any.
+    pub fn get(id: &str) -> Option<&'static Preset> {
+        PRESETS.iter().find(|preset| preset.id == id)
+    }
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    static PRESETS: &[Preset] = &[
+        // OpenAI Codex, signed in with a ChatGPT account. The access token is a
+        // bearer for the Codex Responses backend; the account it is scoped to
+        // rides in a claim the adapter reads back out.
+        Preset {
+            id: "codex-oauth",
+            label: "OpenAI Codex — sign in with a ChatGPT account",
+            dialect: Dialect::OpenaiResponses,
+            base_url: "https://chatgpt.com/backend-api/codex",
+            models: &["gpt-5-codex", "gpt-5", "gpt-5-mini"],
+            build_oauth: || OAuth {
+                authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
+                token_url: "https://auth.openai.com/oauth/token".to_owned(),
+                device_authorization_url: None,
+                client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),
+                client_secret: None,
+                scopes: owned(&["openid", "profile", "email", "offline_access"]),
+                redirect_uri: Some("http://localhost:1455/auth/callback".to_owned()),
+                authorize_params: vec![
+                    ("id_token_add_organizations".to_owned(), "true".to_owned()),
+                    ("codex_cli_simplified_flow".to_owned(), "true".to_owned()),
+                ],
+            },
+        },
+        // Google Antigravity, signed in with a Google account. Talks to Cloud
+        // Code Assist; the client is a Google "desktop app" type, so the token
+        // exchange still wants the (non-secret) client secret.
+        Preset {
+            id: "antigravity",
+            label: "Google Antigravity — sign in with a Google account",
+            dialect: Dialect::GoogleCodeAssist,
+            base_url: "https://cloudcode-pa.googleapis.com",
+            models: &["gemini-3-pro", "gemini-2.5-flash", "gemini-2.5-pro"],
+            build_oauth: || OAuth {
+                authorize_url: "https://accounts.google.com/o/oauth2/auth".to_owned(),
+                token_url: "https://oauth2.googleapis.com/token".to_owned(),
+                device_authorization_url: None,
+                client_id:
+                    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+                        .to_owned(),
+                client_secret: Some("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".to_owned()),
+                scopes: owned(&[
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                    "https://www.googleapis.com/auth/cclog",
+                    "https://www.googleapis.com/auth/experimentsandconfigs",
+                ]),
+                redirect_uri: Some("http://localhost:36742/oauth-callback".to_owned()),
+                authorize_params: vec![
+                    ("access_type".to_owned(), "offline".to_owned()),
+                    ("prompt".to_owned(), "consent".to_owned()),
+                ],
+            },
+        },
+    ];
 }
 
 #[cfg(test)]

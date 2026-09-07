@@ -94,6 +94,12 @@ impl fmt::Display for Layer {
 pub enum Dialect {
     Anthropic,
     Openai,
+    /// OpenAI's Responses API (`/responses`), as the Codex/ChatGPT backend
+    /// speaks it. A different body and event stream from Chat Completions.
+    OpenaiResponses,
+    /// Google's Cloud Code Assist API, as Antigravity speaks it: a Gemini
+    /// `generateContent` payload inside a Code Assist wrapper.
+    GoogleCodeAssist,
 }
 
 impl Dialect {
@@ -101,6 +107,8 @@ impl Dialect {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::OpenaiResponses => "openai_responses",
+            Self::GoogleCodeAssist => "google_code_assist",
         }
     }
 
@@ -109,6 +117,8 @@ impl Dialect {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Openai => "https://api.openai.com/v1",
+            Self::OpenaiResponses => "https://chatgpt.com/backend-api/codex",
+            Self::GoogleCodeAssist => "https://cloudcode-pa.googleapis.com",
         }
     }
 
@@ -116,7 +126,8 @@ impl Dialect {
     pub const fn default_api_key_env(self) -> &'static str {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::Openai => "OPENAI_API_KEY",
+            Self::Openai | Self::OpenaiResponses => "OPENAI_API_KEY",
+            Self::GoogleCodeAssist => "GEMINI_API_KEY",
         }
     }
 
@@ -124,6 +135,8 @@ impl Dialect {
         match raw {
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::Openai),
+            "openai_responses" => Some(Self::OpenaiResponses),
+            "google_code_assist" => Some(Self::GoogleCodeAssist),
             _ => None,
         }
     }
@@ -533,7 +546,8 @@ impl Config {
             .map(|raw| {
                 Dialect::parse(raw).ok_or_else(|| {
                     reject(format!(
-                        "`{prefix}.kind` must be \"anthropic\" or \"openai\", not \"{raw}\""
+                        "`{prefix}.kind` must be one of \"anthropic\", \"openai\", \
+                         \"openai_responses\", \"google_code_assist\", not \"{raw}\""
                     ))
                 })
             })
@@ -1257,7 +1271,7 @@ credential = "secret://os/official"
             ("schema_version = 1\n[nonsense]\na = 1\n", "unknown key `nonsense`"),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"gemini\"\n",
-                "must be \"anthropic\" or \"openai\"",
+                "google_code_assist",
             ),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nbase_url = \"https://x.test\"\n",
