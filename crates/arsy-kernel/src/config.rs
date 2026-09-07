@@ -187,6 +187,25 @@ impl Endpoint {
 /// substantial edit, small enough to bound a runaway response.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// The `[theme]` table: a built-in theme to start from, plus per-role colour
+/// overrides. The CLI turns this into its palette; the kernel only carries and
+/// validates it, so a headless run rejects a bad colour at load time too.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Theme {
+    /// Name of a built-in theme. `None` leaves the CLI's default in force.
+    pub base: Option<String>,
+    /// `role -> "#rrggbb"`. Role names are the CLI's to know; the kernel only
+    /// checks the colour is well formed.
+    pub roles: BTreeMap<String, String>,
+}
+
+/// Whether `hex` is `#rrggbb` (the `#` optional), the one colour form `[theme]`
+/// accepts.
+fn valid_hex(hex: &str) -> bool {
+    let body = hex.strip_prefix('#').unwrap_or(hex);
+    body.len() == 6 && body.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Effective value of one key and the file it won from.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Origin {
@@ -227,6 +246,7 @@ pub struct Config {
     model_default: Option<String>,
     credential_store: Option<String>,
     endpoints: BTreeMap<String, Endpoint>,
+    theme: Theme,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -271,6 +291,11 @@ impl Config {
 
     pub fn model_default(&self) -> Option<&str> {
         self.model_default.as_deref()
+    }
+
+    /// The `[theme]` table, empty when the file did not set one.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
@@ -351,9 +376,41 @@ impl Config {
                         self.record(layer, path, "credentials.store", store);
                     }
                 }
+                "theme" => self.apply_theme(layer, path, value)?,
                 section if INERT_SECTIONS.contains(&section) => {}
                 other => return Err(reject(format!("unknown key `{other}`"))),
             }
+        }
+        Ok(())
+    }
+
+    fn apply_theme(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "theme", path)? {
+            if key == "base" {
+                let base = expect_string(value, "theme.base", path)?;
+                self.theme.base = Some(base.clone());
+                self.record(layer, path, "theme.base", base);
+                continue;
+            }
+            // Any other key is a role name. The kernel does not police the set
+            // of roles (that is the CLI's), only that the value is a colour.
+            let hex = expect_string(value, &format!("theme.{key}"), path)?;
+            if !valid_hex(hex) {
+                return Err(reject(format!(
+                    "`theme.{key}` must be a #rrggbb colour, not `{hex}`"
+                )));
+            }
+            self.theme.roles.insert(key.clone(), hex.clone());
+            self.record(layer, path, &format!("theme.{key}"), hex);
         }
         Ok(())
     }
@@ -876,6 +933,43 @@ mod tests {
                 "{bad} was accepted: {error}"
             );
         }
+    }
+
+    #[test]
+    fn theme_carries_a_base_and_well_formed_role_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), "config.toml", body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        // No `[theme]` at all is the empty theme, not an error.
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().theme(),
+            &Theme::default()
+        );
+
+        let config = read(
+            "schema_version = 1\n[theme]\nbase = \"light\"\naccent = \"#12ab34\"\ninput_bg = \"445566\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.theme().base.as_deref(), Some("light"));
+        assert_eq!(
+            config.theme().roles.get("accent").map(String::as_str),
+            Some("#12ab34")
+        );
+        assert_eq!(
+            config.theme().roles.get("input_bg").map(String::as_str),
+            Some("445566")
+        );
+
+        // A colour that is not #rrggbb is refused rather than carried.
+        let error = read("schema_version = 1\n[theme]\naccent = \"reddish\"\n").unwrap_err();
+        assert!(
+            error.message.contains("#rrggbb"),
+            "unexpected: {}",
+            error.message
+        );
     }
 
     use super::*;

@@ -132,8 +132,8 @@ def main():
             # the highlighted command, which a second Enter then sends.
             terminal.send(b"/")
             terminal.expect("› /provider")
-            # Four rows down: /model, /effort, /mcp, then /hooks.
-            terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B")
+            # Five rows down: /model, /effort, /theme, /mcp, then /hooks.
+            terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B")
             terminal.expect("› /hooks")
             terminal.send(b"\r\r")
             terminal.expect("1 hook declared; none loaded")
@@ -183,6 +183,25 @@ def main():
             assert child.poll() is None, "leaving the effort picker ended the session"
             terminal.send(b"/effort high\r")
             terminal.expect("Effort: high")
+
+            # `/theme` picks a colour theme the same way, and remembers it
+            # beside the effort file.
+            terminal.send(b"/theme\r")
+            terminal.expect("greytones only, no hue")
+            terminal.expect("› dark")
+            terminal.send(b"\x1b[B")
+            terminal.expect("› light")
+            terminal.send(b"\r\r")
+            terminal.expect("Theme: light")
+            assert (root / "Library/Application Support/ARSY/theme").exists() or (
+                root / "config/arsy/theme"
+            ).exists(), "the theme choice was not remembered"
+            terminal.send(b"/theme\r")
+            terminal.expect("› light")
+            terminal.send(b"\x03")
+            assert child.poll() is None, "leaving the theme picker ended the session"
+            terminal.send(b"/theme mono\r")
+            terminal.expect("Theme: mono")
 
             # `/provider` adds an endpoint without leaving the session: every
             # field is asked for, the credential is typed masked, and the

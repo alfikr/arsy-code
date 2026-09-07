@@ -1330,6 +1330,7 @@ enum Prompt {
     Task,
     Model,
     Effort,
+    Theme,
     /// `/provider` is a wizard rather than one question, so the step it is on
     /// travels with the prompt.
     Provider(tui::ProviderStep),
@@ -1380,6 +1381,26 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     });
     let native = native.map(|(resolved, _)| resolved);
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
+
+    // The palette is fixed before the first frame. A rejected `[theme]`
+    // override is reported and dropped, never left to blank the screen.
+    let theme_config = load_config(&workspace, &workspace)
+        .map(|config| config.theme().clone())
+        .unwrap_or_default();
+    let (mut theme, palette) = resolve_palette(&theme_config);
+    match palette {
+        Ok(palette) => tui::activate_palette(palette),
+        Err(reason) => {
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-UIX-1002",
+                format!("a [theme] override was ignored: {reason}"),
+                "use #rrggbb colours and role names ARSY knows (see /help)",
+            ));
+            if let Some(palette) = tui::builtin_palette(&theme) {
+                tui::activate_palette(palette);
+            }
+        }
+    }
 
     // The picker lists every provider's models in one place: configured
     // endpoints offer what they list, and a Codex login offers what its CLI
@@ -1444,6 +1465,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
             Prompt::Effort => tui::effort_prompt(effort, colour),
+            Prompt::Theme => tui::theme_prompt(&theme, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
             Prompt::Auth(step) => step.prompt(&auth_draft, colour),
         };
@@ -1457,6 +1479,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
+            }
+            Prompt::Theme => {
+                composer.offer_table(Some(tui::THEMES), tui::theme_row(&theme));
             }
             Prompt::Provider(step) => composer.offer(
                 step.rows(&providers, &route.provider, chosen_provider.as_deref()),
@@ -1490,12 +1515,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // exits ARSY instead.
                 None if matches!(
                     prompt,
-                    Prompt::Model | Prompt::Effort | Prompt::Provider(_) | Prompt::Auth(_)
+                    Prompt::Model
+                        | Prompt::Effort
+                        | Prompt::Theme
+                        | Prompt::Provider(_)
+                        | Prompt::Auth(_)
                 ) =>
                 {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
+                        Prompt::Theme => format!("Theme unchanged: {theme}"),
                         Prompt::Provider(_) => {
                             draft = tui::ProviderDraft::default();
                             "Provider unchanged.".to_owned()
@@ -1565,6 +1595,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     Err(reason) => {
                         writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
                     }
+                }
+            }
+            Prompt::Theme => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // On a rejected answer the list stays open so it can be retyped.
+                if apply_theme(&line, &mut theme, &theme_config.roles, &mut stdout, emitter)
+                    .map_err(terminal_failed)?
+                {
+                    prompt = Prompt::Task;
                 }
             }
             Prompt::Model => {
@@ -1655,6 +1694,23 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                 .map_err(terminal_failed)?;
                         }
                     },
+                }
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/theme") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // A bare `/theme` opens the list; `/theme light` sets it outright.
+                match line.split_whitespace().nth(1) {
+                    None => prompt = Prompt::Theme,
+                    Some(answer) => {
+                        apply_theme(
+                            answer,
+                            &mut theme,
+                            &theme_config.roles,
+                            &mut stdout,
+                            emitter,
+                        )
+                        .map_err(terminal_failed)?;
+                    }
                 }
             }
             Prompt::Task if line.trim().starts_with('/') => {
@@ -1867,6 +1923,101 @@ fn save_effort(effort: Option<Effort>) -> io::Result<()> {
             result => result,
         },
     }
+}
+
+/// The remembered colour theme, beside the remembered effort.
+#[cfg(feature = "tui")]
+fn theme_store() -> Option<PathBuf> {
+    Some(arsy_kernel::config::user_config()?.with_file_name("theme"))
+}
+
+/// The theme chosen last time, kept only if it is still a built-in name: a
+/// file written by a build that knew a theme this one dropped must not select
+/// nothing.
+#[cfg(feature = "tui")]
+fn saved_theme() -> Option<String> {
+    let raw = std::fs::read_to_string(theme_store()?).ok()?;
+    let name = raw.trim().to_owned();
+    tui::builtin_palette(&name).map(|_| name)
+}
+
+#[cfg(feature = "tui")]
+fn save_theme(name: &str) -> io::Result<()> {
+    let path = theme_store()
+        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{name}\n"))
+}
+
+#[cfg(feature = "tui")]
+fn remember_theme(name: &str, emitter: &mut Emitter) {
+    if let Err(error) = save_theme(name) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-UIX-1001",
+            format!("the theme choice was not remembered: {error}"),
+            "check that the ARSY user configuration directory is writable",
+        ));
+    }
+}
+
+/// Take a `/theme` answer: swap the live palette, remember the choice, and
+/// report it. Returns whether it landed — `false` leaves the picker open so
+/// the answer can be retyped. `[theme]` role overrides stay on top of the new
+/// base.
+#[cfg(feature = "tui")]
+fn apply_theme(
+    answer: &str,
+    current: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> io::Result<bool> {
+    let picked = match tui::resolve_theme_answer(answer, current) {
+        Ok(picked) => picked,
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason))?;
+            return Ok(false);
+        }
+    };
+    let palette =
+        tui::builtin_palette(&picked).expect("resolve_theme_answer only returns built-in names");
+    match palette.with_overrides(roles) {
+        Ok(palette) => {
+            tui::activate_palette(palette);
+            *current = picked;
+            remember_theme(current, emitter);
+            writeln!(stdout, "Theme: {current}")?;
+            Ok(true)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason))?;
+            Ok(false)
+        }
+    }
+}
+
+/// The palette the session paints with: a built-in base — the `[theme]` base,
+/// else the remembered theme, else the default — with any `[theme]` role
+/// overrides on top. Returns the base name (for the `/theme` picker) and the
+/// palette, or the reason an override was rejected.
+#[cfg(feature = "tui")]
+fn resolve_palette(theme: &arsy_kernel::config::Theme) -> (String, Result<tui::Palette, String>) {
+    let base = theme
+        .base
+        .clone()
+        .or_else(saved_theme)
+        .unwrap_or_else(|| tui::DEFAULT_THEME.to_owned());
+    let palette = tui::builtin_palette(&base).unwrap_or_else(|| {
+        tui::builtin_palette(tui::DEFAULT_THEME).expect("the default theme is built in")
+    });
+    let built = if theme.roles.is_empty() {
+        Ok(palette)
+    } else {
+        palette.with_overrides(&theme.roles)
+    };
+    (base, built)
 }
 
 /// Where `/provider` goes after an answer.
@@ -4154,13 +4305,13 @@ mod tests {
     #[cfg(feature = "tui")]
     #[test]
     fn the_menu_and_the_dispatch_table_hold_the_same_commands() {
-        // `/model`, `/effort`, `/help`, and `/quit` are answered by the loop
-        // itself; every other offered command must be an inspection it knows
-        // how to run.
+        // `/model`, `/effort`, `/theme`, `/help`, and `/quit` are answered by
+        // the loop itself; every other offered command must be an inspection it
+        // knows how to run.
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/provider" | "/help" | "/quit"
+                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

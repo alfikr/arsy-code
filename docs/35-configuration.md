@@ -77,6 +77,8 @@ Authority classes are:
 | `git.respect_ignore` | boolean | `true` | replace | intent |
 | `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
 | `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |
+| `theme.base` | `"dark"`, `"light"`, `"dim"`, or `"mono"` | `"dark"` | replace | user |
+| `theme.<role>` | `#rrggbb` colour | the base theme's | replace | user |
 
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
 
@@ -145,6 +147,25 @@ are the same two the `secret://` handles use. Switching to `file` migrates an
 existing catalog out of the platform store on first read, once. A store that is
 neither is refused when the file loads, so a typo cannot quietly send
 credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+
+## Theme
+
+`[theme]` colours the interactive TUI. `base` picks one of the built-in themes
+(`dark`, `light`, `dim`, `mono`); any other key is a role whose colour it
+replaces, given as `#rrggbb`. The roles are `assistant`, `dim`, `accent`, `ok`,
+`err`, `run`, `model`, `cwd`, `border`, `bullet`, and `input_bg` (a background).
+
+```toml
+[theme]
+base   = "light"
+accent = "#1e78b4"
+err    = "#c8283f"
+```
+
+The `/theme` command in the TUI switches `base` live and remembers it beside the
+configuration; an explicit `[theme].base` in the file wins over that. An
+unrecognized role or a malformed colour is reported and skipped, never applied.
+`--no-color` and `NO_COLOR` still suppress all of it.
 
 ## Six-layer example
 

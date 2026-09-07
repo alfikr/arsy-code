@@ -24,21 +24,297 @@ const DEFAULT_WIDTH: usize = 80;
 const DEFAULT_HEIGHT: usize = 24;
 const MIN_WIDTH: usize = 20;
 
-/// brainless palette, as truecolor SGR prefixes.
-const ASSISTANT: &str = "\x1b[38;2;201;201;201m";
-const DIM: &str = "\x1b[38;2;122;122;122m";
-const ACCENT: &str = "\x1b[38;2;92;194;224m";
-const OK: &str = "\x1b[38;2;78;169;111m";
-const ERR: &str = "\x1b[38;2;247;118;142m";
-const RUN: &str = "\x1b[38;2;224;175;104m";
-const MODEL: &str = "\x1b[38;2;246;226;183m";
-const CWD: &str = "\x1b[38;2;171;223;167m";
-const BORDER: &str = "\x1b[38;2;58;58;58m";
-const BULLET: &str = "\x1b[38;2;167;167;167m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
+
+/// One SGR prefix per visual role the renderer paints. Owned strings, because
+/// `[theme]` in the configuration can replace any of them with a colour the
+/// operator picked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub assistant: String,
+    pub dim: String,
+    pub accent: String,
+    pub ok: String,
+    pub err: String,
+    pub run: String,
+    pub model: String,
+    pub cwd: String,
+    pub border: String,
+    pub bullet: String,
+    pub input_bg: String,
+}
+
+/// The role names `[theme]` keys and the picker's error messages use, in the
+/// order [`Palette::from_codes`] takes them.
+pub const THEME_ROLES: &[&str] = &[
+    "assistant",
+    "dim",
+    "accent",
+    "ok",
+    "err",
+    "run",
+    "model",
+    "cwd",
+    "border",
+    "bullet",
+    "input_bg",
+];
+
+impl Palette {
+    fn from_codes(codes: [&str; 11]) -> Self {
+        Self {
+            assistant: codes[0].to_owned(),
+            dim: codes[1].to_owned(),
+            accent: codes[2].to_owned(),
+            ok: codes[3].to_owned(),
+            err: codes[4].to_owned(),
+            run: codes[5].to_owned(),
+            model: codes[6].to_owned(),
+            cwd: codes[7].to_owned(),
+            border: codes[8].to_owned(),
+            bullet: codes[9].to_owned(),
+            input_bg: codes[10].to_owned(),
+        }
+    }
+
+    fn slot(&mut self, role: &str) -> Option<&mut String> {
+        Some(match role {
+            "assistant" => &mut self.assistant,
+            "dim" => &mut self.dim,
+            "accent" => &mut self.accent,
+            "ok" => &mut self.ok,
+            "err" => &mut self.err,
+            "run" => &mut self.run,
+            "model" => &mut self.model,
+            "cwd" => &mut self.cwd,
+            "border" => &mut self.border,
+            "bullet" => &mut self.bullet,
+            "input_bg" => &mut self.input_bg,
+            _ => return None,
+        })
+    }
+
+    /// Replace roles from a `name -> "#rrggbb"` map. A `#rrggbb` becomes a
+    /// foreground prefix; `input_bg` a background one. An unknown role or a
+    /// malformed colour is rejected rather than ignored, so a typo in the
+    /// configuration is seen.
+    pub fn with_overrides(
+        mut self,
+        overrides: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        for (role, hex) in overrides {
+            let code = hex_to_sgr(hex, role == "input_bg")
+                .map_err(|why| format!("[theme].{role}: {why}"))?;
+            *self.slot(role).ok_or_else(|| {
+                format!(
+                    "[theme] has no role `{role}`; expected one of {}",
+                    THEME_ROLES.join(", ")
+                )
+            })? = code;
+        }
+        Ok(self)
+    }
+}
+
+/// The themes `/theme` offers: name, then the line the picker shows.
+pub const THEMES: &[(&str, &str)] = &[
+    ("dark", "default — light text for a dark terminal"),
+    ("light", "dark text for a light terminal"),
+    ("dim", "muted, lower contrast"),
+    ("mono", "greytones only, no hue"),
+];
+
+/// The theme in force when nothing has been chosen: the original palette.
+pub const DEFAULT_THEME: &str = "dark";
+
+/// A built-in theme's palette, or `None` when the name is not one.
+pub fn builtin_palette(name: &str) -> Option<Palette> {
+    // `dark` is the historical `brainless` palette, unchanged.
+    Some(match name {
+        "dark" => Palette::from_codes([
+            "\x1b[38;2;201;201;201m",
+            "\x1b[38;2;122;122;122m",
+            "\x1b[38;2;92;194;224m",
+            "\x1b[38;2;78;169;111m",
+            "\x1b[38;2;247;118;142m",
+            "\x1b[38;2;224;175;104m",
+            "\x1b[38;2;246;226;183m",
+            "\x1b[38;2;171;223;167m",
+            "\x1b[38;2;58;58;58m",
+            "\x1b[38;2;167;167;167m",
+            "\x1b[48;2;53;53;53m",
+        ]),
+        "light" => Palette::from_codes([
+            "\x1b[38;2;51;51;51m",
+            "\x1b[38;2;120;120;120m",
+            "\x1b[38;2;20;115;175m",
+            "\x1b[38;2;28;125;70m",
+            "\x1b[38;2;200;40;70m",
+            "\x1b[38;2;165;105;25m",
+            "\x1b[38;2;140;90;20m",
+            "\x1b[38;2;28;120;60m",
+            "\x1b[38;2;200;200;200m",
+            "\x1b[38;2;90;90;90m",
+            "\x1b[48;2;232;232;232m",
+        ]),
+        "dim" => Palette::from_codes([
+            "\x1b[38;2;170;170;170m",
+            "\x1b[38;2;108;108;108m",
+            "\x1b[38;2;120;160;175m",
+            "\x1b[38;2;110;150;120m",
+            "\x1b[38;2;180;120;130m",
+            "\x1b[38;2;175;150;115m",
+            "\x1b[38;2;190;180;150m",
+            "\x1b[38;2;140;170;140m",
+            "\x1b[38;2;70;70;70m",
+            "\x1b[38;2;138;138;138m",
+            "\x1b[48;2;45;45;45m",
+        ]),
+        "mono" => Palette::from_codes([
+            "\x1b[38;2;220;220;220m",
+            "\x1b[38;2;120;120;120m",
+            "\x1b[38;2;255;255;255m",
+            "\x1b[38;2;200;200;200m",
+            "\x1b[38;2;255;255;255m",
+            "\x1b[38;2;180;180;180m",
+            "\x1b[38;2;235;235;235m",
+            "\x1b[38;2;200;200;200m",
+            "\x1b[38;2;80;80;80m",
+            "\x1b[38;2;160;160;160m",
+            "\x1b[48;2;48;48;48m",
+        ]),
+        _ => return None,
+    })
+}
+
+// The renderer reads the palette through the `sgr_*` helpers below, so a theme
+// swap needs no change past `activate_palette`.
+//
+// ponytail: a process-global, not a value threaded through every render
+// function — the TUI shows one session in one theme. `activate_palette` leaks
+// one `Palette` per call so the helpers can hand out `&'static str`; a human
+// changes theme a handful of times a session, so the leak is bounded. Thread a
+// `&Palette` only if a split view ever needs two themes at once.
+static ACTIVE_PALETTE: std::sync::RwLock<Option<&'static Palette>> = std::sync::RwLock::new(None);
+
+/// Make `palette` the one the renderer paints with from now on. Safe to call
+/// again when `/theme` changes it mid-session.
+pub fn activate_palette(palette: Palette) {
+    let leaked: &'static Palette = Box::leak(Box::new(palette));
+    if let Ok(mut active) = ACTIVE_PALETTE.write() {
+        *active = Some(leaked);
+    }
+}
+
+fn palette() -> &'static Palette {
+    if let Some(active) = ACTIVE_PALETTE.read().ok().and_then(|active| *active) {
+        return active;
+    }
+    static DEFAULT: std::sync::OnceLock<Palette> = std::sync::OnceLock::new();
+    DEFAULT.get_or_init(|| builtin_palette(DEFAULT_THEME).expect("`dark` is built in"))
+}
+
+fn sgr_assistant() -> &'static str {
+    &palette().assistant
+}
+fn sgr_dim() -> &'static str {
+    &palette().dim
+}
+fn sgr_accent() -> &'static str {
+    &palette().accent
+}
+fn sgr_ok() -> &'static str {
+    &palette().ok
+}
+fn sgr_err() -> &'static str {
+    &palette().err
+}
+fn sgr_run() -> &'static str {
+    &palette().run
+}
+fn sgr_model() -> &'static str {
+    &palette().model
+}
+fn sgr_cwd() -> &'static str {
+    &palette().cwd
+}
+fn sgr_border() -> &'static str {
+    &palette().border
+}
+fn sgr_bullet() -> &'static str {
+    &palette().bullet
+}
 /// Codex `user_message_bg`: white at 12% over the `#1a1a1a` terminal surface.
-const INPUT_BG: &str = "\x1b[48;2;53;53;53m";
+fn sgr_input_bg() -> &'static str {
+    &palette().input_bg
+}
+
+/// `#rrggbb` to an SGR prefix — foreground, or background when `background`.
+fn hex_to_sgr(hex: &str, background: bool) -> Result<String, String> {
+    let body = hex.strip_prefix('#').unwrap_or(hex);
+    if body.len() != 6 || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("`{hex}` is not a #rrggbb colour"));
+    }
+    let channel = |at: usize| u8::from_str_radix(&body[at..at + 2], 16).unwrap_or(0);
+    let (red, green, blue) = (channel(0), channel(2), channel(4));
+    let lead = if background { 48 } else { 38 };
+    Ok(format!("\x1b[{lead};2;{red};{green};{blue}m"))
+}
+
+/// Take an answer to the `/theme` picker: a list number, a theme name, or an
+/// empty line to keep what is set. A rejected answer reports why, like the
+/// effort picker, because an accepted one is written to the user configuration.
+pub fn resolve_theme_answer(line: &str, current: &str) -> Result<String, String> {
+    let answer = line.trim();
+    if answer.is_empty() {
+        return Ok(current.to_owned());
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return THEMES
+            .get(
+                number
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("`{answer}` is out of range; the list starts at 1"))?,
+            )
+            .map(|(name, _)| (*name).to_owned())
+            .ok_or_else(|| format!("`{answer}` is not on the list"));
+    }
+    THEMES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(answer))
+        .map(|(name, _)| (*name).to_owned())
+        .ok_or_else(|| {
+            format!(
+                "`{}` is not a theme; use {}",
+                safe_text(answer),
+                THEMES
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+/// The row the `/theme` picker opens on: the theme in force.
+pub fn theme_row(current: &str) -> usize {
+    THEMES
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case(current))
+        .unwrap_or(0)
+}
+
+pub fn theme_prompt(current: &str, colour: bool) -> String {
+    paint(
+        colour,
+        sgr_dim(),
+        &format!(
+            "  theme [{current}] · Up/Down then Enter, a name, or 1-{}",
+            THEMES.len()
+        ),
+    )
+}
 const CLEAR_EOL: &str = "\x1b[K";
 #[cfg(test)]
 const CARET_UP_1: &str = "\x1b[1A";
@@ -314,6 +590,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
     (
+        "/theme",
+        "choose the colour theme; dark | light | dim | mono",
+    ),
+    (
         "/mcp",
         "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
     ),
@@ -373,7 +653,7 @@ impl AuthStep {
             Self::SetKey => format!("credential for {draft} · not shown as you type"),
             Self::RemoveHandle => "remove which credential · Up/Down then Enter".to_owned(),
         };
-        paint(colour, DIM, &format!("  {text}"))
+        paint(colour, sgr_dim(), &format!("  {text}"))
     }
 
     pub fn rows(self, providers: &[String], handles: &[String]) -> Option<Vec<(String, String)>> {
@@ -461,7 +741,7 @@ impl ProviderStep {
                 format!("remove `{}` from the configuration?", draft.name)
             }
         };
-        paint(colour, DIM, &format!("  {text}"))
+        paint(colour, sgr_dim(), &format!("  {text}"))
     }
 
     /// The rows this step offers, or none when it collects free text.
@@ -551,7 +831,7 @@ pub const EFFORT_ROWS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 11;
+const MENU_ROWS: usize = 12;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -564,9 +844,9 @@ pub fn help(colour: bool) -> String {
     for (name, description) in COMMANDS {
         text.push_str(&format!(
             "  {}{}{}\n",
-            paint(colour, ACCENT, name),
+            paint(colour, sgr_accent(), name),
             " ".repeat(label - name.chars().count() + 2),
-            paint(colour, DIM, description),
+            paint(colour, sgr_dim(), description),
         ));
     }
     for line in [
@@ -575,7 +855,7 @@ pub fn help(colour: bool) -> String {
         "Esc/Ctrl-C: cancel turn · Ctrl-D: exit on empty input",
         "MCP connections and executable hooks are not loaded by ARSY; imported declarations grant no authority.",
     ] {
-        text.push_str(&paint(colour, DIM, line));
+        text.push_str(&paint(colour, sgr_dim(), line));
         text.push('\n');
     }
     text
@@ -934,7 +1214,7 @@ impl Composer {
         self.drawn = true;
         self.top_status = false;
         let surface = if colour {
-            format!("{INPUT_BG}{CLEAR_EOL}")
+            format!("{}{CLEAR_EOL}", sgr_input_bg())
         } else {
             String::new()
         };
@@ -949,7 +1229,7 @@ impl Composer {
             frame.push_str(&format!(
                 "{surface}{} {text}{}\n",
                 if colour {
-                    format!("{INPUT_BG}›")
+                    format!("{}›", sgr_input_bg())
                 } else {
                     "›".to_owned()
                 },
@@ -959,7 +1239,7 @@ impl Composer {
             for (idx, line) in self.buffer.split('\n').enumerate() {
                 let prompt_char = if idx == 0 { "›" } else { "·" };
                 let prompt_str = if colour {
-                    format!("{INPUT_BG}{prompt_char}")
+                    format!("{}{prompt_char}", sgr_input_bg())
                 } else {
                     prompt_char.to_owned()
                 };
@@ -1022,7 +1302,7 @@ impl Composer {
         self.drawn = true;
         self.top_status = true;
         let surface = if colour {
-            format!("{INPUT_BG}{CLEAR_EOL}")
+            format!("{}{CLEAR_EOL}", sgr_input_bg())
         } else {
             String::new()
         };
@@ -1039,7 +1319,7 @@ impl Composer {
             frame.push_str(&format!(
                 "{surface}{} {text}{}\n",
                 if colour {
-                    format!("{INPUT_BG}›")
+                    format!("{}›", sgr_input_bg())
                 } else {
                     "›".to_owned()
                 },
@@ -1049,7 +1329,7 @@ impl Composer {
             for (idx, line) in self.buffer.split('\n').enumerate() {
                 let prompt_char = if idx == 0 { "›" } else { "·" };
                 let prompt_str = if colour {
-                    format!("{INPUT_BG}{prompt_char}")
+                    format!("{}{prompt_char}", sgr_input_bg())
                 } else {
                     prompt_char.to_owned()
                 };
@@ -1123,10 +1403,14 @@ impl Composer {
                 let chosen = index == selected;
                 let row = format!(
                     "  {} {}{}{}",
-                    paint(colour, ACCENT, if chosen { "›" } else { " " }),
-                    paint(colour, if chosen { ACCENT } else { BULLET }, name),
+                    paint(colour, sgr_accent(), if chosen { "›" } else { " " }),
+                    paint(
+                        colour,
+                        if chosen { sgr_accent() } else { sgr_bullet() },
+                        name
+                    ),
                     " ".repeat(label - name.chars().count() + 2),
-                    paint(colour, DIM, description),
+                    paint(colour, sgr_dim(), description),
                 );
                 fit(&row, width)
             })
@@ -1142,7 +1426,7 @@ impl Composer {
             out.push_str(&format!(
                 "{} {}\n",
                 paint(colour, BOLD, prompt),
-                paint(colour, ASSISTANT, line),
+                paint(colour, sgr_assistant(), line),
             ));
         }
         if submitted.trim().is_empty() {
@@ -1378,57 +1662,61 @@ impl TuiState {
         let mut rows = vec![
             format!(
                 "{} {}{}",
-                paint(colour, DIM, ">_"),
+                paint(colour, sgr_dim(), ">_"),
                 paint(colour, BOLD, "ARSY CODE"),
-                paint(colour, DIM, &format!(" (v{})", env!("CARGO_PKG_VERSION"))),
+                paint(
+                    colour,
+                    sgr_dim(),
+                    &format!(" (v{})", env!("CARGO_PKG_VERSION"))
+                ),
             ),
             String::new(),
         ];
         if let Some(route) = &self.model_route {
             rows.push(format!(
                 "{}   {}",
-                label_row(colour, "model:", &route.to_string(), MODEL),
-                paint(colour, DIM, "/model to change"),
+                label_row(colour, "model:", &route.to_string(), sgr_model()),
+                paint(colour, sgr_dim(), "/model to change"),
             ));
         }
-        rows.push(label_row(colour, "directory:", &self.workspace, CWD));
+        rows.push(label_row(colour, "directory:", &self.workspace, sgr_cwd()));
         rows.push(label_row(
             colour,
             "sandbox:",
             &format!("{} · read-only", self.sandbox_assurance),
-            DIM,
+            sgr_dim(),
         ));
         rows.push(label_row(
             colour,
             "session:",
             &self.session.to_string(),
-            DIM,
+            sgr_dim(),
         ));
         if let Some(entry) = self.timeline.last() {
             rows.push(label_row(
                 colour,
                 "event:",
                 &format!("{} {}", entry.sequence, entry.name),
-                DIM,
+                sgr_dim(),
             ));
         }
         if let Some(text) = &self.streaming {
-            rows.push(paint(colour, ASSISTANT, text));
+            rows.push(paint(colour, sgr_assistant(), text));
         }
 
         let rows = beside_logo(rows, inner, colour);
         let rule = "─".repeat(width.saturating_sub(2));
-        let mut lines = vec![paint(colour, BORDER, &format!("╭{rule}╮"))];
+        let mut lines = vec![paint(colour, sgr_border(), &format!("╭{rule}╮"))];
         for row in &rows {
             let row = fit(row, inner);
             let pad = " ".repeat(inner.saturating_sub(visible_len(&row)));
             lines.push(format!(
                 "{} {row}{pad} {}",
-                paint(colour, BORDER, "│"),
-                paint(colour, BORDER, "│"),
+                paint(colour, sgr_border(), "│"),
+                paint(colour, sgr_border(), "│"),
             ));
         }
-        lines.push(paint(colour, BORDER, &format!("╰{rule}╯")));
+        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
         lines.join("\n")
     }
 
@@ -1485,14 +1773,14 @@ impl TuiState {
         let mut row = format!(
             "{}{}{}{}",
             " ".repeat(INDENT),
-            paint(colour, MODEL, &model_label),
+            paint(colour, sgr_model(), &model_label),
             " ".repeat(GAP),
-            paint(colour, DIM, &effort_label),
+            paint(colour, sgr_dim(), &effort_label),
         );
         let mut used = head;
         if let Some(workspace) = &workspace {
             row.push_str(&" ".repeat(GAP));
-            row.push_str(&paint(colour, CWD, workspace));
+            row.push_str(&paint(colour, sgr_cwd(), workspace));
             used += GAP + visible_len(workspace);
         }
         // Only now is there a final answer on whether the branch fits.
@@ -1500,7 +1788,7 @@ impl TuiState {
             if let Some(gap) = width.checked_sub(used + visible_len(&branch_label)) {
                 if gap >= GAP {
                     row.push_str(&" ".repeat(gap));
-                    row.push_str(&paint(colour, ACCENT, &branch_label));
+                    row.push_str(&paint(colour, sgr_accent(), &branch_label));
                     return row;
                 }
             }
@@ -1553,7 +1841,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
 fn label_row(colour: bool, label: &str, value: &str, value_colour: &str) -> String {
     format!(
         "{}{}{}",
-        paint(colour, DIM, label),
+        paint(colour, sgr_dim(), label),
         " ".repeat(LABEL_WIDTH.saturating_sub(label.chars().count()) + 1),
         paint(colour, value_colour, value),
     )
@@ -1568,11 +1856,11 @@ enum Status {
 }
 
 impl Status {
-    const fn colour(self) -> &'static str {
+    fn colour(self) -> &'static str {
         match self {
-            Self::Ok => OK,
-            Self::Error => ERR,
-            Self::Run => RUN,
+            Self::Ok => sgr_ok(),
+            Self::Error => sgr_err(),
+            Self::Run => sgr_run(),
         }
     }
 }
@@ -1581,10 +1869,10 @@ fn exec_row(colour: bool, status: Status, command: &str, result: Option<&str>) -
     let head = format!(
         "  {} {}",
         paint(colour, status.colour(), "•"),
-        paint(colour, ACCENT, command),
+        paint(colour, sgr_accent(), command),
     );
     match result {
-        Some(result) => format!("{head}  {}", paint(colour, DIM, result)),
+        Some(result) => format!("{head}  {}", paint(colour, sgr_dim(), result)),
         None => head,
     }
 }
@@ -1619,7 +1907,7 @@ pub fn render_codex_event(line: &str, colour: bool) -> Option<String> {
 pub fn working_row(colour: bool) -> String {
     format!(
         "  {} {}",
-        paint(colour, BULLET, "•"),
+        paint(colour, sgr_bullet(), "•"),
         paint(colour, BOLD, "Working…"),
     )
 }
@@ -1634,9 +1922,9 @@ pub fn thinking_box_top(width: usize, colour: bool) -> String {
     let rule_len = width.saturating_sub(prefix_len + title_len + 1);
     format!(
         "{}{}{}",
-        paint(colour, BORDER, prefix),
-        paint(colour, ACCENT, title),
-        paint(colour, BORDER, &format!("{}╮", "─".repeat(rule_len))),
+        paint(colour, sgr_border(), prefix),
+        paint(colour, sgr_accent(), title),
+        paint(colour, sgr_border(), &format!("{}╮", "─".repeat(rule_len))),
     )
 }
 
@@ -1648,10 +1936,10 @@ pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
     let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
     format!(
         "{} {}{} {}",
-        paint(colour, BORDER, "│"),
-        paint(colour, DIM, &fitted),
+        paint(colour, sgr_border(), "│"),
+        paint(colour, sgr_dim(), &fitted),
         pad,
-        paint(colour, BORDER, "│"),
+        paint(colour, sgr_border(), "│"),
     )
 }
 
@@ -1659,7 +1947,7 @@ pub fn thinking_box_row(width: usize, colour: bool, text: &str) -> String {
 pub fn thinking_box_bottom(width: usize, colour: bool) -> String {
     let width = width.max(MIN_WIDTH);
     let rule = "─".repeat(width.saturating_sub(2));
-    paint(colour, BORDER, &format!("╰{rule}╯"))
+    paint(colour, sgr_border(), &format!("╰{rule}╯"))
 }
 
 /// A complete boxed thinking section.
@@ -1694,14 +1982,14 @@ pub fn turn_status(
     };
     let mut status = format!(
         "  {} {} · {}s",
-        paint(colour, RUN, FRAMES[tick % FRAMES.len()]),
+        paint(colour, sgr_run(), FRAMES[tick % FRAMES.len()]),
         paint(colour, BOLD, label),
         elapsed.as_secs(),
     );
     if queued > 0 {
-        status.push_str(&paint(colour, DIM, &format!(" · {queued} queued")));
+        status.push_str(&paint(colour, sgr_dim(), &format!(" · {queued} queued")));
     }
-    status.push_str(&paint(colour, DIM, " · Esc cancel"));
+    status.push_str(&paint(colour, sgr_dim(), " · Esc cancel"));
     status
 }
 
@@ -1716,7 +2004,7 @@ pub enum TurnPhase {
 /// One line of streamed model text, styled as the Codex projection styles an
 /// assistant message, so both routes read the same in scrollback.
 pub fn assistant_row(colour: bool, text: &str) -> String {
-    paint(colour, ASSISTANT, text.trim_end())
+    paint(colour, sgr_assistant(), text.trim_end())
 }
 
 /// Shown when a turn is stopped from the keyboard.
@@ -1727,8 +2015,8 @@ pub fn interrupted_row(colour: bool) -> String {
 fn error_row(colour: bool, message: &str) -> String {
     format!(
         "  {} {}",
-        paint(colour, ERR, "•"),
-        paint(colour, ERR, &unwrap_api_error(message.trim())),
+        paint(colour, sgr_err(), "•"),
+        paint(colour, sgr_err(), &unwrap_api_error(message.trim())),
     )
 }
 
@@ -1748,7 +2036,7 @@ fn unwrap_api_error(message: &str) -> String {
 fn render_codex_item(item: &Value, colour: bool) -> Option<String> {
     let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
     match item.get("type")?.as_str()? {
-        "agent_message" => Some(paint(colour, ASSISTANT, text("text").trim())),
+        "agent_message" => Some(paint(colour, sgr_assistant(), text("text").trim())),
         // Codex reports some failures as an item rather than a top-level event.
         "error" => Some(error_row(colour, text("message"))),
         "reasoning" => {
@@ -1975,7 +2263,7 @@ pub fn render_model_list(
             writeln!(
                 writer,
                 "{}",
-                paint(colour, ACCENT, &format!("  [{}]", choice.provider))
+                paint(colour, sgr_accent(), &format!("  [{}]", choice.provider))
             )?;
             last_provider = Some(&choice.provider);
         }
@@ -1983,10 +2271,10 @@ pub fn render_model_list(
         writeln!(
             writer,
             "    {} {} {}  {}",
-            paint(colour, ACCENT, marker),
-            paint(colour, DIM, &format!("{}.", index + 1)),
-            paint(colour, MODEL, &choice.slug),
-            paint(colour, DIM, &choice.name),
+            paint(colour, sgr_accent(), marker),
+            paint(colour, sgr_dim(), &format!("{}.", index + 1)),
+            paint(colour, sgr_model(), &choice.slug),
+            paint(colour, sgr_dim(), &choice.name),
         )?;
     }
     Ok(())
@@ -2011,7 +2299,7 @@ pub fn effort_prompt(current: Option<Effort>, colour: bool) -> String {
     let current = current.map_or_else(|| "off".to_owned(), |effort| effort.to_string());
     paint(
         colour,
-        DIM,
+        sgr_dim(),
         &format!(
             "  effort [{current}] · Up/Down then Enter, a name, or 1-{}",
             effort_choices().len()
@@ -2089,7 +2377,11 @@ pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) 
     } else {
         format!("Up/Down then Enter, a name, or 1-{}", models.len())
     };
-    paint(colour, DIM, &format!("  model [{}] · {choices}", current))
+    paint(
+        colour,
+        sgr_dim(),
+        &format!("  model [{}] · {choices}", current),
+    )
 }
 
 /// Resolve a picker answer: a list index, a slug typed in full, or an empty
@@ -2357,6 +2649,62 @@ mod tests {
         policy::ApprovalRequest,
     };
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn theme_answers_and_overrides_resolve() {
+        // Every built-in name in the picker table has a palette, and its
+        // description is non-empty.
+        for (name, description) in THEMES {
+            assert!(builtin_palette(name).is_some(), "{name} has no palette");
+            assert!(!description.is_empty());
+        }
+        assert!(builtin_palette("chartreuse").is_none());
+
+        // A number, a name (any case), or an empty line to keep what is set.
+        assert_eq!(resolve_theme_answer("2", "dark").unwrap(), "light");
+        assert_eq!(resolve_theme_answer("LIGHT", "dark").unwrap(), "light");
+        assert_eq!(resolve_theme_answer("   ", "dim").unwrap(), "dim");
+        assert!(resolve_theme_answer("0", "dark").is_err());
+        assert!(resolve_theme_answer("99", "dark").is_err());
+        assert!(resolve_theme_answer("solarized", "dark").is_err());
+
+        // #rrggbb (with or without the hash) becomes a truecolor prefix;
+        // input_bg is a background one.
+        assert_eq!(hex_to_sgr("#ff0000", false).unwrap(), "\x1b[38;2;255;0;0m");
+        assert_eq!(hex_to_sgr("00ff80", true).unwrap(), "\x1b[48;2;0;255;128m");
+        assert!(hex_to_sgr("#fff", false).is_err());
+        assert!(hex_to_sgr("#gggggg", false).is_err());
+
+        // Overrides replace only the named roles; an unknown role or a bad
+        // colour is rejected, not ignored.
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert("accent".to_owned(), "#123456".to_owned());
+        roles.insert("input_bg".to_owned(), "#abcdef".to_owned());
+        let painted = builtin_palette("dark")
+            .unwrap()
+            .with_overrides(&roles)
+            .unwrap();
+        assert_eq!(painted.accent, "\x1b[38;2;18;52;86m");
+        assert_eq!(painted.input_bg, "\x1b[48;2;171;205;239m");
+        assert_eq!(
+            painted.assistant,
+            builtin_palette("dark").unwrap().assistant
+        );
+
+        let mut bad_role = std::collections::BTreeMap::new();
+        bad_role.insert("accnt".to_owned(), "#123456".to_owned());
+        assert!(builtin_palette("dark")
+            .unwrap()
+            .with_overrides(&bad_role)
+            .is_err());
+
+        let mut bad_hex = std::collections::BTreeMap::new();
+        bad_hex.insert("accent".to_owned(), "red".to_owned());
+        assert!(builtin_palette("dark")
+            .unwrap()
+            .with_overrides(&bad_hex)
+            .is_err());
+    }
 
     #[test]
     fn first_frame_stream_resize_no_colour_and_approval_are_complete() {
@@ -2643,9 +2991,9 @@ mod tests {
         }
 
         // A cut row keeps the styling of the part that survived.
-        let cut = fit(&paint(true, CWD, "/a/very/long/path"), 8);
+        let cut = fit(&paint(true, sgr_cwd(), "/a/very/long/path"), 8);
         assert_eq!(visible_len(&cut), 8);
-        assert!(cut.starts_with(CWD));
+        assert!(cut.starts_with(sgr_cwd()));
         assert!(cut.ends_with(RESET));
         assert!(cut.contains('…'));
 
@@ -3053,7 +3401,7 @@ mod tests {
         // Every later frame erases the previous block from its first row.
         let painted = composer.render(80, true, "  status");
         assert!(painted.starts_with(&format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")));
-        assert_eq!(painted.matches(INPUT_BG).count(), 4);
+        assert_eq!(painted.matches(sgr_input_bg()).count(), 4);
         assert_eq!(
             composer.clear(),
             format!("{RESET}{CARET_UP_1}\r{CLEAR_BELOW}")
