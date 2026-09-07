@@ -196,17 +196,20 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
 //
 // ponytail: a process-global, not a value threaded through every render
 // function — the TUI shows one session in one theme. `activate_palette` leaks
-// one `Palette` per call so the helpers can hand out `&'static str`; a human
-// changes theme a handful of times a session, so the leak is bounded. Thread a
+// one `Palette` the first time each distinct palette is set, so the helpers can
+// hand out `&'static str`; an unchanged palette is a no-op, so repainting the
+// theme picker on every keystroke does not accumulate anything. Thread a
 // `&Palette` only if a split view ever needs two themes at once.
 static ACTIVE_PALETTE: std::sync::RwLock<Option<&'static Palette>> = std::sync::RwLock::new(None);
 
 /// Make `palette` the one the renderer paints with from now on. Safe to call
-/// again when `/theme` changes it mid-session.
+/// again — on every frame, even — when `/theme` previews or changes it.
 pub fn activate_palette(palette: Palette) {
-    let leaked: &'static Palette = Box::leak(Box::new(palette));
     if let Ok(mut active) = ACTIVE_PALETTE.write() {
-        *active = Some(leaked);
+        if active.map(|current| *current == palette).unwrap_or(false) {
+            return;
+        }
+        *active = Some(Box::leak(Box::new(palette)));
     }
 }
 

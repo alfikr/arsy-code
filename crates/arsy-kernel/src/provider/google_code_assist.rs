@@ -175,10 +175,28 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             );
         }
 
+        // Gemini keys a `functionResponse` by the function's name, but a
+        // canonical tool result carries only the call id. Recover the name from
+        // the `functionCall` earlier in the conversation that shares that id.
+        let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for message in &request.messages {
+            for content in &message.content {
+                if let ModelContent::ToolCall { id, name, .. } = content {
+                    names.insert(id.as_str(), name.as_str());
+                }
+            }
+        }
+
         let mut inner = Map::new();
         inner.insert(
             "contents".to_owned(),
-            Value::Array(request.messages.iter().flat_map(encode_message).collect()),
+            Value::Array(
+                request
+                    .messages
+                    .iter()
+                    .flat_map(|message| encode_message(message, &names))
+                    .collect(),
+            ),
         );
         if let Some(system) = request
             .system
@@ -225,8 +243,12 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
 }
 
 /// One canonical message becomes one Gemini `content` (plus a `functionResponse`
-/// content for each tool result it carries).
-fn encode_message(message: &ModelMessage) -> Vec<Value> {
+/// content for each tool result it carries). `names` maps a tool-call id to the
+/// function name, so a result can be labelled the way Gemini expects.
+fn encode_message(
+    message: &ModelMessage,
+    names: &std::collections::HashMap<&str, &str>,
+) -> Vec<Value> {
     let role = match message.role {
         ModelRole::User => "user",
         ModelRole::Assistant => "model",
@@ -250,7 +272,7 @@ fn encode_message(message: &ModelMessage) -> Vec<Value> {
                 is_error,
             } => responses.push(json!({
                 "functionResponse": {
-                    "name": id,
+                    "name": names.get(id.as_str()).copied().unwrap_or(id.as_str()),
                     "id": id,
                     "response": {
                         "output": content,
@@ -680,6 +702,46 @@ mod tests {
                 stop: StopReason::EndTurn
             }
         ));
+    }
+
+    #[test]
+    fn a_tool_result_is_labelled_with_the_name_of_the_call_it_answers() {
+        let mut req = request();
+        req.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::ToolCall {
+                id: "call-7".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: json!({"path": "x"}),
+            }],
+        });
+        req.messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::ToolResult {
+                id: "call-7".to_owned(),
+                content: "contents".to_owned(),
+                is_error: false,
+            }],
+        });
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[]),
+        )
+        .with_project("p");
+        let body: Value = serde_json::from_str(&provider.encode(&req, "p").body).unwrap();
+        let contents = body["request"]["contents"].as_array().unwrap();
+        let response = contents
+            .iter()
+            .find_map(|content| {
+                content["parts"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|part| part.get("functionResponse"))
+            })
+            .expect("a functionResponse part");
+        assert_eq!(response["name"], json!("read_file"));
+        assert_eq!(response["id"], json!("call-7"));
     }
 
     #[test]
