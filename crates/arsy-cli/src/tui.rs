@@ -117,12 +117,14 @@ impl Palette {
     }
 }
 
-/// The themes `/theme` offers: name, then the line the picker shows.
+/// The themes `/theme` offers: name, then the line the picker shows. All are
+/// built for a dark terminal — the surface the composer already draws over —
+/// so the picker can preview one by just repainting.
 pub const THEMES: &[(&str, &str)] = &[
-    ("dark", "default — light text for a dark terminal"),
-    ("light", "dark text for a light terminal"),
-    ("dim", "muted, lower contrast"),
-    ("mono", "greytones only, no hue"),
+    ("dark", "the original — grey text, cyan accents"),
+    ("ocean", "cool — teal and blue"),
+    ("sunset", "warm — amber and rose"),
+    ("mono", "greys only, no hue"),
 ];
 
 /// The theme in force when nothing has been chosen: the original palette.
@@ -145,44 +147,45 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;167;167;167m",
             "\x1b[48;2;53;53;53m",
         ]),
-        "light" => Palette::from_codes([
-            "\x1b[38;2;51;51;51m",
-            "\x1b[38;2;120;120;120m",
-            "\x1b[38;2;20;115;175m",
-            "\x1b[38;2;28;125;70m",
-            "\x1b[38;2;200;40;70m",
-            "\x1b[38;2;165;105;25m",
-            "\x1b[38;2;140;90;20m",
-            "\x1b[38;2;28;120;60m",
-            "\x1b[38;2;200;200;200m",
-            "\x1b[38;2;90;90;90m",
-            "\x1b[48;2;232;232;232m",
+        // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
+        "ocean" => Palette::from_codes([
+            "\x1b[38;2;205;214;224m",
+            "\x1b[38;2;107;122;137m",
+            "\x1b[38;2;79;201;201m",
+            "\x1b[38;2;95;208;160m",
+            "\x1b[38;2;244;132;156m",
+            "\x1b[38;2;217;176;106m",
+            "\x1b[38;2;215;230;230m",
+            "\x1b[38;2;143;214;192m",
+            "\x1b[38;2;55;67;76m",
+            "\x1b[38;2;127;149;160m",
+            "\x1b[48;2;36;48;56m",
         ]),
-        "dim" => Palette::from_codes([
-            "\x1b[38;2;170;170;170m",
-            "\x1b[38;2;108;108;108m",
-            "\x1b[38;2;120;160;175m",
-            "\x1b[38;2;110;150;120m",
-            "\x1b[38;2;180;120;130m",
-            "\x1b[38;2;175;150;115m",
-            "\x1b[38;2;190;180;150m",
-            "\x1b[38;2;140;170;140m",
-            "\x1b[38;2;70;70;70m",
-            "\x1b[38;2;138;138;138m",
-            "\x1b[48;2;45;45;45m",
+        "sunset" => Palette::from_codes([
+            "\x1b[38;2;224;212;200m",
+            "\x1b[38;2;138;122;108m",
+            "\x1b[38;2;230;168;79m",
+            "\x1b[38;2;168;201;106m",
+            "\x1b[38;2;244;125;146m",
+            "\x1b[38;2;224;138;74m",
+            "\x1b[38;2;242;226;183m",
+            "\x1b[38;2;188;212;154m",
+            "\x1b[38;2;74;63;56m",
+            "\x1b[38;2;160;140;124m",
+            "\x1b[48;2;51;42;36m",
         ]),
         "mono" => Palette::from_codes([
             "\x1b[38;2;220;220;220m",
-            "\x1b[38;2;120;120;120m",
-            "\x1b[38;2;255;255;255m",
+            "\x1b[38;2;122;122;122m",
+            "\x1b[38;2;245;245;245m",
             "\x1b[38;2;200;200;200m",
-            "\x1b[38;2;255;255;255m",
+            "\x1b[38;2;235;235;235m",
             "\x1b[38;2;180;180;180m",
             "\x1b[38;2;235;235;235m",
-            "\x1b[38;2;200;200;200m",
-            "\x1b[38;2;80;80;80m",
+            "\x1b[38;2;205;205;205m",
+            "\x1b[38;2;74;74;74m",
             "\x1b[38;2;160;160;160m",
-            "\x1b[48;2;48;48;48m",
+            "\x1b[48;2;42;42;42m",
         ]),
         _ => return None,
     })
@@ -591,7 +594,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/effort", "set reasoning effort; low | medium | high | off"),
     (
         "/theme",
-        "choose the colour theme; dark | light | dim | mono",
+        "choose the colour theme; dark | ocean | sunset | mono",
     ),
     (
         "/mcp",
@@ -973,6 +976,14 @@ impl Composer {
             .take(self.menu_capacity())
             .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
             .collect()
+    }
+
+    /// The row the picker is on right now, for a live preview of a choice
+    /// before Enter takes it. `None` when no menu is open.
+    pub fn highlighted(&self) -> Option<String> {
+        let menu = self.menu();
+        menu.get(self.selected.min(menu.len().checked_sub(1)?))
+            .map(|(name, _)| name.clone())
     }
 
     /// How many menu rows the terminal can hold.
@@ -2675,9 +2686,9 @@ mod tests {
         assert!(builtin_palette("chartreuse").is_none());
 
         // A number, a name (any case), or an empty line to keep what is set.
-        assert_eq!(resolve_theme_answer("2", "dark").unwrap(), "light");
-        assert_eq!(resolve_theme_answer("LIGHT", "dark").unwrap(), "light");
-        assert_eq!(resolve_theme_answer("   ", "dim").unwrap(), "dim");
+        assert_eq!(resolve_theme_answer("2", "dark").unwrap(), "ocean");
+        assert_eq!(resolve_theme_answer("OCEAN", "dark").unwrap(), "ocean");
+        assert_eq!(resolve_theme_answer("   ", "mono").unwrap(), "mono");
         assert!(resolve_theme_answer("0", "dark").is_err());
         assert!(resolve_theme_answer("99", "dark").is_err());
         assert!(resolve_theme_answer("solarized", "dark").is_err());

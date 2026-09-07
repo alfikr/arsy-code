@@ -1041,10 +1041,10 @@ mod tests {
         );
 
         let config = read(
-            "schema_version = 1\n[theme]\nbase = \"light\"\naccent = \"#12ab34\"\ninput_bg = \"445566\"\n",
+            "schema_version = 1\n[theme]\nbase = \"ocean\"\naccent = \"#12ab34\"\ninput_bg = \"445566\"\n",
         )
         .unwrap();
-        assert_eq!(config.theme().base.as_deref(), Some("light"));
+        assert_eq!(config.theme().base.as_deref(), Some("ocean"));
         assert_eq!(
             config.theme().roles.get("accent").map(String::as_str),
             Some("#12ab34")

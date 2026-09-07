@@ -1555,6 +1555,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             matches!(prompt, Prompt::Provider(step) if step.masked())
                 || matches!(prompt, Prompt::Auth(step) if step.masked()),
         );
+        // While the theme picker is open, repaint in whichever theme is
+        // arrowed onto so it can be seen before Enter takes it.
+        let preview_theme = |name: &str| set_palette(name, &theme_config.roles);
+        let preview: Option<&dyn Fn(&str)> = match prompt {
+            Prompt::Theme => Some(&preview_theme),
+            _ => None,
+        };
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1564,6 +1571,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 &mut stdout,
                 colour,
                 &status,
+                preview,
             )? {
                 Some(line) => line,
                 // Ending input at a picker cancels the picker, not the
@@ -1582,7 +1590,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
-                        Prompt::Theme => format!("Theme unchanged: {theme}"),
+                        Prompt::Theme => {
+                            // The preview left the palette on the last row
+                            // arrowed onto; put the committed one back.
+                            set_palette(&theme, &theme_config.roles);
+                            format!("Theme unchanged: {theme}")
+                        }
                         Prompt::Provider(_) => {
                             draft = tui::ProviderDraft::default();
                             "Provider unchanged.".to_owned()
@@ -1856,6 +1869,10 @@ fn read_line(
     stdout: &mut impl Write,
     colour: bool,
     status: &str,
+    // Called with the highlighted row before each repaint, so a picker can
+    // preview the choice the reader is arrowed onto (the theme picker repaints
+    // in that theme's colours).
+    preview: Option<&dyn Fn(&str)>,
 ) -> Result<Option<String>, Diagnostic> {
     let mut width = tui::terminal_width();
     composer.set_height(tui::terminal_rows());
@@ -1866,6 +1883,9 @@ fn read_line(
             width = tui::terminal_width();
             composer.set_height(tui::terminal_rows());
             measured = std::time::Instant::now();
+        }
+        if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
+            preview(&row);
         }
         write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
@@ -2019,10 +2039,23 @@ fn remember_theme(name: &str, emitter: &mut Emitter) {
     }
 }
 
+/// Make `name` (a built-in theme) the live palette, with the `[theme]` role
+/// overrides on top. A bad override was already reported at startup, so here it
+/// falls back to the plain base rather than repeating the warning every frame.
+#[cfg(feature = "tui")]
+fn set_palette(name: &str, roles: &std::collections::BTreeMap<String, String>) {
+    let Some(palette) = tui::builtin_palette(name) else {
+        return;
+    };
+    let palette = palette
+        .with_overrides(roles)
+        .unwrap_or_else(|_| tui::builtin_palette(name).expect("just built it"));
+    tui::activate_palette(palette);
+}
+
 /// Take a `/theme` answer: swap the live palette, remember the choice, and
 /// report it. Returns whether it landed — `false` leaves the picker open so
-/// the answer can be retyped. `[theme]` role overrides stay on top of the new
-/// base.
+/// the answer can be retyped.
 #[cfg(feature = "tui")]
 fn apply_theme(
     answer: &str,
@@ -2038,21 +2071,11 @@ fn apply_theme(
             return Ok(false);
         }
     };
-    let palette =
-        tui::builtin_palette(&picked).expect("resolve_theme_answer only returns built-in names");
-    match palette.with_overrides(roles) {
-        Ok(palette) => {
-            tui::activate_palette(palette);
-            *current = picked;
-            remember_theme(current, emitter);
-            writeln!(stdout, "Theme: {current}")?;
-            Ok(true)
-        }
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason))?;
-            Ok(false)
-        }
-    }
+    set_palette(&picked, roles);
+    *current = picked;
+    remember_theme(current, emitter);
+    writeln!(stdout, "Theme: {current}")?;
+    Ok(true)
 }
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,

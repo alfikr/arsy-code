@@ -187,17 +187,17 @@ def main():
             # `/theme` picks a colour theme the same way, and remembers it
             # beside the effort file.
             terminal.send(b"/theme\r")
-            terminal.expect("greytones only, no hue")
+            terminal.expect("greys only, no hue")
             terminal.expect("› dark")
             terminal.send(b"\x1b[B")
-            terminal.expect("› light")
+            terminal.expect("› ocean")
             terminal.send(b"\r\r")
-            terminal.expect("Theme: light")
+            terminal.expect("Theme: ocean")
             assert (root / "Library/Application Support/ARSY/theme").exists() or (
                 root / "config/arsy/theme"
             ).exists(), "the theme choice was not remembered"
             terminal.send(b"/theme\r")
-            terminal.expect("› light")
+            terminal.expect("› ocean")
             terminal.send(b"\x03")
             assert child.poll() is None, "leaving the theme picker ended the session"
             terminal.send(b"/theme mono\r")
