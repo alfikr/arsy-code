@@ -1,16 +1,17 @@
-//! OAuth 2.0 login, driven entirely by configuration.
+//! OAuth 2.0 login, driven by configuration or a built-in preset.
 //!
-//! No issuer is built in: the authorize, token, and device endpoints and the
-//! client identifier all come from `[provider.endpoint.<id>.oauth]`, so this
-//! serves any issuer an operator registers a client with, and ships no
-//! vendor's client secret.
+//! The authorize, token, and device endpoints and the client identifier come
+//! from `[provider.endpoint.<id>.oauth]`, so this serves any issuer an operator
+//! registers a client with. The built-in presets (`oauth::presets`) fill the
+//! same shape for the few vendors ARSY ships a client for.
 //!
 //! Two grants, chosen by what the issuer offers. The device grant (RFC 8628)
 //! needs no listening socket and works over SSH, so it is preferred when the
 //! configuration names a device endpoint. Otherwise the authorization-code
-//! grant with PKCE (RFC 7636) runs against a loopback redirect. Neither uses a
-//! client secret, which is what makes them safe for a program installed on the
-//! operator's own machine.
+//! grant with PKCE (RFC 7636) runs against a loopback redirect. A public client
+//! sends no secret; an installed-app client whose issuer still demands one (a
+//! Google desktop client, say) carries it in `client_secret` — not confidential
+//! for software the operator runs, but required for the exchange to succeed.
 //!
 //! HTTP is the same injected [`WireTransport`] the provider adapters use, so a
 //! login is testable without a network and adds no second HTTP path.
@@ -47,6 +48,11 @@ pub struct TokenSet {
     /// Unix seconds. Absent when the issuer did not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// The raw OIDC `id_token`, kept when the issuer sent one: some APIs need a
+    /// claim from it (OpenAI scopes ChatGPT-plan calls by an account id carried
+    /// there). Not a credential on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 impl TokenSet {
@@ -57,6 +63,28 @@ impl TokenSet {
     pub fn is_expired(&self, now: u64) -> bool {
         self.expires_at
             .is_some_and(|at| now.saturating_add(EXPIRY_MARGIN.as_secs()) >= at)
+    }
+
+    /// A string claim from the `id_token` payload, without verifying the
+    /// signature: the token came straight from the issuer over TLS in the same
+    /// exchange, and the claim only picks which account to address, never
+    /// grants anything.
+    pub fn id_token_claim(&self, name: &str) -> Option<String> {
+        let payload = self.id_token.as_deref()?.split('.').nth(1)?;
+        let bytes = base64url_decode(payload)?;
+        let value: Value = serde_json::from_slice(&bytes).ok()?;
+        // A claim can sit at the top level or one level in (`.../auth`).
+        value
+            .get(name)
+            .or_else(|| {
+                value
+                    .as_object()?
+                    .values()
+                    .filter_map(Value::as_object)
+                    .find_map(|nested| nested.get(name))
+            })
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     }
 }
 
@@ -170,11 +198,14 @@ pub fn poll_device(
         match post_form(
             transport,
             &oauth.token_url,
-            &[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", &prompt.device_code),
-                ("client_id", &oauth.client_id),
-            ],
+            &with_secret(
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", &prompt.device_code),
+                    ("client_id", &oauth.client_id),
+                ],
+                oauth.client_secret.as_deref(),
+            ),
         ) {
             Ok(value) => return token_set(&value),
             Err(OAuthError::Issuer { code, description }) => match code.as_str() {
@@ -205,48 +236,80 @@ pub fn authorization_code(
     oauth: &OAuth,
     visit: &mut dyn FnMut(&str),
 ) -> Result<TokenSet, OAuthError> {
-    // Port 0 asks the OS for a free port, so two logins cannot collide.
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| OAuthError::Local(error.to_string()))?
-        .port();
-    let redirect = format!("http://127.0.0.1:{port}/callback");
+    // A registered redirect names its port; the listener has to be on that
+    // one. With none, port 0 takes a free port so two logins cannot collide.
+    let (listener, redirect) = match &oauth.redirect_uri {
+        Some(uri) => {
+            let port = crate::config::redirect_loopback_port(uri).ok_or_else(|| {
+                OAuthError::Local(format!("`{uri}` is not a loopback redirect with a port"))
+            })?;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                .map_err(|error| OAuthError::Local(format!("port {port}: {error}")))?;
+            (listener, uri.clone())
+        }
+        None => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .map_err(|error| OAuthError::Local(error.to_string()))?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| OAuthError::Local(error.to_string()))?
+                .port();
+            (listener, format!("http://127.0.0.1:{port}/callback"))
+        }
+    };
 
     let verifier = random_token();
     let challenge = base64url(&sha256(verifier.as_bytes()));
     // Bound to this one attempt: a callback carrying a different state is a
     // response to somebody else's login and is refused.
     let state = random_token();
-    let authorize = format!(
-        "{}?{}",
-        oauth.authorize_url,
-        form_encode(&[
-            ("response_type", "code"),
-            ("client_id", &oauth.client_id),
-            ("redirect_uri", &redirect),
-            ("scope", &oauth.scopes.join(" ")),
-            ("state", &state),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-        ])
+    let scope = oauth.scopes.join(" ");
+    let mut params = vec![
+        ("response_type", "code"),
+        ("client_id", oauth.client_id.as_str()),
+        ("redirect_uri", redirect.as_str()),
+        ("scope", scope.as_str()),
+        ("state", state.as_str()),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ];
+    params.extend(
+        oauth
+            .authorize_params
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
     );
-    visit(&authorize);
+    visit(&format!("{}?{}", oauth.authorize_url, form_encode(&params)));
 
     let code = await_callback(&listener, &state)?;
     let value = post_form(
         transport,
         &oauth.token_url,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &redirect),
-            ("client_id", &oauth.client_id),
-            ("code_verifier", &verifier),
-        ],
+        &with_secret(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", &redirect),
+                ("client_id", &oauth.client_id),
+                ("code_verifier", &verifier),
+            ],
+            oauth.client_secret.as_deref(),
+        ),
     )?;
     token_set(&value)
+}
+
+/// The token-endpoint fields with `client_secret` appended when the client has
+/// one. Public clients send none; some installed-app clients must.
+fn with_secret<'a>(
+    base: &[(&'a str, &'a str)],
+    secret: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields = base.to_vec();
+    if let Some(secret) = secret {
+        fields.push(("client_secret", secret));
+    }
+    fields
 }
 
 /// Trade a refresh token for a fresh access token.
@@ -265,15 +328,22 @@ pub fn refresh(
     let value = post_form(
         transport,
         &oauth.token_url,
-        &[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", &oauth.client_id),
-        ],
+        &with_secret(
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", &oauth.client_id),
+            ],
+            oauth.client_secret.as_deref(),
+        ),
     )?;
     let mut refreshed = token_set(&value)?;
+    // Carry forward anything the refresh response left out.
     if refreshed.refresh_token.is_none() {
         refreshed.refresh_token = tokens.refresh_token.clone();
+    }
+    if refreshed.id_token.is_none() {
+        refreshed.id_token = tokens.id_token.clone();
     }
     Ok(refreshed)
 }
@@ -386,13 +456,12 @@ fn post_form(
 }
 
 fn token_set(value: &Value) -> Result<TokenSet, OAuthError> {
+    let owned = |name| value.get(name).and_then(Value::as_str).map(str::to_owned);
     Ok(TokenSet {
         access_token: string(value, "access_token")?,
-        refresh_token: value
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        refresh_token: owned("refresh_token"),
         expires_at: seconds(value, "expires_in").map(|lifetime| now().saturating_add(lifetime)),
+        id_token: owned("id_token"),
     })
 }
 
@@ -453,6 +522,34 @@ fn base64url(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Inverse of [`base64url`], ignoring any padding. `None` on a character
+/// outside the URL alphabet. Used only to read a JWT payload.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut sextets = Vec::with_capacity(text.len());
+    for byte in text.bytes() {
+        sextets.push(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => continue,
+            _ => return None,
+        });
+    }
+    let mut out = Vec::with_capacity(sextets.len() / 4 * 3);
+    for chunk in sextets.chunks(4) {
+        let mut block = 0_u32;
+        for (index, sextet) in chunk.iter().enumerate() {
+            block |= u32::from(*sextet) << (18 - 6 * index);
+        }
+        for index in 0..chunk.len().saturating_sub(1) {
+            out.push((block >> (16 - 8 * index)) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn form_encode(fields: &[(&str, &str)]) -> String {
@@ -563,6 +660,7 @@ mod tests {
             device_authorization_url: device.then(|| "https://issuer.test/device".to_owned()),
             client_id: "arsy cli".to_owned(),
             scopes: vec!["offline_access".to_owned(), "models:read".to_owned()],
+            ..OAuth::default()
         }
     }
 
@@ -652,6 +750,7 @@ mod tests {
             access_token: "at-1".to_owned(),
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
+            id_token: None,
         };
 
         let kept = refresh(&issuer, &oauth(false), &existing).unwrap();
@@ -678,9 +777,77 @@ mod tests {
                 access_token: "at".to_owned(),
                 refresh_token: None,
                 expires_at: None,
+                id_token: None,
             },
         );
         assert!(matches!(cannot, Err(OAuthError::Abandoned(_))));
+    }
+
+    #[test]
+    fn base64url_round_trips_and_reads_a_jwt_claim() {
+        for sample in [
+            b"".as_slice(),
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            &[251, 255, 190],
+        ] {
+            assert_eq!(base64url_decode(&base64url(sample)).unwrap(), sample);
+        }
+        assert!(base64url_decode("not base64 !!").is_none());
+
+        // A JWT is header.payload.signature; only the payload is read, and a
+        // claim may sit one level in (OpenAI nests it under an `.../auth` key).
+        let payload = base64url(
+            br#"{"sub":"u1","https://api.openai.com/auth":{"chatgpt_account_id":"acct-9"}}"#,
+        );
+        let token = TokenSet {
+            access_token: "at".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            id_token: Some(format!("hdr.{payload}.sig")),
+        };
+        assert_eq!(token.id_token_claim("sub").as_deref(), Some("u1"));
+        assert_eq!(
+            token.id_token_claim("chatgpt_account_id").as_deref(),
+            Some("acct-9")
+        );
+        assert_eq!(token.id_token_claim("missing"), None);
+        assert_eq!(
+            TokenSet {
+                id_token: None,
+                ..token
+            }
+            .id_token_claim("sub"),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_redirect_ports_are_recognised() {
+        use crate::config::redirect_loopback_port;
+        assert_eq!(
+            redirect_loopback_port("http://localhost:1455/auth/callback"),
+            Some(1455)
+        );
+        assert_eq!(
+            redirect_loopback_port("http://127.0.0.1:36742/oauth-callback"),
+            Some(36742)
+        );
+        assert_eq!(redirect_loopback_port("https://example.com:443/x"), None);
+        assert_eq!(redirect_loopback_port("http://localhost/callback"), None);
+        assert_eq!(redirect_loopback_port("not a url"), None);
+    }
+
+    #[test]
+    fn with_secret_appends_only_when_there_is_one() {
+        let base = [("grant_type", "refresh_token")];
+        assert_eq!(with_secret(&base, None), base.to_vec());
+        assert_eq!(
+            with_secret(&base, Some("shh")),
+            vec![("grant_type", "refresh_token"), ("client_secret", "shh")]
+        );
     }
 
     #[test]

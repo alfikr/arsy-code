@@ -135,16 +135,29 @@ impl fmt::Display for Dialect {
     }
 }
 
-/// Config-driven OAuth client. No provider's client identifier is built in:
-/// an operator supplies the whole client, so this works for any issuer.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Config-driven OAuth client. An operator supplies the whole client, so this
+/// works for any issuer; the built-in presets in `oauth::presets` fill the
+/// same shape for the vendors ARSY ships a client for.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct OAuth {
     pub authorize_url: String,
     pub token_url: String,
     /// Present when the issuer supports RFC 8628, which needs no loopback port.
     pub device_authorization_url: Option<String>,
     pub client_id: String,
+    /// Some installed-app clients (Google's, for one) still require the
+    /// "secret" in the token exchange. It is not confidential for a client
+    /// that ships in software, but the exchange fails without it.
+    pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    /// Exact loopback redirect the issuer has registered, e.g.
+    /// `http://localhost:1455/auth/callback`. When set, the listener binds
+    /// that port and the URI is sent verbatim; otherwise a free port is taken
+    /// and `http://127.0.0.1:<port>/callback` is used.
+    pub redirect_uri: Option<String>,
+    /// Extra query parameters for the authorization request, such as Google's
+    /// `access_type=offline`.
+    pub authorize_params: Vec<(String, String)>,
 }
 
 /// One resolved provider endpoint.
@@ -204,6 +217,22 @@ pub struct Theme {
 fn valid_hex(hex: &str) -> bool {
     let body = hex.strip_prefix('#').unwrap_or(hex);
     body.len() == 6 && body.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The port of a loopback OAuth redirect URI, or `None` when it is not one:
+/// `http`/`https`, a loopback host, and an explicit port. The login binds this
+/// port so the issuer's registered redirect resolves to ARSY's own listener.
+pub fn redirect_loopback_port(uri: &str) -> Option<u16> {
+    let rest = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+    port.parse().ok()
 }
 
 /// Effective value of one key and the file it won from.
@@ -631,7 +660,14 @@ impl Config {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "authorize_url" | "token_url" | "device_authorization_url" | "client_id" | "scopes"
+                "authorize_url"
+                    | "token_url"
+                    | "device_authorization_url"
+                    | "client_id"
+                    | "client_secret"
+                    | "scopes"
+                    | "redirect_uri"
+                    | "authorize_params"
             ) {
                 return Err(reject(format!("unknown key `{prefix}.{key}`")));
             }
@@ -676,6 +712,44 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let client_secret = string(
+            table,
+            "client_secret",
+            &format!("{prefix}.client_secret"),
+            path,
+        )?
+        .cloned();
+        let redirect_uri = string(
+            table,
+            "redirect_uri",
+            &format!("{prefix}.redirect_uri"),
+            path,
+        )?
+        .cloned();
+        if let Some(uri) = &redirect_uri {
+            if redirect_loopback_port(uri).is_none() {
+                return Err(reject(format!(
+                    "`{prefix}.redirect_uri` must be a loopback URL with a port, such as \
+                     \"http://localhost:1455/callback\": \"{uri}\""
+                )));
+            }
+        }
+        let authorize_params = match table.get("authorize_params") {
+            None => Vec::new(),
+            Some(value) => as_table(value, &format!("{prefix}.authorize_params"), path)?
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| {
+                            reject(format!(
+                                "`{prefix}.authorize_params.{key}` must be a string"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         self.record(layer, path, &format!("{prefix}.client_id"), &client_id);
         self.record(layer, path, &format!("{prefix}.token_url"), &token_url);
         Ok(OAuth {
@@ -683,7 +757,10 @@ impl Config {
             token_url,
             device_authorization_url,
             client_id,
+            client_secret,
             scopes,
+            redirect_uri,
+            authorize_params,
         })
     }
 
@@ -1231,7 +1308,11 @@ base_url = "http://localhost:11434/v1"
 authorize_url = "https://issuer.test/authorize"
 token_url = "https://issuer.test/token"
 client_id = "arsy"
+client_secret = "not-really-secret"
 scopes = ["offline_access"]
+redirect_uri = "http://localhost:1455/auth/callback"
+[provider.endpoint.local.oauth.authorize_params]
+access_type = "offline"
 "#,
         );
 
@@ -1244,14 +1325,19 @@ scopes = ["offline_access"]
         assert_eq!(endpoint.id, "local");
         assert_eq!(endpoint.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(config.model_default(), Some("claude-sonnet-4-6"));
-        assert_eq!(endpoint.oauth.as_ref().unwrap().client_id, "arsy");
-        assert_eq!(endpoint.oauth.as_ref().unwrap().scopes, ["offline_access"]);
-        assert!(endpoint
-            .oauth
-            .as_ref()
-            .unwrap()
-            .device_authorization_url
-            .is_none());
+        let oauth = endpoint.oauth.as_ref().unwrap();
+        assert_eq!(oauth.client_id, "arsy");
+        assert_eq!(oauth.client_secret.as_deref(), Some("not-really-secret"));
+        assert_eq!(oauth.scopes, ["offline_access"]);
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(
+            oauth.authorize_params,
+            [("access_type".to_owned(), "offline".to_owned())]
+        );
+        assert!(oauth.device_authorization_url.is_none());
         assert!(
             config.endpoint(Some("nope")).is_none(),
             "an unknown provider resolves to nothing, never to a different endpoint"
