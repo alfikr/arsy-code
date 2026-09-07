@@ -49,6 +49,7 @@ impl Endpoint {
 /// TOML strings here are written, not parsed, so a value that would need
 /// escaping is refused up front rather than producing a file that no longer
 /// loads. Every field `/provider` collects is a name, a URL, or a handle.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn is_writable(value: &str) -> bool {
     !value.is_empty()
         && !value.contains(['"', '\\', '\n', '\r'])
@@ -77,6 +78,7 @@ pub fn append_endpoint(config: &str, endpoint: &Endpoint) -> String {
 /// The table ends where the next one begins, so everything from its header to
 /// the following header goes, and one blank line left behind by the removal is
 /// taken with it. A name that is not there leaves the file untouched.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn remove_endpoint(config: &str, name: &str) -> String {
     let header = format!("[provider.endpoint.{name}]");
     let lines: Vec<&str> = config.lines().collect();
@@ -114,6 +116,7 @@ pub fn remove_endpoint(config: &str, name: &str) -> String {
 
 /// Point `[provider] default` at `name`, adding the key or the table when the
 /// file does not have them yet.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn set_default(config: &str, name: &str) -> String {
     let line = format!("default = \"{name}\"");
     let mut lines: Vec<String> = config.lines().map(str::to_owned).collect();

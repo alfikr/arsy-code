@@ -666,12 +666,26 @@ impl AuthStep {
         };
         match self {
             Self::Pick => named(AUTH_ACTIONS),
-            Self::LoginProvider | Self::SetProvider => Some(
+            Self::SetProvider => Some(
                 providers
                     .iter()
                     .map(|p| (p.clone(), format!("configured endpoint `{p}`")))
                     .collect(),
             ),
+            Self::LoginProvider => {
+                let mut rows: Vec<(String, String)> = providers
+                    .iter()
+                    .map(|p| (p.clone(), format!("configured endpoint `{p}`")))
+                    .collect();
+                // Built-in presets that are not already configured: signing in
+                // to one writes its endpoint.
+                for preset in arsy_kernel::oauth::presets::all() {
+                    if !providers.iter().any(|p| p == preset.id) {
+                        rows.push((preset.id.to_owned(), preset.label.to_owned()));
+                    }
+                }
+                Some(rows)
+            }
             Self::RemoveHandle => Some(
                 handles
                     .iter()

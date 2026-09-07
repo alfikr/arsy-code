@@ -18,7 +18,6 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
-#[cfg(feature = "tui")]
 mod config_edit;
 mod eval;
 mod integrations;
@@ -1130,27 +1129,44 @@ fn auth_login(
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let config = load_config(&root, &working)?;
-    let endpoint = config.endpoint(Some(provider)).ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            format!("no provider endpoint named `{provider}` is configured"),
-            "add a `[provider.endpoint.<name>]` table to the user config.toml",
-        )
-    })?;
-    let oauth = endpoint.oauth.as_ref().ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            format!("provider `{provider}` has no OAuth client configured"),
-            format!(
-                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
-                 with `arsy auth set {provider}`"
-            ),
-        )
-    })?;
+    let configured = config.endpoint(Some(provider)).cloned();
+    let preset = arsy_kernel::oauth::presets::get(provider);
+
+    // The OAuth client to run the flow with. A built-in preset stands in when
+    // the endpoint names none, and when the endpoint does not exist at all its
+    // `[provider.endpoint]` table is written after the token is stored.
+    let (oauth, synthesize) = match (&configured, preset) {
+        (Some(endpoint), _) if endpoint.oauth.is_some() => {
+            (endpoint.oauth.clone().expect("checked"), false)
+        }
+        (Some(_), Some(preset)) => (preset.oauth(), false),
+        (Some(_), None) => {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("provider `{provider}` has no OAuth client configured"),
+                format!(
+                    "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
+                     with `arsy auth set {provider}`"
+                ),
+            ))
+        }
+        (None, Some(preset)) => (preset.oauth(), true),
+        (None, None) => {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("no provider endpoint named `{provider}` is configured"),
+                format!(
+                    "configure `[provider.endpoint.{provider}]`, or sign in to a built-in \
+                     preset: {}",
+                    preset_ids()
+                ),
+            ))
+        }
+    };
 
     let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let tokens = if arsy_kernel::oauth::uses_device_grant(oauth) {
-        let prompt = arsy_kernel::oauth::begin_device(&transport, oauth).map_err(login_failed)?;
+    let tokens = if arsy_kernel::oauth::uses_device_grant(&oauth) {
+        let prompt = arsy_kernel::oauth::begin_device(&transport, &oauth).map_err(login_failed)?;
         // Printed rather than opened: the operator may be on another machine,
         // and this is the grant that does not need a local browser at all.
         emitter.result(json!({
@@ -1160,11 +1176,11 @@ fn auth_login(
                 .unwrap_or_else(|| prompt.verification_uri.clone()),
             "user_code": prompt.user_code,
         }));
-        arsy_kernel::oauth::poll_device(&transport, oauth, &prompt, &mut std::thread::sleep)
+        arsy_kernel::oauth::poll_device(&transport, &oauth, &prompt, &mut std::thread::sleep)
             .map_err(login_failed)?
     } else {
         let mut url = None;
-        let tokens = arsy_kernel::oauth::authorization_code(&transport, oauth, &mut |authorize| {
+        let tokens = arsy_kernel::oauth::authorization_code(&transport, &oauth, &mut |authorize| {
             url = Some(authorize.to_owned());
             let _ = writeln!(io::stderr(), "Open this URL to sign in:\n  {authorize}");
         });
@@ -1192,13 +1208,54 @@ fn auth_login(
         }),
     }
     save_catalog(records_store, &records)?;
+
+    // A preset that had no endpoint of its own gets one written now, pointed at
+    // the credential just stored, so `/model` and a turn find it like any other.
+    let mut wrote_endpoint = false;
+    if synthesize {
+        let preset = preset.expect("synthesize is only set when a preset matched");
+        let endpoint = config_edit::Endpoint {
+            name: provider.to_owned(),
+            kind: preset.dialect.as_str().to_owned(),
+            base_url: preset.base_url.to_owned(),
+            models: preset
+                .models
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+            credential: handle.to_string(),
+        };
+        write_config(|config| {
+            let config = config_edit::ensure_schema(config);
+            config_edit::append_endpoint(&config, &endpoint)
+        })
+        .map_err(|error| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("signed in, but the `[provider.endpoint.{provider}]` table could not be written: {error}"),
+                "add the endpoint table by hand; the credential is already stored",
+            )
+        })?;
+        wrote_endpoint = true;
+    }
+
     emitter.result(json!({
         "provider": provider,
         "handle": handle,
         "kind": "oauth",
         "expires_at": tokens.expires_at,
+        "endpoint_written": wrote_endpoint,
     }));
     Ok(0)
+}
+
+/// The built-in preset ids, for an error that offers them as an alternative.
+fn preset_ids() -> String {
+    arsy_kernel::oauth::presets::all()
+        .iter()
+        .map(|preset| preset.id)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
@@ -2239,15 +2296,9 @@ fn auth_step(
     }
     match step {
         tui::AuthStep::Pick => match answer {
-            "login" => {
-                if providers.is_empty() {
-                    return Err(
-                        "no providers are configured; configure a provider endpoint first"
-                            .to_owned(),
-                    );
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::LoginProvider))
-            }
+            // A built-in preset is always an option, so `login` never dead-ends
+            // the way `set` does with nothing configured.
+            "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
             "list" => {
                 let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
                 let human = human_credentials(&records);
@@ -2279,9 +2330,11 @@ fn auth_step(
             )),
         },
         tui::AuthStep::LoginProvider => {
-            if !providers.iter().any(|p| p == answer) {
+            let known = providers.iter().any(|p| p == answer)
+                || arsy_kernel::oauth::presets::get(answer).is_some();
+            if !known {
                 return Err(format!(
-                    "`{}` is not a configured provider",
+                    "`{}` is not a configured provider or a built-in preset",
                     tui::safe_text(answer)
                 ));
             }
@@ -2407,7 +2460,6 @@ fn store_credential(
 ///
 /// The file is read and written whole, so `edit` sees exactly what is on disk
 /// and nothing it did not change can move.
-#[cfg(feature = "tui")]
 fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
     let path = arsy_kernel::config::user_config()
         .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
