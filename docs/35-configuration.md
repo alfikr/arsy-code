@@ -51,7 +51,10 @@ Authority classes are:
 | `provider.endpoint.<id>.oauth.token_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.device_authorization_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.client_id` | string | none | replace | user |
+| `provider.endpoint.<id>.oauth.client_secret` | string | none | replace | user |
 | `provider.endpoint.<id>.oauth.scopes` | array of strings | `[]` | replace | user |
+| `provider.endpoint.<id>.oauth.redirect_uri` | loopback URL with a port | free port on `/callback` | replace | user |
+| `provider.endpoint.<id>.oauth.authorize_params` | table of string values | `{}` | replace | user |
 | `model.default` | string or `"auto"` | `"auto"` | replace | intent |
 | `model.allowed` | array of model IDs | all profiled | intersection | ceiling |
 | `context.max_tokens` | positive integer | `65536` | min | ceiling |
@@ -119,6 +122,23 @@ A credential is looked for in the order an operator would expect to override it:
 variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but blank counts as
 absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
 are told apart by shape, and an expired access token is refreshed and written back before use.
+
+### Built-in login presets
+
+`arsy auth login <id>` also accepts an `<id>` that names no configured endpoint
+but is a built-in preset — a vendor ARSY ships an OAuth client for:
+
+| Preset | Signs in with | Endpoint it writes |
+|---|---|---|
+| `codex-oauth` | a ChatGPT account | `kind = "openai_responses"`, the Codex backend |
+| `antigravity` | a Google account | `kind = "google_code_assist"`, Cloud Code Assist |
+
+Signing in to one runs its OAuth flow, stores the token, and appends a
+`[provider.endpoint.<id>]` table pointed at it, so `/model` and a turn find it
+like any hand-configured endpoint. These reuse another product's client
+identifier; the Antigravity path in particular may violate that product's terms
+of service. An endpoint you configure yourself with its own `[oauth]` table
+always takes precedence over a preset of the same name.
 
 Credential values are handles such as `secret://os/gateway`, never raw secrets.
 The half after `secret://` names the store that answers, and a store ARSY does
