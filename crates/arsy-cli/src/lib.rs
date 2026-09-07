@@ -1179,10 +1179,21 @@ fn auth_login(
         arsy_kernel::oauth::poll_device(&transport, &oauth, &prompt, &mut std::thread::sleep)
             .map_err(login_failed)?
     } else {
-        let mut url = None;
+        // Open the browser for an interactive operator; a scripted or headless
+        // run (`--output json|ci`) only prints the URL. Either way the URL is
+        // printed, so a browser that does not open is not a dead end.
+        let interactive = emitter.output == Output::Human;
         let tokens = arsy_kernel::oauth::authorization_code(&transport, &oauth, &mut |authorize| {
-            url = Some(authorize.to_owned());
-            let _ = writeln!(io::stderr(), "Open this URL to sign in:\n  {authorize}");
+            let opened = interactive && open_browser(authorize);
+            let _ = writeln!(
+                io::stderr(),
+                "{}\n  {authorize}",
+                if opened {
+                    "Opening your browser to sign in. If it did not open, visit:"
+                } else {
+                    "Open this URL to sign in:"
+                }
+            );
         });
         tokens.map_err(login_failed)?
     };
@@ -1256,6 +1267,44 @@ fn preset_ids() -> String {
         .map(|preset| preset.id)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Hand the URL to the platform's browser opener. Best-effort: the return
+/// says the opener was launched, not that a browser appeared.
+fn open_browser(url: &str) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    ))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        };
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    )))]
+    {
+        let _ = url;
+        false
+    }
 }
 
 fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {

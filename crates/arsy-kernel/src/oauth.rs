@@ -396,17 +396,51 @@ fn await_callback(listener: &TcpListener, state: &str) -> Result<String, OAuthEr
             "the callback carried no authorization code".to_owned(),
         )),
     };
-    let page = match &outcome {
-        Ok(_) => "ARSY is signed in. You can close this tab.",
-        Err(_) => "ARSY could not complete the sign-in. Check the terminal.",
-    };
+    let page = callback_page(outcome.is_ok());
     let mut stream = stream;
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
         page.len()
     );
     outcome
+}
+
+/// The page the browser lands on after the redirect. Self-contained — no
+/// network fetch — and carries the ARSY wordmark so it reads as ARSY's own,
+/// not a blank tab.
+fn callback_page(ok: bool) -> String {
+    let (class, glyph, headline, hint) = if ok {
+        (
+            "ok",
+            "\u{2713}",
+            "Signed in",
+            "You can close this tab and return to the terminal.",
+        )
+    } else {
+        (
+            "err",
+            "\u{2717}",
+            "Sign-in failed",
+            "Check the terminal for what went wrong.",
+        )
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ARSY</title>\
+<style>:root{{color-scheme:dark}}\
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#1a1a1a;\
+color:#c9c9c9;font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}\
+.card{{text-align:center;padding:2.5rem 3rem}}\
+.mark{{font-size:2rem;letter-spacing:.15em;color:#f6e2b7}}\
+.mark b{{color:#5cc2e0}}\
+.status{{margin-top:1.5rem;font-size:1.05rem}}\
+.status.ok{{color:#4ea96f}}.status.err{{color:#e0af68}}\
+.hint{{margin-top:.5rem;color:#7a7a7a;font-size:.9rem}}</style></head>\
+<body><div class=\"card\"><div class=\"mark\"><b>&gt;_</b> ARSY</div>\
+<div class=\"status {class}\">{glyph} {headline}</div>\
+<div class=\"hint\">{hint}</div></div></body></html>"
+    )
 }
 
 /// One form-encoded POST, decoded as JSON.
@@ -975,6 +1009,19 @@ mod tests {
         let token = random_token();
         assert_eq!(token.len(), 43, "32 bytes, unpadded");
         assert_ne!(token, random_token());
+    }
+
+    #[test]
+    fn the_callback_page_is_self_contained_and_branded() {
+        for ok in [true, false] {
+            let page = callback_page(ok);
+            assert!(page.starts_with("<!doctype html>"));
+            assert!(page.contains("ARSY"));
+            // No off-origin fetch: the page has to render on a machine that
+            // just finished an auth flow and may have no route out.
+            assert!(!page.contains("http://") && !page.contains("https://"));
+            assert!(page.contains(if ok { "Signed in" } else { "Sign-in failed" }));
+        }
     }
 
     #[test]
