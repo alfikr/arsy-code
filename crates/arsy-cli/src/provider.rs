@@ -11,8 +11,9 @@ use arsy_kernel::{
     config::{Config, Dialect, Endpoint},
     oauth::{self, TokenSet},
     provider::{
-        anthropic::AnthropicProvider, http::HttpTransport, openai::OpenAiProvider, wire::ApiKey,
-        ModelProvider,
+        anthropic::AnthropicProvider, google_code_assist::GoogleCodeAssistProvider,
+        http::HttpTransport, openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider,
+        wire::ApiKey, ModelProvider,
     },
     secret::{
         CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretError,
@@ -101,6 +102,16 @@ pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Dia
         ),
         Dialect::Openai => Arc::new(
             OpenAiProvider::with_base_url(&endpoint.base_url, key, transport)
+                .with_id(&endpoint.id)
+                .with_redactor(redactor),
+        ),
+        Dialect::OpenaiResponses => Arc::new(
+            OpenAiResponsesProvider::with_base_url(&endpoint.base_url, key, transport)
+                .with_id(&endpoint.id)
+                .with_redactor(redactor),
+        ),
+        Dialect::GoogleCodeAssist => Arc::new(
+            GoogleCodeAssistProvider::with_base_url(&endpoint.base_url, key, transport)
                 .with_id(&endpoint.id)
                 .with_redactor(redactor),
         ),
@@ -215,22 +226,28 @@ fn stored(
         Stored::Token(tokens) => return Ok((tokens.access_token, CredentialSource::OAuth)),
         Stored::Expired(tokens) => tokens,
     };
-    let oauth_client = endpoint.oauth.as_ref().ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            format!(
-                "the stored login for provider `{}` has expired and its OAuth client is no \
-                 longer configured",
-                endpoint.id
-            ),
-            format!(
-                "restore the `[provider.endpoint.{}.oauth]` table",
-                endpoint.id
-            ),
-        )
-    })?;
+    // A hand-configured endpoint carries its own `[oauth]`; a built-in preset
+    // does not, so fall back to the preset that shares the endpoint's id.
+    let oauth_client = endpoint
+        .oauth
+        .clone()
+        .or_else(|| oauth::presets::get(&endpoint.id).map(|preset| preset.oauth()))
+        .ok_or_else(|| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!(
+                    "the stored login for provider `{}` has expired and its OAuth client is no \
+                     longer configured",
+                    endpoint.id
+                ),
+                format!(
+                    "restore the `[provider.endpoint.{}.oauth]` table",
+                    endpoint.id
+                ),
+            )
+        })?;
     let refreshed =
-        oauth::refresh(&HttpTransport::default(), oauth_client, &tokens).map_err(|error| {
+        oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).map_err(|error| {
             Diagnostic::error(
                 ARSY_PRV_1000,
                 format!(

@@ -94,6 +94,12 @@ impl fmt::Display for Layer {
 pub enum Dialect {
     Anthropic,
     Openai,
+    /// OpenAI's Responses API (`/responses`), as the Codex/ChatGPT backend
+    /// speaks it. A different body and event stream from Chat Completions.
+    OpenaiResponses,
+    /// Google's Cloud Code Assist API, as Antigravity speaks it: a Gemini
+    /// `generateContent` payload inside a Code Assist wrapper.
+    GoogleCodeAssist,
 }
 
 impl Dialect {
@@ -101,6 +107,8 @@ impl Dialect {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::OpenaiResponses => "openai_responses",
+            Self::GoogleCodeAssist => "google_code_assist",
         }
     }
 
@@ -109,6 +117,8 @@ impl Dialect {
         match self {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Openai => "https://api.openai.com/v1",
+            Self::OpenaiResponses => "https://chatgpt.com/backend-api/codex",
+            Self::GoogleCodeAssist => "https://cloudcode-pa.googleapis.com",
         }
     }
 
@@ -116,7 +126,8 @@ impl Dialect {
     pub const fn default_api_key_env(self) -> &'static str {
         match self {
             Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::Openai => "OPENAI_API_KEY",
+            Self::Openai | Self::OpenaiResponses => "OPENAI_API_KEY",
+            Self::GoogleCodeAssist => "GEMINI_API_KEY",
         }
     }
 
@@ -124,6 +135,8 @@ impl Dialect {
         match raw {
             "anthropic" => Some(Self::Anthropic),
             "openai" => Some(Self::Openai),
+            "openai_responses" => Some(Self::OpenaiResponses),
+            "google_code_assist" => Some(Self::GoogleCodeAssist),
             _ => None,
         }
     }
@@ -135,16 +148,29 @@ impl fmt::Display for Dialect {
     }
 }
 
-/// Config-driven OAuth client. No provider's client identifier is built in:
-/// an operator supplies the whole client, so this works for any issuer.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Config-driven OAuth client. An operator supplies the whole client, so this
+/// works for any issuer; the built-in presets in `oauth::presets` fill the
+/// same shape for the vendors ARSY ships a client for.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct OAuth {
     pub authorize_url: String,
     pub token_url: String,
     /// Present when the issuer supports RFC 8628, which needs no loopback port.
     pub device_authorization_url: Option<String>,
     pub client_id: String,
+    /// Some installed-app clients (Google's, for one) still require the
+    /// "secret" in the token exchange. It is not confidential for a client
+    /// that ships in software, but the exchange fails without it.
+    pub client_secret: Option<String>,
     pub scopes: Vec<String>,
+    /// Exact loopback redirect the issuer has registered, e.g.
+    /// `http://localhost:1455/auth/callback`. When set, the listener binds
+    /// that port and the URI is sent verbatim; otherwise a free port is taken
+    /// and `http://127.0.0.1:<port>/callback` is used.
+    pub redirect_uri: Option<String>,
+    /// Extra query parameters for the authorization request, such as Google's
+    /// `access_type=offline`.
+    pub authorize_params: Vec<(String, String)>,
 }
 
 /// One resolved provider endpoint.
@@ -187,6 +213,41 @@ impl Endpoint {
 /// substantial edit, small enough to bound a runaway response.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// The `[theme]` table: a built-in theme to start from, plus per-role colour
+/// overrides. The CLI turns this into its palette; the kernel only carries and
+/// validates it, so a headless run rejects a bad colour at load time too.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Theme {
+    /// Name of a built-in theme. `None` leaves the CLI's default in force.
+    pub base: Option<String>,
+    /// `role -> "#rrggbb"`. Role names are the CLI's to know; the kernel only
+    /// checks the colour is well formed.
+    pub roles: BTreeMap<String, String>,
+}
+
+/// Whether `hex` is `#rrggbb` (the `#` optional), the one colour form `[theme]`
+/// accepts.
+fn valid_hex(hex: &str) -> bool {
+    let body = hex.strip_prefix('#').unwrap_or(hex);
+    body.len() == 6 && body.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The port of a loopback OAuth redirect URI, or `None` when it is not one:
+/// `http`/`https`, a loopback host, and an explicit port. The login binds this
+/// port so the issuer's registered redirect resolves to ARSY's own listener.
+pub fn redirect_loopback_port(uri: &str) -> Option<u16> {
+    let rest = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// Effective value of one key and the file it won from.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Origin {
@@ -227,6 +288,7 @@ pub struct Config {
     model_default: Option<String>,
     credential_store: Option<String>,
     endpoints: BTreeMap<String, Endpoint>,
+    theme: Theme,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -271,6 +333,11 @@ impl Config {
 
     pub fn model_default(&self) -> Option<&str> {
         self.model_default.as_deref()
+    }
+
+    /// The `[theme]` table, empty when the file did not set one.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
@@ -351,9 +418,41 @@ impl Config {
                         self.record(layer, path, "credentials.store", store);
                     }
                 }
+                "theme" => self.apply_theme(layer, path, value)?,
                 section if INERT_SECTIONS.contains(&section) => {}
                 other => return Err(reject(format!("unknown key `{other}`"))),
             }
+        }
+        Ok(())
+    }
+
+    fn apply_theme(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "theme", path)? {
+            if key == "base" {
+                let base = expect_string(value, "theme.base", path)?;
+                self.theme.base = Some(base.clone());
+                self.record(layer, path, "theme.base", base);
+                continue;
+            }
+            // Any other key is a role name. The kernel does not police the set
+            // of roles (that is the CLI's), only that the value is a colour.
+            let hex = expect_string(value, &format!("theme.{key}"), path)?;
+            if !valid_hex(hex) {
+                return Err(reject(format!(
+                    "`theme.{key}` must be a #rrggbb colour, not `{hex}`"
+                )));
+            }
+            self.theme.roles.insert(key.clone(), hex.clone());
+            self.record(layer, path, &format!("theme.{key}"), hex);
         }
         Ok(())
     }
@@ -447,7 +546,8 @@ impl Config {
             .map(|raw| {
                 Dialect::parse(raw).ok_or_else(|| {
                     reject(format!(
-                        "`{prefix}.kind` must be \"anthropic\" or \"openai\", not \"{raw}\""
+                        "`{prefix}.kind` must be one of \"anthropic\", \"openai\", \
+                         \"openai_responses\", \"google_code_assist\", not \"{raw}\""
                     ))
                 })
             })
@@ -574,7 +674,14 @@ impl Config {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "authorize_url" | "token_url" | "device_authorization_url" | "client_id" | "scopes"
+                "authorize_url"
+                    | "token_url"
+                    | "device_authorization_url"
+                    | "client_id"
+                    | "client_secret"
+                    | "scopes"
+                    | "redirect_uri"
+                    | "authorize_params"
             ) {
                 return Err(reject(format!("unknown key `{prefix}.{key}`")));
             }
@@ -619,6 +726,44 @@ impl Config {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let client_secret = string(
+            table,
+            "client_secret",
+            &format!("{prefix}.client_secret"),
+            path,
+        )?
+        .cloned();
+        let redirect_uri = string(
+            table,
+            "redirect_uri",
+            &format!("{prefix}.redirect_uri"),
+            path,
+        )?
+        .cloned();
+        if let Some(uri) = &redirect_uri {
+            if redirect_loopback_port(uri).is_none() {
+                return Err(reject(format!(
+                    "`{prefix}.redirect_uri` must be a loopback URL with a port, such as \
+                     \"http://localhost:1455/callback\": \"{uri}\""
+                )));
+            }
+        }
+        let authorize_params = match table.get("authorize_params") {
+            None => Vec::new(),
+            Some(value) => as_table(value, &format!("{prefix}.authorize_params"), path)?
+                .iter()
+                .map(|(key, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (key.clone(), value.to_owned()))
+                        .ok_or_else(|| {
+                            reject(format!(
+                                "`{prefix}.authorize_params.{key}` must be a string"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         self.record(layer, path, &format!("{prefix}.client_id"), &client_id);
         self.record(layer, path, &format!("{prefix}.token_url"), &token_url);
         Ok(OAuth {
@@ -626,7 +771,10 @@ impl Config {
             token_url,
             device_authorization_url,
             client_id,
+            client_secret,
             scopes,
+            redirect_uri,
+            authorize_params,
         })
     }
 
@@ -878,6 +1026,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn theme_carries_a_base_and_well_formed_role_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), "config.toml", body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        // No `[theme]` at all is the empty theme, not an error.
+        assert_eq!(
+            read("schema_version = 1\n").unwrap().theme(),
+            &Theme::default()
+        );
+
+        let config = read(
+            "schema_version = 1\n[theme]\nbase = \"ocean\"\naccent = \"#12ab34\"\ninput_bg = \"445566\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.theme().base.as_deref(), Some("ocean"));
+        assert_eq!(
+            config.theme().roles.get("accent").map(String::as_str),
+            Some("#12ab34")
+        );
+        assert_eq!(
+            config.theme().roles.get("input_bg").map(String::as_str),
+            Some("445566")
+        );
+
+        // A colour that is not #rrggbb is refused rather than carried.
+        let error = read("schema_version = 1\n[theme]\naccent = \"reddish\"\n").unwrap_err();
+        assert!(
+            error.message.contains("#rrggbb"),
+            "unexpected: {}",
+            error.message
+        );
+    }
+
     use super::*;
 
     fn write(directory: &Path, name: &str, body: &str) -> PathBuf {
@@ -1086,7 +1271,7 @@ credential = "secret://os/official"
             ("schema_version = 1\n[nonsense]\na = 1\n", "unknown key `nonsense`"),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"gemini\"\n",
-                "must be \"anthropic\" or \"openai\"",
+                "google_code_assist",
             ),
             (
                 "schema_version = 1\n[provider.endpoint.p]\nbase_url = \"https://x.test\"\n",
@@ -1137,7 +1322,11 @@ base_url = "http://localhost:11434/v1"
 authorize_url = "https://issuer.test/authorize"
 token_url = "https://issuer.test/token"
 client_id = "arsy"
+client_secret = "not-really-secret"
 scopes = ["offline_access"]
+redirect_uri = "http://localhost:1455/auth/callback"
+[provider.endpoint.local.oauth.authorize_params]
+access_type = "offline"
 "#,
         );
 
@@ -1150,14 +1339,19 @@ scopes = ["offline_access"]
         assert_eq!(endpoint.id, "local");
         assert_eq!(endpoint.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(config.model_default(), Some("claude-sonnet-4-6"));
-        assert_eq!(endpoint.oauth.as_ref().unwrap().client_id, "arsy");
-        assert_eq!(endpoint.oauth.as_ref().unwrap().scopes, ["offline_access"]);
-        assert!(endpoint
-            .oauth
-            .as_ref()
-            .unwrap()
-            .device_authorization_url
-            .is_none());
+        let oauth = endpoint.oauth.as_ref().unwrap();
+        assert_eq!(oauth.client_id, "arsy");
+        assert_eq!(oauth.client_secret.as_deref(), Some("not-really-secret"));
+        assert_eq!(oauth.scopes, ["offline_access"]);
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(
+            oauth.authorize_params,
+            [("access_type".to_owned(), "offline".to_owned())]
+        );
+        assert!(oauth.device_authorization_url.is_none());
         assert!(
             config.endpoint(Some("nope")).is_none(),
             "an unknown provider resolves to nothing, never to a different endpoint"

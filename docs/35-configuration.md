@@ -51,7 +51,10 @@ Authority classes are:
 | `provider.endpoint.<id>.oauth.token_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.device_authorization_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.client_id` | string | none | replace | user |
+| `provider.endpoint.<id>.oauth.client_secret` | string | none | replace | user |
 | `provider.endpoint.<id>.oauth.scopes` | array of strings | `[]` | replace | user |
+| `provider.endpoint.<id>.oauth.redirect_uri` | loopback URL with a port | free port on `/callback` | replace | user |
+| `provider.endpoint.<id>.oauth.authorize_params` | table of string values | `{}` | replace | user |
 | `model.default` | string or `"auto"` | `"auto"` | replace | intent |
 | `model.allowed` | array of model IDs | all profiled | intersection | ceiling |
 | `context.max_tokens` | positive integer | `65536` | min | ceiling |
@@ -77,6 +80,8 @@ Authority classes are:
 | `git.respect_ignore` | boolean | `true` | replace | intent |
 | `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
 | `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |
+| `theme.base` | `"dark"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | user |
+| `theme.<role>` | `#rrggbb` colour | the base theme's | replace | user |
 
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
 
@@ -118,6 +123,23 @@ variable (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`). A source that is present but
 absent. `credential` may hold either an API key or the token set `arsy auth login` writes; the two
 are told apart by shape, and an expired access token is refreshed and written back before use.
 
+### Built-in login presets
+
+`arsy auth login <id>` also accepts an `<id>` that names no configured endpoint
+but is a built-in preset — a vendor ARSY ships an OAuth client for:
+
+| Preset | Signs in with | Endpoint it writes |
+|---|---|---|
+| `codex-oauth` | a ChatGPT account | `kind = "openai_responses"`, the Codex backend |
+| `antigravity` | a Google account | `kind = "google_code_assist"`, Cloud Code Assist |
+
+Signing in to one runs its OAuth flow, stores the token, and appends a
+`[provider.endpoint.<id>]` table pointed at it, so `/model` and a turn find it
+like any hand-configured endpoint. These reuse another product's client
+identifier; the Antigravity path in particular may violate that product's terms
+of service. An endpoint you configure yourself with its own `[oauth]` table
+always takes precedence over a preset of the same name.
+
 Credential values are handles such as `secret://os/gateway`, never raw secrets.
 The half after `secret://` names the store that answers, and a store ARSY does
 not have is refused rather than resolved somewhere else. Two exist: `os` is the
@@ -145,6 +167,28 @@ are the same two the `secret://` handles use. Switching to `file` migrates an
 existing catalog out of the platform store on first read, once. A store that is
 neither is refused when the file loads, so a typo cannot quietly send
 credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
+
+## Theme
+
+`[theme]` colours the interactive TUI. `base` picks one of the built-in themes
+(`dark`, `ocean`, `sunset`, `mono` — all designed for a dark terminal); any
+other key is a role whose colour it replaces, given as `#rrggbb`. The roles are
+`assistant`, `dim`, `accent`, `ok`, `err`, `run`, `model`, `cwd`, `border`,
+`bullet`, and `input_bg` (a background).
+
+```toml
+[theme]
+base   = "ocean"
+accent = "#1e78b4"
+err    = "#c8283f"
+```
+
+The `/theme` command in the TUI opens a picker that repaints in each theme as
+you arrow onto it, so the choice is previewed before Enter takes it; the chosen
+`base` is remembered beside the configuration. An explicit `[theme].base` in the
+file wins over the remembered one. An unrecognized role or a malformed colour is
+reported and skipped, never applied. `--no-color` and `NO_COLOR` still suppress
+all of it.
 
 ## Six-layer example
 

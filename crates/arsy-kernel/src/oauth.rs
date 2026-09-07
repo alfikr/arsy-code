@@ -1,16 +1,17 @@
-//! OAuth 2.0 login, driven entirely by configuration.
+//! OAuth 2.0 login, driven by configuration or a built-in preset.
 //!
-//! No issuer is built in: the authorize, token, and device endpoints and the
-//! client identifier all come from `[provider.endpoint.<id>.oauth]`, so this
-//! serves any issuer an operator registers a client with, and ships no
-//! vendor's client secret.
+//! The authorize, token, and device endpoints and the client identifier come
+//! from `[provider.endpoint.<id>.oauth]`, so this serves any issuer an operator
+//! registers a client with. The built-in presets (`oauth::presets`) fill the
+//! same shape for the few vendors ARSY ships a client for.
 //!
 //! Two grants, chosen by what the issuer offers. The device grant (RFC 8628)
 //! needs no listening socket and works over SSH, so it is preferred when the
 //! configuration names a device endpoint. Otherwise the authorization-code
-//! grant with PKCE (RFC 7636) runs against a loopback redirect. Neither uses a
-//! client secret, which is what makes them safe for a program installed on the
-//! operator's own machine.
+//! grant with PKCE (RFC 7636) runs against a loopback redirect. A public client
+//! sends no secret; an installed-app client whose issuer still demands one (a
+//! Google desktop client, say) carries it in `client_secret` — not confidential
+//! for software the operator runs, but required for the exchange to succeed.
 //!
 //! HTTP is the same injected [`WireTransport`] the provider adapters use, so a
 //! login is testable without a network and adds no second HTTP path.
@@ -47,6 +48,11 @@ pub struct TokenSet {
     /// Unix seconds. Absent when the issuer did not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    /// The raw OIDC `id_token`, kept when the issuer sent one: some APIs need a
+    /// claim from it (OpenAI scopes ChatGPT-plan calls by an account id carried
+    /// there). Not a credential on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 impl TokenSet {
@@ -58,6 +64,32 @@ impl TokenSet {
         self.expires_at
             .is_some_and(|at| now.saturating_add(EXPIRY_MARGIN.as_secs()) >= at)
     }
+
+    /// A string claim from the `id_token` payload. See [`jwt_claim`].
+    pub fn id_token_claim(&self, name: &str) -> Option<String> {
+        jwt_claim(self.id_token.as_deref()?, name)
+    }
+}
+
+/// A string claim from a JWT payload, without verifying the signature: the
+/// token came straight from the issuer over TLS in the same exchange, and the
+/// claims read here only pick which account to address, never grant anything.
+/// The claim may sit at the top level or one object deep (OpenAI nests account
+/// details under a `https://api.openai.com/auth` key).
+pub fn jwt_claim(token: &str, name: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let value: Value = serde_json::from_slice(&base64url_decode(payload)?).ok()?;
+    value
+        .get(name)
+        .or_else(|| {
+            value
+                .as_object()?
+                .values()
+                .filter_map(Value::as_object)
+                .find_map(|nested| nested.get(name))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// What the operator has to do to finish a device login.
@@ -170,11 +202,14 @@ pub fn poll_device(
         match post_form(
             transport,
             &oauth.token_url,
-            &[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code", &prompt.device_code),
-                ("client_id", &oauth.client_id),
-            ],
+            &with_secret(
+                &[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", &prompt.device_code),
+                    ("client_id", &oauth.client_id),
+                ],
+                oauth.client_secret.as_deref(),
+            ),
         ) {
             Ok(value) => return token_set(&value),
             Err(OAuthError::Issuer { code, description }) => match code.as_str() {
@@ -205,48 +240,80 @@ pub fn authorization_code(
     oauth: &OAuth,
     visit: &mut dyn FnMut(&str),
 ) -> Result<TokenSet, OAuthError> {
-    // Port 0 asks the OS for a free port, so two logins cannot collide.
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| OAuthError::Local(error.to_string()))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| OAuthError::Local(error.to_string()))?
-        .port();
-    let redirect = format!("http://127.0.0.1:{port}/callback");
+    // A registered redirect names its port; the listener has to be on that
+    // one. With none, port 0 takes a free port so two logins cannot collide.
+    let (listener, redirect) = match &oauth.redirect_uri {
+        Some(uri) => {
+            let port = crate::config::redirect_loopback_port(uri).ok_or_else(|| {
+                OAuthError::Local(format!("`{uri}` is not a loopback redirect with a port"))
+            })?;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                .map_err(|error| OAuthError::Local(format!("port {port}: {error}")))?;
+            (listener, uri.clone())
+        }
+        None => {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .map_err(|error| OAuthError::Local(error.to_string()))?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| OAuthError::Local(error.to_string()))?
+                .port();
+            (listener, format!("http://127.0.0.1:{port}/callback"))
+        }
+    };
 
     let verifier = random_token();
     let challenge = base64url(&sha256(verifier.as_bytes()));
     // Bound to this one attempt: a callback carrying a different state is a
     // response to somebody else's login and is refused.
     let state = random_token();
-    let authorize = format!(
-        "{}?{}",
-        oauth.authorize_url,
-        form_encode(&[
-            ("response_type", "code"),
-            ("client_id", &oauth.client_id),
-            ("redirect_uri", &redirect),
-            ("scope", &oauth.scopes.join(" ")),
-            ("state", &state),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-        ])
+    let scope = oauth.scopes.join(" ");
+    let mut params = vec![
+        ("response_type", "code"),
+        ("client_id", oauth.client_id.as_str()),
+        ("redirect_uri", redirect.as_str()),
+        ("scope", scope.as_str()),
+        ("state", state.as_str()),
+        ("code_challenge", challenge.as_str()),
+        ("code_challenge_method", "S256"),
+    ];
+    params.extend(
+        oauth
+            .authorize_params
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
     );
-    visit(&authorize);
+    visit(&format!("{}?{}", oauth.authorize_url, form_encode(&params)));
 
     let code = await_callback(&listener, &state)?;
     let value = post_form(
         transport,
         &oauth.token_url,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &redirect),
-            ("client_id", &oauth.client_id),
-            ("code_verifier", &verifier),
-        ],
+        &with_secret(
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", &redirect),
+                ("client_id", &oauth.client_id),
+                ("code_verifier", &verifier),
+            ],
+            oauth.client_secret.as_deref(),
+        ),
     )?;
     token_set(&value)
+}
+
+/// The token-endpoint fields with `client_secret` appended when the client has
+/// one. Public clients send none; some installed-app clients must.
+fn with_secret<'a>(
+    base: &[(&'a str, &'a str)],
+    secret: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields = base.to_vec();
+    if let Some(secret) = secret {
+        fields.push(("client_secret", secret));
+    }
+    fields
 }
 
 /// Trade a refresh token for a fresh access token.
@@ -265,15 +332,22 @@ pub fn refresh(
     let value = post_form(
         transport,
         &oauth.token_url,
-        &[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", &oauth.client_id),
-        ],
+        &with_secret(
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", &oauth.client_id),
+            ],
+            oauth.client_secret.as_deref(),
+        ),
     )?;
     let mut refreshed = token_set(&value)?;
+    // Carry forward anything the refresh response left out.
     if refreshed.refresh_token.is_none() {
         refreshed.refresh_token = tokens.refresh_token.clone();
+    }
+    if refreshed.id_token.is_none() {
+        refreshed.id_token = tokens.id_token.clone();
     }
     Ok(refreshed)
 }
@@ -322,17 +396,51 @@ fn await_callback(listener: &TcpListener, state: &str) -> Result<String, OAuthEr
             "the callback carried no authorization code".to_owned(),
         )),
     };
-    let page = match &outcome {
-        Ok(_) => "ARSY is signed in. You can close this tab.",
-        Err(_) => "ARSY could not complete the sign-in. Check the terminal.",
-    };
+    let page = callback_page(outcome.is_ok());
     let mut stream = stream;
     let _ = write!(
         stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
         page.len()
     );
     outcome
+}
+
+/// The page the browser lands on after the redirect. Self-contained — no
+/// network fetch — and carries the ARSY wordmark so it reads as ARSY's own,
+/// not a blank tab.
+fn callback_page(ok: bool) -> String {
+    let (class, glyph, headline, hint) = if ok {
+        (
+            "ok",
+            "\u{2713}",
+            "Signed in",
+            "You can close this tab and return to the terminal.",
+        )
+    } else {
+        (
+            "err",
+            "\u{2717}",
+            "Sign-in failed",
+            "Check the terminal for what went wrong.",
+        )
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ARSY</title>\
+<style>:root{{color-scheme:dark}}\
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#1a1a1a;\
+color:#c9c9c9;font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}\
+.card{{text-align:center;padding:2.5rem 3rem}}\
+.mark{{font-size:2rem;letter-spacing:.15em;color:#f6e2b7}}\
+.mark b{{color:#5cc2e0}}\
+.status{{margin-top:1.5rem;font-size:1.05rem}}\
+.status.ok{{color:#4ea96f}}.status.err{{color:#e0af68}}\
+.hint{{margin-top:.5rem;color:#7a7a7a;font-size:.9rem}}</style></head>\
+<body><div class=\"card\"><div class=\"mark\"><b>&gt;_</b> ARSY</div>\
+<div class=\"status {class}\">{glyph} {headline}</div>\
+<div class=\"hint\">{hint}</div></div></body></html>"
+    )
 }
 
 /// One form-encoded POST, decoded as JSON.
@@ -386,13 +494,12 @@ fn post_form(
 }
 
 fn token_set(value: &Value) -> Result<TokenSet, OAuthError> {
+    let owned = |name| value.get(name).and_then(Value::as_str).map(str::to_owned);
     Ok(TokenSet {
         access_token: string(value, "access_token")?,
-        refresh_token: value
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        refresh_token: owned("refresh_token"),
         expires_at: seconds(value, "expires_in").map(|lifetime| now().saturating_add(lifetime)),
+        id_token: owned("id_token"),
     })
 }
 
@@ -455,6 +562,34 @@ fn base64url(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`base64url`], ignoring any padding. `None` on a character
+/// outside the URL alphabet. Used only to read a JWT payload.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut sextets = Vec::with_capacity(text.len());
+    for byte in text.bytes() {
+        sextets.push(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => continue,
+            _ => return None,
+        });
+    }
+    let mut out = Vec::with_capacity(sextets.len() / 4 * 3);
+    for chunk in sextets.chunks(4) {
+        let mut block = 0_u32;
+        for (index, sextet) in chunk.iter().enumerate() {
+            block |= u32::from(*sextet) << (18 - 6 * index);
+        }
+        for index in 0..chunk.len().saturating_sub(1) {
+            out.push((block >> (16 - 8 * index)) as u8);
+        }
+    }
+    Some(out)
+}
+
 fn form_encode(fields: &[(&str, &str)]) -> String {
     fields
         .iter()
@@ -510,6 +645,110 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Built-in OAuth clients for the vendors ARSY can sign in to directly.
+///
+/// A preset is the same shape a hand-written `[provider.endpoint.<id>.oauth]`
+/// would take, plus the endpoint facts a login has to know to make the result
+/// usable: which wire dialect it speaks, its API root, and the models to offer.
+/// `arsy auth login <id>` uses one when `<id>` names no configured endpoint.
+///
+/// The client identifiers here are public (they ship in the vendors' own
+/// clients); the Google entry also carries the non-confidential "secret" its
+/// desktop client type still requires in the token exchange.
+pub mod presets {
+    use crate::config::{Dialect, OAuth};
+
+    /// One built-in login target.
+    pub struct Preset {
+        pub id: &'static str,
+        /// One line for the `/auth` picker.
+        pub label: &'static str,
+        pub dialect: Dialect,
+        pub base_url: &'static str,
+        /// Offered by `/model` after the login; the first is the default.
+        pub models: &'static [&'static str],
+        /// Built fresh because [`OAuth`] owns its strings.
+        build_oauth: fn() -> OAuth,
+    }
+
+    impl Preset {
+        pub fn oauth(&self) -> OAuth {
+            (self.build_oauth)()
+        }
+    }
+
+    /// Every preset, in the order the picker should list them.
+    pub fn all() -> &'static [Preset] {
+        PRESETS
+    }
+
+    /// The preset `id` names, if any.
+    pub fn get(id: &str) -> Option<&'static Preset> {
+        PRESETS.iter().find(|preset| preset.id == id)
+    }
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    static PRESETS: &[Preset] = &[
+        // OpenAI Codex, signed in with a ChatGPT account. The access token is a
+        // bearer for the Codex Responses backend; the account it is scoped to
+        // rides in a claim the adapter reads back out.
+        Preset {
+            id: "codex-oauth",
+            label: "OpenAI Codex — sign in with a ChatGPT account",
+            dialect: Dialect::OpenaiResponses,
+            base_url: "https://chatgpt.com/backend-api/codex",
+            models: &["gpt-5-codex", "gpt-5", "gpt-5-mini"],
+            build_oauth: || OAuth {
+                authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
+                token_url: "https://auth.openai.com/oauth/token".to_owned(),
+                device_authorization_url: None,
+                client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),
+                client_secret: None,
+                scopes: owned(&["openid", "profile", "email", "offline_access"]),
+                redirect_uri: Some("http://localhost:1455/auth/callback".to_owned()),
+                authorize_params: vec![
+                    ("id_token_add_organizations".to_owned(), "true".to_owned()),
+                    ("codex_cli_simplified_flow".to_owned(), "true".to_owned()),
+                ],
+            },
+        },
+        // Google Antigravity, signed in with a Google account. Talks to Cloud
+        // Code Assist; the client is a Google "desktop app" type, so the token
+        // exchange still wants the (non-secret) client secret.
+        Preset {
+            id: "antigravity",
+            label: "Google Antigravity — sign in with a Google account",
+            dialect: Dialect::GoogleCodeAssist,
+            base_url: "https://cloudcode-pa.googleapis.com",
+            models: &["gemini-3-pro", "gemini-2.5-flash", "gemini-2.5-pro"],
+            build_oauth: || OAuth {
+                authorize_url: "https://accounts.google.com/o/oauth2/auth".to_owned(),
+                token_url: "https://oauth2.googleapis.com/token".to_owned(),
+                device_authorization_url: None,
+                client_id:
+                    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+                        .to_owned(),
+                client_secret: Some("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".to_owned()),
+                scopes: owned(&[
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                    "https://www.googleapis.com/auth/cclog",
+                    "https://www.googleapis.com/auth/experimentsandconfigs",
+                ]),
+                redirect_uri: Some("http://localhost:36742/oauth-callback".to_owned()),
+                authorize_params: vec![
+                    ("access_type".to_owned(), "offline".to_owned()),
+                    ("prompt".to_owned(), "consent".to_owned()),
+                ],
+            },
+        },
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +802,7 @@ mod tests {
             device_authorization_url: device.then(|| "https://issuer.test/device".to_owned()),
             client_id: "arsy cli".to_owned(),
             scopes: vec!["offline_access".to_owned(), "models:read".to_owned()],
+            ..OAuth::default()
         }
     }
 
@@ -652,6 +892,7 @@ mod tests {
             access_token: "at-1".to_owned(),
             refresh_token: Some("rt-1".to_owned()),
             expires_at: Some(0),
+            id_token: None,
         };
 
         let kept = refresh(&issuer, &oauth(false), &existing).unwrap();
@@ -678,9 +919,77 @@ mod tests {
                 access_token: "at".to_owned(),
                 refresh_token: None,
                 expires_at: None,
+                id_token: None,
             },
         );
         assert!(matches!(cannot, Err(OAuthError::Abandoned(_))));
+    }
+
+    #[test]
+    fn base64url_round_trips_and_reads_a_jwt_claim() {
+        for sample in [
+            b"".as_slice(),
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            &[251, 255, 190],
+        ] {
+            assert_eq!(base64url_decode(&base64url(sample)).unwrap(), sample);
+        }
+        assert!(base64url_decode("not base64 !!").is_none());
+
+        // A JWT is header.payload.signature; only the payload is read, and a
+        // claim may sit one level in (OpenAI nests it under an `.../auth` key).
+        let payload = base64url(
+            br#"{"sub":"u1","https://api.openai.com/auth":{"chatgpt_account_id":"acct-9"}}"#,
+        );
+        let token = TokenSet {
+            access_token: "at".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            id_token: Some(format!("hdr.{payload}.sig")),
+        };
+        assert_eq!(token.id_token_claim("sub").as_deref(), Some("u1"));
+        assert_eq!(
+            token.id_token_claim("chatgpt_account_id").as_deref(),
+            Some("acct-9")
+        );
+        assert_eq!(token.id_token_claim("missing"), None);
+        assert_eq!(
+            TokenSet {
+                id_token: None,
+                ..token
+            }
+            .id_token_claim("sub"),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_redirect_ports_are_recognised() {
+        use crate::config::redirect_loopback_port;
+        assert_eq!(
+            redirect_loopback_port("http://localhost:1455/auth/callback"),
+            Some(1455)
+        );
+        assert_eq!(
+            redirect_loopback_port("http://127.0.0.1:36742/oauth-callback"),
+            Some(36742)
+        );
+        assert_eq!(redirect_loopback_port("https://example.com:443/x"), None);
+        assert_eq!(redirect_loopback_port("http://localhost/callback"), None);
+        assert_eq!(redirect_loopback_port("not a url"), None);
+    }
+
+    #[test]
+    fn with_secret_appends_only_when_there_is_one() {
+        let base = [("grant_type", "refresh_token")];
+        assert_eq!(with_secret(&base, None), base.to_vec());
+        assert_eq!(
+            with_secret(&base, Some("shh")),
+            vec![("grant_type", "refresh_token"), ("client_secret", "shh")]
+        );
     }
 
     #[test]
@@ -700,6 +1009,19 @@ mod tests {
         let token = random_token();
         assert_eq!(token.len(), 43, "32 bytes, unpadded");
         assert_ne!(token, random_token());
+    }
+
+    #[test]
+    fn the_callback_page_is_self_contained_and_branded() {
+        for ok in [true, false] {
+            let page = callback_page(ok);
+            assert!(page.starts_with("<!doctype html>"));
+            assert!(page.contains("ARSY"));
+            // No off-origin fetch: the page has to render on a machine that
+            // just finished an auth flow and may have no route out.
+            assert!(!page.contains("http://") && !page.contains("https://"));
+            assert!(page.contains(if ok { "Signed in" } else { "Sign-in failed" }));
+        }
     }
 
     #[test]

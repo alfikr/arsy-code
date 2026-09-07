@@ -18,7 +18,6 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
-#[cfg(feature = "tui")]
 mod config_edit;
 mod eval;
 mod integrations;
@@ -1130,27 +1129,44 @@ fn auth_login(
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let config = load_config(&root, &working)?;
-    let endpoint = config.endpoint(Some(provider)).ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            format!("no provider endpoint named `{provider}` is configured"),
-            "add a `[provider.endpoint.<name>]` table to the user config.toml",
-        )
-    })?;
-    let oauth = endpoint.oauth.as_ref().ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            format!("provider `{provider}` has no OAuth client configured"),
-            format!(
-                "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
-                 with `arsy auth set {provider}`"
-            ),
-        )
-    })?;
+    let configured = config.endpoint(Some(provider)).cloned();
+    let preset = arsy_kernel::oauth::presets::get(provider);
+
+    // The OAuth client to run the flow with. A built-in preset stands in when
+    // the endpoint names none, and when the endpoint does not exist at all its
+    // `[provider.endpoint]` table is written after the token is stored.
+    let (oauth, synthesize) = match (&configured, preset) {
+        (Some(endpoint), _) if endpoint.oauth.is_some() => {
+            (endpoint.oauth.clone().expect("checked"), false)
+        }
+        (Some(_), Some(preset)) => (preset.oauth(), false),
+        (Some(_), None) => {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("provider `{provider}` has no OAuth client configured"),
+                format!(
+                    "add a `[provider.endpoint.{provider}.oauth]` table, or store an API key \
+                     with `arsy auth set {provider}`"
+                ),
+            ))
+        }
+        (None, Some(preset)) => (preset.oauth(), true),
+        (None, None) => {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("no provider endpoint named `{provider}` is configured"),
+                format!(
+                    "configure `[provider.endpoint.{provider}]`, or sign in to a built-in \
+                     preset: {}",
+                    preset_ids()
+                ),
+            ))
+        }
+    };
 
     let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let tokens = if arsy_kernel::oauth::uses_device_grant(oauth) {
-        let prompt = arsy_kernel::oauth::begin_device(&transport, oauth).map_err(login_failed)?;
+    let tokens = if arsy_kernel::oauth::uses_device_grant(&oauth) {
+        let prompt = arsy_kernel::oauth::begin_device(&transport, &oauth).map_err(login_failed)?;
         // Printed rather than opened: the operator may be on another machine,
         // and this is the grant that does not need a local browser at all.
         emitter.result(json!({
@@ -1160,13 +1176,24 @@ fn auth_login(
                 .unwrap_or_else(|| prompt.verification_uri.clone()),
             "user_code": prompt.user_code,
         }));
-        arsy_kernel::oauth::poll_device(&transport, oauth, &prompt, &mut std::thread::sleep)
+        arsy_kernel::oauth::poll_device(&transport, &oauth, &prompt, &mut std::thread::sleep)
             .map_err(login_failed)?
     } else {
-        let mut url = None;
-        let tokens = arsy_kernel::oauth::authorization_code(&transport, oauth, &mut |authorize| {
-            url = Some(authorize.to_owned());
-            let _ = writeln!(io::stderr(), "Open this URL to sign in:\n  {authorize}");
+        // Open the browser for an interactive operator; a scripted or headless
+        // run (`--output json|ci`) only prints the URL. Either way the URL is
+        // printed, so a browser that does not open is not a dead end.
+        let interactive = emitter.output == Output::Human;
+        let tokens = arsy_kernel::oauth::authorization_code(&transport, &oauth, &mut |authorize| {
+            let opened = interactive && open_browser(authorize);
+            let _ = writeln!(
+                io::stderr(),
+                "{}\n  {authorize}",
+                if opened {
+                    "Opening your browser to sign in. If it did not open, visit:"
+                } else {
+                    "Open this URL to sign in:"
+                }
+            );
         });
         tokens.map_err(login_failed)?
     };
@@ -1192,13 +1219,92 @@ fn auth_login(
         }),
     }
     save_catalog(records_store, &records)?;
+
+    // A preset that had no endpoint of its own gets one written now, pointed at
+    // the credential just stored, so `/model` and a turn find it like any other.
+    let mut wrote_endpoint = false;
+    if synthesize {
+        let preset = preset.expect("synthesize is only set when a preset matched");
+        let endpoint = config_edit::Endpoint {
+            name: provider.to_owned(),
+            kind: preset.dialect.as_str().to_owned(),
+            base_url: preset.base_url.to_owned(),
+            models: preset
+                .models
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+            credential: handle.to_string(),
+        };
+        write_config(|config| {
+            let config = config_edit::ensure_schema(config);
+            config_edit::append_endpoint(&config, &endpoint)
+        })
+        .map_err(|error| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("signed in, but the `[provider.endpoint.{provider}]` table could not be written: {error}"),
+                "add the endpoint table by hand; the credential is already stored",
+            )
+        })?;
+        wrote_endpoint = true;
+    }
+
     emitter.result(json!({
         "provider": provider,
         "handle": handle,
         "kind": "oauth",
         "expires_at": tokens.expires_at,
+        "endpoint_written": wrote_endpoint,
     }));
     Ok(0)
+}
+
+/// The built-in preset ids, for an error that offers them as an alternative.
+fn preset_ids() -> String {
+    arsy_kernel::oauth::presets::all()
+        .iter()
+        .map(|preset| preset.id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Hand the URL to the platform's browser opener. Best-effort: the return
+/// says the opener was launched, not that a browser appeared.
+fn open_browser(url: &str) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    ))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = std::process::Command::new("xdg-open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        };
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(unix, not(target_os = "macos"))
+    )))]
+    {
+        let _ = url;
+        false
+    }
 }
 
 fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
@@ -1330,6 +1436,7 @@ enum Prompt {
     Task,
     Model,
     Effort,
+    Theme,
     /// `/provider` is a wizard rather than one question, so the step it is on
     /// travels with the prompt.
     Provider(tui::ProviderStep),
@@ -1380,6 +1487,26 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     });
     let native = native.map(|(resolved, _)| resolved);
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
+
+    // The palette is fixed before the first frame. A rejected `[theme]`
+    // override is reported and dropped, never left to blank the screen.
+    let theme_config = load_config(&workspace, &workspace)
+        .map(|config| config.theme().clone())
+        .unwrap_or_default();
+    let (mut theme, palette) = resolve_palette(&theme_config);
+    match palette {
+        Ok(palette) => tui::activate_palette(palette),
+        Err(reason) => {
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-UIX-1002",
+                format!("a [theme] override was ignored: {reason}"),
+                "use #rrggbb colours and role names ARSY knows (see /help)",
+            ));
+            if let Some(palette) = tui::builtin_palette(&theme) {
+                tui::activate_palette(palette);
+            }
+        }
+    }
 
     // The picker lists every provider's models in one place: configured
     // endpoints offer what they list, and a Codex login offers what its CLI
@@ -1444,6 +1571,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             ),
             Prompt::Model => tui::model_prompt(&models, &route, colour),
             Prompt::Effort => tui::effort_prompt(effort, colour),
+            Prompt::Theme => tui::theme_prompt(&theme, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
             Prompt::Auth(step) => step.prompt(&auth_draft, colour),
         };
@@ -1457,6 +1585,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Effort => {
                 composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
+            }
+            Prompt::Theme => {
+                composer.offer_table(Some(tui::THEMES), tui::theme_row(&theme));
             }
             Prompt::Provider(step) => composer.offer(
                 step.rows(&providers, &route.provider, chosen_provider.as_deref()),
@@ -1473,6 +1604,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             matches!(prompt, Prompt::Provider(step) if step.masked())
                 || matches!(prompt, Prompt::Auth(step) if step.masked()),
         );
+        // While the theme picker is open, repaint in whichever theme is
+        // arrowed onto so it can be seen before Enter takes it.
+        let preview_theme = |name: &str| set_palette(name, &theme_config.roles);
+        let preview: Option<&dyn Fn(&str)> = match prompt {
+            Prompt::Theme => Some(&preview_theme),
+            _ => None,
+        };
         let line = match queued.pop_front() {
             Some(line) => line,
             None => match read_line(
@@ -1482,6 +1620,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 &mut stdout,
                 colour,
                 &status,
+                preview,
             )? {
                 Some(line) => line,
                 // Ending input at a picker cancels the picker, not the
@@ -1490,12 +1629,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // exits ARSY instead.
                 None if matches!(
                     prompt,
-                    Prompt::Model | Prompt::Effort | Prompt::Provider(_) | Prompt::Auth(_)
+                    Prompt::Model
+                        | Prompt::Effort
+                        | Prompt::Theme
+                        | Prompt::Provider(_)
+                        | Prompt::Auth(_)
                 ) =>
                 {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = match prompt {
                         Prompt::Effort => effort_line(effort),
+                        Prompt::Theme => {
+                            // The preview left the palette on the last row
+                            // arrowed onto; put the committed one back.
+                            set_palette(&theme, &theme_config.roles);
+                            format!("Theme unchanged: {theme}")
+                        }
                         Prompt::Provider(_) => {
                             draft = tui::ProviderDraft::default();
                             "Provider unchanged.".to_owned()
@@ -1565,6 +1714,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     Err(reason) => {
                         writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
                     }
+                }
+            }
+            Prompt::Theme => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // On a rejected answer the list stays open so it can be retyped.
+                if apply_theme(&line, &mut theme, &theme_config.roles, &mut stdout, emitter)
+                    .map_err(terminal_failed)?
+                {
+                    prompt = Prompt::Task;
                 }
             }
             Prompt::Model => {
@@ -1657,6 +1815,23 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     },
                 }
             }
+            Prompt::Task if line.split_whitespace().next() == Some("/theme") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // A bare `/theme` opens the list; `/theme light` sets it outright.
+                match line.split_whitespace().nth(1) {
+                    None => prompt = Prompt::Theme,
+                    Some(answer) => {
+                        apply_theme(
+                            answer,
+                            &mut theme,
+                            &theme_config.roles,
+                            &mut stdout,
+                            emitter,
+                        )
+                        .map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 if line.split_whitespace().next() == Some("/help") {
@@ -1743,6 +1918,10 @@ fn read_line(
     stdout: &mut impl Write,
     colour: bool,
     status: &str,
+    // Called with the highlighted row before each repaint, so a picker can
+    // preview the choice the reader is arrowed onto (the theme picker repaints
+    // in that theme's colours).
+    preview: Option<&dyn Fn(&str)>,
 ) -> Result<Option<String>, Diagnostic> {
     let mut width = tui::terminal_width();
     composer.set_height(tui::terminal_rows());
@@ -1753,6 +1932,9 @@ fn read_line(
             width = tui::terminal_width();
             composer.set_height(tui::terminal_rows());
             measured = std::time::Instant::now();
+        }
+        if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
+            preview(&row);
         }
         write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
@@ -1867,6 +2049,104 @@ fn save_effort(effort: Option<Effort>) -> io::Result<()> {
             result => result,
         },
     }
+}
+
+/// The remembered colour theme, beside the remembered effort.
+#[cfg(feature = "tui")]
+fn theme_store() -> Option<PathBuf> {
+    Some(arsy_kernel::config::user_config()?.with_file_name("theme"))
+}
+
+/// The theme chosen last time, kept only if it is still a built-in name: a
+/// file written by a build that knew a theme this one dropped must not select
+/// nothing.
+#[cfg(feature = "tui")]
+fn saved_theme() -> Option<String> {
+    let raw = std::fs::read_to_string(theme_store()?).ok()?;
+    let name = raw.trim().to_owned();
+    tui::builtin_palette(&name).map(|_| name)
+}
+
+#[cfg(feature = "tui")]
+fn save_theme(name: &str) -> io::Result<()> {
+    let path = theme_store()
+        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{name}\n"))
+}
+
+#[cfg(feature = "tui")]
+fn remember_theme(name: &str, emitter: &mut Emitter) {
+    if let Err(error) = save_theme(name) {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-UIX-1001",
+            format!("the theme choice was not remembered: {error}"),
+            "check that the ARSY user configuration directory is writable",
+        ));
+    }
+}
+
+/// Make `name` (a built-in theme) the live palette, with the `[theme]` role
+/// overrides on top. A bad override was already reported at startup, so here it
+/// falls back to the plain base rather than repeating the warning every frame.
+#[cfg(feature = "tui")]
+fn set_palette(name: &str, roles: &std::collections::BTreeMap<String, String>) {
+    let Some(palette) = tui::builtin_palette(name) else {
+        return;
+    };
+    let palette = palette
+        .with_overrides(roles)
+        .unwrap_or_else(|_| tui::builtin_palette(name).expect("just built it"));
+    tui::activate_palette(palette);
+}
+
+/// Take a `/theme` answer: swap the live palette, remember the choice, and
+/// report it. Returns whether it landed — `false` leaves the picker open so
+/// the answer can be retyped.
+#[cfg(feature = "tui")]
+fn apply_theme(
+    answer: &str,
+    current: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> io::Result<bool> {
+    let picked = match tui::resolve_theme_answer(answer, current) {
+        Ok(picked) => picked,
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason))?;
+            return Ok(false);
+        }
+    };
+    set_palette(&picked, roles);
+    *current = picked;
+    remember_theme(current, emitter);
+    writeln!(stdout, "Theme: {current}")?;
+    Ok(true)
+}
+
+/// The palette the session paints with: a built-in base — the `[theme]` base,
+/// else the remembered theme, else the default — with any `[theme]` role
+/// overrides on top. Returns the base name (for the `/theme` picker) and the
+/// palette, or the reason an override was rejected.
+#[cfg(feature = "tui")]
+fn resolve_palette(theme: &arsy_kernel::config::Theme) -> (String, Result<tui::Palette, String>) {
+    let base = theme
+        .base
+        .clone()
+        .or_else(saved_theme)
+        .unwrap_or_else(|| tui::DEFAULT_THEME.to_owned());
+    let palette = tui::builtin_palette(&base).unwrap_or_else(|| {
+        tui::builtin_palette(tui::DEFAULT_THEME).expect("the default theme is built in")
+    });
+    let built = if theme.roles.is_empty() {
+        Ok(palette)
+    } else {
+        palette.with_overrides(&theme.roles)
+    };
+    (base, built)
 }
 
 /// Where `/provider` goes after an answer.
@@ -2088,15 +2368,9 @@ fn auth_step(
     }
     match step {
         tui::AuthStep::Pick => match answer {
-            "login" => {
-                if providers.is_empty() {
-                    return Err(
-                        "no providers are configured; configure a provider endpoint first"
-                            .to_owned(),
-                    );
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::LoginProvider))
-            }
+            // A built-in preset is always an option, so `login` never dead-ends
+            // the way `set` does with nothing configured.
+            "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
             "list" => {
                 let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
                 let human = human_credentials(&records);
@@ -2128,9 +2402,11 @@ fn auth_step(
             )),
         },
         tui::AuthStep::LoginProvider => {
-            if !providers.iter().any(|p| p == answer) {
+            let known = providers.iter().any(|p| p == answer)
+                || arsy_kernel::oauth::presets::get(answer).is_some();
+            if !known {
                 return Err(format!(
-                    "`{}` is not a configured provider",
+                    "`{}` is not a configured provider or a built-in preset",
                     tui::safe_text(answer)
                 ));
             }
@@ -2256,7 +2532,6 @@ fn store_credential(
 ///
 /// The file is read and written whole, so `edit` sees exactly what is on disk
 /// and nothing it did not change can move.
-#[cfg(feature = "tui")]
 fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
     let path = arsy_kernel::config::user_config()
         .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
@@ -4154,13 +4429,13 @@ mod tests {
     #[cfg(feature = "tui")]
     #[test]
     fn the_menu_and_the_dispatch_table_hold_the_same_commands() {
-        // `/model`, `/effort`, `/help`, and `/quit` are answered by the loop
-        // itself; every other offered command must be an inspection it knows
-        // how to run.
+        // `/model`, `/effort`, `/theme`, `/help`, and `/quit` are answered by
+        // the loop itself; every other offered command must be an inspection it
+        // knows how to run.
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/provider" | "/help" | "/quit"
+                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
