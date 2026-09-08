@@ -44,7 +44,6 @@ use arsy_kernel::{
 use arsy_kernel::{config::LanguageServer, domain::StateVersion};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -453,16 +452,13 @@ fn lsp_path(id: &SymbolId, workspace: &Workspace) -> Result<PathBuf, OperationEr
 
 /// Apply a rename plan as one transaction.
 ///
-/// The plan's revision is replaced with a digest of the files it touches, as
-/// they are on disk now, and the transaction re-computes the same digest
-/// before writing anything: a file that changed between planning and applying
-/// invalidates the whole plan rather than half-renaming the workspace. That is
-/// the only reason a rename can be trusted at all — a server computed these
-/// offsets against text it read a moment ago.
-fn apply_rename(
-    workspace: &Workspace,
-    mut plan: WorkspaceEditPlan,
-) -> Result<Value, OperationError> {
+/// The plan carries a digest of the documents its offsets were computed
+/// against. This re-reads those files from disk and computes the same digest;
+/// `EditAddress::WorkspaceEdit` refuses unless the two match, so a file that
+/// moved between planning and applying invalidates the whole plan rather than
+/// half-renaming the workspace at offsets that no longer mean anything. That
+/// is the only reason byte offsets from a language server are safe to apply.
+fn apply_rename(workspace: &Workspace, plan: WorkspaceEditPlan) -> Result<Value, OperationError> {
     let mut by_file: BTreeMap<PathBuf, Vec<RangeReplacement>> = BTreeMap::new();
     for edit in &plan.edits {
         let path = crate::lsp::uri_path(&edit.uri);
@@ -475,7 +471,7 @@ fn apply_rename(
             replacement: edit.new_text.clone().into_bytes(),
         });
     }
-    plan.revision = touched_revision(workspace, by_file.keys())?;
+    let on_disk = disk_revision(workspace, &by_file)?;
 
     let operations: Vec<EditOperation> = by_file
         .iter()
@@ -490,9 +486,11 @@ fn apply_rename(
         })
         .collect();
 
+    // What the files are now. The addresses carry what they were when the plan
+    // was made, and `EditAddress::WorkspaceEdit` refuses when the two differ.
     let resolver = PlanRevision {
         server: plan.server.clone(),
-        revision: plan.revision,
+        revision: on_disk,
     };
     let applied = edit::apply_with_resolver(
         workspace.path(),
@@ -520,13 +518,16 @@ fn apply_rename(
     }))
 }
 
-/// A digest of the files a plan touches, as they are now.
-fn touched_revision<'a>(
+/// The plan's digest recomputed from the files as they are on disk now.
+///
+/// Keyed by URI rather than by path, because that is what the planner keyed it
+/// by: the two sides have to hash the same names or every plan is stale.
+fn disk_revision(
     workspace: &Workspace,
-    paths: impl Iterator<Item = &'a PathBuf>,
+    by_file: &BTreeMap<PathBuf, Vec<RangeReplacement>>,
 ) -> Result<StateVersion, OperationError> {
-    let mut hasher = Sha256::new();
-    for path in paths {
+    let mut documents = BTreeMap::new();
+    for path in by_file.keys() {
         let content = workspace
             .read(path, crate::intelligence::MAX_DOCUMENT_BYTES)
             .map_err(|error| {
@@ -535,11 +536,19 @@ fn touched_revision<'a>(
                     path.display()
                 ))
             })?;
-        hasher.update(path.to_string_lossy().replace('\\', "/").as_bytes());
-        hasher.update([0]);
-        hasher.update(content.digest.digest());
+        let text = String::from_utf8(content.bytes).map_err(|_| {
+            OperationError::Execution(format!(
+                "the rename touches {}, which is not UTF-8",
+                path.display()
+            ))
+        })?;
+        documents.insert(crate::lsp::file_uri(&workspace.path().join(path)), text);
     }
-    Ok(StateVersion::from_digest(hasher.finalize().into()))
+    Ok(crate::intelligence::document_revision(
+        documents
+            .iter()
+            .map(|(uri, text)| (uri.as_str(), text.as_str())),
+    ))
 }
 
 /// Confirms the files are what the plan was computed against.
@@ -753,12 +762,28 @@ mod tests {
         let root = fixture.workspace.path().to_owned();
         let engine = root.join("src/engine.rs");
         let main = root.join("src/main.rs");
-        let plan = |edits: Vec<crate::intelligence::WorkspaceTextEdit>| WorkspaceEditPlan {
-            server: "fake".to_owned(),
-            revision: StateVersion::from_digest([0; 32]),
-            symbol: SymbolId::new("lsp:x#0:0").unwrap(),
-            new_name: "walk".to_owned(),
-            edits,
+        // A plan carries the digest of the text its offsets were computed
+        // against, which is what a planner produces and what the applier
+        // checks; building one by hand means computing it the same way.
+        let plan = |edits: Vec<crate::intelligence::WorkspaceTextEdit>| {
+            let documents: std::collections::BTreeMap<String, String> = edits
+                .iter()
+                .filter_map(|edit: &crate::intelligence::WorkspaceTextEdit| {
+                    let text = std::fs::read_to_string(crate::lsp::uri_path(&edit.uri)).ok()?;
+                    Some((edit.uri.clone(), text))
+                })
+                .collect();
+            WorkspaceEditPlan {
+                server: "fake".to_owned(),
+                revision: crate::intelligence::document_revision(
+                    documents
+                        .iter()
+                        .map(|(uri, text)| (uri.as_str(), text.as_str())),
+                ),
+                symbol: SymbolId::new("lsp:x#0:0").unwrap(),
+                new_name: "walk".to_owned(),
+                edits,
+            }
         };
         let edit = |path: &std::path::Path, bytes: std::ops::Range<usize>| {
             crate::intelligence::WorkspaceTextEdit {
@@ -812,49 +837,47 @@ mod tests {
         let engine = fixture.workspace.path().join("src/engine.rs");
         let source = std::fs::read_to_string(&engine).unwrap();
         let at = source.find("run").unwrap();
-        let mut plan = WorkspaceEditPlan {
+        let uri = crate::lsp::file_uri(&engine);
+        // The revision a planner would have produced: a digest of the text the
+        // offsets were computed against.
+        let plan = WorkspaceEditPlan {
             server: "fake".to_owned(),
-            revision: StateVersion::from_digest([0; 32]),
+            revision: crate::intelligence::document_revision([(uri.as_str(), source.as_str())]),
             symbol: SymbolId::new("lsp:x#0:0").unwrap(),
             new_name: "walk".to_owned(),
             edits: vec![crate::intelligence::WorkspaceTextEdit {
-                uri: crate::lsp::file_uri(&engine),
+                uri,
                 bytes: at..at + 3,
                 new_text: "walk".to_owned(),
             }],
         };
-        // The applier recomputes the revision from disk and checks it against
-        // the one on the plan, so a plan carrying a revision from a different
-        // state of the file is refused rather than applied at stale offsets.
-        plan.revision = StateVersion::from_digest([9; 32]);
 
-        let resolver = PlanRevision {
-            server: "fake".to_owned(),
-            revision: StateVersion::from_digest([9; 32]),
-        };
-        let stale = edit::apply_with_resolver(
-            fixture.workspace.path(),
-            &edit::EditTransaction {
-                base: edit::workspace_version(fixture.workspace.path()).unwrap(),
-                operations: vec![EditOperation {
-                    path: PathBuf::from("src/engine.rs"),
-                    address: EditAddress::WorkspaceEdit {
-                        server: "fake".to_owned(),
-                        // Not the revision the resolver will report.
-                        revision: StateVersion::from_digest([1; 32]),
-                        edits: vec![RangeReplacement {
-                            bytes: at..at + 3,
-                            replacement: b"walk".to_vec(),
-                        }],
-                    },
-                    replacement: Vec::new(),
-                }],
-            },
-            &resolver,
+        // Someone else edits the file between planning and applying. The
+        // offsets in the plan now point at the wrong bytes.
+        let moved = format!("// a line nobody planned around\n{source}");
+        std::fs::write(&engine, &moved).unwrap();
+
+        let refused = apply_rename(&fixture.workspace, plan.clone())
+            .expect_err("a plan computed against other text must not be applied");
+
+        assert!(
+            format!("{refused}").to_lowercase().contains("stale"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&engine).unwrap(),
+            moved,
+            "a refused plan writes nothing"
         );
 
-        assert!(stale.is_err(), "a stale plan must not be applied");
-        assert_eq!(std::fs::read_to_string(&engine).unwrap(), source);
+        // Put the file back, and the same plan applies: the check is about the
+        // bytes, not about time having passed.
+        std::fs::write(&engine, &source).unwrap();
+        apply_rename(&fixture.workspace, plan)
+            .expect("the plan applies to the text it was made for");
+        assert!(std::fs::read_to_string(&engine)
+            .unwrap()
+            .contains("pub fn walk"));
     }
 
     #[test]

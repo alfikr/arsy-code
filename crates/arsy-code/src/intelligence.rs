@@ -349,6 +349,29 @@ impl<'a, T: LspTransport> LspCodeIntelligence<'a, T> {
 /// Largest file this tier will hand a server or convert positions in.
 pub const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A digest of the documents an edit plan was computed against.
+///
+/// The planner computes this over the text it read; whatever applies the plan
+/// computes it again over the same URIs as they are on disk. Equal means the
+/// bytes the offsets were computed against are still the bytes that will be
+/// edited — which is the only thing that makes byte offsets from a language
+/// server safe to apply at all.
+///
+/// Order-independent, because the two sides walk the same files in whatever
+/// order their own structures give them.
+pub fn document_revision<'a>(
+    documents: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> StateVersion {
+    let ordered: BTreeMap<&str, &str> = documents.into_iter().collect();
+    let mut hasher = Sha256::new();
+    for (uri, text) in ordered {
+        hasher.update(uri.as_bytes());
+        hasher.update([0]);
+        hasher.update(Sha256::digest(text.as_bytes()));
+    }
+    StateVersion::from_digest(hasher.finalize().into())
+}
+
 /// The `languageId` a server expects for a file, by extension.
 ///
 /// Wrong-but-present is better than absent: a server that does not recognize
@@ -582,9 +605,21 @@ impl<T: LspTransport> CodeIntelligence for LspCodeIntelligence<'_, T> {
                 .cmp(&right.uri)
                 .then(right.bytes.start.cmp(&left.bytes.start))
         });
+        // Bound to the text the offsets were computed against, not to the
+        // server's own notion of a version: the applier re-reads these files
+        // and refuses the plan if any of them moved underneath it.
+        let touched: BTreeMap<String, String> = edits
+            .iter()
+            .filter_map(|edit| self.text_of(&edit.uri).map(|text| (edit.uri.clone(), text)))
+            .collect();
+        let revision = document_revision(
+            touched
+                .iter()
+                .map(|(uri, text)| (uri.as_str(), text.as_str())),
+        );
         Ok(WorkspaceEditPlan {
             server: self.server.clone(),
-            revision: self.revision,
+            revision,
             symbol: id.clone(),
             new_name: name.into(),
             edits,
@@ -1208,7 +1243,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.server, "rust-analyzer");
-        assert_eq!(plan.revision, StateVersion::from_digest([7; 32]));
+        // The revision binds the plan to the text its offsets were computed
+        // against, not to the tier's own version stamp: that is what lets an
+        // applier tell a fresh plan from one whose file has since moved.
+        assert_eq!(
+            plan.revision,
+            document_revision([(uri.as_str(), SOURCE)]),
+            "the plan is bound to the document it was planned against"
+        );
+        assert_ne!(plan.revision, StateVersion::from_digest([7; 32]));
         assert_eq!(plan.edits.len(), 2);
         // Descending within a file, so applying one does not move the next.
         assert!(plan.edits[0].bytes.start > plan.edits[1].bytes.start);

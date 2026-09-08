@@ -1,0 +1,15 @@
+{
+  "id": "ec0e22f7-23c7-4feb-b37a-6c639884778c",
+  "media_type": "application/json",
+  "digest": "b748476f6182b0e84d1f0ae67f0670e939b378099ecf56cc890c6bfb1a961e98",
+  "size": 252,
+  "encoded_size": 207,
+  "compression": "zstd",
+  "creator": {
+    "kind": "user",
+    "id": "badrusshoolehk"
+  },
+  "source_revision": null,
+  "sensitivity": "internal",
+  "retain_until_ms": 1788904445239
+}
