@@ -31,13 +31,15 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
     }
     match arguments.protocol.as_deref() {
         None | Some("mcp") => Ok(Command::Serve),
-        Some(other @ ("canonical" | "acp")) => Err(Diagnostic::error(
+        Some("acp") => Ok(Command::ServeAcp),
+        Some(other @ "canonical") => Err(Diagnostic::error(
             "ARSY-SCH-1002",
             format!("`arsy serve --protocol {other}` is not available yet"),
-            "the adapter exists; serving it needs the interactive turn executor. \
-             Use `--protocol mcp`, which serves operations as tools",
+            "use `--protocol acp` for an editor, or `--protocol mcp` to offer operations as tools",
         )),
-        Some(other) => Err(usage(format!("--protocol must be `mcp`, not `{other}`"))),
+        Some(other) => Err(usage(format!(
+            "--protocol must be `mcp` or `acp`, not `{other}`"
+        ))),
     }
 }
 
@@ -111,7 +113,7 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
 
 /// One line, bounded. An unbounded read here would let a client grow this
 /// process until it dies.
-fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, Diagnostic> {
+pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, Diagnostic> {
     let mut buffer = Vec::new();
     let read = Read::take(reader, MAX_MESSAGE_BYTES as u64 + 1)
         .read_until(b'\n', &mut buffer)
@@ -151,9 +153,14 @@ mod tests {
         assert!(command(&["serve", "extra"]).is_err());
         assert!(command(&["serve", "--protocol", "smoke-signals"]).is_err());
 
+        assert_eq!(
+            command(&["serve", "--protocol", "acp"]).unwrap(),
+            Command::ServeAcp
+        );
+
         // An adapter that exists but is not served says which, rather than
         // failing as unknown input.
-        let error = command(&["serve", "--protocol", "acp"]).unwrap_err();
+        let error = command(&["serve", "--protocol", "canonical"]).unwrap_err();
         assert_eq!(error.code, "ARSY-SCH-1002");
         assert_eq!(error.exit_code(), 2);
     }

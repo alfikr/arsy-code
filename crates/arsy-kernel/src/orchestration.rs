@@ -237,6 +237,23 @@ impl TaskGraph {
         self.transition(id, TaskState::Completed, Some(evidence))
     }
 
+    /// Stop a task before it finished, with the reason.
+    ///
+    /// Allowed from any state, because cancelling is a decision about the
+    /// future: a task that is pending never starts, and one that is running
+    /// stops being anyone's to finish.
+    pub fn cancel(&mut self, id: TaskId, reason: impl Into<String>) -> Result<(), GraphError> {
+        let reason = reason.into();
+        if self
+            .nodes
+            .get(&id)
+            .is_some_and(|node| node.state == TaskState::Cancelled)
+        {
+            return Ok(());
+        }
+        self.transition(id, TaskState::Cancelled, Some(json!({"reason": reason})))
+    }
+
     /// Record why a task stopped, keeping whatever it produced.
     ///
     /// Idempotent, like `complete`: a caller that fails a task twice — a

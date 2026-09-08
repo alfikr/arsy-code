@@ -18,6 +18,7 @@
 //! | `ARSY-PRV-1001` | no credential store is registered |
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
+mod acp;
 mod config_edit;
 mod eval;
 mod evidence;
@@ -104,7 +105,8 @@ Usage:
   arsy plugin install <SOURCE> [--force]          approve, then install
   arsy plugin inspect <ID> | arsy plugin remove <ID>
   arsy plugin refresh [ID] [--dry-run]            re-read plugin sources
-  arsy serve [--protocol mcp]                     offer operations as MCP tools on stdio
+  arsy serve [--protocol mcp|acp]                offer operations as MCP tools, or
+                                                 speak ACP to an editor, on stdio
   arsy provider list [--all]                      providers resolved as allowed
   arsy model list [--provider <ID>] [--capability <NAME>]
   arsy mcp list [--source <KIND>]       inspect imported MCP declarations
@@ -131,6 +133,10 @@ pub enum Output {
     Human,
     Json,
     Ci,
+    /// Records become ACP `session/update` notifications on the protocol's own
+    /// stdout. Not selectable with `--output`: it is what `arsy serve
+    /// --protocol acp` installs for the turn it is serving.
+    Acp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -344,6 +350,8 @@ pub enum Command {
     },
     /// `arsy serve`: speak MCP on stdio for an embedding client.
     Serve,
+    /// `arsy serve --protocol acp`: speak an editor's session vocabulary.
+    ServeAcp,
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -788,6 +796,13 @@ impl Emitter {
                     "remediation": remediation,
                 }),
             ),
+            Output::Acp => acp::notify(
+                self.session,
+                json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": format!("{}: {message}", diagnostic.code)},
+                }),
+            ),
             // Both human and CI keep diagnostics on stderr; the CI form is the
             // stable, unlocalized one machines grep for.
             _ => {
@@ -810,6 +825,9 @@ impl Emitter {
         };
         match self.output {
             Output::Json => self.record("result", payload),
+            // The turn's outcome is the JSON-RPC response the serve loop
+            // sends; repeating it as a notification would report it twice.
+            Output::Acp => {}
             _ => {
                 let mut stdout = io::stdout();
                 if let Some(fields) = payload.as_object() {
@@ -843,6 +861,17 @@ impl Emitter {
     fn delta(&mut self, text: &str) {
         match self.output {
             Output::Json => self.record("model.delta", json!({"text": text})),
+            Output::Acp => {
+                if let Ok(text) = self.redactor.sanitize(text) {
+                    acp::notify(
+                        self.session,
+                        json!({
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        }),
+                    );
+                }
+            }
             _ => {
                 let Ok(text) = self.redactor.sanitize(text) else {
                     return;
@@ -1042,6 +1071,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             extensions::refresh(invocation, id.as_deref(), *dry_run, emitter)
         }
         Command::Serve => serve::run(invocation, emitter),
+        Command::ServeAcp => acp::run(invocation, emitter),
         Command::ProviderList { all } => provider::list(invocation, *all, emitter),
         Command::ModelList {
             provider,
