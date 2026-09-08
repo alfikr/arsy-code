@@ -422,7 +422,9 @@ impl KnowledgeGraph {
 }
 
 /// Declarations worth a node. Deliberately the ones a person searches for.
-const DECLARATIONS: &[&str] = &[
+/// The Rust declarations this index addresses. Public because a symbol the
+/// graph named must be findable again by whoever it named it to.
+pub const DECLARATIONS: &[&str] = &[
     "function_item",
     "struct_item",
     "enum_item",

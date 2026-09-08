@@ -34,6 +34,7 @@
 //! operation's. It holds no policy, no state, and no I/O.
 
 pub mod budget;
+pub mod codeops;
 pub mod fsops;
 pub mod instructions;
 pub mod patch;
@@ -332,6 +333,54 @@ pub const TOOLS: &[Tool] = &[
             Ok(input)
         },
         summarize: |arguments| text(arguments, "query"),
+    },
+    Tool {
+        name: "code.symbol",
+        operation: "code.symbol",
+        description: "Find where a name is declared, using the repository's parsed declarations rather than a text match. Returns each declaration's file, byte range, and an id for `code.explain` and `code.references`. Falls back to a text search when nothing declares the name.",
+        schema: || {
+            object(
+                json!({
+                    "name": {"type": "string", "description": "Exact symbol name, such as `run` or `Workspace`."},
+                    "limit": {"type": "number", "description": "Most declarations to return. Defaults to 20."}
+                }),
+                &["name"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"name": text(arguments, "name")});
+            if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                input["limit"] = json!(limit);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "name"),
+    },
+    Tool {
+        name: "code.explain",
+        operation: "code.explain",
+        description: "Read one declaration by the id `code.symbol` returned: what kind it is, its source, and where it lives. Cheaper than reading the whole file it is in.",
+        schema: || {
+            object(
+                json!({"symbol": {"type": "string", "description": "A symbol id from `code.symbol`, such as `symbol:src/lib.rs#run`."}}),
+                &["symbol"],
+            )
+        },
+        translate: |arguments| Ok(json!({"symbol": text(arguments, "symbol")})),
+        summarize: |arguments| text(arguments, "symbol"),
+    },
+    Tool {
+        name: "code.references",
+        operation: "code.references",
+        description: "Files that import the module a symbol is declared in — what a change to it could affect. An import is not proof of a call, and each result says how much it is worth.",
+        schema: || {
+            object(
+                json!({"symbol": {"type": "string", "description": "A symbol id from `code.symbol`."}}),
+                &["symbol"],
+            )
+        },
+        translate: |arguments| Ok(json!({"symbol": text(arguments, "symbol")})),
+        summarize: |arguments| text(arguments, "symbol"),
     },
     Tool {
         name: "fs.edit",

@@ -116,6 +116,11 @@ pub fn registry(
             &artifacts,
             retain_until_ms,
         ))
+        .chain(crate::agent::codeops::executors(
+            workspace,
+            &artifacts,
+            retain_until_ms,
+        ))
     {
         registry.register(executor)?;
     }
@@ -167,6 +172,9 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                "code.explain".to_owned(),
+                "code.references".to_owned(),
+                "code.symbol".to_owned(),
                 "fs.create".to_owned(),
                 "fs.delete".to_owned(),
                 "fs.edit".to_owned(),

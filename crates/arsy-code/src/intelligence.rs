@@ -3,12 +3,17 @@
 use crate::{
     lsp::{LspError, LspHost, LspRequest, LspTransport, MAX_LSP_BATCH},
     resource::Workspace,
+    syntax::RustSyntax,
 };
 use arsy_kernel::domain::StateVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{fmt, ops::Range};
+use std::{
+    fmt,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 pub const MAX_SEMANTIC_RESULTS: usize = 256;
 
@@ -260,6 +265,222 @@ impl<T: LspTransport> CodeIntelligence for LspCodeIntelligence<T> {
             edits,
         })
     }
+}
+
+/// Level-2 fallback: tree-sitter declarations, indexed into the repository
+/// graph.
+///
+/// Between the text tier, which can only find a string, and a language server,
+/// which can prove what a name binds to. It knows a `fn foo` from a comment
+/// mentioning `foo`, and it knows which files import the one a symbol lives
+/// in — but an import is not a call and a declaration is not a definition site
+/// proof, so it says so in its confidence and refuses the operations that
+/// would need more than it has.
+pub struct GraphCodeIntelligence<'a> {
+    workspace: &'a Workspace,
+    graph: crate::graph::KnowledgeGraph,
+}
+
+/// A symbol the graph tier found, addressed the way the graph addresses it.
+///
+/// The LSP tier passes an opaque server id through; this tier's ids are
+/// `symbol:<path>#<name>`, so a follow-up call can find the declaration again
+/// without the caller holding the graph.
+struct GraphSymbol {
+    path: PathBuf,
+    name: String,
+}
+
+impl GraphSymbol {
+    fn parse(id: &SymbolId) -> Result<Self, IntelligenceError> {
+        let (path, name) = id
+            .as_str()
+            .strip_prefix("symbol:")
+            .and_then(|rest| rest.rsplit_once('#'))
+            .ok_or_else(|| {
+                // Named rather than rejected as malformed: the caller almost
+                // always passed the symbol's *name*, and the fix is to look it
+                // up first rather than to spell the id differently.
+                IntelligenceError::Protocol(format!(
+                    "`{}` is not a symbol id; find one with code.symbol first, such as \
+                     `symbol:src/lib.rs#run`",
+                    id.as_str()
+                ))
+            })?;
+        Ok(Self {
+            path: PathBuf::from(path),
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// How much of a declaration `explain_symbol` quotes back.
+const MAX_DECLARATION_BYTES: usize = 4 * 1024;
+
+impl<'a> GraphCodeIntelligence<'a> {
+    /// Index the workspace now. The graph itself is incremental, but a fresh
+    /// process has nothing to be incremental against.
+    pub fn index(workspace: &'a Workspace) -> Result<Self, IntelligenceError> {
+        let mut graph = crate::graph::KnowledgeGraph::new();
+        graph
+            .index(workspace)
+            .map_err(|error| IntelligenceError::Protocol(error.to_string()))?;
+        Ok(Self { workspace, graph })
+    }
+
+    /// The declaration's byte range, found by re-parsing the file the graph
+    /// says it is in. The graph stores identity, not offsets: an offset goes
+    /// stale on the next edit, and the parse that would refresh it is the same
+    /// parse that answers this question.
+    fn locate(
+        &self,
+        path: &Path,
+        name: &str,
+    ) -> Result<(SourceLocation, StateVersion), IntelligenceError> {
+        let content = self.workspace.read(path, crate::graph::MAX_INDEXED_BYTES)?;
+        let syntax = RustSyntax::new(content.bytes.clone())
+            .map_err(|error| IntelligenceError::Protocol(error.to_string()))?;
+        for kind in crate::graph::DECLARATIONS {
+            let Ok(declarations) = syntax.declarations(kind) else {
+                continue;
+            };
+            if let Some((node, _)) = declarations.into_iter().find(|(_, found)| found == name) {
+                return Ok((
+                    SourceLocation {
+                        uri: format!("file:{}", slash(path)),
+                        bytes: node.bytes,
+                    },
+                    content.digest,
+                ));
+            }
+        }
+        Err(IntelligenceError::Protocol(format!(
+            "{name} is indexed in {} but no longer declared there",
+            path.display()
+        )))
+    }
+}
+
+impl CodeIntelligence for GraphCodeIntelligence<'_> {
+    fn find_symbol(&mut self, query: &SymbolQuery) -> Result<Vec<SymbolHit>, IntelligenceError> {
+        if query.name.is_empty() || query.max_results == 0 {
+            return Err(IntelligenceError::InvalidQuery);
+        }
+        let found: Vec<(PathBuf, String)> = self
+            .graph
+            .symbols(&query.name)
+            .into_iter()
+            .filter_map(|node| Some((node.path.clone()?, node.name.clone())))
+            .take(query.max_results.min(MAX_SEMANTIC_RESULTS))
+            .collect();
+        found
+            .into_iter()
+            .map(|(path, name)| {
+                let (location, revision) = self.locate(&path, &name)?;
+                Ok(SymbolHit {
+                    id: SymbolId::new(crate::graph::NodeId::symbol(&path, &name).to_string())?,
+                    name,
+                    location,
+                    source_revision: revision,
+                    provider: EvidenceProvider::Syntax,
+                    // A grammar proves this is a declaration of that name; it
+                    // does not prove it is the one the caller meant.
+                    confidence_basis_points: 6_000,
+                })
+            })
+            .collect()
+    }
+
+    fn explain_symbol(&mut self, id: &SymbolId) -> Result<SymbolEvidence, IntelligenceError> {
+        let symbol = GraphSymbol::parse(id)?;
+        let node = self
+            .graph
+            .node(&crate::graph::NodeId::symbol(&symbol.path, &symbol.name))
+            .ok_or(IntelligenceError::InvalidSymbol)?;
+        let declaration = node.declaration.clone().unwrap_or_default();
+        let (location, revision) = self.locate(&symbol.path, &symbol.name)?;
+        let content = self
+            .workspace
+            .read(&symbol.path, crate::graph::MAX_INDEXED_BYTES)?;
+        let text = content
+            .bytes
+            .get(location.bytes.clone())
+            .map(|slice| String::from_utf8_lossy(slice).into_owned())
+            .unwrap_or_default();
+        let mut summary = format!("{declaration} {}\n", symbol.name);
+        summary.push_str(&text[..text.len().min(MAX_DECLARATION_BYTES)]);
+        Ok(SymbolEvidence {
+            symbol: id.clone(),
+            summary,
+            citations: vec![location],
+            source_revision: revision,
+            provider: EvidenceProvider::Syntax,
+            confidence_basis_points: 6_000,
+        })
+    }
+
+    /// The files that import this symbol's module.
+    ///
+    /// Not callers: an import proves a file can reach the symbol, not that it
+    /// uses it. Reported at low confidence rather than withheld, because "these
+    /// eight files could be affected" is the answer a change needs and the text
+    /// tier cannot give it at all.
+    fn find_callers(&mut self, id: &SymbolId) -> Result<ReferenceGraph, IntelligenceError> {
+        let symbol = GraphSymbol::parse(id)?;
+        let importers: Vec<(PathBuf, String)> = self
+            .graph
+            .importers_of(&symbol.path)
+            .into_iter()
+            .filter_map(|node| Some((node.path.clone()?, node.name.clone())))
+            .collect();
+        let truncated = importers.len() > MAX_SEMANTIC_RESULTS;
+        let callers = importers
+            .into_iter()
+            .take(MAX_SEMANTIC_RESULTS)
+            .map(|(path, name)| {
+                let content = self
+                    .workspace
+                    .read(&path, crate::graph::MAX_INDEXED_BYTES)?;
+                Ok(SymbolHit {
+                    id: SymbolId::new(crate::graph::NodeId::file(&path).to_string())?,
+                    name,
+                    location: SourceLocation {
+                        uri: format!("file:{}", slash(&path)),
+                        bytes: 0..0,
+                    },
+                    source_revision: content.digest,
+                    provider: EvidenceProvider::Syntax,
+                    confidence_basis_points: 3_000,
+                })
+            })
+            .collect::<Result<_, IntelligenceError>>()?;
+        Ok(ReferenceGraph { callers, truncated })
+    }
+
+    fn diagnostics(&mut self, _scope: &str) -> Result<DiagnosticSet, IntelligenceError> {
+        Err(IntelligenceError::Unsupported("diagnostics"))
+    }
+
+    /// Refused rather than approximated.
+    ///
+    /// A grammar can find every declaration of a name; it cannot tell which
+    /// uses of that name bind to this declaration, and a rename that is wrong
+    /// about that silently breaks the build somewhere the caller is not
+    /// looking. A language server answers this question or nobody does.
+    fn plan_rename(
+        &mut self,
+        _id: &SymbolId,
+        _name: &str,
+    ) -> Result<WorkspaceEditPlan, IntelligenceError> {
+        Err(IntelligenceError::Unsupported("plan_rename"))
+    }
+}
+
+fn slash(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Level-1 fallback used when no language server is configured.
