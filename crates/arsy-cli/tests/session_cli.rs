@@ -261,3 +261,26 @@ fn an_artifact_shows_bounded_exports_whole_and_is_collected_when_unreachable() {
     let (code, _) = arsy(workspace.path(), &["artifact", "show", &reference]);
     assert_eq!(code, 6);
 }
+
+#[test]
+fn migrate_reports_a_current_store_and_refuses_a_missing_one() {
+    let workspace = tempfile::tempdir().unwrap();
+
+    // Before any session exists there is nothing to migrate, and saying so is
+    // more useful than creating an empty store to report it as current.
+    let (code, _) = arsy(workspace.path(), &["migrate"]);
+    assert_eq!(code, 8);
+
+    let _ = recorded(workspace.path());
+    let (code, report) = arsy(workspace.path(), &["migrate"]);
+    assert_eq!(code, 0);
+    assert_eq!(report["current_schema"], true);
+    assert_eq!(report["current"], report["target"]);
+    assert!(report["steps"].as_array().unwrap().is_empty());
+
+    // A current store needs no backup, so --apply writes nothing.
+    let (code, applied) = arsy(workspace.path(), &["migrate", "--apply"]);
+    assert_eq!(code, 0);
+    assert_eq!(applied["applied"], false);
+    assert_eq!(applied["backup"], Value::Null);
+}

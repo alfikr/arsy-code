@@ -67,7 +67,7 @@ const RECORD_SCHEMA: u32 = 1;
 
 /// Documented commands that a later phase ships, so they report their phase
 /// instead of failing as unknown input.
-const UNAVAILABLE: &[(&str, u8)] = &[("completions", 1), ("migrate", 1), ("review", 6)];
+const UNAVAILABLE: &[(&str, u8)] = &[("completions", 1), ("review", 6)];
 
 const USAGE: &str = "\
 arsy — agentic coding harness
@@ -87,6 +87,7 @@ Usage:
   arsy artifact show <REF> [--max-bytes <N>]      render a bounded, redacted excerpt
   arsy artifact export <REF> --out <PATH>         write one artifact to a file
   arsy gc [--apply] [--retention <DURATION>]      report, then remove, unreachable evidence
+  arsy migrate [--apply] [--out <PATH>]           report, then apply, the store's schema migration
   arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
   arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
   arsy plugin list [--capabilities]               installed plugins
@@ -256,6 +257,12 @@ pub enum Command {
         apply: bool,
         retention_ms: u64,
     },
+    /// `arsy migrate`: move the session store to the supported schema version.
+    Migrate {
+        apply: bool,
+        /// Where the pre-migration copy goes; defaults beside the store.
+        backup: Option<PathBuf>,
+    },
     /// `arsy policy explain <OPERATION>`: evaluate without executing.
     PolicyExplain {
         operation: String,
@@ -361,6 +368,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("session") => session::parse(&parsed)?,
         Some("artifact") => evidence::parse_artifact(&parsed)?,
         Some("gc") => evidence::parse_gc(&parsed)?,
+        Some("migrate") => session::parse_migrate(&parsed)?,
         Some("policy") => policy::parse(&parsed)?,
         Some("serve") => serve::parse(&parsed)?,
         Some("skill") => extensions::parse_skill(&parsed)?,
@@ -962,6 +970,9 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             apply,
             retention_ms,
         } => evidence::collect(invocation, *apply, *retention_ms, emitter),
+        Command::Migrate { apply, backup } => {
+            session::migrate(invocation, *apply, backup.as_deref(), emitter)
+        }
         Command::PolicyExplain {
             operation,
             resource,

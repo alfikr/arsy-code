@@ -23,6 +23,16 @@ use std::{
 /// How many sessions `session list` reports when the caller does not say.
 const DEFAULT_LIMIT: usize = 50;
 
+pub fn parse_migrate(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
+    if !arguments.positional.is_empty() {
+        return Err(usage("migrate takes no positional argument"));
+    }
+    Ok(Command::Migrate {
+        apply: arguments.apply,
+        backup: arguments.out.clone(),
+    })
+}
+
 pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
     let mut positional = arguments.positional.clone();
     if positional.is_empty() {
@@ -471,6 +481,91 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         shifted_month - 9
     } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// `arsy migrate`: report the session store's schema migration, then apply it.
+///
+/// Planning never writes, so the default run is a report and `--apply` is the
+/// only path that touches the store. The engine takes a verified backup before
+/// the first step runs; this command only decides where it goes.
+pub fn migrate(
+    invocation: &Invocation,
+    apply: bool,
+    backup: Option<&Path>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let store = root.join(crate::STORE_PATH);
+    if !store.exists() {
+        return Err(Diagnostic::error(
+            "ARSY-CMP-1001",
+            format!("there is no session store at {}", store.display()),
+            "run a task in this workspace first: the store is created with the first session",
+        ));
+    }
+
+    let plan = arsy_kernel::migrate::plan(&store).map_err(storage_failed)?;
+    let mut report = json!({
+        "store": store.display().to_string(),
+        "current": plan.current,
+        "target": plan.target,
+        "current_schema": plan.is_current(),
+        "applied": false,
+        "steps": plan
+            .steps
+            .iter()
+            .map(|step| json!({
+                "from": step.from,
+                "to": step.to,
+                "description": step.description,
+                "loss": step.loss,
+            }))
+            .collect::<Vec<_>>(),
+        "loss": plan.loss,
+    });
+
+    if apply && !plan.is_current() {
+        let backup = backup.map_or_else(
+            || store.with_file_name(format!("sessions.v{}.backup", plan.current)),
+            Path::to_path_buf,
+        );
+        arsy_kernel::migrate::apply(&store, &backup).map_err(storage_failed)?;
+        report["applied"] = json!(true);
+        report["backup"] = json!(backup.display().to_string());
+    }
+
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        json!({ "migrate": human_migration(&report, &plan) })
+    });
+    Ok(0)
+}
+
+fn human_migration(report: &Value, plan: &arsy_kernel::migrate::MigrationPlan) -> String {
+    if plan.is_current() {
+        return format!("Schema version {} is current.", plan.current);
+    }
+    let mut text = format!(
+        "{} step(s) from schema version {} to {}\n",
+        plan.steps.len(),
+        plan.current,
+        plan.target
+    );
+    for step in &plan.steps {
+        text.push_str(&format!(
+            "  {} → {} · {}\n",
+            step.from, step.to, step.description
+        ));
+    }
+    for loss in &plan.loss {
+        text.push_str(&format!("  loses: {loss}\n"));
+    }
+    match report.get("backup").and_then(Value::as_str) {
+        Some(backup) => text.push_str(&format!("Applied. The original is at {backup}.")),
+        None => text.push_str("Nothing was written. Re-run with --apply."),
+    }
+    text
 }
 
 #[cfg(test)]
