@@ -120,13 +120,18 @@ pub const HARNESS_INSTRUCTIONS: &str = concat!(
 
 /// Build the system prompt for one turn.
 ///
+/// `recalled` is context the caller retrieved — what this workspace remembers,
+/// most often — carried as a context fragment so it is ordered with the
+/// repository's own instructions and budgeted against them rather than added
+/// on top of whatever they cost.
+///
 /// Compilation goes through the kernel's prompt compiler rather than string
 /// concatenation, so ordering is the family's, secrets are redacted on the way
 /// out, and every segment is traceable to the fragment it came from.
 pub fn system_prompt(
     family: ModelFamily,
     instructions: &[Instruction],
-    task_context: Option<&str>,
+    recalled: Option<&str>,
     redactor: &Redactor,
     token_budget: u32,
 ) -> Result<CompiledPrompt, prompt::PromptError> {
@@ -151,10 +156,10 @@ pub fn system_prompt(
             ),
         });
     }
-    if let Some(context) = task_context.filter(|text| !text.trim().is_empty()) {
+    if let Some(context) = recalled.filter(|text| !text.trim().is_empty()) {
         fragments.push(PromptFragment {
             id: FragmentId::new(),
-            kind: PromptFragmentKind::PermissionState,
+            kind: PromptFragmentKind::Context,
             content: context.to_owned(),
         });
     }

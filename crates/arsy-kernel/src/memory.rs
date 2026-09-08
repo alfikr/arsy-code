@@ -16,11 +16,12 @@
 
 use crate::{
     capability::PolicySource,
-    domain::{ArtifactId, MemoryId, Principal},
+    domain::{ArtifactId, CorrelationId, MemoryId, Principal, SessionId},
+    event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
     secret::Redactor,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 /// Where a memory applies. A record is only ever retrieved for the scope it was
 /// written in: a repository fact never becomes a user fact on its own.
@@ -151,6 +152,8 @@ pub enum MemoryError {
     ScopeMismatch,
     /// The record is already superseded or revoked.
     NotActive(MemoryId),
+    /// The index accepted the change and the store did not.
+    Storage(String),
 }
 
 impl fmt::Display for MemoryError {
@@ -168,6 +171,7 @@ impl fmt::Display for MemoryError {
                 formatter.write_str("a record may only supersede one in its own scope")
             }
             Self::NotActive(id) => write!(formatter, "memory record {id} is not active"),
+            Self::Storage(error) => write!(formatter, "memory could not be recorded: {error}"),
         }
     }
 }
@@ -416,6 +420,149 @@ fn is_high_entropy(token: &str) -> bool {
         && token.bytes().any(|byte| byte.is_ascii_digit())
         && token.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
+
+/// The stream a workspace's memory lives in.
+///
+/// A fixed id rather than a session's, because memory outlives the session
+/// that wrote it: a repository fact learned in one run has to be there for the
+/// next. It is the same store, so memory inherits the durability, the export,
+/// and the audit trail the sessions already have instead of inventing a second
+/// place to keep things.
+pub const MEMORY_STREAM: SessionId =
+    SessionId::from_uuid(uuid::uuid!("a5c04e11-0000-4000-8000-000000000001"));
+
+/// Every mutation appends the records it touched, whole.
+///
+/// A record is small and a supersession changes two of them, so writing the
+/// records rather than a delta keeps replay to "the last version of each id"
+/// — no second implementation of the rules that produced them, and therefore
+/// no way for replay to disagree with the write that it is replaying.
+const MEMORY_RECORDED: &str = "memory.recorded";
+
+/// The memory of one workspace, kept in its event store.
+pub struct MemoryStore {
+    store: Arc<dyn EventStore>,
+    index: MemoryIndex,
+    version: StreamVersion,
+}
+
+impl MemoryStore {
+    /// Replay the memory stream into an index.
+    pub fn open(store: Arc<dyn EventStore>) -> Result<Self, StoreError> {
+        let mut records: BTreeMap<MemoryId, MemoryRecord> = BTreeMap::new();
+        let mut next = 1;
+        loop {
+            let page = store.read(MEMORY_STREAM, next, MAX_MEMORY_PAGE)?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            next = last.sequence.saturating_add(1);
+            for event in &page {
+                let EventPayload::Inline { data } = &event.payload else {
+                    continue;
+                };
+                if event.kind != MEMORY_RECORDED {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_value::<MemoryRecord>(data.clone()) {
+                    // Last write wins by sequence, which is how a superseded
+                    // record's own update reaches the index.
+                    records.insert(record.id, record);
+                }
+            }
+        }
+        let version = store.current_version(MEMORY_STREAM)?;
+        Ok(Self {
+            store,
+            index: MemoryIndex::rebuild(records.into_values()),
+            version,
+        })
+    }
+
+    pub const fn index(&self) -> &MemoryIndex {
+        &self.index
+    }
+
+    /// Record a claim and make it durable.
+    pub fn remember(
+        &mut self,
+        new: NewMemory,
+        claim_text: &str,
+        redactor: &Redactor,
+        now_ms: u64,
+    ) -> Result<MemoryId, MemoryError> {
+        let superseded = new.supersedes;
+        let id = self.index.remember(new, claim_text, redactor, now_ms)?;
+        self.append(&[Some(id), superseded])
+            .map_err(|error| MemoryError::Storage(error.to_string()))?;
+        Ok(id)
+    }
+
+    pub fn revoke(
+        &mut self,
+        id: MemoryId,
+        by: PolicySource,
+        reason: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<(), MemoryError> {
+        self.index.revoke(id, by, reason, now_ms)?;
+        self.append(&[Some(id)])
+            .map_err(|error| MemoryError::Storage(error.to_string()))
+    }
+
+    /// Tombstone everything whose expiry has passed.
+    ///
+    /// Expiry is a lifecycle decision, not a read-time filter: a record that
+    /// has run out should leave the store's answer *and* say when it did, and
+    /// `is_live` alone would silently keep it forever.
+    pub fn expire(&mut self, now_ms: u64) -> Result<Vec<MemoryId>, MemoryError> {
+        let expired = self.index.expired(now_ms);
+        for id in &expired {
+            let origin = self
+                .index
+                .get(*id)
+                .map(|record| record.origin)
+                .ok_or(MemoryError::Unknown(*id))?;
+            self.index.revoke(*id, origin, "expired", now_ms)?;
+        }
+        self.append(&expired.iter().copied().map(Some).collect::<Vec<_>>())
+            .map_err(|error| MemoryError::Storage(error.to_string()))?;
+        Ok(expired)
+    }
+
+    fn append(&mut self, touched: &[Option<MemoryId>]) -> Result<(), StoreError> {
+        let mut events = Vec::new();
+        let mut sequence = self.version.0;
+        for id in touched.iter().flatten() {
+            let Some(record) = self.index.get(*id) else {
+                continue;
+            };
+            sequence = sequence
+                .checked_add(1)
+                .ok_or(StoreError::SequenceOverflow)?;
+            events.push(EventEnvelope::new(
+                MEMORY_STREAM,
+                sequence,
+                record.author.clone(),
+                None,
+                CorrelationId::new(),
+                SchemaVersion(1),
+                MEMORY_RECORDED,
+                EventPayload::Inline {
+                    data: serde_json::to_value(record)
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+                },
+            ));
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.version = self.store.append(MEMORY_STREAM, self.version, events)?;
+        Ok(())
+    }
+}
+
+const MAX_MEMORY_PAGE: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -730,5 +877,68 @@ mod tests {
             index.recall(&MemoryScope::Repository, 2),
             "retrieval does not depend on the order records were read in"
         );
+    }
+
+    #[test]
+    fn memory_survives_the_process_that_wrote_it_and_keeps_its_tombstones() {
+        use crate::event::MemoryEventStore;
+
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let redactor = Redactor::new();
+        let mut memory = MemoryStore::open(Arc::clone(&store)).unwrap();
+
+        let first = memory
+            .remember(
+                new(
+                    MemoryScope::Repository,
+                    PolicySource::User,
+                    Confidence::Observed,
+                ),
+                "the build uses cargo",
+                &redactor,
+                1,
+            )
+            .unwrap();
+        let mut replacement = new(
+            MemoryScope::Repository,
+            PolicySource::User,
+            Confidence::Verified,
+        );
+        replacement.supersedes = Some(first);
+        let second = memory
+            .remember(replacement, "the build uses cargo and make", &redactor, 2)
+            .unwrap();
+        let expiring = {
+            let mut new = new(
+                MemoryScope::Working,
+                PolicySource::User,
+                Confidence::Reported,
+            );
+            new.expires_at_ms = Some(5);
+            memory
+                .remember(new, "the branch is green", &redactor, 3)
+                .unwrap()
+        };
+
+        // A second process reads the same store and believes the same things.
+        let reopened = MemoryStore::open(Arc::clone(&store)).unwrap();
+        let live = reopened.index().recall(&MemoryScope::Repository, 4);
+        assert_eq!(live.len(), 1, "a superseded record leaves retrieval");
+        assert_eq!(live[0].id, second);
+        assert_eq!(
+            reopened.index().get(first).unwrap().status,
+            MemoryStatus::Superseded,
+            "the record it replaced is still there, marked"
+        );
+        assert_eq!(reopened.index().recall(&MemoryScope::Working, 4).len(), 1);
+
+        // Expiry is a write, so it survives too, with its reason.
+        let mut memory = MemoryStore::open(Arc::clone(&store)).unwrap();
+        assert_eq!(memory.expire(6).unwrap(), vec![expiring]);
+        let reopened = MemoryStore::open(store).unwrap();
+        assert!(reopened.index().recall(&MemoryScope::Working, 6).is_empty());
+        let tombstone = reopened.index().get(expiring).unwrap();
+        assert_eq!(tombstone.status, MemoryStatus::Revoked);
+        assert_eq!(tombstone.revocation.as_deref(), Some("expired"));
     }
 }

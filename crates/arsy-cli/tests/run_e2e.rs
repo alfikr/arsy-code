@@ -323,3 +323,68 @@ fn a_task_its_process_never_finished_is_continued_by_resume() {
     assert_eq!(quiet["continuing"], Value::Null);
     assert_eq!(quiet["recovered_tasks"], 0);
 }
+
+#[test]
+fn what_the_workspace_remembers_reaches_the_model_and_can_be_withdrawn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![answers("noted."), answers("noted again.")]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &[
+            "memory",
+            "remember",
+            "the test command is `cargo nextest run`",
+        ],
+    );
+    assert_eq!(code, 0, "{records:#?}");
+    let memory = result(&records)["memory"].as_str().unwrap().to_owned();
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["memory", "list"]);
+    assert_eq!(code, 0);
+    let listed = result(&records);
+    assert_eq!(listed["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["memories"][0]["scope"], "repository");
+    assert_eq!(
+        listed["memories"][0]["claim"],
+        "the test command is `cargo nextest run`"
+    );
+    // Typed at a prompt with nothing checking it: reported, whatever authority
+    // the operator has.
+    assert_eq!(listed["memories"][0]["confidence"], "reported");
+
+    let (code, _) = arsy(workspace.path(), home.path(), &["run", "how do I test?"]);
+    assert_eq!(code, 0);
+    let asked = provider.request().to_string();
+    assert!(asked.contains("cargo nextest run"), "{asked}");
+
+    // Withdrawn, and the next turn is not told it.
+    let (code, _) = arsy(
+        workspace.path(),
+        home.path(),
+        &[
+            "memory",
+            "forget",
+            &memory,
+            "--to",
+            "we moved back to cargo test",
+        ],
+    );
+    assert_eq!(code, 0);
+    let (code, _) = arsy(workspace.path(), home.path(), &["run", "how do I test?"]);
+    assert_eq!(code, 0);
+    let asked = provider.request().to_string();
+    assert!(!asked.contains("cargo nextest run"), "{asked}");
+
+    // The tombstone stays, with the reason.
+    let (_, records) = arsy(workspace.path(), home.path(), &["memory", "list", "--all"]);
+    let all = result(&records);
+    assert_eq!(all["memories"][0]["status"], "revoked");
+    assert_eq!(
+        all["memories"][0]["revocation"],
+        "we moved back to cargo test"
+    );
+}

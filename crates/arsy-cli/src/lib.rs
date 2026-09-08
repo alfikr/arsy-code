@@ -24,6 +24,7 @@ mod evidence;
 mod extensions;
 mod integrations;
 mod mcp;
+mod memory;
 mod policy;
 pub mod provider;
 mod review;
@@ -93,6 +94,9 @@ Usage:
   arsy artifact export <REF> --out <PATH>         write one artifact to a file
   arsy gc [--apply] [--retention <DURATION>]      report, then remove, unreachable evidence
   arsy migrate [--apply] [--out <PATH>]           report, then apply, the store's schema migration
+  arsy memory list [--scope <SCOPE>] [--all]      what this workspace remembers
+  arsy memory remember <CLAIM> [--scope <SCOPE>]  record a durable claim
+  arsy memory forget <ID> [--to <REASON>]        withdraw one, keeping the tombstone
   arsy review [--strict]      report what the working tree changed, and what it needs
   arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
   arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
@@ -263,6 +267,18 @@ pub enum Command {
         apply: bool,
         retention_ms: u64,
     },
+    MemoryList {
+        scope: Option<String>,
+        all: bool,
+    },
+    MemoryRemember {
+        claim: String,
+        scope: Option<String>,
+    },
+    MemoryForget {
+        id: arsy_kernel::domain::MemoryId,
+        reason: String,
+    },
     /// `arsy review`: assess the working tree's change.
     Review {
         /// Any finding becomes a non-zero exit, for a pipeline gate.
@@ -381,6 +397,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("gc") => evidence::parse_gc(&parsed)?,
         Some("migrate") => session::parse_migrate(&parsed)?,
         Some("review") => review::parse(&parsed)?,
+        Some("memory") => memory::parse(&parsed)?,
         Some("policy") => policy::parse(&parsed)?,
         Some("serve") => serve::parse(&parsed)?,
         Some("skill") => extensions::parse_skill(&parsed)?,
@@ -983,6 +1000,13 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             retention_ms,
         } => evidence::collect(invocation, *apply, *retention_ms, emitter),
         Command::Review { strict } => review::run(invocation, *strict, emitter),
+        Command::MemoryList { scope, all } => {
+            memory::list(invocation, scope.clone(), *all, emitter)
+        }
+        Command::MemoryRemember { claim, scope } => {
+            memory::remember(invocation, claim, scope.clone(), emitter)
+        }
+        Command::MemoryForget { id, reason } => memory::forget(invocation, *id, reason, emitter),
         Command::Migrate { apply, backup } => {
             session::migrate(invocation, *apply, backup.as_deref(), emitter)
         }
@@ -4824,6 +4848,13 @@ fn actor() -> Principal {
 /// call have to reach the same operations under the same rules; the only
 /// difference is the risk context, which says whether an operator is present to
 /// answer an approval.
+/// The workspace's artifact store: where every operation's result, every
+/// exported excerpt, and every memory's claim is kept.
+fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStore, Diagnostic> {
+    arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
+        .map_err(|error| storage_failed(error.to_string()))
+}
+
 fn agent_runtime(
     root: &Path,
     config: &arsy_kernel::config::Config,
@@ -4831,10 +4862,7 @@ fn agent_runtime(
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
         .map_err(|error| storage_failed(error.to_string()))?;
-    let artifacts = Arc::new(
-        arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
-            .map_err(|error| storage_failed(error.to_string()))?,
-    );
+    let artifacts = Arc::new(artifact_store(root)?);
     arsy_code::agent::runtime(
         &workspace,
         config.policy_rule_set(),
@@ -4861,6 +4889,13 @@ fn agent_runtime(
 /// Compilation failure is not a reason to lose the turn — a prompt over budget
 /// or an unredactable secret is a degradation, not a fault — so the harness
 /// instructions alone are the floor.
+/// What a recalled memory may take out of the prompt.
+///
+/// Small on purpose. Memory competes with the task and the repository's own
+/// instructions for the same window, and a workspace that remembers a page of
+/// facts is one whose next turn has less room to read the code.
+const MAX_RECALLED_MEMORY_BYTES: usize = 4 * 1024;
+
 fn system_prompt(root: &Path, provider: &str, model: &str) -> Option<String> {
     let workspace = arsy_code::resource::Workspace::open(root).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
@@ -4869,7 +4904,7 @@ fn system_prompt(root: &Path, provider: &str, model: &str) -> Option<String> {
     let compiled = arsy_code::agent::instructions::system_prompt(
         family,
         &instructions,
-        None,
+        memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
         &arsy_kernel::secret::Redactor::new(),
         arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
     )
