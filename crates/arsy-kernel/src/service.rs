@@ -53,6 +53,46 @@ pub struct TurnFailure {
     pub message: String,
 }
 
+/// How a new stream relates to the one it came from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchMode {
+    /// The branch continues from the parent's state at the branch point: a
+    /// reader reconstructs its history by walking ancestry into the parent's
+    /// prefix. Nothing is copied and nothing is truncated.
+    Rewind,
+    /// The branch records where it came from but inherits no history.
+    Fork,
+}
+
+impl BranchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rewind => "rewind",
+            Self::Fork => "fork",
+        }
+    }
+
+    /// Whether the parent's prefix is part of this branch's history.
+    pub const fn inherits_prefix(self) -> bool {
+        matches!(self, Self::Rewind)
+    }
+}
+
+/// Evidence recorded with `session.branched`: enough to replay the branch's
+/// history without consulting anything but the store.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BranchEvidence {
+    pub mode: BranchMode,
+    pub parent: SessionId,
+    /// The parent event the branch continues from.
+    pub at_event: EventId,
+    pub at_sequence: u64,
+    /// The parent's committed length when the branch was taken, so a later
+    /// reader can tell how much of the parent the branch does not include.
+    pub parent_version: u64,
+}
+
 /// Verdict for a `turn_start` request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TurnAdmission {
@@ -126,6 +166,79 @@ impl AgentService {
 
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// Read one stream in full, in sequence order.
+    pub fn history(
+        store: &dyn EventStore,
+        session: SessionId,
+    ) -> Result<Vec<EventEnvelope>, ServiceError> {
+        let mut events = Vec::new();
+        let mut next = 1;
+        loop {
+            let page = store.read(session, next, MAX_SUBSCRIPTION_BATCH)?;
+            let Some(last) = page.last() else {
+                return Ok(events);
+            };
+            next = last
+                .sequence
+                .checked_add(1)
+                .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
+            events.extend(page);
+        }
+    }
+
+    /// Open a new stream that records where it came from.
+    ///
+    /// History is never rewritten: the parent keeps every event it had, and the
+    /// branch begins with one `session.branched` event naming the parent and
+    /// the branch point. A `Rewind` branch continues from the parent's state at
+    /// that point; a `Fork` records the ancestry only.
+    ///
+    /// `at` defaults to the parent's last committed event.
+    pub fn branch(
+        store: Arc<dyn EventStore>,
+        parent: SessionId,
+        at: Option<EventId>,
+        mode: BranchMode,
+        actor: Principal,
+    ) -> Result<(Self, SessionId, BranchEvidence), ServiceError> {
+        let history = Self::history(store.as_ref(), parent)?;
+        let branch_point = match at {
+            Some(id) => history
+                .iter()
+                .find(|event| event.id == id)
+                .ok_or(ServiceError::UnknownEvent(id))?,
+            None => history.last().ok_or(ServiceError::EmptyStream(parent))?,
+        };
+        let evidence = BranchEvidence {
+            mode,
+            parent,
+            at_event: branch_point.id,
+            at_sequence: branch_point.sequence,
+            parent_version: history.last().map_or(0, |event| event.sequence),
+        };
+
+        let session = SessionId::new();
+        let service = Self::attach(store, session)?;
+        {
+            let mut state = service.lock()?;
+            service.append(&mut state, actor, SESSION_BRANCHED, &evidence)?;
+        }
+        Ok((service, session, evidence))
+    }
+
+    /// The `session.branched` evidence this stream opened with, when it is a
+    /// branch of another one.
+    pub fn ancestry(
+        store: &dyn EventStore,
+        session: SessionId,
+    ) -> Result<Option<BranchEvidence>, ServiceError> {
+        let first = store.read(session, 1, 1)?;
+        match first.first() {
+            Some(event) if event.kind == SESSION_BRANCHED => Ok(Some(inline(event)?)),
+            _ => Ok(None),
+        }
     }
 
     /// Admit a `turn_start` request and append `turn.started`.
@@ -420,6 +533,7 @@ impl Subscriber {
     }
 }
 
+const SESSION_BRANCHED: &str = "session.branched";
 const TURN_STARTED: &str = "turn.started";
 const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
@@ -449,6 +563,8 @@ pub enum ServiceError {
     UnknownTurn(TurnId),
     TurnNotRunning(TurnId),
     UnknownSubscription(SubscriptionId),
+    UnknownEvent(EventId),
+    EmptyStream(SessionId),
     MissingEvidence(String),
     LedgerDesync,
     Poisoned,
@@ -483,6 +599,10 @@ impl fmt::Display for ServiceError {
             Self::UnknownTurn(turn) => write!(formatter, "turn {turn} does not exist"),
             Self::TurnNotRunning(turn) => write!(formatter, "turn {turn} is already finished"),
             Self::UnknownSubscription(id) => write!(formatter, "subscription {id} does not exist"),
+            Self::UnknownEvent(id) => write!(formatter, "event {id} is not in this session"),
+            Self::EmptyStream(session) => {
+                write!(formatter, "session {session} has no recorded events")
+            }
             Self::MissingEvidence(kind) => {
                 write!(formatter, "{kind} is missing its inline evidence")
             }

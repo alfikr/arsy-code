@@ -23,7 +23,7 @@ use std::{fmt, time::Duration};
 
 /// Provider-qualified model name. The provider half selects the adapter; the
 /// model half is passed through to the wire untouched.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ModelKey {
     pub provider: String,
     pub model: String,

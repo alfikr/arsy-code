@@ -67,6 +67,40 @@ pub struct GcReport {
     pub objects_removed: u64,
 }
 
+/// A stored blob no surviving reference points at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanObject {
+    pub digest: StateVersion,
+    /// Where the blob was actually found. Carried rather than rebuilt from the
+    /// digest, so applying the plan removes the file the plan reported: a store
+    /// whose layout has drifted is still collected, not turned into an error
+    /// about a path nothing ever wrote.
+    pub path: PathBuf,
+    pub encoded_size: u64,
+}
+
+/// What a collection would remove. `bytes` counts only the referenced
+/// artifacts, whose encoded size is recorded; orphan blobs carry their own.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GcPlan {
+    pub references: Vec<ArtifactMetadata>,
+    pub objects: Vec<OrphanObject>,
+    pub bytes: u64,
+}
+
+impl GcPlan {
+    pub fn is_empty(&self) -> bool {
+        self.references.is_empty() && self.objects.is_empty()
+    }
+
+    /// Every byte the plan reclaims, references and orphan blobs together.
+    pub fn reclaimed_bytes(&self) -> u64 {
+        self.objects.iter().fold(self.bytes, |total, object| {
+            total.saturating_add(object.encoded_size)
+        })
+    }
+}
+
 pub trait ArtifactStore: Send + Sync {
     fn put(&self, bytes: &[u8], new: NewArtifact) -> Result<ArtifactMetadata, ArtifactError>;
     fn metadata(&self, id: ArtifactId) -> Result<ArtifactMetadata, ArtifactError>;
@@ -101,6 +135,61 @@ impl FileArtifactStore {
             .join("objects")
             .join(&digest[..2])
             .join(format!("{digest}.blob"))
+    }
+
+    /// Everything `gc` would remove, without removing it.
+    ///
+    /// `gc` is defined as "apply this plan", so a dry run and the deletion can
+    /// never disagree about what is unreachable — which is the only reason to
+    /// trust `arsy gc` before `arsy gc --apply`.
+    pub fn gc_plan(
+        &self,
+        reachable: &HashSet<ArtifactId>,
+        now_ms: u64,
+    ) -> Result<GcPlan, ArtifactError> {
+        let mut plan = GcPlan::default();
+        let mut live = HashSet::new();
+        for metadata in self.all_metadata()? {
+            if !reachable.contains(&metadata.id) && now_ms >= metadata.retain_until_ms {
+                plan.bytes = plan.bytes.saturating_add(metadata.encoded_size);
+                plan.references.push(metadata);
+            } else {
+                live.insert(metadata.digest);
+            }
+        }
+
+        for prefix in fs::read_dir(self.root.join("objects")).map_err(io_error)? {
+            let prefix = prefix.map_err(io_error)?;
+            if !prefix.file_type().map_err(io_error)?.is_dir() {
+                continue;
+            }
+            for object in fs::read_dir(prefix.path()).map_err(io_error)? {
+                let object = object.map_err(io_error)?;
+                if !object.file_type().map_err(io_error)?.is_file() {
+                    continue;
+                }
+                let Some(stem) = object
+                    .path()
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                let Ok(digest) = stem.parse::<StateVersion>() else {
+                    continue;
+                };
+                let file = object.metadata().map_err(io_error)?;
+                if !live.contains(&digest) && age_ms(&file, now_ms)? >= self.orphan_retention_ms {
+                    plan.objects.push(OrphanObject {
+                        digest,
+                        path: object.path(),
+                        encoded_size: file.len(),
+                    });
+                }
+            }
+        }
+        Ok(plan)
     }
 
     fn all_metadata(&self) -> Result<Vec<ArtifactMetadata>, ArtifactError> {
@@ -196,52 +285,21 @@ impl ArtifactStore for FileArtifactStore {
     }
 
     fn gc(&self, reachable: &HashSet<ArtifactId>, now_ms: u64) -> Result<GcReport, ArtifactError> {
-        let mut report = GcReport::default();
-        for metadata in self.all_metadata()? {
-            if !reachable.contains(&metadata.id) && now_ms >= metadata.retain_until_ms {
-                fs::remove_file(self.reference_path(metadata.id)).map_err(io_error)?;
-                report.references_removed += 1;
-            }
+        let plan = self.gc_plan(reachable, now_ms)?;
+        for metadata in &plan.references {
+            fs::remove_file(self.reference_path(metadata.id)).map_err(io_error)?;
         }
         sync_dir(&self.root.join("refs"))?;
-
-        let live: HashSet<_> = self
-            .all_metadata()?
-            .into_iter()
-            .map(|metadata| metadata.digest)
-            .collect();
-        for prefix in fs::read_dir(self.root.join("objects")).map_err(io_error)? {
-            let prefix = prefix.map_err(io_error)?;
-            if !prefix.file_type().map_err(io_error)?.is_dir() {
-                continue;
+        for object in &plan.objects {
+            fs::remove_file(&object.path).map_err(io_error)?;
+            if let Some(prefix) = object.path.parent() {
+                sync_dir(prefix)?;
             }
-            for object in fs::read_dir(prefix.path()).map_err(io_error)? {
-                let object = object.map_err(io_error)?;
-                if !object.file_type().map_err(io_error)?.is_file() {
-                    continue;
-                }
-                let Some(stem) = object
-                    .path()
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .map(str::to_owned)
-                else {
-                    continue;
-                };
-                let Ok(digest) = stem.parse::<StateVersion>() else {
-                    continue;
-                };
-                if !live.contains(&digest)
-                    && age_ms(&object.metadata().map_err(io_error)?, now_ms)?
-                        >= self.orphan_retention_ms
-                {
-                    fs::remove_file(object.path()).map_err(io_error)?;
-                    report.objects_removed += 1;
-                }
-            }
-            sync_dir(&prefix.path())?;
         }
-        Ok(report)
+        Ok(GcReport {
+            references_removed: plan.references.len() as u64,
+            objects_removed: plan.objects.len() as u64,
+        })
     }
 }
 
@@ -499,5 +557,37 @@ mod tests {
             Err(ArtifactError::ExpansionRatioExceeded)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Collection removes the file the plan reported, not a path rebuilt from
+    /// the digest.
+    ///
+    /// The two coincide while the store obeys its own layout. They stop
+    /// coinciding on a store whose layout has drifted, and a garbage collector
+    /// that errors instead of collecting is the one case where drift becomes
+    /// permanent.
+    #[test]
+    fn collection_removes_the_orphan_it_found() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FileArtifactStore::open(directory.path(), 0).unwrap();
+        let digest = StateVersion::from_digest([0xab; 32]);
+        // Deliberately not under the prefix `object_path` would derive.
+        let misplaced = directory.path().join("objects/zz");
+        fs::create_dir_all(&misplaced).unwrap();
+        let stray = misplaced.join(format!("{digest}.blob"));
+        fs::write(&stray, b"orphaned").unwrap();
+
+        let plan = store.gc_plan(&HashSet::new(), u64::MAX).unwrap();
+        assert_eq!(plan.objects.len(), 1);
+        assert_eq!(plan.objects[0].path, stray, "the plan names what it found");
+        assert_ne!(
+            plan.objects[0].path,
+            store.object_path(digest),
+            "and that is not what the digest would rebuild"
+        );
+
+        let report = ArtifactStore::gc(&store, &HashSet::new(), u64::MAX).unwrap();
+        assert_eq!(report.objects_removed, 1);
+        assert!(!stray.exists(), "the orphan is gone");
     }
 }

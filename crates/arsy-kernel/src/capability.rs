@@ -45,6 +45,49 @@ pub enum CapabilityAction {
 }
 
 impl CapabilityAction {
+    /// Every action, so a caller that must cover the vocabulary — synthesizing
+    /// one default rule per action, for instance — cannot silently miss one
+    /// when the enum grows.
+    pub const ALL: &'static [Self] = &[
+        Self::FsRead,
+        Self::FsWrite,
+        Self::FsDelete,
+        Self::ProcessExec,
+        Self::ProcessSignal,
+        Self::NetworkConnect,
+        Self::GitRead,
+        Self::GitWrite,
+        Self::CredentialUse,
+        Self::BrowserControl,
+        Self::DebugLaunch,
+        Self::DebugAttach,
+        Self::RemoteExec,
+        Self::SystemModify,
+        Self::PluginInvoke,
+    ];
+
+    /// The resource scheme this action is written against.
+    ///
+    /// One mapping, because a rule's pattern, a request's resource, and a
+    /// dry run's assumed resource all have to agree: an action matched against
+    /// `file:**` in one place and `fs:**` in another is a rule that silently
+    /// stops applying.
+    pub const fn default_scheme(self) -> &'static str {
+        match self {
+            Self::FsRead | Self::FsWrite | Self::FsDelete | Self::GitRead | Self::GitWrite => {
+                "file"
+            }
+            Self::ProcessExec | Self::ProcessSignal => "process",
+            Self::NetworkConnect => "host",
+            Self::CredentialUse => "secret",
+            Self::BrowserControl => "browser",
+            Self::DebugLaunch | Self::DebugAttach => "debug",
+            Self::RemoteExec => "remote",
+            Self::SystemModify => "system",
+            Self::PluginInvoke => "plugin",
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FsRead => "fs.read",

@@ -22,6 +22,31 @@ use std::{
 const MAX_GIT_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LOG_ENTRIES: u64 = 1_000;
 
+/// Whether the working tree has uncommitted changes, or `None` when that
+/// cannot be established — Git is absent, or this is not a repository.
+///
+/// Policy raises a Git mutation to approval in a dirty tree, so a caller that
+/// wants a truthful decision needs this before it evaluates. It is a read-only
+/// `git status`, which is why it does not go through the operation registry:
+/// asking for a grant in order to explain a grant would not terminate.
+pub fn cleanliness(workspace: &Path) -> Option<WorkspaceCleanliness> {
+    let output = Command::new("git")
+        .args(["--no-pager", "status", "--porcelain"])
+        .current_dir(workspace)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(if output.stdout.is_empty() {
+        WorkspaceCleanliness::Clean
+    } else {
+        WorkspaceCleanliness::Dirty
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GitOperation {
     Status,

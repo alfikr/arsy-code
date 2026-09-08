@@ -101,6 +101,33 @@ impl RustSyntax {
         self.nodes("use_declaration")
     }
 
+    /// Declarations of `kind` with the name each one binds.
+    ///
+    /// The name comes from tree-sitter's `name` field rather than from slicing
+    /// the declaration's text: an attribute, a doc comment, or a generic
+    /// parameter list would all defeat a textual rule, and the grammar already
+    /// knows which child is the name.
+    pub fn declarations(&self, kind: &str) -> Result<Vec<(SyntaxNode, String)>, SyntaxError> {
+        self.require_fresh_tree()?;
+        let mut matches = Vec::new();
+        collect_named(self.tree.root_node(), kind, self.revision, &mut matches);
+        matches
+            .into_iter()
+            .map(|(node, range)| {
+                let name = std::str::from_utf8(&self.source[range])
+                    .map_err(|_| SyntaxError::ParseFailed)?
+                    .to_owned();
+                Ok((node, name))
+            })
+            .collect()
+    }
+
+    /// The source this tree was parsed from, for a caller that needs the text
+    /// behind a node's byte range.
+    pub fn source(&self) -> &[u8] {
+        &self.source
+    }
+
     pub fn apply_edit(
         &mut self,
         expected: StateVersion,
@@ -178,6 +205,39 @@ impl RustSyntax {
             Ok(())
         } else {
             Err(SyntaxError::StaleSyntax)
+        }
+    }
+}
+
+/// Like `collect`, but only for declarations that bind a name, and carrying the
+/// byte range of that name alongside the declaration.
+fn collect_named(
+    node: Node<'_>,
+    kind: &str,
+    revision: StateVersion,
+    matches: &mut Vec<(SyntaxNode, Range<usize>)>,
+) {
+    if matches.len() == MAX_RESULTS {
+        return;
+    }
+    if node.kind() == kind {
+        if let Some(name) = node.child_by_field_name("name") {
+            matches.push((
+                SyntaxNode {
+                    identity: node.id(),
+                    kind: node.kind().to_owned(),
+                    bytes: node.byte_range(),
+                    source_revision: revision,
+                },
+                name.byte_range(),
+            ));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_named(child, kind, revision, matches);
+        if matches.len() == MAX_RESULTS {
+            break;
         }
     }
 }

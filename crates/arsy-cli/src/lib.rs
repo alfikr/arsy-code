@@ -20,8 +20,16 @@
 
 mod config_edit;
 mod eval;
+mod evidence;
+mod extensions;
 mod integrations;
+mod mcp;
+mod policy;
 pub mod provider;
+mod serve;
+mod session;
+#[cfg(feature = "tui")]
+pub mod tools;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -61,20 +69,7 @@ const RECORD_SCHEMA: u32 = 1;
 
 /// Documented commands that a later phase ships, so they report their phase
 /// instead of failing as unknown input.
-const UNAVAILABLE: &[(&str, u8)] = &[
-    ("artifact", 1),
-    ("completions", 1),
-    ("gc", 1),
-    ("migrate", 1),
-    ("model", 2),
-    ("plugin", 8),
-    ("policy", 1),
-    ("provider", 1),
-    ("review", 6),
-    ("serve", 1),
-    ("session", 1),
-    ("skill", 5),
-];
+const UNAVAILABLE: &[(&str, u8)] = &[("completions", 1), ("migrate", 1), ("review", 6)];
 
 const USAGE: &str = "\
 arsy — agentic coding harness
@@ -86,8 +81,29 @@ Usage:
   arsy eval <SUITE>          run a pinned evaluation fixture
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
+  arsy session list [--limit <N>]      list recorded sessions in this workspace
+  arsy session show <ID> [--turns] [--evidence]   show one session's projection
+  arsy session export <ID> [--out <PATH>]         export canonical events as JSONL
+  arsy session rewind <ID> --to <EVENT_ID>        branch continuing from an event
+  arsy session fork <ID> [--at <EVENT_ID>]        branch recording ancestry only
+  arsy artifact show <REF> [--max-bytes <N>]      render a bounded, redacted excerpt
+  arsy artifact export <REF> --out <PATH>         write one artifact to a file
+  arsy gc [--apply] [--retention <DURATION>]      report, then remove, unreachable evidence
+  arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
+  arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
+  arsy plugin list [--capabilities]               installed plugins
+  arsy plugin install <SOURCE> [--force]          approve, then install
+  arsy plugin inspect <ID> | arsy plugin remove <ID>
+  arsy plugin refresh [ID] [--dry-run]            re-read plugin sources
+  arsy serve [--protocol mcp]                     offer operations as MCP tools on stdio
+  arsy provider list [--all]                      providers resolved as allowed
+  arsy model list [--provider <ID>] [--capability <NAME>]
   arsy mcp list [--source <KIND>]       inspect imported MCP declarations
   arsy mcp show <NAME> [--source <KIND>] show one MCP declaration
+  arsy mcp add <NAME> --command <CMD> [-- ARGS...]  define a stdio connection
+  arsy mcp add <NAME> --transport http --url <URL>  define an HTTP connection
+  arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
+  arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
   arsy hook list [--event <NAME>]      inspect imported lifecycle hooks
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
@@ -209,6 +225,93 @@ pub enum Command {
     ConfigExplain {
         key: Option<String>,
     },
+    SessionList {
+        limit: usize,
+    },
+    SessionShow {
+        session: SessionId,
+        turns: bool,
+        evidence: bool,
+    },
+    SessionExport {
+        session: SessionId,
+        out: Option<PathBuf>,
+        include_artifacts: bool,
+    },
+    /// `arsy session rewind` and `arsy session fork`: one operation, two
+    /// documented names, distinguished by whether the branch inherits the
+    /// parent's prefix.
+    SessionBranch {
+        session: SessionId,
+        at: Option<arsy_kernel::domain::EventId>,
+        mode: arsy_kernel::service::BranchMode,
+    },
+    ArtifactShow {
+        reference: arsy_kernel::domain::ArtifactId,
+        max_bytes: u64,
+    },
+    ArtifactExport {
+        reference: arsy_kernel::domain::ArtifactId,
+        out: PathBuf,
+    },
+    Gc {
+        apply: bool,
+        retention_ms: u64,
+    },
+    /// `arsy policy explain <OPERATION>`: evaluate without executing.
+    PolicyExplain {
+        operation: String,
+        resource: Option<String>,
+        actor: Option<String>,
+    },
+    ProviderList {
+        all: bool,
+    },
+    ModelList {
+        provider: Option<String>,
+        capability: Option<String>,
+    },
+    McpAdd {
+        server: arsy_kernel::config::McpServer,
+        scope: mcp::Scope,
+    },
+    McpRemove {
+        name: String,
+        scope: mcp::Scope,
+    },
+    /// `arsy mcp enable` and `arsy mcp disable`: one key, two names.
+    McpEnable {
+        name: String,
+        enabled: bool,
+        scope: mcp::Scope,
+    },
+    McpTest {
+        name: String,
+        /// `None` keeps the connection's configured deadline.
+        timeout_ms: Option<u64>,
+    },
+    SkillList {
+        source: Option<String>,
+    },
+    PluginList {
+        capabilities: bool,
+    },
+    PluginInstall {
+        source: PathBuf,
+        force: bool,
+    },
+    PluginInspect {
+        id: String,
+    },
+    PluginRemove {
+        id: String,
+    },
+    PluginRefresh {
+        id: Option<String>,
+        dry_run: bool,
+    },
+    /// `arsy serve`: speak MCP on stdio for an embedding client.
+    Serve,
     /// Bare `arsy`: the interactive TUI.
     Tui,
     Help,
@@ -236,10 +339,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         ));
     }
     if (parsed.source.is_some() || parsed.event.is_some())
-        && !matches!(parsed.name.as_deref(), Some("mcp" | "hook"))
+        && !matches!(parsed.name.as_deref(), Some("mcp" | "hook" | "skill"))
     {
         return Err(usage(
-            "--source and --event apply only to MCP/hook inspection",
+            "--source and --event apply only to MCP, hook, and skill inspection",
         ));
     }
     let command = match parsed.name.as_deref() {
@@ -257,14 +360,21 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("compat") => Command::CompatExplain {
             ecosystem: compatibility_kind(parsed.positional)?,
         },
+        Some("session") => session::parse(&parsed)?,
+        Some("artifact") => evidence::parse_artifact(&parsed)?,
+        Some("gc") => evidence::parse_gc(&parsed)?,
+        Some("policy") => policy::parse(&parsed)?,
+        Some("serve") => serve::parse(&parsed)?,
+        Some("skill") => extensions::parse_skill(&parsed)?,
+        Some("plugin") => extensions::parse_plugin(&parsed)?,
+        Some("provider") => provider::parse_list(&parsed)?,
+        Some("model") => provider::parse_models(&parsed)?,
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
         Some("config") => parse_config(parsed.positional)?,
-        Some("mcp" | "hook") => integrations::parse(
-            parsed.name.as_deref().unwrap(),
-            parsed.positional,
-            parsed.source,
-            parsed.event,
-        )?,
+        Some("mcp") => mcp::parse(&parsed)?,
+        Some("hook") => {
+            integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?
+        }
         Some(other) => return Err(unknown_command(other)),
     };
     Ok(invocation(
@@ -283,11 +393,33 @@ struct ParsedArguments {
     follow: bool,
     strict: bool,
     force: bool,
+    turns: bool,
+    evidence: bool,
+    include_artifacts: bool,
+    apply: bool,
+    all: bool,
+    capabilities: bool,
+    dry_run: bool,
     handle: Option<String>,
     trials: Option<u32>,
+    limit: Option<usize>,
+    max_bytes: Option<u64>,
     out: Option<PathBuf>,
     source: Option<String>,
     event: Option<String>,
+    to: Option<String>,
+    at: Option<String>,
+    retention: Option<String>,
+    resource: Option<String>,
+    actor: Option<String>,
+    provider: Option<String>,
+    capability: Option<String>,
+    transport: Option<String>,
+    protocol: Option<String>,
+    command: Option<String>,
+    url: Option<String>,
+    scope: Option<String>,
+    timeout: Option<u64>,
     name: Option<String>,
     positional: Vec<String>,
     early: Option<Command>,
@@ -300,6 +432,12 @@ fn collect_arguments<I: IntoIterator<Item = String>>(
     let mut parsed = ParsedArguments::default();
 
     while let Some(argument) = arguments.next() {
+        // Everything after a bare `--` belongs to whatever the command is
+        // wrapping, so a subprocess's own flags cannot be mistaken for ARSY's.
+        if argument == "--" {
+            parsed.positional.extend(arguments.by_ref());
+            break;
+        }
         if apply_switch(&argument, &mut parsed) {
             if parsed.early.is_some() {
                 return Ok(parsed);
@@ -329,6 +467,13 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         "--follow" => parsed.follow = true,
         "--strict" => parsed.strict = true,
         "--force" => parsed.force = true,
+        "--turns" => parsed.turns = true,
+        "--evidence" => parsed.evidence = true,
+        "--include-artifacts" => parsed.include_artifacts = true,
+        "--apply" => parsed.apply = true,
+        "--all" => parsed.all = true,
+        "--capabilities" => parsed.capabilities = true,
+        "--dry-run" => parsed.dry_run = true,
         _ => return false,
     }
     true
@@ -350,9 +495,42 @@ fn apply_value_flag(
                     .map_err(|_| usage("--trials must be an integer"))?,
             );
         }
+        "--limit" => {
+            parsed.limit = Some(
+                value(arguments, argument)?
+                    .parse()
+                    .map_err(|_| usage("--limit must be a non-negative integer"))?,
+            );
+        }
+        "--max-bytes" => {
+            parsed.max_bytes = Some(
+                value(arguments, argument)?
+                    .parse()
+                    .map_err(|_| usage("--max-bytes must be a non-negative integer"))?,
+            );
+        }
         "--out" => parsed.out = Some(PathBuf::from(value(arguments, argument)?)),
         "--source" => parsed.source = Some(value(arguments, argument)?),
         "--event" => parsed.event = Some(value(arguments, argument)?),
+        "--to" => parsed.to = Some(value(arguments, argument)?),
+        "--at" => parsed.at = Some(value(arguments, argument)?),
+        "--retention" => parsed.retention = Some(value(arguments, argument)?),
+        "--resource" => parsed.resource = Some(value(arguments, argument)?),
+        "--actor" => parsed.actor = Some(value(arguments, argument)?),
+        "--provider" => parsed.provider = Some(value(arguments, argument)?),
+        "--capability" => parsed.capability = Some(value(arguments, argument)?),
+        "--transport" => parsed.transport = Some(value(arguments, argument)?),
+        "--protocol" => parsed.protocol = Some(value(arguments, argument)?),
+        "--command" => parsed.command = Some(value(arguments, argument)?),
+        "--url" => parsed.url = Some(value(arguments, argument)?),
+        "--scope" => parsed.scope = Some(value(arguments, argument)?),
+        "--timeout" => {
+            parsed.timeout = Some(
+                value(arguments, argument)?
+                    .parse()
+                    .map_err(|_| usage("--timeout must be a whole number of seconds"))?,
+            );
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -755,7 +933,93 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             Ok(0)
         }
         Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::SessionList { limit } => session::list(invocation, *limit, emitter),
+        Command::SessionShow {
+            session,
+            turns,
+            evidence,
+        } => session::show(invocation, *session, *turns, *evidence, emitter),
+        Command::SessionExport {
+            session,
+            out,
+            include_artifacts,
+        } => session::export(
+            invocation,
+            *session,
+            out.as_deref(),
+            *include_artifacts,
+            emitter,
+        ),
+        Command::SessionBranch { session, at, mode } => {
+            session::branch(invocation, *session, *at, *mode, emitter)
+        }
+        Command::ArtifactShow {
+            reference,
+            max_bytes,
+        } => evidence::show(invocation, *reference, *max_bytes, emitter),
+        Command::ArtifactExport { reference, out } => {
+            evidence::export(invocation, *reference, out, emitter)
+        }
+        Command::Gc {
+            apply,
+            retention_ms,
+        } => evidence::collect(invocation, *apply, *retention_ms, emitter),
+        Command::PolicyExplain {
+            operation,
+            resource,
+            actor,
+        } => policy::explain(
+            invocation,
+            operation,
+            resource.as_deref(),
+            actor.as_deref(),
+            emitter,
+        ),
+        Command::McpAdd { server, scope } => mcp::add(invocation, server, *scope, emitter),
+        Command::McpRemove { name, scope } => mcp::remove(invocation, name, *scope, emitter),
+        Command::McpEnable {
+            name,
+            enabled,
+            scope,
+        } => mcp::set_enabled(invocation, name, *enabled, *scope, emitter),
+        Command::McpTest { name, timeout_ms } => mcp::test(invocation, name, *timeout_ms, emitter),
+        Command::SkillList { source } => extensions::skills(invocation, source.as_deref(), emitter),
+        Command::PluginList { capabilities } => {
+            extensions::list(invocation, *capabilities, emitter)
+        }
+        Command::PluginInstall { source, force } => {
+            extensions::install(invocation, source, *force, tty, emitter)
+        }
+        Command::PluginInspect { id } => extensions::inspect(invocation, id, emitter),
+        Command::PluginRemove { id } => extensions::remove(invocation, id, emitter),
+        Command::PluginRefresh { id, dry_run } => {
+            extensions::refresh(invocation, id.as_deref(), *dry_run, emitter)
+        }
+        Command::Serve => serve::run(invocation, emitter),
+        Command::ProviderList { all } => provider::list(invocation, *all, emitter),
+        Command::ModelList {
+            provider,
+            capability,
+        } => provider::models(
+            invocation,
+            provider.as_deref(),
+            capability.as_deref(),
+            emitter,
+        ),
     }
+}
+
+/// A redactor that knows every credential this workspace has stored, installed
+/// on the emitter so anything it prints goes through the same pipeline.
+fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, Diagnostic> {
+    let mut broker = SecretBroker::new();
+    broker.register_store(Box::new(OsCredentialStore));
+    broker.register_store(Box::new(FileCredentialStore));
+    for record in catalog(CatalogStore::resolve(invocation))? {
+        broker.resolve(&record.handle).map_err(secret_failed)?;
+    }
+    emitter.install_redactor(broker.redactor().clone());
+    Ok(broker.redactor().clone())
 }
 
 fn compat_explain(
@@ -2575,13 +2839,18 @@ fn run_turn(
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    // Where the conversation stood before this turn. A turn that fails or is
+    // stopped rewinds to here, which is more than one message once the turn
+    // has run tools.
+    let base = conversation.len();
     conversation.push(ModelMessage {
         role: ModelRole::User,
         content: vec![ModelContent::Text { text: task.clone() }],
     });
     let outcome = match native.filter(|_| !route.is_codex()) {
-        Some(resolved) => native_status(
+        Some(resolved) => native_turn(
             resolved,
+            &workspace_root(&invocation.workspace)?,
             conversation,
             route,
             effort,
@@ -2627,7 +2896,7 @@ fn run_turn(
         }
     };
     if turn.interrupted {
-        conversation.pop();
+        conversation.truncate(base);
         // Stopping a turn is a decision, not a fault: the turn is recorded as
         // failed for the audit trail, but the terminal already said so with an
         // `Interrupted` row and does not need a diagnostic on top.
@@ -2675,7 +2944,7 @@ fn run_turn(
             );
         }
         Some(failure) => {
-            conversation.pop();
+            conversation.truncate(base);
             fail_turn(
                 &service,
                 actor,
@@ -2690,7 +2959,190 @@ fn run_turn(
     Ok(turn)
 }
 
-/// Stream one turn from a configured provider, keeping the composer alive.
+/// How many times one turn may come back asking to run tools. The bound is
+/// what stops a model that answers every result with another call from
+/// spending a session on its own loop.
+#[cfg(feature = "tui")]
+const MAX_TOOL_ROUNDS: usize = 24;
+
+/// What the operator said about one tool call.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Answer {
+    Yes,
+    /// Refuse this call; the turn carries on and can propose something else.
+    No,
+    /// Refuse this call and end the turn. Declining one call at a time is no
+    /// way out of a model that keeps asking, so Ctrl-C stops the turn here as
+    /// it does while the provider is streaming.
+    Stop,
+}
+
+/// Run a turn on a configured provider, executing the tools it asks for.
+///
+/// Each round is one request. A round that ends without tool calls is the
+/// answer; a round that asks for tools runs the confirmed ones, appends the
+/// call and its result to the conversation, and asks again.
+///
+/// Nothing runs unconfirmed: every call is shown and answered from the
+/// keyboard, and a declined call is reported to the model as a failed result
+/// rather than hidden, so it can say what it would do instead.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn native_turn(
+    resolved: &provider::Resolved,
+    workspace: &Path,
+    conversation: &mut Vec<ModelMessage>,
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    colour: bool,
+    footer: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+) -> io::Result<Turn> {
+    // One turn now costs one request per round, so the tokens are summed
+    // rather than taken from the last one: an audit that reads a tool-using
+    // turn as the price of its final request under-reports what it cost.
+    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    let charge = |outcome: &mut Turn, input: &mut u64, output: &mut u64| {
+        *input += outcome.usage["input_tokens"].as_u64().unwrap_or_default();
+        *output += outcome.usage["output_tokens"].as_u64().unwrap_or_default();
+        if *input > 0 || *output > 0 {
+            outcome.usage = json!({"input_tokens": *input, "output_tokens": *output});
+        }
+    };
+    for round in 0..MAX_TOOL_ROUNDS {
+        let mut outcome = native_status(
+            resolved,
+            conversation,
+            route,
+            effort,
+            turn,
+            round,
+            colour,
+            footer,
+            keys,
+            decoder,
+            composer,
+        )?;
+        charge(&mut outcome, &mut input_tokens, &mut output_tokens);
+        if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
+            return Ok(outcome);
+        }
+        // The calls are history now, whatever the operator decides about them:
+        // a provider that sent a call and never sees its result rejects the
+        // next request.
+        let calls = std::mem::take(&mut outcome.calls);
+        let mut content: Vec<ModelContent> = Vec::new();
+        if !outcome.response.trim().is_empty() {
+            content.push(ModelContent::Text {
+                text: outcome.response.clone(),
+            });
+        }
+        content.extend(
+            calls
+                .iter()
+                .map(|(id, name, arguments)| ModelContent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+        );
+        conversation.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content,
+        });
+
+        let mut results = Vec::with_capacity(calls.len());
+        let mut terminal = io::stdout();
+        for (id, name, arguments) in &calls {
+            let summary = tools::summarize(name, arguments);
+            // Once the turn is stopped the remaining calls are still answered,
+            // because a call the provider sent needs a result; they are simply
+            // answered without running anything.
+            let answer = if outcome.interrupted {
+                Answer::No
+            } else {
+                confirm_tool(&mut terminal, colour, name, &summary, keys, decoder)?
+            };
+            let (content, is_error) = match answer {
+                Answer::No => ("The operator declined to run this call.".to_owned(), true),
+                Answer::Stop => {
+                    outcome.interrupted = true;
+                    writeln!(terminal, "{}", tui::interrupted_row(colour))?;
+                    ("The operator stopped the turn.".to_owned(), true)
+                }
+                Answer::Yes => match tools::execute(workspace, name, arguments) {
+                    Ok(output) => (output, false),
+                    Err(error) => (error, true),
+                },
+            };
+            let detail = content.lines().next_back().unwrap_or_default();
+            writeln!(
+                terminal,
+                "{}",
+                tui::tool_result_row(colour, name, !is_error, detail)
+            )?;
+            terminal.flush()?;
+            results.push(ModelContent::ToolResult {
+                id: id.clone(),
+                content,
+                is_error,
+            });
+        }
+        conversation.push(ModelMessage {
+            role: ModelRole::User,
+            content: results,
+        });
+        // The response of a round that called tools belongs to the history
+        // above, not to the answer this turn returns.
+        outcome.response.clear();
+        if outcome.interrupted {
+            return Ok(outcome);
+        }
+        if round + 1 == MAX_TOOL_ROUNDS {
+            outcome.failure = Some(format!(
+                "{route} asked for tools {MAX_TOOL_ROUNDS} times without finishing the turn"
+            ));
+            return Ok(outcome);
+        }
+    }
+    Ok(Turn::default())
+}
+
+/// Ask the operator whether one tool call may run.
+///
+/// `y` runs it and anything else does not, because the safe answer is the one
+/// a mistyped key gives.
+#[cfg(feature = "tui")]
+fn confirm_tool(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    name: &str,
+    summary: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> io::Result<Answer> {
+    writeln!(terminal, "{}", tui::tool_prompt_row(colour, name, summary))?;
+    terminal.flush()?;
+    loop {
+        match keys.recv() {
+            Ok(byte) => match decoder.feed(byte) {
+                Some(tui::Key::Char('y' | 'Y')) => return Ok(Answer::Yes),
+                Some(tui::Key::Char(_)) => return Ok(Answer::No),
+                Some(tui::Key::Interrupt | tui::Key::Eof) => return Ok(Answer::Stop),
+                _ => continue,
+            },
+            // The key reader is gone, so no answer can arrive and none will.
+            Err(_) => return Ok(Answer::Stop),
+        }
+    }
+}
+
+/// Stream one round of a turn from a configured provider, keeping the composer
+/// alive.
 ///
 /// The stream runs on its own thread for the same reason the Codex reader
 /// does: the main loop has to keep watching the key stream, which is what lets
@@ -2706,6 +3158,7 @@ fn native_status(
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
+    round: usize,
     colour: bool,
     footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -2719,12 +3172,13 @@ fn native_status(
         },
         system: None,
         messages: conversation.to_vec(),
-        // As in `arsy run`: operations are not dispatched from here yet, so a
-        // tool offered now would have nowhere to run.
-        tools: Vec::new(),
+        tools: tools::schemas(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
         effort,
-        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(turn.to_string())
+        // One turn can take several requests, one per round of tool calls. The
+        // round is part of the key, because a retry must repeat its own
+        // request rather than collapse into the one before it.
+        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
             .map_err(io::Error::other)?,
     };
 
@@ -2753,9 +3207,16 @@ fn native_status(
                     input_tokens,
                     output_tokens,
                 }),
-                Ok(ModelEvent::ToolCallCompleted { name, .. }) => Err(format!(
-                    "the model called the tool `{name}`, which this path cannot run yet"
-                )),
+                Ok(ModelEvent::ToolCallCompleted {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                }) => Ok(Streamed::Tool {
+                    id,
+                    name,
+                    arguments,
+                }),
                 Ok(_) => continue,
                 Err(error) => Err(error.to_string()),
             };
@@ -2921,6 +3382,14 @@ fn native_status(
                 outcome.usage =
                     json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
             }
+            Ok(Ok(Streamed::Tool {
+                id,
+                name,
+                arguments,
+            })) => {
+                outcome.calls.push((id, name, arguments));
+                first_event = true;
+            }
             Ok(Err(failure)) => {
                 outcome.failure = Some(failure);
                 break;
@@ -2984,6 +3453,13 @@ enum Streamed {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// A complete tool call. The host runs it after the stream ends, so a turn
+    /// is never edited from under a model that is still writing.
+    Tool {
+        id: String,
+        name: String,
+        arguments: Value,
     },
 }
 
@@ -3075,7 +3551,9 @@ fn drive_provider(
     let started = std::time::Instant::now();
     let mut cancelling = None;
     let mut stream_closed = false;
-    let mut finished = false;
+    let mut finished = None;
+    let mut last_event = std::time::Instant::now();
+    let mut stopped_early = false;
     let mut last_row = None;
     let mut last_key = std::time::Instant::now();
     let mut exited = None;
@@ -3125,6 +3603,23 @@ fn drive_provider(
         if exited
             .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
         {
+            break;
+        }
+        // The turn is over when the provider says it is over. A CLI that
+        // lingers after its terminal event — cleaning up a session, flushing
+        // telemetry — must not keep the clock running against the answer that
+        // is already on screen.
+        //
+        // Trailing rows still land: the stream drains until it has been quiet
+        // for 250ms, and no longer than 2 seconds however talkative it stays.
+        if status.is_none()
+            && finished.is_some_and(|at: std::time::Instant| {
+                last_event.elapsed() >= std::time::Duration::from_millis(250)
+                    || at.elapsed() >= std::time::Duration::from_secs(2)
+            })
+        {
+            stopped_early = true;
+            child.stop(false);
             break;
         }
         if started.elapsed() >= std::time::Duration::from_secs(300) {
@@ -3255,6 +3750,7 @@ fn drive_provider(
         match events.recv_timeout(std::time::Duration::from_millis(40)) {
             Ok(_) if outcome.interrupted => {}
             Ok(line) => {
+                last_event = std::time::Instant::now();
                 let line = line?;
                 let line = redactor.sanitize(&line).map_err(io::Error::other)?;
                 let event = serde_json::from_str::<Value>(&line)
@@ -3262,8 +3758,9 @@ fn drive_provider(
                 if matches!(
                     event["type"].as_str(),
                     Some("turn.completed" | "turn.failed")
-                ) {
-                    finished = true;
+                ) && finished.is_none()
+                {
+                    finished = Some(std::time::Instant::now());
                 }
                 outcome.provider_failed |= event["type"] == "turn.failed";
                 // A killed provider still flushes buffered events; showing them
@@ -3307,7 +3804,7 @@ fn drive_provider(
     }
     write!(terminal, "{}", composer.clear())?;
     terminal.flush()?;
-    if !outcome.interrupted && !finished {
+    if !outcome.interrupted && finished.is_none() {
         let detail = error_output
             .recv_timeout(std::time::Duration::from_millis(100))
             .unwrap_or_default();
@@ -3322,11 +3819,29 @@ fn drive_provider(
     if !outcome.interrupted {
         let status = match status {
             Some(status) => status,
+            // The turn ended before the process did, so the process is asked to
+            // leave and then made to: waiting on a CLI that ignores the signal
+            // is the hang this exit was added to avoid.
+            None if stopped_early => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                loop {
+                    if let Some(status) = child.0.try_wait()? {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        child.stop(true);
+                        break child.0.wait()?;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
             None => child.0.wait()?,
         };
         outcome.failure = if outcome.provider_failed {
             Some(format!("{route} reported a failed turn"))
-        } else if status.success() {
+        // A signal ARSY sent after a completed turn is its own exit code, not a
+        // verdict on the turn the provider already reported.
+        } else if status.success() || stopped_early {
             None
         } else {
             Some(format!("{route} exited with status {status}"))
@@ -3351,6 +3866,10 @@ struct Turn {
     /// A line submitted while this turn was still running.
     queued: std::collections::VecDeque<String>,
     quit: bool,
+    /// Tool calls the model made and the host has not run yet: id, name, and
+    /// arguments. Only complete calls land here, so a truncated stream cannot
+    /// leave a half-parsed call to execute.
+    calls: Vec<(String, String, Value)>,
 }
 #[cfg(feature = "tui")]
 /// Record and report a turn the provider did not complete.
@@ -3573,15 +4092,9 @@ fn prepare_task(
     if task.trim().is_empty() {
         return Err(usage("run requires a non-empty task"));
     }
-    let mut broker = SecretBroker::new();
-    broker.register_store(Box::new(OsCredentialStore));
-    broker.register_store(Box::new(FileCredentialStore));
-    for record in catalog(CatalogStore::resolve(invocation))? {
-        broker.resolve(&record.handle).map_err(secret_failed)?;
-    }
-    let task = broker.redactor().sanitize(task).map_err(secret_failed)?;
-    emitter.install_redactor(broker.redactor().clone());
-    Ok(task)
+    redactor(invocation, emitter)?
+        .sanitize(task)
+        .map_err(secret_failed)
 }
 
 fn record_turn(
@@ -3707,6 +4220,17 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
                 "kind": resolved.endpoint.kind.as_str(),
                 "base_url": resolved.endpoint.base_url,
                 "credential_source": resolved.source.as_str(),
+                // Present only when `provider.default = "auto"` left the choice
+                // to routing; naming the criterion is what makes the choice
+                // reviewable rather than surprising.
+                "routing": resolved.route.as_ref().map(|decision| match decision {
+                    arsy_kernel::routing::Decision::Routed { key, reasons, excluded } => json!({
+                        "model": key.to_string(),
+                        "reasons": reasons,
+                        "excluded": excluded.len(),
+                    }),
+                    other => serde_json::to_value(other).unwrap_or(Value::Null),
+                }),
             }),
             Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
         },
@@ -3825,6 +4349,323 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    /// A provider that replays a scripted round per request and records what
+    /// it was asked, so a test can assert on the conversation the loop built.
+    #[cfg(feature = "tui")]
+    struct Scripted {
+        descriptor: arsy_kernel::provider::ProviderDescriptor,
+        rounds: std::sync::Mutex<std::collections::VecDeque<Vec<ModelEvent>>>,
+        seen: std::sync::Mutex<Vec<CanonicalModelRequest>>,
+    }
+
+    #[cfg(feature = "tui")]
+    impl arsy_kernel::provider::ModelProvider for Scripted {
+        fn descriptor(&self) -> &arsy_kernel::provider::ProviderDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &self,
+            request: &CanonicalModelRequest,
+        ) -> Result<arsy_kernel::provider::ModelEventStream, arsy_kernel::provider::ProviderError>
+        {
+            self.seen.lock().unwrap().push(request.clone());
+            let events = self.rounds.lock().unwrap().pop_front().unwrap_or_default();
+            Ok(Box::new(events.into_iter().map(Ok)))
+        }
+    }
+
+    #[cfg(feature = "tui")]
+    fn resolved(rounds: Vec<Vec<ModelEvent>>) -> (provider::Resolved, std::sync::Arc<Scripted>) {
+        let scripted = std::sync::Arc::new(Scripted {
+            descriptor: arsy_kernel::provider::ProviderDescriptor {
+                id: "stub".to_owned(),
+                max_retries: 0,
+            },
+            rounds: std::sync::Mutex::new(rounds.into()),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let resolved = provider::Resolved {
+            provider: scripted.clone(),
+            endpoint: arsy_kernel::config::Endpoint {
+                id: "stub".to_owned(),
+                kind: arsy_kernel::config::Dialect::Openai,
+                base_url: "https://stub.invalid/v1".to_owned(),
+                credential: None,
+                api_key_env: None,
+                model: Some("m".to_owned()),
+                models: vec!["m".to_owned()],
+                max_output_tokens: 64,
+                oauth: None,
+            },
+            source: provider::CredentialSource::DefaultEnv,
+            route: None,
+        };
+        (resolved, scripted)
+    }
+
+    #[cfg(feature = "tui")]
+    fn route() -> tui::ModelRoute {
+        tui::ModelRoute {
+            provider: "stub".to_owned(),
+            model: "m".to_owned(),
+        }
+    }
+
+    /// Answers typed at the confirmation prompt. Keys sent while a round is
+    /// still streaming belong to the composer, exactly as they do in a
+    /// session, so the answers are sent once the prompt is up.
+    #[cfg(feature = "tui")]
+    fn typed(
+        answers: &'static [u8],
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<u8>) {
+        let (sender, keys) = std::sync::mpsc::channel();
+        let typist = std::thread::spawn(move || {
+            for answer in answers {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if sender.send(*answer).is_err() {
+                    return;
+                }
+            }
+            // The sender stays alive: a confirmation that never comes must
+            // block, not read as a hung-up keyboard.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(sender);
+        });
+        (typist, keys)
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_confirmed_tool_call_runs_and_its_result_goes_back_to_the_model() {
+        let workspace = tempfile::tempdir().unwrap();
+        let patch =
+            "*** Begin Patch\n*** Add File: note.txt\n+written by the tool loop\n*** End Patch\n";
+        let (resolved, scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: json!({ "patch": patch }),
+                },
+                ModelEvent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Usage {
+                    input_tokens: 300,
+                    output_tokens: 5,
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let (typist, keys) = typed(b"y");
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "write a note".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &resolved,
+            workspace.path(),
+            &mut conversation,
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+        )
+        .unwrap();
+        typist.join().unwrap();
+
+        assert_eq!(turn.response.trim(), "done");
+        // Both requests are charged to the turn, not just the last one.
+        assert_eq!(
+            turn.usage,
+            json!({"input_tokens": 400, "output_tokens": 15})
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("note.txt")).unwrap(),
+            "written by the tool loop\n"
+        );
+        // The call and its result are both history, in that order.
+        assert!(matches!(
+            conversation[1].content.first(),
+            Some(ModelContent::ToolCall { name, .. }) if name == "apply_patch"
+        ));
+        assert!(matches!(
+            conversation[2].content.first(),
+            Some(ModelContent::ToolResult { is_error: false, content, .. })
+                if content.contains("added note.txt")
+        ));
+        // Both requests offered the tools, and the second carried the result.
+        let seen = scripted.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the loop asked again after the tool ran");
+        assert_eq!(
+            seen[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["bash", "apply_patch"]
+        );
+        assert_eq!(seen[1].messages.len(), 3);
+        assert_ne!(
+            seen[0].idempotency_key, seen[1].idempotency_key,
+            "each round is its own request"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_declined_tool_call_does_not_run_and_the_model_is_told_so() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (resolved, _scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "touch escaped"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "understood\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        // Anything but `y` declines; `n` is what an operator would type.
+        let (typist, keys) = typed(b"n");
+        let mut conversation = Vec::new();
+        let turn = native_turn(
+            &resolved,
+            workspace.path(),
+            &mut conversation,
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+        )
+        .unwrap();
+        typist.join().unwrap();
+
+        assert_eq!(turn.response.trim(), "understood");
+        assert!(
+            !turn.interrupted,
+            "declining one call is not a stopped turn"
+        );
+        assert!(
+            !workspace.path().join("escaped").exists(),
+            "a declined command must not run"
+        );
+        assert!(matches!(
+            conversation[1].content.first(),
+            Some(ModelContent::ToolResult { is_error: true, content, .. })
+                if content.contains("declined")
+        ));
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn ctrl_c_at_the_prompt_stops_the_turn_instead_of_declining_one_call() {
+        let workspace = tempfile::tempdir().unwrap();
+        // Two calls in one round, and a second round that would follow. Neither
+        // may run, and the loop must not ask the provider again.
+        let asking = || {
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "touch first"}),
+                },
+                ModelEvent::ToolCallCompleted {
+                    index: 1,
+                    id: "call-2".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "touch second"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ]
+        };
+        let (resolved, scripted) = resolved(vec![asking(), asking()]);
+        let (typist, keys) = typed(b"\x03");
+        let mut conversation = Vec::new();
+        // A stop is answered by the stop, not by waiting for the keyboard to
+        // hang up: the calls after it are refused without asking.
+        let started = std::time::Instant::now();
+        let turn = native_turn(
+            &resolved,
+            workspace.path(),
+            &mut conversation,
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+        )
+        .unwrap();
+        // Measured before the typist is joined, which outlives the turn on
+        // purpose so an unanswered prompt blocks rather than reading as a
+        // hung-up keyboard.
+        let took = started.elapsed();
+        typist.join().unwrap();
+
+        assert!(turn.interrupted, "Ctrl-C at the prompt ends the turn");
+        assert!(
+            took < std::time::Duration::from_millis(1500),
+            "the stop did not carry to the calls after it: {took:?}"
+        );
+        assert!(!workspace.path().join("first").exists());
+        assert!(
+            !workspace.path().join("second").exists(),
+            "the calls after the stop must not run either"
+        );
+        assert_eq!(
+            scripted.seen.lock().unwrap().len(),
+            1,
+            "a stopped turn does not ask the provider again"
+        );
+        // Every call still has a result, because a provider that sent one and
+        // never sees an answer rejects the next request.
+        let results = &conversation[1].content;
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|content| matches!(content, ModelContent::ToolResult { is_error: true, .. })));
+    }
 
     #[cfg(feature = "tui")]
     #[test]
@@ -4504,6 +5345,43 @@ mod tests {
         assert!(
             result.failure.is_some(),
             "a failed turn is recorded as a failure, not a completion"
+        );
+
+        // A provider that reports its turn complete and then lingers must not
+        // hold the session: the answer is on screen, so the clock stops with
+        // the turn rather than with the process. The stub ignores TERM, which
+        // is what makes the wait for it a hang instead of a pause.
+        let (_sender, keys) = std::sync::mpsc::channel();
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "read task; printf '%s\\n' '{\"type\":\"turn.completed\"}'; trap '' TERM; sleep 30",
+        ]);
+        let started = Instant::now();
+        let result = drive_provider(
+            command,
+            "task\n",
+            &route,
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a completed turn waited on the provider process"
+        );
+        assert!(
+            result.failure.is_none(),
+            "stopping a lingering provider is not a failed turn: {:?}",
+            result.failure
+        );
+        assert!(
+            !result.interrupted,
+            "the turn completed, it was not cancelled"
         );
     }
 

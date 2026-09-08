@@ -15,6 +15,7 @@ use arsy_kernel::{
         http::HttpTransport, openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider,
         wire::ApiKey, ModelProvider,
     },
+    routing,
     secret::{
         CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretError,
         SecretHandle, FILE_STORE_ID, OS_STORE_ID,
@@ -62,6 +63,9 @@ pub struct Resolved {
     pub provider: Arc<dyn ModelProvider>,
     pub endpoint: Endpoint,
     pub source: CredentialSource,
+    /// Present when routing chose the endpoint rather than configuration
+    /// naming it, so a caller can report which criterion decided.
+    pub route: Option<routing::Decision>,
 }
 
 /// Build the provider for `requested`, or for the configured default.
@@ -72,18 +76,115 @@ pub struct Resolved {
 /// one that holds a value wins, so exporting a key for one shell is enough to
 /// override a stored one without editing anything.
 pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Diagnostic> {
-    let endpoint = config.endpoint(requested).cloned().ok_or_else(|| {
-        Diagnostic::error(
-            ARSY_PRV_1000,
-            match requested.or_else(|| config.provider_default()) {
-                Some(id) => format!("no provider endpoint named `{id}` is configured"),
-                None => "no provider endpoint is configured".to_owned(),
-            },
-            "add a `[provider.endpoint.<name>]` table with `kind` and `base_url` to the user \
-             config.toml, then run `arsy config explain provider`",
-        )
-    })?;
+    let (endpoint, route) = resolve_with_route(config, requested)?;
+    build(endpoint, route)
+}
 
+/// The endpoint a turn should use, and the routing decision that chose it.
+///
+/// Configuration selects an endpoint by name; `provider.default = "auto"` — the
+/// documented default — leaves the choice to routing, which picks between the
+/// endpoints policy already allows and never outside them.
+pub fn resolve_with_route(
+    config: &Config,
+    requested: Option<&str>,
+) -> Result<(Endpoint, Option<routing::Decision>), Diagnostic> {
+    if let Some(id) = requested
+        .or_else(|| config.provider_default())
+        .filter(|id| *id != "auto")
+    {
+        // A named provider is used as named, or reported as missing. Routing
+        // must never substitute another one for the one that was asked for.
+        return config
+            .endpoint(Some(id))
+            .cloned()
+            .map(|endpoint| (endpoint, None))
+            .ok_or_else(|| unconfigured(Some(id)));
+    }
+    // Every unnamed choice goes through routing, including the single-endpoint
+    // one: that is where `model.allowed` is applied, and an endpoint whose only
+    // model a ceiling excludes must not be selected just because it is alone.
+    let decision = route(config);
+    let Some(key) = decision.key() else {
+        let routing::Decision::Refused { reason, excluded } = &decision else {
+            unreachable!("only a refusal has no key")
+        };
+        return Err(Diagnostic::error(
+            ARSY_PRV_1000,
+            format!("no provider could be routed to: {reason}"),
+            excluded.first().map_or_else(
+                || {
+                    "configure a `[provider.endpoint.<name>]` table, or set `provider.default`"
+                        .to_owned()
+                },
+                |first| format!("{} was excluded because {}", first.key, first.reason),
+            ),
+        ));
+    };
+    let endpoint = config
+        .endpoint(Some(&key.provider))
+        .cloned()
+        .ok_or_else(|| unconfigured(Some(&key.provider)))?;
+    Ok((endpoint, Some(decision)))
+}
+
+/// Rank the allowed endpoints. One candidate per endpoint, keyed by the model
+/// it would use, because an endpoint is what carries the URL and the credential.
+fn route(config: &Config) -> routing::Decision {
+    // The ceilings are passed to the router rather than applied here, so an
+    // endpoint policy excluded is reported as excluded instead of vanishing.
+    let candidates: Vec<routing::Candidate> = config
+        .all_endpoints()
+        .filter_map(|endpoint| {
+            let model = endpoint
+                .model
+                .clone()
+                .or_else(|| config.model_default().map(str::to_owned))?;
+            Some(routing::Candidate {
+                key: arsy_kernel::provider::ModelKey {
+                    provider: endpoint.id.clone(),
+                    model,
+                },
+                capabilities: arsy_kernel::model_profile::declared(Some(u64::from(
+                    endpoint.max_output_tokens,
+                ))),
+                residency: None,
+                cost_micros_per_1k: None,
+            })
+        })
+        .collect();
+    routing::decide(
+        &candidates,
+        &routing::Constraints {
+            allowed_providers: config.provider_allowed().cloned().unwrap_or_default(),
+            allowed_models: config.model_allowed().cloned().unwrap_or_default(),
+            ..routing::Constraints::default()
+        },
+        // Nothing is persisted across processes yet, so a routed choice is
+        // decided by policy and by the deterministic tie-break rather than by
+        // measurements this run has not taken.
+        &routing::Observations::new(),
+        &routing::Preference {
+            route: true,
+            ..routing::Preference::default()
+        },
+    )
+}
+
+fn unconfigured(named: Option<&str>) -> Diagnostic {
+    Diagnostic::error(
+        ARSY_PRV_1000,
+        match named {
+            Some(id) => format!("no provider endpoint named `{id}` is configured"),
+            None => "no provider endpoint is configured".to_owned(),
+        },
+        "add a `[provider.endpoint.<name>]` table with `kind` and `base_url` to the user \
+         config.toml, then run `arsy config explain provider`",
+    )
+}
+
+/// Assemble the adapter for a chosen endpoint: credential, redaction, dialect.
+fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolved, Diagnostic> {
     let (secret, source) = credential(&endpoint, &from_env)?;
     let mut redactor = Redactor::new();
     // Registering here, rather than at the wire, means a key echoed back into
@@ -120,6 +221,7 @@ pub fn resolve(config: &Config, requested: Option<&str>) -> Result<Resolved, Dia
         provider,
         endpoint,
         source,
+        route,
     })
 }
 
@@ -300,6 +402,231 @@ fn credential_failed(provider: &str, error: impl ToString) -> Diagnostic {
         ),
         "unlock the OS credential store, or re-run `arsy auth set` for this provider",
     )
+}
+
+// -- Discovery -------------------------------------------------------------
+//
+// `arsy provider list` and `arsy model list` read configuration only. Neither
+// contacts a provider, and neither resolves a credential: reporting which
+// endpoints exist must not cost a keychain unlock or a billable request.
+
+pub(crate) fn parse_list(arguments: &crate::ParsedArguments) -> Result<crate::Command, Diagnostic> {
+    match arguments.positional.first().map(String::as_str) {
+        Some("list") if arguments.positional.len() == 1 => {
+            Ok(crate::Command::ProviderList { all: arguments.all })
+        }
+        _ => Err(crate::usage("provider requires `list` [--all]")),
+    }
+}
+
+pub(crate) fn parse_models(
+    arguments: &crate::ParsedArguments,
+) -> Result<crate::Command, Diagnostic> {
+    match arguments.positional.first().map(String::as_str) {
+        Some("list") if arguments.positional.len() == 1 => Ok(crate::Command::ModelList {
+            provider: arguments.provider.clone(),
+            capability: arguments.capability.clone(),
+        }),
+        _ => Err(crate::usage(
+            "model requires `list` [--provider <ID>] [--capability <NAME>]",
+        )),
+    }
+}
+
+pub(crate) fn list(
+    invocation: &crate::Invocation,
+    all: bool,
+    emitter: &mut crate::Emitter,
+) -> Result<i32, Diagnostic> {
+    let config = configuration(invocation)?;
+    let report = provider_report(&config, all);
+    emitter.result(if emitter.output == crate::Output::Json {
+        report
+    } else {
+        serde_json::json!({"providers": human_providers(&report)})
+    });
+    Ok(0)
+}
+
+fn provider_report(config: &Config, all: bool) -> serde_json::Value {
+    let ceiling = config.provider_allowed();
+    let providers: Vec<_> = config
+        .all_endpoints()
+        .filter(|endpoint| all || config.provider_is_allowed(&endpoint.id))
+        .map(|endpoint| {
+            serde_json::json!({
+                "id": endpoint.id,
+                "kind": endpoint.kind.as_str(),
+                "base_url": endpoint.base_url,
+                "allowed": config.provider_is_allowed(&endpoint.id),
+                "default": config.provider_default() == Some(endpoint.id.as_str()),
+                "models": endpoint.models,
+                "credential": endpoint.credential.as_ref().map(ToString::to_string),
+                "api_key_env": endpoint.api_key_env,
+                "oauth": endpoint.oauth.is_some(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "providers": providers,
+        "ceiling": ceiling.map(|allowed| allowed.iter().cloned().collect::<Vec<_>>()),
+        "includes_disallowed": all,
+    })
+}
+
+pub(crate) fn models(
+    invocation: &crate::Invocation,
+    provider: Option<&str>,
+    capability: Option<&str>,
+    emitter: &mut crate::Emitter,
+) -> Result<i32, Diagnostic> {
+    let config = configuration(invocation)?;
+    let report = model_report(&config, provider, capability)?;
+    emitter.result(if emitter.output == crate::Output::Json {
+        report
+    } else {
+        serde_json::json!({"models": human_models(&report)})
+    });
+    Ok(0)
+}
+
+fn model_report(
+    config: &Config,
+    provider: Option<&str>,
+    capability: Option<&str>,
+) -> Result<serde_json::Value, Diagnostic> {
+    if let Some(name) = capability {
+        if !arsy_kernel::model_profile::DECLARED_CAPABILITIES.contains(&name) {
+            return Err(crate::usage(format!(
+                "`{name}` is not a declared capability; this build declares {}",
+                arsy_kernel::model_profile::DECLARED_CAPABILITIES.join(", ")
+            )));
+        }
+    }
+    let mut models = Vec::new();
+    for endpoint in config.all_endpoints() {
+        if provider.is_some_and(|id| id != endpoint.id) || !config.provider_is_allowed(&endpoint.id)
+        {
+            continue;
+        }
+        let declared =
+            arsy_kernel::model_profile::declared(Some(u64::from(endpoint.max_output_tokens)));
+        for model in &endpoint.models {
+            if !config.model_is_allowed(model) {
+                continue;
+            }
+            if capability.is_some_and(|name| {
+                declared.get(name).map(|value| value.state)
+                    != Some(arsy_kernel::model_profile::CapabilityState::Supported)
+            }) {
+                continue;
+            }
+            models.push(serde_json::json!({
+                "provider": endpoint.id,
+                "model": model,
+                "kind": endpoint.kind.as_str(),
+                "default": endpoint.model.as_deref() == Some(model.as_str()),
+                "max_output_tokens": endpoint.max_output_tokens,
+                "capabilities": declared,
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "models": models,
+        "provider_filter": provider,
+        "capability_filter": capability,
+        "ceiling": config
+            .model_allowed()
+            .map(|allowed| allowed.iter().cloned().collect::<Vec<_>>()),
+    }))
+}
+
+fn configuration(invocation: &crate::Invocation) -> Result<Config, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    crate::load_config(&root, &working)
+}
+
+fn human_providers(report: &serde_json::Value) -> String {
+    let providers = report["providers"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if providers.is_empty() {
+        return "No provider endpoint is configured.".to_owned();
+    }
+    let mut text = format!("{} provider endpoint(s)\n", providers.len());
+    for provider in providers {
+        text.push_str(&format!(
+            "\n  {}{} · {} · {}\n    models: {}\n",
+            provider["id"].as_str().unwrap_or("?"),
+            if provider["default"] == serde_json::Value::Bool(true) {
+                " (default)"
+            } else {
+                ""
+            },
+            provider["kind"].as_str().unwrap_or("?"),
+            provider["base_url"].as_str().unwrap_or("?"),
+            provider["models"]
+                .as_array()
+                .map(|models| models
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .filter(|listed| !listed.is_empty())
+                .unwrap_or_else(|| "none configured".to_owned()),
+        ));
+        if provider["allowed"] == serde_json::Value::Bool(false) {
+            text.push_str("    excluded by the provider.allowed ceiling\n");
+        }
+    }
+    if let Some(ceiling) = report["ceiling"].as_array() {
+        text.push_str(&format!(
+            "\nceiling: provider.allowed = [{}]\n",
+            ceiling
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    text
+}
+
+fn human_models(report: &serde_json::Value) -> String {
+    let models = report["models"].as_array().map_or(&[][..], Vec::as_slice);
+    if models.is_empty() {
+        return "No allowed model is configured for the requested filter.".to_owned();
+    }
+    let mut text = format!("{} allowed model(s)\n", models.len());
+    for model in models {
+        text.push_str(&format!(
+            "\n  {}/{}{}\n",
+            model["provider"].as_str().unwrap_or("?"),
+            model["model"].as_str().unwrap_or("?"),
+            if model["default"] == serde_json::Value::Bool(true) {
+                " (default)"
+            } else {
+                ""
+            },
+        ));
+        if let Some(capabilities) = model["capabilities"].as_object() {
+            for (name, capability) in capabilities {
+                text.push_str(&format!(
+                    "    {name}: {} ({}, observed {})\n",
+                    capability["state"].as_str().unwrap_or("?"),
+                    capability["source"].as_str().unwrap_or("?"),
+                    match capability["observed_at_unix_seconds"].as_u64() {
+                        Some(0) | None => "never".to_owned(),
+                        Some(seconds) => crate::session::timestamp(&serde_json::json!(
+                            seconds.saturating_mul(1000)
+                        )),
+                    }
+                ));
+            }
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -506,6 +833,200 @@ kind = "openai"
         assert!(
             message.contains("`typo`"),
             "a misspelled provider must not silently resolve to another one: {message}"
+        );
+    }
+
+    #[test]
+    fn a_provider_ceiling_hides_an_endpoint_and_narrows_the_default() {
+        let capped = config(
+            r#"
+schema_version = 1
+
+[provider]
+default = "second"
+allowed = ["first"]
+
+[provider.endpoint.first]
+kind = "openai"
+model = "m1"
+models = ["m1", "m2"]
+
+[provider.endpoint.second]
+kind = "anthropic"
+model = "m3"
+"#,
+        );
+        // The default names an endpoint the ceiling excludes, so nothing
+        // resolves: a ceiling that silently fell back to another provider would
+        // send prompts somewhere the operator capped out.
+        assert!(capped.endpoint(None).is_none());
+        assert!(capped.endpoint(Some("second")).is_none());
+        assert_eq!(
+            capped.endpoint(Some("first")).map(|e| e.id.as_str()),
+            Some("first")
+        );
+
+        let listed = provider_report(&capped, false);
+        assert_eq!(listed["providers"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["providers"][0]["id"], "first");
+        assert_eq!(listed["ceiling"], serde_json::json!(["first"]));
+
+        // `--all` shows what was excluded, and says so.
+        let every = provider_report(&capped, true);
+        let excluded: Vec<_> = every["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["allowed"] == serde_json::Value::Bool(false))
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(excluded, vec!["second".to_owned()]);
+    }
+
+    #[test]
+    fn model_listing_applies_both_ceilings_and_the_capability_filter() {
+        let capped = config(
+            r#"
+schema_version = 1
+
+[provider.endpoint.first]
+kind = "openai"
+model = "m1"
+models = ["m1", "m2"]
+
+[model]
+allowed = ["m1"]
+"#,
+        );
+        let report = model_report(&capped, None, None).unwrap();
+        let models: Vec<_> = report["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["model"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(models, vec!["m1".to_owned()], "model.allowed is a ceiling");
+        assert_eq!(
+            report["models"][0]["capabilities"]["streaming"]["state"],
+            "supported"
+        );
+
+        // A provider filter that names nothing configured lists nothing rather
+        // than everything.
+        assert!(
+            model_report(&capped, Some("absent"), None).unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(model_report(&capped, None, Some("telepathy")).is_err());
+        assert_eq!(
+            model_report(&capped, None, Some("tool_calls")).unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// `provider.default = "auto"` is the documented default, so several
+    /// configured endpoints must resolve to one deterministically rather than
+    /// to "no provider is configured".
+    #[test]
+    fn auto_routes_between_allowed_endpoints_and_never_outside_them() {
+        let several = config(
+            r#"
+schema_version = 1
+
+[provider]
+default = "auto"
+
+[provider.endpoint.zeta]
+kind = "openai"
+model = "z1"
+
+[provider.endpoint.alpha]
+kind = "anthropic"
+model = "a1"
+"#,
+        );
+        let (endpoint, decision) = resolve_with_route(&several, None).unwrap();
+        assert_eq!(
+            endpoint.id, "alpha",
+            "the tie-break is stable, not arbitrary"
+        );
+        let decision = decision.expect("routing chose it");
+        assert_eq!(decision.key().unwrap().to_string(), "alpha/a1");
+        assert!(
+            matches!(&decision, routing::Decision::Routed { reasons, .. }
+            if reasons.iter().any(|reason| reason.contains("nothing has been measured")))
+        );
+
+        // Naming one explicitly bypasses routing entirely.
+        let (endpoint, decision) = resolve_with_route(&several, Some("zeta")).unwrap();
+        assert_eq!(endpoint.id, "zeta");
+        assert!(
+            decision.is_none(),
+            "an explicit name is not a routed choice"
+        );
+
+        // A ceiling narrows what routing may pick, and routing stays inside it.
+        let capped = config(
+            r#"
+schema_version = 1
+
+[provider]
+default = "auto"
+allowed = ["zeta"]
+
+[provider.endpoint.zeta]
+kind = "openai"
+model = "z1"
+
+[provider.endpoint.alpha]
+kind = "anthropic"
+model = "a1"
+"#,
+        );
+        let (endpoint, decision) = resolve_with_route(&capped, None).unwrap();
+        assert_eq!(endpoint.id, "zeta");
+        let decision = decision.expect("an unnamed choice is always routed");
+        assert_eq!(
+            decision.excluded().len(),
+            1,
+            "the capped endpoint is reported as excluded, not silently dropped"
+        );
+
+        // A named provider that does not exist is still an error: routing must
+        // never quietly substitute another one.
+        assert_eq!(
+            resolve_with_route(&capped, Some("alpha"))
+                .err()
+                .map(|error| error.code),
+            Some(ARSY_PRV_1000.to_owned())
+        );
+
+        // Every model excluded leaves nothing to route to, and says so.
+        let impossible = config(
+            r#"
+schema_version = 1
+
+[provider]
+default = "auto"
+
+[provider.endpoint.zeta]
+kind = "openai"
+model = "z1"
+
+[model]
+allowed = ["nothing-like-it"]
+"#,
+        );
+        let error = resolve_with_route(&impossible, None).expect_err("nothing is routable");
+        assert!(
+            error.message.contains("no provider could be routed to"),
+            "{}",
+            error.message
         );
     }
 }

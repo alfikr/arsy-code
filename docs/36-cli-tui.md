@@ -13,9 +13,29 @@ events and matchers, and accepts `--event <original-or-canonical-name>`.
 Unsupported lifecycle events are labelled unsupported. Other hook ecosystems
 and user/enterprise integration configuration are not yet inspected.
 
-Every declaration is labelled `not_loaded`. Native MCP connection management,
-handshakes, discovery, reconnect/refresh, and executable hooks remain unimplemented;
-these inspection results are not a claim that an integration is running.
+Every declaration is labelled `not_loaded`: an inspection result is never a claim
+that an integration is running.
+
+Native MCP connections are separate from those imported declarations. They are
+defined in `config.toml` as `[mcp.server.<name>]`, written by `arsy mcp add` and
+`arsy mcp remove` and toggled by `arsy mcp enable`/`disable`, with `--scope
+user|workspace` selecting the configuration layer that owns the table. The layer
+decides the connection's trust label, so a definition that travels with a
+repository is `workspace` rather than `user`. `arsy mcp list` shows those
+connections alongside the imported declarations; `--source arsy` narrows to the
+native ones. `arsy mcp test <NAME>` is the only command that contacts a server:
+it connects, negotiates, discovers, and disconnects, and never invokes a tool.
+
+The client itself supports stdio and Streamable HTTP, bounded bodies and
+deadlines, reconnect with bounded backoff and an explicit attempt limit, and
+refresh as re-discovery without a teardown. Reconnect and refresh cannot widen
+authority: the tools, resources, and prompts adopted on the first connection are
+the ceiling, and anything appearing later outside it is reported and rejected.
+Authentication failure and a disabled connection are excluded from automatic
+retry. Executable hooks are dispatched by the lifecycle engine, which `arsy hook
+list` reports the effect class and failure policy of; the engine is not yet wired
+into the interactive turn loop.
+
 The existing provider subprocess owns its own integrations and permissions.
 
 Human output lists each declaration as a count line and one row per declaration:

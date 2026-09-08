@@ -12,10 +12,15 @@
 //! Endpoint keys are therefore accepted from the enterprise and user layers
 //! only, and reported as a diagnostic anywhere else.
 
-use crate::secret::SecretHandle;
+use crate::{
+    capability::{CapabilityAction, PolicySource, ResourcePattern},
+    domain::Principal,
+    policy::{ActorMatch, PolicyRule, RuleEffect, RuleSet, SandboxAssurance},
+    secret::SecretHandle,
+};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
 };
@@ -44,7 +49,6 @@ const INERT_SECTIONS: &[&str] = &[
     "context",
     "execution",
     "git",
-    "policy",
     "sandbox",
     "storage",
     "telemetry",
@@ -213,6 +217,111 @@ impl Endpoint {
 /// substantial edit, small enough to bound a runaway response.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
 
+/// How long an MCP request may take before the connection is treated as
+/// dropped. Long enough for a server that shells out, short enough that a hung
+/// one does not hold a turn open.
+pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// Largest response body accepted from an MCP server. The connection is
+/// operator-configured and may be anything, so the cap is not optional.
+pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
+
+/// Where a command may be run other than on this machine.
+///
+/// A target is a *named* place, never a host a caller supplies: an operation
+/// selects one of these by name, so nothing a model produces can decide which
+/// machine a command reaches.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RemoteTarget {
+    Ssh {
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        /// Private key file. A path, never a key: this struct is safe to print.
+        identity: Option<String>,
+    },
+    Container {
+        /// `docker` or `podman`; the two speak the same `exec` surface.
+        engine: String,
+        container: String,
+    },
+}
+
+impl RemoteTarget {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ssh { .. } => "ssh",
+            Self::Container { .. } => "container",
+        }
+    }
+
+    /// What an operator would recognize the target by.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Ssh {
+                host, user, port, ..
+            } => {
+                let mut described = match user {
+                    Some(user) => format!("ssh {user}@{host}"),
+                    None => format!("ssh {host}"),
+                };
+                if let Some(port) = port {
+                    described.push_str(&format!(":{port}"));
+                }
+                described
+            }
+            Self::Container { engine, container } => format!("{engine} exec {container}"),
+        }
+    }
+}
+
+/// Container engines this build knows how to drive.
+pub const CONTAINER_ENGINES: &[&str] = &["docker", "podman"];
+
+/// How ARSY reaches one MCP server.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum McpTransport {
+    Stdio { command: String, args: Vec<String> },
+    Http { url: String },
+}
+
+impl McpTransport {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Stdio { .. } => "stdio",
+            Self::Http { .. } => "http",
+        }
+    }
+
+    /// What a connection would actually run or reach, for a listing that has
+    /// to let an operator recognize the server they meant.
+    pub fn target(&self) -> String {
+        match self {
+            Self::Stdio { command, args } if args.is_empty() => command.clone(),
+            Self::Stdio { command, args } => format!("{command} {}", args.join(" ")),
+            Self::Http { url } => url.clone(),
+        }
+    }
+}
+
+/// One configured MCP connection. Holding the definition is not connecting:
+/// nothing here has contacted the server.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(flatten)]
+    pub transport: McpTransport,
+    pub enabled: bool,
+    /// The authority of the layer that defined it. A workspace definition is
+    /// untrusted content: it may be connected to, but it cannot grant itself
+    /// the right to act.
+    pub trust: PolicySource,
+    pub timeout_ms: u64,
+    pub max_body_bytes: u64,
+}
+
 /// The `[theme]` table: a built-in theme to start from, plus per-role colour
 /// overrides. The CLI turns this into its palette; the kernel only carries and
 /// validates it, so a headless run rejects a bad colour at load time too.
@@ -288,7 +397,21 @@ pub struct Config {
     model_default: Option<String>,
     credential_store: Option<String>,
     endpoints: BTreeMap<String, Endpoint>,
+    /// `provider.allowed` and `model.allowed` after intersection. `None` means
+    /// no layer capped the set, which is not the same as an empty allowlist:
+    /// an empty one permits nothing.
+    provider_allowed: Option<BTreeSet<String>>,
+    model_allowed: Option<BTreeSet<String>>,
     theme: Theme,
+    /// Policy rules keyed by their stable `id`, so a later layer amends a rule
+    /// rather than appending a second one with the same meaning.
+    policy_rules: BTreeMap<String, PolicyRule>,
+    policy_default_effect: Option<RuleEffect>,
+    /// `[mcp.server.<name>]` keyed by name, so a higher layer replaces a
+    /// definition rather than adding a second connection with the same name.
+    mcp_servers: BTreeMap<String, McpServer>,
+    /// `[remote.target.<name>]`, from a trusted layer only.
+    remote_targets: BTreeMap<String, RemoteTarget>,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -348,6 +471,78 @@ impl Config {
         &self.diagnostics
     }
 
+    /// Configured remote targets in name order. Nothing is connected.
+    pub fn remote_targets(&self) -> impl Iterator<Item = (&String, &RemoteTarget)> {
+        self.remote_targets.iter()
+    }
+
+    pub fn remote_target(&self, name: &str) -> Option<&RemoteTarget> {
+        self.remote_targets.get(name)
+    }
+
+    /// Configured MCP connections in name order. Nothing is connected.
+    pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServer> {
+        self.mcp_servers.values()
+    }
+
+    pub fn mcp_server(&self, name: &str) -> Option<&McpServer> {
+        self.mcp_servers.get(name)
+    }
+
+    /// The `[[policy.rules]]` this configuration resolved to, in rule-id order.
+    /// Compile them with `RuleSet::compile` before evaluating: that is where an
+    /// untrusted layer's `allow` is downgraded.
+    pub fn policy_rules(&self) -> Vec<PolicyRule> {
+        self.policy_rules.values().cloned().collect()
+    }
+
+    /// The compiled rule set this configuration means, including the catch-all
+    /// that `policy.default_effect` stands for.
+    ///
+    /// Every caller that decides anything uses this, so a dry run and an
+    /// execution cannot reach different answers: building the rules in one
+    /// place and the default in another is exactly how they would.
+    ///
+    /// The default is one rule per action rather than one wildcard rule,
+    /// because a rule matches on a concrete action; and it is compiled with the
+    /// layer's own authority, so a default an untrusted layer wrote is
+    /// downgraded like any other allow it wrote.
+    pub fn policy_rule_set(&self) -> RuleSet {
+        let (effect, source) = self.policy_default();
+        let defaults = CapabilityAction::ALL.iter().map(|action| PolicyRule {
+            source,
+            effect,
+            actor: ActorMatch::Any,
+            action: *action,
+            pattern: ResourcePattern::new(action.default_scheme(), "**")
+                .expect("a static scheme and glob are valid"),
+            expires_at_ms: None,
+            delegation_depth: 0,
+            minimum_assurance: SandboxAssurance::None,
+        });
+        RuleSet::compile(self.policy_rules().into_iter().chain(defaults))
+    }
+
+    /// What happens to a query no rule covers, and the authority that decided
+    /// it. The engine denies silence outright, so this is the effect a
+    /// synthesized catch-all rule carries.
+    ///
+    /// Unset means `ask` on the built-in schema's authority; `ask` grants
+    /// nothing, so a built-in default can never widen what a layer allowed.
+    pub fn policy_default(&self) -> (RuleEffect, PolicySource) {
+        let source = self
+            .trace
+            .get("policy.default_effect")
+            .map_or(PolicySource::Enterprise, |origin| {
+                policy_source(origin.layer)
+            });
+        (
+            self.policy_default_effect
+                .unwrap_or(RuleEffect::RequireApproval),
+            source,
+        )
+    }
+
     /// The endpoint a turn should use: the requested one, else the configured
     /// default, else the only one there is.
     ///
@@ -355,11 +550,52 @@ impl Config {
     /// provider that does not exist is `None` rather than a silent fallback to
     /// some other endpoint.
     pub fn endpoint(&self, requested: Option<&str>) -> Option<&Endpoint> {
-        match requested.or(self.provider_default.as_deref()) {
-            Some(id) => self.endpoints.get(id),
-            None if self.endpoints.len() == 1 => self.endpoints.values().next(),
+        let allowed: Vec<&Endpoint> = self
+            .endpoints
+            .values()
+            .filter(|endpoint| self.provider_is_allowed(&endpoint.id))
+            .collect();
+        // `"auto"` is the documented way to say "no explicit choice", so it
+        // resolves like an absent one rather than like an endpoint of that name.
+        match requested
+            .or(self.provider_default.as_deref())
+            .filter(|id| *id != "auto")
+        {
+            Some(id) => allowed.into_iter().find(|endpoint| endpoint.id == id),
+            None if allowed.len() == 1 => allowed.into_iter().next(),
             None => None,
         }
+    }
+
+    /// Whether `provider.allowed` admits this endpoint. An unset allowlist
+    /// admits every configured endpoint; an empty one admits none.
+    pub fn provider_is_allowed(&self, id: &str) -> bool {
+        self.provider_allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(id))
+    }
+
+    /// Whether `model.allowed` admits this model.
+    pub fn model_is_allowed(&self, model: &str) -> bool {
+        self.model_allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(model))
+    }
+
+    /// The resolved `provider.allowed` ceiling, or `None` when no layer set one.
+    pub fn provider_allowed(&self) -> Option<&BTreeSet<String>> {
+        self.provider_allowed.as_ref()
+    }
+
+    /// The resolved `model.allowed` ceiling, or `None` when no layer set one.
+    pub fn model_allowed(&self) -> Option<&BTreeSet<String>> {
+        self.model_allowed.as_ref()
+    }
+
+    /// Every configured endpoint, whether or not the ceiling admits it.
+    /// `arsy provider list --all` is the caller.
+    pub fn all_endpoints(&self) -> impl Iterator<Item = &Endpoint> {
+        self.endpoints.values()
     }
 
     /// Effective values with their sources, optionally narrowed to one key or
@@ -403,6 +639,11 @@ impl Config {
                         self.model_default = Some(default.clone());
                         self.record(layer, path, "model.default", default);
                     }
+                    if let Some(value) = table.get("allowed") {
+                        let allowed = name_set(value, "model.allowed", path)?;
+                        self.record(layer, path, "model.allowed", joined(&allowed));
+                        self.model_allowed = Some(intersect(self.model_allowed.take(), allowed));
+                    }
                 }
                 "credentials" => {
                     let table = as_table(value, "credentials", path)?;
@@ -418,12 +659,382 @@ impl Config {
                         self.record(layer, path, "credentials.store", store);
                     }
                 }
+                "mcp" => self.apply_mcp(layer, path, value)?,
+                "remote" => self.apply_remote(layer, path, value)?,
+                "policy" => self.apply_policy(layer, path, value)?,
                 "theme" => self.apply_theme(layer, path, value)?,
                 section if INERT_SECTIONS.contains(&section) => {}
                 other => return Err(reject(format!("unknown key `{other}`"))),
             }
         }
         Ok(())
+    }
+
+    /// `[mcp.server.<name>]`: one external MCP connection each.
+    ///
+    /// A definition names a program to run or a host to send workspace content
+    /// to, so the layer that wrote it becomes the connection's trust label. A
+    /// workspace file may still declare one — that is how a repository ships
+    /// its own tooling — but it is labelled untrusted, and nothing that cannot
+    /// grant authority can make it trusted by saying so.
+    fn apply_mcp(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "mcp", path)? {
+            if key != "server" {
+                return Err(reject(format!("unknown key `mcp.{key}`")));
+            }
+            for (name, value) in as_table(value, "mcp.server", path)? {
+                let server = self.parse_mcp_server(layer, path, name, value)?;
+                self.record(
+                    layer,
+                    path,
+                    &format!("mcp.server.{name}"),
+                    format!(
+                        "{} · {} · {}",
+                        server.transport.kind(),
+                        server.transport.target(),
+                        if server.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ),
+                );
+                self.mcp_servers.insert(name.clone(), server);
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_mcp_server(
+        &self,
+        layer: Layer,
+        path: &Path,
+        name: &str,
+        value: &toml::Value,
+    ) -> Result<McpServer, ConfigError> {
+        let prefix = format!("mcp.server.{name}");
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let table = as_table(value, &prefix, path)?;
+        for key in table.keys() {
+            if !MCP_SERVER_KEYS.contains(&key.as_str()) {
+                return Err(reject(format!("unknown key `{prefix}.{key}`")));
+            }
+        }
+        let kind = expect_string(
+            table
+                .get("transport")
+                .ok_or_else(|| reject(format!("`{prefix}` needs a `transport`")))?,
+            &format!("{prefix}.transport"),
+            path,
+        )?;
+        let transport = match kind.as_str() {
+            "stdio" => {
+                let command = expect_string(
+                    table.get("command").ok_or_else(|| {
+                        reject(format!("`{prefix}` is stdio, so it needs a `command`"))
+                    })?,
+                    &format!("{prefix}.command"),
+                    path,
+                )?
+                .clone();
+                let args = match table.get("args") {
+                    None => Vec::new(),
+                    Some(value) => value
+                        .as_array()
+                        .ok_or_else(|| reject(format!("`{prefix}.args` must be an array")))?
+                        .iter()
+                        .map(|argument| {
+                            expect_string(argument, &format!("{prefix}.args"), path).cloned()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                McpTransport::Stdio { command, args }
+            }
+            "http" => McpTransport::Http {
+                url: expect_string(
+                    table.get("url").ok_or_else(|| {
+                        reject(format!("`{prefix}` is http, so it needs a `url`"))
+                    })?,
+                    &format!("{prefix}.url"),
+                    path,
+                )?
+                .clone(),
+            },
+            other => {
+                return Err(reject(format!(
+                    "`{prefix}.transport` must be `stdio` or `http`, not `{other}`"
+                )))
+            }
+        };
+        let positive = |key: &str, default: u64| -> Result<u64, ConfigError> {
+            match table.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_integer()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| reject(format!("`{prefix}.{key}` must be a positive integer"))),
+            }
+        };
+        Ok(McpServer {
+            name: name.to_owned(),
+            transport,
+            enabled: match table.get("enabled") {
+                None => true,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| reject(format!("`{prefix}.enabled` must be a boolean")))?,
+            },
+            trust: policy_source(layer),
+            timeout_ms: positive("timeout_ms", DEFAULT_MCP_TIMEOUT_MS)?,
+            max_body_bytes: positive("max_body_bytes", DEFAULT_MCP_MAX_BODY_BYTES)?,
+        })
+    }
+
+    /// `[remote.target.<name>]`: where a command may be run other than here.
+    ///
+    /// Refused outside the enterprise and user layers, for the same reason a
+    /// provider endpoint is: a file that travels with a repository must not be
+    /// able to decide which machine the agent's commands execute on.
+    fn apply_remote(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "remote", path)? {
+            if key != "target" {
+                return Err(reject(format!("unknown key `remote.{key}`")));
+            }
+            let targets = as_table(value, "remote.target", path)?;
+            if !layer.is_trusted() {
+                for name in targets.keys() {
+                    self.diagnostics.push(Diagnostic {
+                        key: format!("remote.target.{name}"),
+                        layer,
+                        path: path.to_path_buf(),
+                        message: "a remote target may only be set by the enterprise or user \
+                                  configuration, because it decides which machine runs commands"
+                            .to_owned(),
+                    });
+                }
+                return Ok(());
+            }
+            for (name, value) in targets {
+                let target = parse_remote_target(path, name, value)?;
+                self.record(
+                    layer,
+                    path,
+                    &format!("remote.target.{name}"),
+                    target.describe(),
+                );
+                self.remote_targets.insert(name.clone(), target);
+            }
+        }
+        Ok(())
+    }
+
+    /// `[policy]`: `default_effect`, and `[[policy.rules]]` keyed by `id`.
+    ///
+    /// Nothing here can widen authority on its own: every rule is tagged with
+    /// the source of the layer that wrote it, and `RuleSet::compile` downgrades
+    /// an `allow` from a source that may not grant. This function's own job is
+    /// merge order — most restrictive wins — and rejecting a malformed file.
+    fn apply_policy(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "policy", path)? {
+            match key.as_str() {
+                "default_effect" => {
+                    let effect = rule_effect(expect_string(value, "policy.default_effect", path)?)
+                        .map_err(&reject)?;
+                    // `max` on the restriction order: a lower layer may tighten
+                    // the default, never loosen it.
+                    let merged = self
+                        .policy_default_effect
+                        .map_or(effect, |current| current.min(effect));
+                    self.policy_default_effect = Some(merged);
+                    self.record(layer, path, "policy.default_effect", effect_name(merged));
+                }
+                "rules" => {
+                    let rules = value.as_array().ok_or_else(|| {
+                        reject("`policy.rules` must be an array of tables".to_owned())
+                    })?;
+                    let mut seen = std::collections::BTreeSet::new();
+                    for entry in rules {
+                        let (id, rule) = self.policy_rule(layer, path, entry)?;
+                        if !seen.insert(id.clone()) {
+                            return Err(reject(format!(
+                                "`policy.rules` repeats the rule id `{id}` in one file"
+                            )));
+                        }
+                        let merged = match self.policy_rules.remove(&id) {
+                            // A rule that already exists keeps the stricter of
+                            // the two effects, so a later layer cannot relax
+                            // one an earlier layer tightened.
+                            Some(existing) => PolicyRule {
+                                effect: existing.effect.min(rule.effect),
+                                ..rule
+                            },
+                            None => rule,
+                        };
+                        self.record(
+                            layer,
+                            path,
+                            &format!("policy.rules.{id}"),
+                            format!(
+                                "{} {} {}",
+                                effect_name(merged.effect),
+                                merged.action,
+                                merged.pattern
+                            ),
+                        );
+                        self.policy_rules.insert(id, merged);
+                    }
+                }
+                other => return Err(reject(format!("unknown key `policy.{other}`"))),
+            }
+        }
+        Ok(())
+    }
+
+    fn policy_rule(
+        &self,
+        layer: Layer,
+        path: &Path,
+        entry: &toml::Value,
+    ) -> Result<(String, PolicyRule), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let table = as_table(entry, "policy.rules", path)?;
+        for key in table.keys() {
+            if !RULE_KEYS.contains(&key.as_str()) {
+                return Err(reject(format!("unknown key `policy.rules.{key}`")));
+            }
+        }
+        let id = expect_string(
+            table
+                .get("id")
+                .ok_or_else(|| reject("every `policy.rules` entry needs an `id`".to_owned()))?,
+            "policy.rules.id",
+            path,
+        )?
+        .clone();
+        let effect = rule_effect(expect_string(
+            table
+                .get("effect")
+                .ok_or_else(|| reject(format!("`policy.rules.{id}` needs an `effect`")))?,
+            "policy.rules.effect",
+            path,
+        )?)
+        .map_err(&reject)?;
+        let action = expect_string(
+            table
+                .get("action")
+                .ok_or_else(|| reject(format!("`policy.rules.{id}` needs an `action`")))?,
+            "policy.rules.action",
+            path,
+        )?;
+        let action: CapabilityAction =
+            serde_json::from_value(serde_json::Value::String(action.clone()))
+                .map_err(|_| reject(format!("`{action}` is not a capability action")))?;
+        let resource = expect_string(
+            table
+                .get("resource")
+                .ok_or_else(|| reject(format!("`policy.rules.{id}` needs a `resource`")))?,
+            "policy.rules.resource",
+            path,
+        )?;
+        let (scheme, glob) = resource.split_once(':').ok_or_else(|| {
+            reject(format!(
+                "`policy.rules.{id}.resource` must be `<scheme>:<glob>`, not `{resource}`"
+            ))
+        })?;
+        let pattern = ResourcePattern::new(scheme, glob)
+            .map_err(|error| reject(format!("`policy.rules.{id}.resource`: {error}")))?;
+        let actor = match table.get("actor") {
+            None => ActorMatch::Any,
+            Some(value) => {
+                let value = expect_string(value, "policy.rules.actor", path)?;
+                match value.as_str() {
+                    "*" | "any" => ActorMatch::Any,
+                    "system" => ActorMatch::Exactly(Principal::System),
+                    named => ActorMatch::Exactly(Principal::User(
+                        named.strip_prefix("user:").unwrap_or(named).to_owned(),
+                    )),
+                }
+            }
+        };
+        let expires_at_ms = match table.get("expires_at_ms") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_integer()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        reject(format!(
+                            "`policy.rules.{id}.expires_at_ms` must be a non-negative integer"
+                        ))
+                    })?,
+            ),
+        };
+        let delegation_depth = match table.get("delegation_depth") {
+            None => 0,
+            Some(value) => value
+                .as_integer()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    reject(format!(
+                        "`policy.rules.{id}.delegation_depth` must be a non-negative integer"
+                    ))
+                })?,
+        };
+        let minimum_assurance = match table.get("minimum_assurance") {
+            None => SandboxAssurance::None,
+            Some(value) => {
+                let value = expect_string(value, "policy.rules.minimum_assurance", path)?;
+                serde_json::from_value(serde_json::Value::String(value.clone()))
+                    .map_err(|_| reject(format!("`{value}` is not a sandbox assurance level")))?
+            }
+        };
+        Ok((
+            id,
+            PolicyRule {
+                source: policy_source(layer),
+                effect,
+                actor,
+                action,
+                pattern,
+                expires_at_ms,
+                delegation_depth,
+                minimum_assurance,
+            },
+        ))
     }
 
     fn apply_theme(
@@ -471,8 +1082,13 @@ impl Config {
                     self.record(layer, path, "provider.default", id);
                 }
                 "endpoint" => self.apply_endpoints(layer, path, value)?,
+                "allowed" => {
+                    let allowed = name_set(value, "provider.allowed", path)?;
+                    self.record(layer, path, "provider.allowed", joined(&allowed));
+                    self.provider_allowed = Some(intersect(self.provider_allowed.take(), allowed));
+                }
                 // Documented, resolved by a later phase.
-                "allowed" | "residency" | "credential" => {}
+                "residency" | "credential" => {}
                 other => {
                     return Err(ConfigError {
                         path: path.to_path_buf(),
@@ -790,6 +1406,165 @@ impl Config {
     }
 }
 
+/// An array of distinct non-empty names, as `provider.allowed` and
+/// `model.allowed` are written.
+fn name_set(value: &toml::Value, key: &str, path: &Path) -> Result<BTreeSet<String>, ConfigError> {
+    let reject = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        message,
+    };
+    let listed = value
+        .as_array()
+        .ok_or_else(|| reject(format!("`{key}` must be an array of names")))?;
+    let mut names = BTreeSet::new();
+    for entry in listed {
+        let name = expect_string(entry, key, path)?;
+        if !names.insert(name.clone()) {
+            return Err(reject(format!("`{key}` repeats `{name}`")));
+        }
+    }
+    Ok(names)
+}
+
+/// `intersection` merge: each layer may only narrow what the previous ones
+/// left, so a repository file can never widen a ceiling.
+fn intersect(current: Option<BTreeSet<String>>, next: BTreeSet<String>) -> BTreeSet<String> {
+    match current {
+        None => next,
+        Some(current) => current.intersection(&next).cloned().collect(),
+    }
+}
+
+fn joined(names: &BTreeSet<String>) -> String {
+    names.iter().cloned().collect::<Vec<_>>().join(", ")
+}
+
+fn parse_remote_target(
+    path: &Path,
+    name: &str,
+    value: &toml::Value,
+) -> Result<RemoteTarget, ConfigError> {
+    let prefix = format!("remote.target.{name}");
+    let reject = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        message,
+    };
+    let table = as_table(value, &prefix, path)?;
+    for key in table.keys() {
+        if !REMOTE_TARGET_KEYS.contains(&key.as_str()) {
+            return Err(reject(format!("unknown key `{prefix}.{key}`")));
+        }
+    }
+    let required = |key: &str| -> Result<String, ConfigError> {
+        table
+            .get(key)
+            .ok_or_else(|| reject(format!("`{prefix}` needs a `{key}`")))
+            .and_then(|value| expect_string(value, &format!("{prefix}.{key}"), path).cloned())
+    };
+    let optional = |key: &str| -> Result<Option<String>, ConfigError> {
+        table
+            .get(key)
+            .map(|value| expect_string(value, &format!("{prefix}.{key}"), path).cloned())
+            .transpose()
+    };
+    match required("kind")?.as_str() {
+        "ssh" => Ok(RemoteTarget::Ssh {
+            host: required("host")?,
+            user: optional("user")?,
+            port: match table.get("port") {
+                None => None,
+                Some(value) => Some(
+                    value
+                        .as_integer()
+                        .and_then(|value| u16::try_from(value).ok())
+                        .filter(|port| *port > 0)
+                        .ok_or_else(|| reject(format!("`{prefix}.port` must be a TCP port")))?,
+                ),
+            },
+            identity: optional("identity")?,
+        }),
+        "container" => {
+            let engine = optional("engine")?.unwrap_or_else(|| "docker".to_owned());
+            if !CONTAINER_ENGINES.contains(&engine.as_str()) {
+                return Err(reject(format!(
+                    "`{prefix}.engine` must be one of {}, not `{engine}`",
+                    CONTAINER_ENGINES.join(", ")
+                )));
+            }
+            Ok(RemoteTarget::Container {
+                engine,
+                container: required("container")?,
+            })
+        }
+        other => Err(reject(format!(
+            "`{prefix}.kind` must be `ssh` or `container`, not `{other}`"
+        ))),
+    }
+}
+
+const REMOTE_TARGET_KEYS: &[&str] = &[
+    "kind",
+    "host",
+    "user",
+    "port",
+    "identity",
+    "engine",
+    "container",
+];
+
+const MCP_SERVER_KEYS: &[&str] = &[
+    "transport",
+    "command",
+    "args",
+    "url",
+    "enabled",
+    "timeout_ms",
+    "max_body_bytes",
+];
+
+const RULE_KEYS: &[&str] = &[
+    "id",
+    "effect",
+    "actor",
+    "action",
+    "resource",
+    "expires_at_ms",
+    "delegation_depth",
+    "minimum_assurance",
+];
+
+/// The documented spelling: `ask` is the configuration word for the engine's
+/// `RequireApproval`.
+fn rule_effect(value: &str) -> Result<RuleEffect, String> {
+    match value {
+        "allow" => Ok(RuleEffect::Allow),
+        "ask" => Ok(RuleEffect::RequireApproval),
+        "deny" => Ok(RuleEffect::Deny),
+        other => Err(format!(
+            "policy effect must be `allow`, `ask`, or `deny`, not `{other}`"
+        )),
+    }
+}
+
+pub const fn effect_name(effect: RuleEffect) -> &'static str {
+    match effect {
+        RuleEffect::Allow => "allow",
+        RuleEffect::RequireApproval => "ask",
+        RuleEffect::Deny => "deny",
+    }
+}
+
+/// A configuration layer's authority as the policy engine names it. Nested
+/// files travel with a repository, so they carry no more authority than the
+/// workspace file beside them.
+pub const fn policy_source(layer: Layer) -> PolicySource {
+    match layer {
+        Layer::Enterprise => PolicySource::Enterprise,
+        Layer::User => PolicySource::User,
+        Layer::Workspace | Layer::Nested => PolicySource::Workspace,
+    }
+}
+
 /// `key` itself, or any key beneath it when `key` names a section.
 fn matches(name: &str, key: &str) -> bool {
     name == key
@@ -1064,6 +1839,84 @@ mod tests {
     }
 
     use super::*;
+
+    /// `policy explain` and a served call must reach the same verdict, which
+    /// they can only do if they compile the same rules. This is that set: the
+    /// configured rules plus exactly one default per action, at the authority
+    /// of whichever layer set the default.
+    #[test]
+    fn the_policy_rule_set_carries_the_configured_rules_and_one_default_per_action() {
+        use crate::capability::CapabilityAction;
+
+        let empty = Config::load(&[]).unwrap();
+        let rules = empty.policy_rule_set();
+        assert_eq!(rules.rules().len(), CapabilityAction::ALL.len());
+        assert!(
+            rules
+                .rules()
+                .iter()
+                .all(|rule| rule.effect == RuleEffect::RequireApproval),
+            "the built-in default is `ask`"
+        );
+        // One per action, and each written against that action's own scheme —
+        // a mismatch here is a rule that silently never matches.
+        for action in CapabilityAction::ALL {
+            let rule = rules
+                .rules()
+                .iter()
+                .find(|rule| rule.action == *action)
+                .unwrap_or_else(|| panic!("{action} has no default"));
+            assert_eq!(rule.pattern.scheme(), action.default_scheme());
+        }
+
+        let configured = single_layer(
+            Layer::User,
+            r#"
+schema_version = 1
+
+[policy]
+default_effect = "deny"
+
+[[policy.rules]]
+id = "read"
+effect = "allow"
+action = "fs.read"
+resource = "file:**"
+"#,
+        );
+        let rules = configured.policy_rule_set();
+        assert_eq!(rules.rules().len(), CapabilityAction::ALL.len() + 1);
+        assert!(rules.rules().iter().any(
+            |rule| rule.effect == RuleEffect::Allow && rule.action == CapabilityAction::FsRead
+        ));
+
+        // A workspace file may tighten the default; its `allow` is downgraded,
+        // so a repository cannot make a default that grants.
+        let untrusted = single_layer(
+            Layer::Workspace,
+            "schema_version = 1
+
+[policy]
+default_effect = \"allow\"\n",
+        );
+        assert_eq!(untrusted.policy_default().0, RuleEffect::Allow);
+        let rules = untrusted.policy_rule_set();
+        assert!(
+            rules
+                .rules()
+                .iter()
+                .all(|rule| rule.effect != RuleEffect::Allow),
+            "a workspace default cannot grant: compilation downgrades it"
+        );
+        assert_eq!(rules.diagnostics().len(), CapabilityAction::ALL.len());
+    }
+
+    fn single_layer(layer: Layer, body: &str) -> Config {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, body).unwrap();
+        Config::load(&[(layer, path)]).unwrap()
+    }
 
     fn write(directory: &Path, name: &str, body: &str) -> PathBuf {
         let path = directory.join(name);

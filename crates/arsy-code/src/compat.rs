@@ -138,6 +138,19 @@ impl CompatibilityImporter {
         }
     }
 
+    /// Skills declared by one ecosystem, as data. A skill is layer-1 content:
+    /// reading it grants nothing, which is why the listing is available without
+    /// loading anything.
+    pub fn skill_declarations(&self, ecosystem: Ecosystem) -> Result<Vec<Value>, CompatError> {
+        let directory = match ecosystem {
+            Ecosystem::Claude => self.root.join(".claude/skills"),
+            Ecosystem::Codex => self.root.join(".codex/skills"),
+            Ecosystem::Omp => self.root.join(".omp/skills"),
+            Ecosystem::AgentsMd => return Ok(Vec::new()),
+        };
+        skills(self, &directory, "mapped")
+    }
+
     pub fn hook_declarations(&self) -> Result<Vec<Value>, CompatError> {
         let source = self.root.join(".claude/settings.json");
         let local = self.root.join(".claude/settings.local.json");

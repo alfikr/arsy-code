@@ -2040,6 +2040,27 @@ pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)
 }
 
+/// A tool the model wants to run, waiting on the operator's answer. The
+/// command or the file list is shown, because that is what is being agreed to.
+pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
+    exec_row(
+        colour,
+        Status::Run,
+        &format!("{name} {summary}"),
+        Some("run it? y / n"),
+    )
+}
+
+/// What a tool call did, once it ran or was declined.
+pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
+    exec_row(
+        colour,
+        if ok { Status::Ok } else { Status::Error },
+        name,
+        Some(detail),
+    )
+}
+
 fn error_row(colour: bool, message: &str) -> String {
     format!(
         "  {} {}",
