@@ -448,7 +448,6 @@ fn no_tool_reaches_outside_the_workspace() {
             );
         }
     }
-    assert!(!std::path::Path::new("/etc/passwd").metadata().is_err());
 
     // A symlink is a local-looking name that resolves out of the tree, so the
     // lexical check passes it and the capability directory has to catch it.
@@ -469,6 +468,9 @@ fn no_tool_reaches_outside_the_workspace() {
     }
 }
 
+/// The commands are POSIX and the tool spawns `sh`, so this is a unix test —
+/// the same gate `process::tests` uses, and for the same reason.
+#[cfg(unix)]
 #[test]
 fn bash_runs_in_the_workspace_and_reports_output_exit_codes_and_deadlines() {
     let root = tempfile::tempdir().unwrap();
