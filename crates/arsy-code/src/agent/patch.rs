@@ -11,7 +11,7 @@
 
 use crate::resource::{ResolveError, Workspace};
 use arsy_kernel::{
-    artifact::{ArtifactStore, NewArtifact, Sensitivity},
+    artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
     domain::ResourceRef,
     operation::{
@@ -123,22 +123,12 @@ impl OperationExecutor for PatchExecutor {
             .unwrap_or_default();
         let result = apply(&workspace, patch)?;
 
-        let bytes = serde_json::to_vec(&result)
-            .map_err(|error| OperationError::Execution(error.to_string()))?;
-        let value = self
-            .artifacts
-            .put(
-                &bytes,
-                NewArtifact {
-                    media_type: "application/json".into(),
-                    creator: request.actor.clone(),
-                    source_revision: None,
-                    sensitivity: Sensitivity::Internal,
-                    retain_until_ms: self.retain_until_ms,
-                },
-            )
-            .map(|metadata| metadata.resource_ref())
-            .map_err(|error| OperationError::Execution(error.to_string()))?;
+        let value = super::store(
+            self.artifacts.as_ref(),
+            &result,
+            request.actor.clone(),
+            self.retain_until_ms,
+        )?;
 
         let observed_effects = result
             .changed

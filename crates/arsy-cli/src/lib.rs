@@ -3018,11 +3018,7 @@ fn native_turn(
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
-        let trimmed = arsy_code::agent::budget::trim(
-            conversation,
-            context_budget(resolved),
-            &std::collections::HashMap::new(),
-        );
+        let trimmed = arsy_code::agent::budget::trim(conversation, context_budget(resolved));
         if trimmed.changed() {
             let mut terminal = io::stdout();
             writeln!(
@@ -4229,11 +4225,7 @@ fn dispatch(
             emitter.end_deltas();
             return Ok(token_usage(input_tokens, output_tokens));
         }
-        arsy_code::agent::budget::trim(
-            &mut request.messages,
-            budget,
-            &std::collections::HashMap::new(),
-        );
+        arsy_code::agent::budget::trim(&mut request.messages, budget);
 
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.

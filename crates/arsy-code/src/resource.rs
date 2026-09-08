@@ -138,6 +138,17 @@ impl Workspace {
         Ok(StateVersion::from_digest(Sha256::digest(bytes).into()))
     }
 
+    /// Whether a path names something that exists, without opening it.
+    ///
+    /// A confinement failure is not an existence question, so it answers
+    /// `false` rather than propagating: a caller asking "was this here before I
+    /// wrote it" gets an answer, and the write itself is what refuses a path
+    /// outside the workspace.
+    pub fn exists(&self, path: impl AsRef<Path>) -> bool {
+        self.relative(path)
+            .is_ok_and(|relative| self.root.metadata(relative).is_ok())
+    }
+
     /// Create a file that must not already exist.
     pub fn create_new(
         &self,
@@ -145,7 +156,7 @@ impl Workspace {
         bytes: &[u8],
     ) -> Result<StateVersion, ResolveError> {
         let relative = self.relative(path)?;
-        if self.root.metadata(&relative).is_ok() {
+        if self.exists(&relative) {
             return Err(ResolveError::AlreadyExists);
         }
         self.write(&relative, bytes)
@@ -159,7 +170,7 @@ impl Workspace {
     pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<(), ResolveError> {
         let from = self.relative(from)?;
         let to = self.relative(to)?;
-        if self.root.metadata(&to).is_ok() {
+        if self.exists(&to) {
             return Err(ResolveError::AlreadyExists);
         }
         if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {

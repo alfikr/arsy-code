@@ -13,7 +13,7 @@ use crate::{
     resource::{DirEntry, ResolveError, Workspace},
 };
 use arsy_kernel::{
-    artifact::{ArtifactStore, NewArtifact, Sensitivity},
+    artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant},
     domain::{Principal, ResourceRef},
     operation::{
@@ -201,21 +201,12 @@ impl FileExecutor {
         value: &impl Serialize,
         creator: Principal,
     ) -> Result<ResourceRef, OperationError> {
-        let bytes = serde_json::to_vec(value)
-            .map_err(|error| OperationError::Execution(error.to_string()))?;
-        self.artifacts
-            .put(
-                &bytes,
-                NewArtifact {
-                    media_type: "application/json".into(),
-                    creator,
-                    source_revision: None,
-                    sensitivity: Sensitivity::Internal,
-                    retain_until_ms: self.retain_until_ms,
-                },
-            )
-            .map(|metadata| metadata.resource_ref())
-            .map_err(|error| OperationError::Execution(error.to_string()))
+        super::store(
+            self.artifacts.as_ref(),
+            value,
+            creator,
+            self.retain_until_ms,
+        )
     }
 }
 
@@ -263,7 +254,9 @@ impl OperationExecutor for FileExecutor {
             FileOperation::Write | FileOperation::Create => {
                 let path = string("path");
                 let content = string("content");
-                let existed = workspace.read(path, MAX_FILE_BYTES).is_ok();
+                // Metadata, not a read: asking whether a file is there by
+                // reading it costs the whole file before overwriting it.
+                let existed = workspace.exists(path);
                 let digest = if self.operation == FileOperation::Create {
                     workspace.create_new(path, content.as_bytes())
                 } else {

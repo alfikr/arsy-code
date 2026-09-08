@@ -53,16 +53,44 @@ use arsy_kernel::{
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 /// Enough output to read a test failure, little enough to leave a turn's
 /// context for the answer.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+
+/// Store an operation's result and name it.
+///
+/// Every executor here returns its result as an artifact rather than inline,
+/// which is what makes a tool call replayable and what lets the transcript be
+/// trimmed without losing anything. That is one decision, so it is written
+/// once: `fs.*`, `search.*`, and `fs.patch` would otherwise each carry their
+/// own copy of the media type, the sensitivity, and the error mapping, and a
+/// change to any of them would have to be made three times.
+pub(crate) fn store(
+    artifacts: &dyn ArtifactStore,
+    value: &impl serde::Serialize,
+    creator: Principal,
+    retain_until_ms: u64,
+) -> Result<arsy_kernel::domain::ResourceRef, OperationError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| OperationError::Execution(error.to_string()))?;
+    artifacts
+        .put(
+            &bytes,
+            arsy_kernel::artifact::NewArtifact {
+                media_type: "application/json".into(),
+                creator,
+                source_revision: None,
+                sensitivity: arsy_kernel::artifact::Sensitivity::Internal,
+                retain_until_ms,
+            },
+        )
+        .map(|metadata| metadata.resource_ref())
+        .map_err(|error| OperationError::Execution(error.to_string()))
+}
 
 /// How much of a result artifact may be read back. Larger than the text a
 /// result can carry, so truncation is decided once, on the rendered text.
@@ -482,7 +510,6 @@ pub struct ToolRuntime {
     workspace: PathBuf,
     actor: Principal,
     context: RiskContext,
-    cancel: Arc<AtomicBool>,
 }
 
 impl ToolRuntime {
@@ -501,23 +528,11 @@ impl ToolRuntime {
             workspace: workspace.as_ref().to_path_buf(),
             actor,
             context,
-            cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
-    }
-
-    /// The flag a turn watches. Setting it stops the loop between calls; a call
-    /// already running finishes, because killing it mid-write is how a file is
-    /// left half-edited.
-    pub fn cancellation(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
-    }
-
-    pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
     }
 
     /// The tools this build can actually dispatch.

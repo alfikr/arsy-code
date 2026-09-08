@@ -290,6 +290,17 @@ fn writing_creating_moving_and_deleting_report_what_they_changed() {
         "hello"
     );
 
+    // Writing over the same path reports an update, not a creation, so the
+    // model is not told it made a file it replaced.
+    let again = attended(
+        &runtime,
+        "fs.write",
+        &json!({"path": "nested/deep/file.txt", "content": "hello again"}),
+    );
+    assert!(again.success, "{}", again.output);
+    assert_eq!(again.metadata["created"], false);
+    assert!(again.output.starts_with("updated"), "{}", again.output);
+
     ok(
         &runtime,
         "fs.move",
@@ -298,7 +309,7 @@ fn writing_creating_moving_and_deleting_report_what_they_changed() {
     assert!(!root.path().join("nested/deep/file.txt").exists());
     assert_eq!(
         std::fs::read_to_string(root.path().join("moved.txt")).unwrap(),
-        "hello"
+        "hello again"
     );
 
     // A move never silently replaces the destination.
@@ -314,7 +325,10 @@ fn writing_creating_moving_and_deleting_report_what_they_changed() {
         "keep me"
     );
 
-    ok(&runtime, "fs.delete", json!({"path": "moved.txt"}));
+    assert_eq!(
+        ok(&runtime, "fs.delete", json!({"path": "moved.txt"})),
+        "deleted moved.txt"
+    );
     assert!(!root.path().join("moved.txt").exists());
 }
 

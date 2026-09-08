@@ -38,7 +38,6 @@ use arsy_kernel::{
     domain::{ArtifactId, ContextViewId, FragmentId, ResourceRef},
     provider::{ModelContent, ModelMessage},
 };
-use std::collections::HashMap;
 
 /// Roughly four characters to a token across the families this targets.
 ///
@@ -88,11 +87,7 @@ impl Trimmed {
 /// Returns what it did, so a caller can tell the operator rather than letting
 /// the transcript shrink invisibly. A conversation already inside the budget is
 /// left exactly as it was.
-pub fn trim(
-    conversation: &mut [ModelMessage],
-    budget: u32,
-    artifacts: &HashMap<String, ArtifactId>,
-) -> Trimmed {
+pub fn trim(conversation: &mut [ModelMessage], budget: u32) -> Trimmed {
     let before = total_tokens(conversation);
     if before <= budget {
         return Trimmed {
@@ -122,10 +117,10 @@ pub fn trim(
                 ResourceRef::new("tool", observation.id.clone()).ok()?,
                 FragmentSourceKind::Tool,
                 ContextScope::Global,
-                artifacts
-                    .get(&observation.id)
-                    .copied()
-                    .unwrap_or_else(ArtifactId::new),
+                // The fragment's content id is not read by the selector, which
+                // ranks on the signals below; the stub tells the model to read
+                // the file again, so nothing here has to find the artifact.
+                ArtifactId::new(),
                 observation.tokens,
                 // A tool result is the workspace talking, not the operator: it
                 // is never trusted context, and the kernel enforces that.
@@ -345,7 +340,7 @@ mod tests {
         let mut conversation = transcript(2);
         let original = conversation.clone();
 
-        let trimmed = trim(&mut conversation, 100_000, &HashMap::new());
+        let trimmed = trim(&mut conversation, 100_000);
 
         assert!(!trimmed.changed());
         assert_eq!(trimmed.before, trimmed.after);
@@ -356,7 +351,7 @@ mod tests {
     fn an_overlong_conversation_loses_its_stalest_observations_first() {
         let mut conversation = transcript(6);
 
-        let trimmed = trim(&mut conversation, 1_500, &HashMap::new());
+        let trimmed = trim(&mut conversation, 1_500);
 
         assert!(trimmed.changed(), "{trimmed:?}");
         assert!(trimmed.after < trimmed.before);
@@ -382,7 +377,7 @@ mod tests {
     fn every_tool_call_still_has_a_result_after_trimming() {
         let mut conversation = transcript(8);
 
-        trim(&mut conversation, 1_000, &HashMap::new());
+        trim(&mut conversation, 1_000);
 
         let calls: Vec<&str> = conversation
             .iter()
@@ -410,7 +405,7 @@ mod tests {
     fn an_elided_observation_says_what_it_was_and_is_not_elided_twice() {
         let mut conversation = transcript(6);
 
-        trim(&mut conversation, 1_500, &HashMap::new());
+        trim(&mut conversation, 1_500);
         let once = bodies(&conversation)
             .into_iter()
             .map(str::to_owned)
@@ -419,7 +414,7 @@ mod tests {
         assert!(once[0].contains("tokens"), "{}", once[0]);
 
         // Trimming again finds nothing left to take from the stubs.
-        trim(&mut conversation, 1_500, &HashMap::new());
+        trim(&mut conversation, 1_500);
         assert_eq!(bodies(&conversation), once);
     }
 
@@ -436,7 +431,7 @@ mod tests {
             }],
         });
 
-        trim(&mut conversation, 1_000, &HashMap::new());
+        trim(&mut conversation, 1_000);
 
         assert!(bodies(&conversation).contains(&"no line matched the context"));
     }

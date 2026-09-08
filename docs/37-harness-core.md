@@ -144,9 +144,15 @@ workspace contains.
 
 ## What is not here yet
 
-- Cancellation stops the loop *between* calls (`ToolRuntime::cancellation`). A
-  call already running finishes, because killing it mid-write is how a file is
-  left half-edited. Interrupting a long `bash` needs the deadline.
+- Cancellation is the TUI's alone. Esc or Ctrl-C sets `Turn::interrupted`; the
+  remaining calls of that round are still *answered* — a provider that sent a
+  call and never sees its result rejects the next request — but nothing further
+  runs. A call already in flight finishes, because killing it mid-write is how
+  a file is left half-edited, so interrupting a long `bash` waits for its
+  deadline. `arsy run` has no interrupt source: a scripted turn ends at its
+  round limit or a tool's deadline. `ToolRuntime` holds no cancellation flag of
+  its own; a second mechanism that the loop did not consult would be a knob
+  that looks like it works.
 - The context budget is a constant, not a per-model window.
 - `arsy_kernel::{memory, orchestration, observer, telemetry, migrate}` and
   `arsy-code::{workspace, review, benchmark, acp, remote, extension, graph,
