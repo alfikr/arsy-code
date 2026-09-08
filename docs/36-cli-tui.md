@@ -175,7 +175,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy` | none | global flags | open the interactive TUI in the workspace | 2 |
 | `arsy run <TASK>` | one required task string; `-` reads it from stdin | global flags | execute one task non-interactively and exit at its terminal state | 1 |
 | `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
-| `arsy review [REVISION]` | optional Git revision; omitted means the working-tree diff | `--base <REVISION>` plus global flags | produce a structured review without modifying the workspace | 6 |
+| `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
 | `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |
 | `arsy session show <SESSION_ID>` | one required session ID | `--turns`, `--evidence` | show turns, recorded evidence, approvals, and totals for one session | 1 |
 | `arsy session export <SESSION_ID>` | one required session ID | `--out <PATH>`, `--include-artifacts` | export canonical events as JSONL for audit or forensic review | 1 |
@@ -237,9 +237,12 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy doctor` | none | `--strict` | check configuration, credentials by handle, sandbox backends, Git, providers without a billable request, and release provenance; `--strict` turns warnings into failure | 1 |
-| `arsy migrate <TARGET>` | one of `config`, `session` | `--apply`, `--backup <PATH>` | report the planned migration and its loss report; `--apply` is required to write | 1 |
+| `arsy migrate` | none; the session store is the only thing with a migration chain | `--apply`, `--backup <PATH>` | report the planned migration and its loss report; `--apply` is required to write, and takes a verified backup first | 1 |
+| `arsy memory list` | none | `--scope <SCOPE>`, `--all` | what this workspace remembers; `--all` includes superseded and revoked records | 9 |
+| `arsy memory remember <CLAIM>` | one required claim | `--scope <SCOPE>` | record a durable claim, stored as an artifact like any other evidence | 9 |
+| `arsy memory forget <ID>` | one required memory ID | `--to <REASON>` | withdraw a record, keeping the tombstone and its reason | 9 |
 | `arsy gc` | none | `--apply`, `--retention <DURATION>` | report artifacts unreachable and past retention; `--apply` is required to delete | 1 |
-| `arsy serve` | none | `--transport <stdio\|socket>` | serve the canonical protocol for an embedding client; defaults to stdio and is never a background daemon | 1 |
+| `arsy serve` | none | `--protocol <mcp\|acp>`, `--transport stdio` | offer operations as MCP tools, or speak ACP to an editor; stdio only, because this is never a background daemon | 1 |
 | `arsy eval <SUITE>` | one suite path or ID | `--trials <N>`, `--out <PATH>` | run an evaluation suite and report outcome, efficiency, and safety metrics | 1 |
 | `arsy completions <SHELL>` | one of `bash`, `zsh`, `fish`, `powershell` | none | print a shell completion script to standard output | 1 |
 

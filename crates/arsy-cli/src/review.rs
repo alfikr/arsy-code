@@ -20,27 +20,40 @@ use std::{
 const MAX_DIFF_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
-    if !arguments.positional.is_empty() {
+    let mut positional = arguments.positional.clone();
+    if positional.len() > 1 {
+        return Err(usage("review takes at most one revision"));
+    }
+    // The positional and the flag name the same thing, so saying both is a
+    // question about which one was meant rather than an answer.
+    if !positional.is_empty() && arguments.base.is_some() {
         return Err(usage(
-            "review takes no positional argument; it reads the working tree",
+            "review takes a revision either as an argument or as --base, not both",
         ));
     }
     Ok(Command::Review {
+        base: positional
+            .pop()
+            .or_else(|| arguments.base.clone())
+            .unwrap_or_else(|| "HEAD".to_owned()),
         strict: arguments.strict,
     })
 }
 
 pub fn run(
     invocation: &Invocation,
+    base: &str,
     strict: bool,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    let review = assess(parse_diff(&diff(&root)?), None);
+    let review = assess(parse_diff(&diff(&root, base)?), None);
 
     let blocking = strict && !review.findings.is_empty();
     emitter.result(if emitter.output == Output::Json {
-        serde_json::to_value(&review).map_err(crate::storage_failed)?
+        let mut report = serde_json::to_value(&review).map_err(crate::storage_failed)?;
+        crate::merge(&mut report, json!({"base": base}));
+        report
     } else {
         json!({"review": human(&review)})
     });
@@ -49,13 +62,15 @@ pub fn run(
     Ok(i32::from(blocking) * 7)
 }
 
-/// Everything the working tree changed since the last commit, staged or not.
+/// Everything the working tree changed since `base`, staged or not.
 ///
-/// `git diff HEAD` rather than `git diff`, because a review that ignored the
-/// index would miss exactly the changes someone was about to commit.
-fn diff(root: &Path) -> Result<String, Diagnostic> {
+/// `git diff <base>` rather than `git diff`, because a review that ignored the
+/// index would miss exactly the changes someone was about to commit. `HEAD` is
+/// the default, and any revision a branch review needs -- `main`,
+/// `origin/main`, a tag -- is the same command with a different name.
+fn diff(root: &Path, base: &str) -> Result<String, Diagnostic> {
     let mut child = Process::new("git")
-        .args(["--no-pager", "diff", "HEAD", "--no-color", "--no-ext-diff"])
+        .args(["--no-pager", "diff", base, "--no-color", "--no-ext-diff"])
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
@@ -87,8 +102,9 @@ fn diff(root: &Path) -> Result<String, Diagnostic> {
     if !status.success() {
         return Err(Diagnostic::error(
             "ARSY-VER-1000",
-            "git could not describe this workspace's changes".to_owned(),
-            "run `arsy review` inside a Git repository that has at least one commit",
+            format!("git could not describe what changed since `{base}`"),
+            "name a revision this repository has, and run `arsy review` inside a Git repository \
+             with at least one commit",
         ));
     }
     Ok(output)
@@ -133,9 +149,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_takes_no_argument_and_carries_strict_through() {
-        assert!(crate::parse(vec!["review".to_owned(), "HEAD~1".to_owned()]).is_err());
-        let parsed = crate::parse(vec!["review".to_owned(), "--strict".to_owned()]).unwrap();
-        assert_eq!(parsed.command, Command::Review { strict: true });
+    fn review_takes_one_revision_either_way_and_defaults_to_head() {
+        let command = |args: &[&str]| {
+            crate::parse(args.iter().map(|argument| (*argument).to_owned())).map(|it| it.command)
+        };
+        assert_eq!(
+            command(&["review"]).unwrap(),
+            Command::Review {
+                base: "HEAD".to_owned(),
+                strict: false
+            }
+        );
+        assert_eq!(
+            command(&["review", "main", "--strict"]).unwrap(),
+            Command::Review {
+                base: "main".to_owned(),
+                strict: true
+            }
+        );
+        assert_eq!(
+            command(&["review", "--base", "origin/main"]).unwrap(),
+            Command::Review {
+                base: "origin/main".to_owned(),
+                strict: false
+            }
+        );
+        // Two revisions, or the same revision twice over, is a question.
+        assert!(command(&["review", "main", "--base", "dev"]).is_err());
+        assert!(command(&["review", "main", "dev"]).is_err());
     }
 }

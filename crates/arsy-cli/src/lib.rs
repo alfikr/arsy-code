@@ -94,11 +94,11 @@ Usage:
   arsy artifact show <REF> [--max-bytes <N>]      render a bounded, redacted excerpt
   arsy artifact export <REF> --out <PATH>         write one artifact to a file
   arsy gc [--apply] [--retention <DURATION>]      report, then remove, unreachable evidence
-  arsy migrate [--apply] [--out <PATH>]           report, then apply, the store's schema migration
+  arsy migrate [--apply] [--backup <PATH>]        report, then apply, the store's schema migration
   arsy memory list [--scope <SCOPE>] [--all]      what this workspace remembers
   arsy memory remember <CLAIM> [--scope <SCOPE>]  record a durable claim
   arsy memory forget <ID> [--to <REASON>]        withdraw one, keeping the tombstone
-  arsy review [--strict]      report what the working tree changed, and what it needs
+  arsy review [REVISION] [--strict]  report what changed since REVISION (default HEAD)
   arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
   arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
   arsy plugin list [--capabilities]               installed plugins
@@ -286,8 +286,10 @@ pub enum Command {
         id: arsy_kernel::domain::MemoryId,
         reason: String,
     },
-    /// `arsy review`: assess the working tree's change.
+    /// `arsy review`: assess what the working tree changed.
     Review {
+        /// What the working tree is compared against. `HEAD` by default.
+        base: String,
         /// Any finding becomes a non-zero exit, for a pipeline gate.
         strict: bool,
     },
@@ -461,6 +463,10 @@ struct ParsedArguments {
     to: Option<String>,
     at: Option<String>,
     retention: Option<String>,
+    /// `arsy migrate --backup`: where the pre-migration copy goes.
+    backup: Option<PathBuf>,
+    /// `arsy review --base`: the revision the working tree is compared against.
+    base: Option<String>,
     resource: Option<String>,
     actor: Option<String>,
     provider: Option<String>,
@@ -566,6 +572,8 @@ fn apply_value_flag(
         "--to" => parsed.to = Some(value(arguments, argument)?),
         "--at" => parsed.at = Some(value(arguments, argument)?),
         "--retention" => parsed.retention = Some(value(arguments, argument)?),
+        "--backup" => parsed.backup = Some(PathBuf::from(value(arguments, argument)?)),
+        "--base" => parsed.base = Some(value(arguments, argument)?),
         "--resource" => parsed.resource = Some(value(arguments, argument)?),
         "--actor" => parsed.actor = Some(value(arguments, argument)?),
         "--provider" => parsed.provider = Some(value(arguments, argument)?),
@@ -1036,7 +1044,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             apply,
             retention_ms,
         } => evidence::collect(invocation, *apply, *retention_ms, emitter),
-        Command::Review { strict } => review::run(invocation, *strict, emitter),
+        Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
         Command::MemoryList { scope, all } => {
             memory::list(invocation, scope.clone(), *all, emitter)
         }

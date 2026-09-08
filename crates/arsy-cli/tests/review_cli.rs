@@ -93,4 +93,17 @@ fn a_working_tree_change_is_read_assessed_and_can_gate_a_pipeline() {
     // The same review, as a gate.
     let (code, _) = arsy(root, &["review", "--strict"]);
     assert_eq!(code, 7);
+
+    // A named revision reviews a branch rather than the working tree: against
+    // the first commit, the committed file is itself the change.
+    git(root, &["add", "."]);
+    git(root, &["commit", "--quiet", "-m", "second"]);
+    let (code, since) = arsy(root, &["review", "HEAD~1"]);
+    assert_eq!(code, 0);
+    assert_eq!(since["base"], "HEAD~1");
+    assert_eq!(since["files"].as_array().unwrap().len(), 1);
+    // And a revision this repository does not have is refused rather than
+    // reported as an empty change.
+    let (code, _) = arsy(root, &["review", "no-such-branch"]);
+    assert_eq!(code, 7);
 }

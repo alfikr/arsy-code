@@ -29,7 +29,7 @@ pub fn parse_migrate(arguments: &crate::ParsedArguments) -> Result<Command, Diag
     }
     Ok(Command::Migrate {
         apply: arguments.apply,
-        backup: arguments.out.clone(),
+        backup: arguments.backup.clone(),
     })
 }
 
