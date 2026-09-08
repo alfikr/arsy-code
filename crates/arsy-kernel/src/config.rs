@@ -17,6 +17,7 @@ use crate::{
     domain::Principal,
     policy::{ActorMatch, PolicyRule, RuleEffect, RuleSet, SandboxAssurance},
     secret::SecretHandle,
+    telemetry::OpenTelemetryConfig,
 };
 use serde::Serialize;
 use std::{
@@ -51,7 +52,6 @@ const INERT_SECTIONS: &[&str] = &[
     "git",
     "sandbox",
     "storage",
-    "telemetry",
     "ui",
 ];
 
@@ -391,6 +391,32 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// `[telemetry]`: how much of a run is observed, and where it may leave.
+///
+/// The defaults are the ones a local run wants — every event kept, nothing
+/// exported — so an operator who never writes the section still gets the
+/// latency and token counts a finished run reports.
+#[derive(Clone, Debug)]
+pub struct TelemetrySettings {
+    /// Keep one trace in every `sample_every`. `1` keeps all of them.
+    pub sample_every: u64,
+    /// How many events may queue before a run drops them rather than wait.
+    /// Telemetry that blocks a turn would be worse than telemetry that is
+    /// missing, and a drop is counted.
+    pub capacity: usize,
+    pub otel: OpenTelemetryConfig,
+}
+
+impl Default for TelemetrySettings {
+    fn default() -> Self {
+        Self {
+            sample_every: 1,
+            capacity: 256,
+            otel: OpenTelemetryConfig::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     provider_default: Option<String>,
@@ -412,6 +438,10 @@ pub struct Config {
     mcp_servers: BTreeMap<String, McpServer>,
     /// `[remote.target.<name>]`, from a trusted layer only.
     remote_targets: BTreeMap<String, RemoteTarget>,
+    telemetry: TelemetrySettings,
+    /// What the layers that spoke agreed on for `telemetry.include_content`.
+    /// `None` means none of them did, which is not the same as `Some(false)`.
+    telemetry_include_content: Option<bool>,
     trace: BTreeMap<String, Origin>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -474,6 +504,11 @@ impl Config {
     /// Configured remote targets in name order. Nothing is connected.
     pub fn remote_targets(&self) -> impl Iterator<Item = (&String, &RemoteTarget)> {
         self.remote_targets.iter()
+    }
+
+    /// `[telemetry]` as the runtime reads it, defaults included.
+    pub fn telemetry(&self) -> &TelemetrySettings {
+        &self.telemetry
     }
 
     pub fn remote_target(&self, name: &str) -> Option<&RemoteTarget> {
@@ -659,6 +694,7 @@ impl Config {
                         self.record(layer, path, "credentials.store", store);
                     }
                 }
+                "telemetry" => self.apply_telemetry(layer, path, value)?,
                 "mcp" => self.apply_mcp(layer, path, value)?,
                 "remote" => self.apply_remote(layer, path, value)?,
                 "policy" => self.apply_policy(layer, path, value)?,
@@ -801,6 +837,107 @@ impl Config {
             timeout_ms: positive("timeout_ms", DEFAULT_MCP_TIMEOUT_MS)?,
             max_body_bytes: positive("max_body_bytes", DEFAULT_MCP_MAX_BODY_BYTES)?,
         })
+    }
+
+    /// `[telemetry]`: sampling, queue depth, and the optional export.
+    ///
+    /// `telemetry.endpoint` names a host that run data is sent to, so the
+    /// export keys are refused outside the enterprise and user layers for the
+    /// same reason a provider endpoint is: cloning a repository must not be
+    /// able to redirect what a run reports about itself. Sampling and queue
+    /// depth carry no such risk and are honoured from any layer.
+    fn apply_telemetry(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let table = as_table(value, "telemetry", path)?;
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "sample_every" | "capacity" | "enabled" | "endpoint" | "include_content"
+            ) {
+                return Err(reject(format!("unknown key `telemetry.{key}`")));
+            }
+        }
+
+        for key in ["sample_every", "capacity"] {
+            let Some(value) = table.get(key) else {
+                continue;
+            };
+            let number = value
+                .as_integer()
+                .and_then(|number| u64::try_from(number).ok())
+                .filter(|number| *number > 0)
+                .ok_or_else(|| reject(format!("`telemetry.{key}` must be a positive integer")))?;
+            if key == "sample_every" {
+                self.telemetry.sample_every = number;
+            } else {
+                self.telemetry.capacity = usize::try_from(number)
+                    .map_err(|_| reject("`telemetry.capacity` is too large".to_owned()))?;
+            }
+            self.record(layer, path, &format!("telemetry.{key}"), number.to_string());
+        }
+
+        let exports = ["enabled", "endpoint", "include_content"];
+        if !exports.iter().any(|key| table.contains_key(*key)) {
+            return Ok(());
+        }
+        if !layer.is_trusted() {
+            // Refused, not merged: see the module note on repository content.
+            self.diagnostics.push(Diagnostic {
+                key: "telemetry.endpoint".to_owned(),
+                layer,
+                path: path.to_path_buf(),
+                message: "the telemetry export may only be configured by the enterprise or user \
+                          configuration, because it decides where run data goes"
+                    .to_owned(),
+            });
+            return Ok(());
+        }
+        let flag = |name: &str| -> Result<Option<bool>, ConfigError> {
+            table
+                .get(name)
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| reject(format!("`telemetry.{name}` must be a boolean")))
+                })
+                .transpose()
+        };
+        if let Some(endpoint) = string(table, "endpoint", "telemetry.endpoint", path)? {
+            // Checked here as well as at export time so a bad endpoint is a
+            // configuration error an operator sees, not a run that fails late.
+            if !endpoint.starts_with("https://") {
+                return Err(reject("`telemetry.endpoint` must use HTTPS".to_owned()));
+            }
+            self.telemetry.otel.endpoint = endpoint.clone();
+            self.record(layer, path, "telemetry.endpoint", endpoint);
+        }
+        if let Some(enabled) = flag("enabled")? {
+            self.telemetry.otel.enabled = enabled;
+            self.record(layer, path, "telemetry.enabled", enabled.to_string());
+        }
+        // `include_content` intersects rather than replaces: sending prompt
+        // content off the machine needs every layer that spoke to agree, so a
+        // layer above cannot widen what one below refused.
+        if let Some(include) = flag("include_content")? {
+            let merged = self.telemetry_include_content.is_none_or(|granted| granted) && include;
+            self.telemetry_include_content = Some(merged);
+            self.telemetry.otel.include_content = merged;
+            self.record(layer, path, "telemetry.include_content", merged.to_string());
+        }
+        if self.telemetry.otel.enabled && self.telemetry.otel.endpoint.is_empty() {
+            return Err(reject(
+                "`telemetry.enabled` requires `telemetry.endpoint`".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// `[remote.target.<name>]`: where a command may be run other than here.

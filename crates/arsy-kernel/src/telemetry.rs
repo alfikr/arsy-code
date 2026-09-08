@@ -39,7 +39,10 @@ pub struct TelemetryEvent {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Metric {
+    /// Time inside the provider call. Separate from the tool figure because
+    /// "the turn was slow" has two different answers and two different fixes.
     LatencyMilliseconds,
+    ToolLatencyMilliseconds,
     InputTokens,
     OutputTokens,
     CostMicrounits,
@@ -49,7 +52,7 @@ pub enum Metric {
 }
 
 impl Metric {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 
     const fn index(self) -> usize {
         self as usize
@@ -220,6 +223,42 @@ pub fn export_next(
     sink.export(&config.endpoint, &redacted)
         .map_err(TelemetryError::Export)?;
     Ok(true)
+}
+
+/// The OTLP/HTTP boundary: one event, one request, no batching.
+///
+/// A run produces tens of events, not thousands, so batching would buy little
+/// and cost the property that matters — an event is redacted and size-checked
+/// individually, immediately before it leaves the machine. The endpoint is
+/// checked for HTTPS by [`export_next`] before anything reaches here.
+#[cfg(feature = "http")]
+pub struct HttpExporter {
+    agent: ureq::Agent,
+}
+
+#[cfg(feature = "http")]
+impl HttpExporter {
+    pub fn new(timeout: std::time::Duration) -> Self {
+        Self {
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(timeout))
+                .user_agent(concat!("arsy/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .into(),
+        }
+    }
+}
+
+#[cfg(feature = "http")]
+impl OpenTelemetrySink for HttpExporter {
+    fn export(&mut self, endpoint: &str, redacted_json: &str) -> Result<(), String> {
+        self.agent
+            .post(endpoint)
+            .content_type("application/json")
+            .send(redacted_json)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

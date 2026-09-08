@@ -28,6 +28,7 @@ mod policy;
 pub mod provider;
 mod serve;
 mod session;
+mod telemetry;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -52,7 +53,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Every session of one workspace shares this store.
@@ -4131,13 +4132,39 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
             .map_err(|error| storage_failed(error.to_string()))?,
     };
 
-    let outcome = dispatch(resolved.provider.as_ref(), &agent, &request, emitter);
+    let mut recorder = telemetry::Recorder::new(&config, actor.clone())?;
+    let outcome = dispatch(
+        resolved.provider.as_ref(),
+        &agent,
+        &request,
+        &mut recorder,
+        emitter,
+    );
+    let stop = match &outcome {
+        Ok(_) => "answered".to_owned(),
+        Err(error) => format!("provider:{}", error.code()),
+    };
+    let summary = recorder.finish(&stop, &redactor(invocation, emitter)?, emitter);
     let record = json!({
         "session": session.to_string(),
         "turn": admission.turn.to_string(),
         "provider": resolved.endpoint.id,
         "model": request.model.model,
+        "telemetry": summary,
     });
+    // Recorded whether the turn completed or failed: a turn that died halfway
+    // still spent the tokens it spent, and a session's totals are wrong if the
+    // failures are missing from them.
+    service
+        .record_usage(
+            actor.clone(),
+            arsy_kernel::projection::UsageTotals {
+                input_tokens: summary_number(&record, "input_tokens"),
+                output_tokens: summary_number(&record, "output_tokens"),
+                cost_micros: 0,
+            },
+        )
+        .map_err(storage_failed)?;
     match outcome {
         Ok(usage) => {
             let mut outcome = record.clone();
@@ -4203,6 +4230,7 @@ fn dispatch(
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
+    recorder: &mut telemetry::Recorder,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let mut request = request.clone();
@@ -4216,8 +4244,25 @@ fn dispatch(
             .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
         let mut answer = String::new();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
-        let stream =
-            arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)?;
+        // Each sleep the retry loop asks for is one attempt that failed, which
+        // is the only place a retry is observable from outside the provider.
+        let mut retries = 0;
+        let started = Instant::now();
+        let stream = arsy_kernel::provider::stream_with_retry(provider, &request, &mut |delay| {
+            retries += 1;
+            std::thread::sleep(delay);
+        })
+        .inspect_err(|error| {
+            recorder.model_call(
+                &request.model.model,
+                started.elapsed(),
+                0,
+                0,
+                retries,
+                error.code(),
+            );
+        })?;
+        let (mut round_input, mut round_output) = (0u64, 0u64);
         for event in stream {
             match event? {
                 ModelEvent::TextDelta { text } => {
@@ -4228,6 +4273,8 @@ fn dispatch(
                     input_tokens: input,
                     output_tokens: output,
                 } => {
+                    round_input += input;
+                    round_output += output;
                     input_tokens += input;
                     output_tokens += output;
                 }
@@ -4245,6 +4292,14 @@ fn dispatch(
                 | ModelEvent::ThinkingDelta { .. } => {}
             }
         }
+        recorder.model_call(
+            &request.model.model,
+            started.elapsed(),
+            round_input,
+            round_output,
+            retries,
+            "ok",
+        );
         if calls.is_empty() {
             emitter.end_deltas();
             return Ok(token_usage(input_tokens, output_tokens));
@@ -4274,6 +4329,7 @@ fn dispatch(
             .iter()
             .map(|(id, name, arguments)| {
                 let result = runtime.invoke(name, arguments);
+                recorder.tool_call(&result);
                 ModelContent::ToolResult {
                     id: id.clone(),
                     content: result.output,
@@ -4290,6 +4346,11 @@ fn dispatch(
     Err(ProviderError::InvalidRequest(format!(
         "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
     )))
+}
+
+/// One counter out of the telemetry summary the run just printed.
+fn summary_number(record: &Value, key: &str) -> u64 {
+    record["telemetry"][key].as_u64().unwrap_or_default()
 }
 
 fn token_usage(input_tokens: u64, output_tokens: u64) -> Value {

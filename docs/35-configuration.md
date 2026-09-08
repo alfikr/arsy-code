@@ -71,6 +71,8 @@ Authority classes are:
 | `execution.max_parallel` | positive integer | `4` | min | ceiling |
 | `storage.data_dir` | absolute path | platform data directory | replace | user |
 | `storage.durability` | `"fast"`, `"balanced"`, or `"strict"` | `"balanced"` | max | user |
+| `telemetry.sample_every` | positive integer | `1` | replace | intent |
+| `telemetry.capacity` | positive integer | `256` | replace | intent |
 | `telemetry.enabled` | boolean | `false` | replace | user |
 | `telemetry.endpoint` | HTTPS URL | none | replace | user |
 | `telemetry.include_content` | boolean | `false` | intersection | ceiling |

@@ -7,14 +7,14 @@
 use crate::{
     domain::{CorrelationId, EventId, Principal, SessionId, StateVersion, SubscriptionId, TurnId},
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
-    projection::{ProjectionError, ProjectionSet, TurnStatus},
+    projection::{ProjectionError, ProjectionSet, TurnStatus, UsageTotals},
     protocol::{
         ClientRequest, IdempotencyKey, ProtocolEnvelope, ProtocolError, RequestLedger, ServerEvent,
         SubscriptionCursor, MAX_SUBSCRIPTION_BATCH,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
@@ -316,6 +316,31 @@ impl AgentService {
         self.finish_turn(actor, turn, TURN_FAILED, &Value::Null, Some(failure))
     }
 
+    /// Append `usage.recorded`, so what a turn spent outlives the process that
+    /// spent it.
+    ///
+    /// Separate from `complete_turn` because a turn that fails has still spent
+    /// tokens, and because the projection folds usage across turns: totals
+    /// belong to the session, not to whichever turn happened to finish last.
+    pub fn record_usage(
+        &self,
+        actor: Principal,
+        usage: UsageTotals,
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(
+            &mut state,
+            actor,
+            USAGE_RECORDED,
+            &json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cost_micros": usage.cost_micros,
+            }),
+        )?;
+        Ok(state.version)
+    }
+
     fn finish_turn(
         &self,
         actor: Principal,
@@ -537,6 +562,7 @@ const SESSION_BRANCHED: &str = "session.branched";
 const TURN_STARTED: &str = "turn.started";
 const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
+const USAGE_RECORDED: &str = "usage.recorded";
 
 fn digest_of(value: &Value) -> Result<StateVersion, ServiceError> {
     use sha2::{Digest, Sha256};
