@@ -26,6 +26,9 @@ serde_json.workspace = true
 unicode-width = "=0.2.2"
 
 [dev-dependencies]
+# The reference thin client, so the pair can be tested as a pair. The
+# dependency runs this way round because the client depends on nothing.
+arsy-ide = { version = "0.1.0", path = "../arsy-ide" }
 tempfile.workspace = true
 
 [lints]

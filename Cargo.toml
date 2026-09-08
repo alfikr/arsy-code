@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/arsy-kernel", "crates/arsy-code", "crates/arsy-cli", "crates/arsy-sandbox"]
+members = [
+    "crates/arsy-kernel",
+    "crates/arsy-code",
+    "crates/arsy-cli",
+    "crates/arsy-ide",
+    "crates/arsy-sandbox",
+]
 resolver = "2"
 
 [workspace.package]
