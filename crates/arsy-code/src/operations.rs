@@ -124,6 +124,12 @@ pub fn registry(
     {
         registry.register(executor)?;
     }
+    #[cfg(feature = "dap")]
+    registry.register(crate::agent::debugops::DebugExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
     #[cfg(feature = "wasm")]
     registry.register(crate::agent::pluginops::PluginExecutor::new(
         workspace,
@@ -179,9 +185,11 @@ mod tests {
         // no host to run one in and does not offer the operation at all.
         #[cfg(feature = "wasm")]
         assert!(kinds.contains(&"plugin.invoke".to_owned()));
+        #[cfg(feature = "dap")]
+        assert!(kinds.contains(&"debug.run".to_owned()));
         let kinds: Vec<_> = kinds
             .into_iter()
-            .filter(|kind| kind != "plugin.invoke")
+            .filter(|kind| kind != "plugin.invoke" && kind != "debug.run")
             .collect();
         assert_eq!(
             kinds,

@@ -35,6 +35,8 @@
 
 pub mod budget;
 pub mod codeops;
+#[cfg(feature = "dap")]
+pub mod debugops;
 pub mod fsops;
 pub mod instructions;
 pub mod patch;
