@@ -2851,7 +2851,20 @@ fn run_turn(
             resolved,
             // An operator is at the keyboard, so an approval can be asked for;
             // the risk context says so and policy decides on it.
-            &agent_runtime(&root, &load_config(&root, &root)?, true)?,
+            //
+            // Configuration is resolved from the working directory, not the
+            // root: a directory-scoped policy layer has to reach the turn, and
+            // it is the same directory the instruction walk starts from, so
+            // what the model is told and what it is allowed to do come from
+            // one place.
+            &agent_runtime(
+                &root,
+                &load_config(
+                    &root,
+                    &std::env::current_dir().unwrap_or_else(|_| root.clone()),
+                )?,
+                true,
+            )?,
             conversation,
             route,
             effort,

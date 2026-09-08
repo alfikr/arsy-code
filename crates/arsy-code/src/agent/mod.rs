@@ -820,11 +820,21 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            // Nothing came back, so say why rather than returning an empty
+            // string a model would read as an empty file. The two causes are
+            // different questions, and only one of them has a next step.
+            if returned == 0 {
+                return (
+                    true,
+                    if total == 0 {
+                        "(empty file)".to_owned()
+                    } else {
+                        format!("(offset {first} is past the end; the file has {total} lines)")
+                    },
+                );
+            }
             let header = if returned < total {
-                format!(
-                    "lines {first}-{} of {total}\n",
-                    first + returned.saturating_sub(1)
-                )
+                format!("lines {first}-{} of {total}\n", first + returned - 1)
             } else {
                 String::new()
             };

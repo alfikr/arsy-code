@@ -152,8 +152,15 @@ impl OperationExecutor for PatchExecutor {
 
 /// Parse and apply a patch, reporting what each file change did.
 ///
-/// The whole patch is parsed before anything is written, so a syntax error in
-/// the last file does not leave the first one half-edited.
+/// The whole patch is parsed before anything is written, so a malformed hunk
+/// anywhere in it costs nothing on disk.
+///
+/// Application is *not* atomic across files: a hunk in the third file that no
+/// longer matches leaves the first two written. The failure therefore names
+/// what already landed, because a model told only that a hunk did not match
+/// retries the whole patch, and by then the files this call already wrote do
+/// not match either. A caller that needs all-or-nothing wants
+/// [`crate::edit::apply_unversioned`], which stages and rolls back.
 pub fn apply(workspace: &Workspace, patch: &str) -> Result<PatchResult, OperationError> {
     let changes = parse(patch).map_err(OperationError::Schema)?;
     let mut result = PatchResult {
@@ -161,52 +168,85 @@ pub fn apply(workspace: &Workspace, patch: &str) -> Result<PatchResult, Operatio
         summary: Vec::new(),
     };
     for change in &changes {
-        let path = change.path().to_owned();
-        let described = match change {
-            Change::Add { path, body } => {
-                workspace
-                    .create_new(path, body.as_bytes())
-                    .map_err(|error| file_error(path, error))?;
-                format!("added {path}")
+        match one(workspace, change, &mut result) {
+            Ok(described) => {
+                result.changed.push(change.path().to_owned());
+                result.summary.push(described);
             }
-            Change::Delete { path } => {
-                workspace
-                    .remove(path)
-                    .map_err(|error| file_error(path, error))?;
-                format!("deleted {path}")
-            }
-            Change::Update { path, moved, hunks } => {
-                let current = workspace
-                    .read(path, MAX_PATCHED_FILE_BYTES)
-                    .map_err(|error| file_error(path, error))?;
-                let text = String::from_utf8(current.bytes)
-                    .map_err(|_| OperationError::Schema(format!("{path} is not UTF-8 text")))?;
-                let updated = update(&text, hunks)
-                    .map_err(|error| OperationError::Schema(format!("{path}: {error}")))?;
-                match moved {
-                    Some(destination) => {
-                        workspace
-                            .write(destination, updated.as_bytes())
-                            .map_err(|error| file_error(destination, error))?;
-                        workspace
-                            .remove(path)
-                            .map_err(|error| file_error(path, error))?;
-                        result.changed.push(destination.clone());
-                        format!("updated {path} and moved it to {destination}")
-                    }
-                    None => {
-                        workspace
-                            .write(path, updated.as_bytes())
-                            .map_err(|error| file_error(path, error))?;
-                        format!("updated {path}")
-                    }
-                }
-            }
-        };
-        result.changed.push(path);
-        result.summary.push(described);
+            // Say what already landed. Without this the model is told only
+            // that a hunk did not match, retries the whole patch, and the
+            // files this call already wrote no longer match either — one
+            // failure becomes a loop.
+            Err(error) => return Err(partial(error, &result)),
+        }
     }
     Ok(result)
+}
+
+/// Apply one file's change, returning how to describe it.
+fn one(
+    workspace: &Workspace,
+    change: &Change,
+    result: &mut PatchResult,
+) -> Result<String, OperationError> {
+    Ok(match change {
+        Change::Add { path, body } => {
+            workspace
+                .create_new(path, body.as_bytes())
+                .map_err(|error| file_error(path, error))?;
+            format!("added {path}")
+        }
+        Change::Delete { path } => {
+            workspace
+                .remove(path)
+                .map_err(|error| file_error(path, error))?;
+            format!("deleted {path}")
+        }
+        Change::Update { path, moved, hunks } => {
+            let current = workspace
+                .read(path, MAX_PATCHED_FILE_BYTES)
+                .map_err(|error| file_error(path, error))?;
+            let text = String::from_utf8(current.bytes)
+                .map_err(|_| OperationError::Schema(format!("{path} is not UTF-8 text")))?;
+            let updated = update(&text, hunks)
+                .map_err(|error| OperationError::Schema(format!("{path}: {error}")))?;
+            match moved {
+                Some(destination) => {
+                    workspace
+                        .write(destination, updated.as_bytes())
+                        .map_err(|error| file_error(destination, error))?;
+                    workspace
+                        .remove(path)
+                        .map_err(|error| file_error(path, error))?;
+                    result.changed.push(destination.clone());
+                    format!("updated {path} and moved it to {destination}")
+                }
+                None => {
+                    workspace
+                        .write(path, updated.as_bytes())
+                        .map_err(|error| file_error(path, error))?;
+                    format!("updated {path}")
+                }
+            }
+        }
+    })
+}
+
+/// A failure, plus what the earlier files in the same patch already did.
+fn partial(error: OperationError, done: &PatchResult) -> OperationError {
+    if done.summary.is_empty() {
+        return error;
+    }
+    let applied = done.summary.join("; ");
+    let note = format!(
+        "{error}\n\nThe rest of the patch was not applied, but these changes \
+         were already made and are on disk: {applied}. Re-read those files \
+         before sending another patch."
+    );
+    match error {
+        OperationError::Schema(_) => OperationError::Schema(note),
+        _ => OperationError::Execution(note),
+    }
 }
 
 fn file_error(path: &str, error: ResolveError) -> OperationError {

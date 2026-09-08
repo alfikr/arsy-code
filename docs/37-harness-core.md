@@ -153,7 +153,17 @@ workspace contains.
   round limit or a tool's deadline. `ToolRuntime` holds no cancellation flag of
   its own; a second mechanism that the loop did not consult would be a knob
   that looks like it works.
-- The context budget is a constant, not a per-model window.
+- The context budget is a constant, not a per-model window, and it counts the
+  transcript only — the system prompt and the tool schemas are not in it. The
+  constant carries the slack.
+- `fs.write` and `apply_patch` write in place: truncate, then write. A failure
+  mid-write leaves a truncated file. `fs.edit` does not have this problem —
+  it goes through `edit::apply_unversioned`, which stages into a temporary
+  directory and renames. Moving the other two onto the same path is the fix,
+  and is not done.
+- `apply_patch` is not atomic across files. A hunk that fails in the third file
+  leaves the first two written; the error says which, so the model can re-read
+  before retrying.
 - `arsy_kernel::{memory, orchestration, observer, telemetry, migrate}` and
   `arsy-code::{workspace, review, benchmark, acp, remote, extension, graph,
   intelligence, lsp, syntax}` are built but not reachable from a turn. They are

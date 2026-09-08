@@ -228,6 +228,12 @@ pub fn apply_with_resolver(
     transaction: &EditTransaction,
     resolver: &dyn SemanticResolver,
 ) -> Result<Vec<FileEdit>, EditError> {
+    // Before the workspace hash, which reads every file: an oversized
+    // transaction is rejected on its own shape and should not first pay for a
+    // full tree traversal to be told so.
+    if transaction.operations.len() > MAX_OPERATIONS {
+        return Err(EditError::TransactionTooLarge);
+    }
     let root = fs::canonicalize(root)?;
     let actual = workspace_version(&root)?;
     if actual != transaction.base {

@@ -164,6 +164,20 @@ fn reading_returns_text_line_windows_and_reports_binary_without_decoding_it() {
 
     let missing = err(&runtime, "fs.read", json!({"path": "nowhere.rs"}));
     assert!(!missing.is_empty());
+
+    // Nothing to return is two different questions, and an empty string would
+    // be read as "the file is empty" for both.
+    std::fs::write(root.path().join("empty.rs"), "").unwrap();
+    assert_eq!(
+        ok(&runtime, "fs.read", json!({"path": "empty.rs"})),
+        "(empty file)"
+    );
+    let past = ok(
+        &runtime,
+        "fs.read",
+        json!({"path": "src/lib.rs", "offset": 900}),
+    );
+    assert_eq!(past, "(offset 900 is past the end; the file has 4 lines)");
 }
 
 #[test]
@@ -425,6 +439,36 @@ fn a_failed_hunk_names_the_closest_line_so_the_model_can_recover() {
     assert!(
         rejected.contains("fn build_context(session: &Session)"),
         "{rejected}"
+    );
+}
+
+#[test]
+fn a_patch_that_half_applies_says_what_already_landed() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("first.txt"), "alpha\n").unwrap();
+    std::fs::write(root.path().join("second.txt"), "beta\n").unwrap();
+    let runtime = permissive(root.path());
+
+    // The first file matches; the second does not.
+    let failed = err(
+        &runtime,
+        "apply_patch",
+        json!({"patch": "*** Begin Patch\n*** Update File: first.txt\n-alpha\n+ALPHA\n*** Update File: second.txt\n-gamma\n+GAMMA\n*** End Patch\n"}),
+    );
+
+    assert!(failed.contains("no line matched"), "{failed}");
+    assert!(
+        failed.contains("already made") && failed.contains("updated first.txt"),
+        "a half-applied patch must name what is on disk, or the model retries \
+         the whole thing against files it already changed: {failed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("first.txt")).unwrap(),
+        "ALPHA\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("second.txt")).unwrap(),
+        "beta\n"
     );
 }
 
