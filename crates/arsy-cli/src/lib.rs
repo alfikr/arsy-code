@@ -26,6 +26,7 @@ mod integrations;
 mod mcp;
 mod policy;
 pub mod provider;
+mod review;
 mod serve;
 mod session;
 mod telemetry;
@@ -68,7 +69,7 @@ const RECORD_SCHEMA: u32 = 1;
 
 /// Documented commands that a later phase ships, so they report their phase
 /// instead of failing as unknown input.
-const UNAVAILABLE: &[(&str, u8)] = &[("completions", 1), ("review", 6)];
+const UNAVAILABLE: &[(&str, u8)] = &[("completions", 1)];
 
 const USAGE: &str = "\
 arsy — agentic coding harness
@@ -89,6 +90,7 @@ Usage:
   arsy artifact export <REF> --out <PATH>         write one artifact to a file
   arsy gc [--apply] [--retention <DURATION>]      report, then remove, unreachable evidence
   arsy migrate [--apply] [--out <PATH>]           report, then apply, the store's schema migration
+  arsy review [--strict]      report what the working tree changed, and what it needs
   arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
   arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
   arsy plugin list [--capabilities]               installed plugins
@@ -258,6 +260,11 @@ pub enum Command {
         apply: bool,
         retention_ms: u64,
     },
+    /// `arsy review`: assess the working tree's change.
+    Review {
+        /// Any finding becomes a non-zero exit, for a pipeline gate.
+        strict: bool,
+    },
     /// `arsy migrate`: move the session store to the supported schema version.
     Migrate {
         apply: bool,
@@ -370,6 +377,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("artifact") => evidence::parse_artifact(&parsed)?,
         Some("gc") => evidence::parse_gc(&parsed)?,
         Some("migrate") => session::parse_migrate(&parsed)?,
+        Some("review") => review::parse(&parsed)?,
         Some("policy") => policy::parse(&parsed)?,
         Some("serve") => serve::parse(&parsed)?,
         Some("skill") => extensions::parse_skill(&parsed)?,
@@ -971,6 +979,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             apply,
             retention_ms,
         } => evidence::collect(invocation, *apply, *retention_ms, emitter),
+        Command::Review { strict } => review::run(invocation, *strict, emitter),
         Command::Migrate { apply, backup } => {
             session::migrate(invocation, *apply, backup.as_deref(), emitter)
         }
