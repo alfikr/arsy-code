@@ -445,6 +445,14 @@ impl AgentService {
 
     /// Append one event, then fan it out. Fan-out only touches per-subscriber
     /// buffers, so a slow subscriber can never block or fail a commit.
+    ///
+    /// The service is not the only writer a session has — a task graph records
+    /// its own state transitions to the same stream, because resuming a task
+    /// means replaying one history rather than correlating two. A conflict is
+    /// therefore the ordinary case of "someone else appended since we looked":
+    /// the missed events are folded into the projection and the append retried
+    /// once at the sequence that is now free. A second conflict is a genuinely
+    /// contended stream and is reported as one.
     fn append<T: Serialize>(
         &self,
         state: &mut ServiceState,
@@ -452,32 +460,71 @@ impl AgentService {
         kind: &str,
         payload: &T,
     ) -> Result<u64, ServiceError> {
-        let sequence = state
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
         let data = serde_json::to_value(payload)
             .map_err(|error| ServiceError::Store(StoreError::Serialization(error.to_string())))?;
-        let envelope = EventEnvelope::new(
-            self.session,
-            sequence,
-            actor,
-            state.last_event_id(),
-            CorrelationId::new(),
-            SERVICE_SCHEMA,
-            kind,
-            EventPayload::Inline { data },
-        );
-        let version = self
-            .store
-            .append(self.session, state.version, vec![envelope.clone()])?;
-        state.projection.apply(&envelope)?;
-        state.version = version;
-        for subscriber in state.subscribers.values_mut() {
-            subscriber.offer(&envelope);
+        for attempt in 0..2 {
+            let sequence = state
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
+            let envelope = EventEnvelope::new(
+                self.session,
+                sequence,
+                actor.clone(),
+                state.last_event_id(),
+                CorrelationId::new(),
+                SERVICE_SCHEMA,
+                kind,
+                EventPayload::Inline { data: data.clone() },
+            );
+            match self
+                .store
+                .append(self.session, state.version, vec![envelope.clone()])
+            {
+                Ok(version) => {
+                    state.projection.apply(&envelope)?;
+                    state.version = version;
+                    for subscriber in state.subscribers.values_mut() {
+                        subscriber.offer(&envelope);
+                    }
+                    return Ok(sequence);
+                }
+                Err(StoreError::Conflict { .. }) if attempt == 0 => self.catch_up(state)?,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(sequence)
+        Err(ServiceError::Store(StoreError::Conflict {
+            expected: state.version,
+            actual: self.store.current_version(self.session)?,
+        }))
+    }
+
+    /// Fold everything appended to this session since the service last looked
+    /// into its projection and its subscribers.
+    fn catch_up(&self, state: &mut ServiceState) -> Result<(), ServiceError> {
+        loop {
+            let page = self.store.read(
+                self.session,
+                state
+                    .version
+                    .0
+                    .checked_add(1)
+                    .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?,
+                MAX_SUBSCRIPTION_BATCH,
+            )?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            let version = StreamVersion(last.sequence);
+            for event in &page {
+                state.projection.apply(event)?;
+                for subscriber in state.subscribers.values_mut() {
+                    subscriber.offer(event);
+                }
+            }
+            state.version = version;
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ServiceState>, ServiceError> {

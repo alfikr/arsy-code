@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, TcpListener},
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     sync::mpsc,
     thread,
 };
@@ -27,10 +27,17 @@ struct FakeProvider {
 impl FakeProvider {
     /// `script` holds one SSE body per expected request, in order.
     fn serving(script: Vec<String>) -> Self {
+        Self::scripted(script.into_iter().map(Some).collect())
+    }
+
+    /// A `None` entry accepts the request and never answers, which is what a
+    /// client sees when the process holding the turn is killed.
+    fn scripted(script: Vec<Option<String>>) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, bodies) = mpsc::channel();
         thread::spawn(move || {
+            let mut held = Vec::new();
             for body in script {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
@@ -40,6 +47,13 @@ impl FakeProvider {
                 // A receiver that has gone away means the test finished early;
                 // the response still goes out so the client is not left hanging.
                 let _ = sender.send(request);
+                let Some(body) = body else {
+                    // Hold the connection open without answering, and keep
+                    // accepting: the test kills the client, then connects
+                    // again to resume.
+                    held.push(stream);
+                    continue;
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -244,4 +258,68 @@ fn a_refused_tool_reaches_the_model_as_a_failed_result_and_is_counted() {
             .starts_with("error:"),
         "{tool_result}"
     );
+}
+
+#[test]
+fn a_task_its_process_never_finished_is_continued_by_resume() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+
+    // The first request is accepted and never answered, so the run is still
+    // holding its task when the test kills it -- a process that died mid-turn.
+    let provider = FakeProvider::scripted(vec![
+        None,
+        Some(asks_to_read("notes.txt")),
+        Some(answers("42.")),
+    ]);
+    configure(home.path(), provider.port);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arsy"))
+        .args(["--workspace", workspace.path().to_str().unwrap()])
+        .args(["run", "what does notes.txt say?"])
+        .args(["--output", "json"])
+        .env("ARSY_CONFIG_HOME", home.path())
+        .env("ARSY_TEST_KEY", "test-key-0123456789abcdef")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    // The provider has the request, so the turn and its task are on the record.
+    drop(provider.request());
+    child.kill().expect("the run is killed mid-turn");
+    child.wait().expect("the killed run is reaped");
+
+    let (code, listed) = arsy(workspace.path(), home.path(), &["session", "list"]);
+    assert_eq!(code, 0);
+    let listed = result(&listed);
+    let session = listed["sessions"][0]["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(listed["sessions"][0]["status"], "running");
+
+    // Resume closes the open turn, takes the task back, and finishes it with
+    // the goal it was created with -- which nothing but the store still knows.
+    let (code, records) = arsy(workspace.path(), home.path(), &["resume", &session]);
+    let resumed = result(&records);
+    assert_eq!(code, 0, "{resumed:#?}");
+    assert_eq!(resumed["closed_turns"], 1);
+    assert_eq!(resumed["recovered_tasks"], 1);
+    assert_eq!(resumed["continuing"], resumed["task"]);
+    assert_eq!(resumed["status"], "completed");
+    assert_eq!(resumed["telemetry"]["tool_calls"], 1);
+
+    // The resumed turn asked the same question the killed one did.
+    let continued = provider.request().to_string();
+    assert!(
+        continued.contains("what does notes.txt say?"),
+        "{continued}"
+    );
+
+    // Nothing is left waiting once it completed.
+    let (code, records) = arsy(workspace.path(), home.path(), &["resume", &session]);
+    assert_eq!(code, 0);
+    let quiet = result(&records);
+    assert_eq!(quiet["continuing"], Value::Null);
+    assert_eq!(quiet["recovered_tasks"], 0);
 }

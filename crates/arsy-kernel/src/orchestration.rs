@@ -237,6 +237,34 @@ impl TaskGraph {
         self.transition(id, TaskState::Completed, Some(evidence))
     }
 
+    /// Record why a task stopped, keeping whatever it produced.
+    ///
+    /// Idempotent, like `complete`: a caller that fails a task twice — a
+    /// retry, a resumed process closing what it found — is describing the same
+    /// history, not writing a second one.
+    pub fn fail(&mut self, id: TaskId, evidence: Value) -> Result<(), GraphError> {
+        if self
+            .nodes
+            .get(&id)
+            .is_some_and(|node| node.state == TaskState::Failed)
+        {
+            return Ok(());
+        }
+        self.transition(id, TaskState::Failed, Some(evidence))
+    }
+
+    /// Tasks waiting for someone to take them, in creation order.
+    ///
+    /// This is what makes a graph resumable: a process that died holding a
+    /// lease leaves a task whose lease expires, and the next one finds it here
+    /// with the goal it was created with.
+    pub fn pending(&self) -> Vec<&TaskNode> {
+        self.nodes
+            .values()
+            .filter(|node| matches!(node.state, TaskState::Ready | TaskState::Pending))
+            .collect()
+    }
+
     pub fn consume(&mut self, id: TaskId, used: Budget) -> Result<(), GraphError> {
         let mut remaining = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?.budget;
         let result = remaining.consume(used);
@@ -254,6 +282,28 @@ impl TaskGraph {
                 Err(GraphError::BudgetExhausted(evidence))
             }
         }
+    }
+
+    /// Hand every running task back to the queue, whatever its lease says.
+    ///
+    /// A lease expiring is how a *silent* holder is detected; this is for the
+    /// case where the holder is known to be gone — its turn was found open by
+    /// the process that came after it. Waiting out a lease we already know is
+    /// dead would make resuming a killed run mean "come back in half an hour".
+    pub fn reclaim_running(&mut self) -> Result<Vec<TaskId>, GraphError> {
+        let running: Vec<_> = self
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| (node.state == TaskState::Running).then_some(*id))
+            .collect();
+        for id in &running {
+            self.record("task.reclaimed", json!({"task_id": id}))?;
+            let node = self.nodes.get_mut(id).expect("selected above");
+            node.state = TaskState::Ready;
+            node.assignee = None;
+            node.lease_expires_at_ms = None;
+        }
+        Ok(running)
     }
 
     pub fn recover_expired(&mut self, now_ms: u64) -> Result<Vec<TaskId>, GraphError> {
@@ -361,7 +411,7 @@ impl TaskGraph {
                 node.lease_expires_at_ms = data.get("expires_at_ms").and_then(Value::as_u64);
                 node.state = TaskState::Running;
             }
-            "task.lease_expired" => {
+            "task.lease_expired" | "task.reclaimed" => {
                 let id = event_task_id(data)?;
                 let node = self.nodes.get_mut(&id).ok_or(GraphError::Unknown(id))?;
                 node.state = TaskState::Ready;
@@ -387,22 +437,67 @@ impl TaskGraph {
         Ok(())
     }
 
+    /// Append one graph event, catching up once if the stream moved.
+    ///
+    /// A task graph shares its session's stream with whatever else writes to
+    /// it — the turn lifecycle, usage — because resuming a task means replaying
+    /// one history, not correlating two. So a conflict here is the normal case
+    /// of "something else appended since we last looked", not a lost update:
+    /// the missed events are replayed into the graph and the append retried
+    /// once. A second conflict is a genuinely contended stream and is reported.
     fn record(&mut self, kind: &str, payload: Value) -> Result<(), GraphError> {
-        let sequence = self.version.0.checked_add(1).ok_or(GraphError::Overflow)?;
-        let event = EventEnvelope::new(
-            self.session,
-            sequence,
-            self.actor.clone(),
-            None,
-            CorrelationId::new(),
-            SchemaVersion(1),
-            kind,
-            EventPayload::Inline { data: payload },
-        );
-        self.version = self.store.append(self.session, self.version, vec![event])?;
-        Ok(())
+        for attempt in 0..2 {
+            let sequence = self.version.0.checked_add(1).ok_or(GraphError::Overflow)?;
+            let event = EventEnvelope::new(
+                self.session,
+                sequence,
+                self.actor.clone(),
+                None,
+                CorrelationId::new(),
+                SchemaVersion(1),
+                kind,
+                EventPayload::Inline {
+                    data: payload.clone(),
+                },
+            );
+            match self.store.append(self.session, self.version, vec![event]) {
+                Ok(version) => {
+                    self.version = version;
+                    return Ok(());
+                }
+                Err(StoreError::Conflict { .. }) if attempt == 0 => self.catch_up()?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(GraphError::Store(StoreError::Conflict {
+            expected: self.version,
+            actual: self.store.current_version(self.session)?,
+        }))
+    }
+
+    /// Replay everything appended to this session since the graph last looked.
+    fn catch_up(&mut self) -> Result<(), GraphError> {
+        loop {
+            let page = self.store.read(
+                self.session,
+                self.version.0.checked_add(1).ok_or(GraphError::Overflow)?,
+                MAX_CATCH_UP_BATCH,
+            )?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            let version = StreamVersion(last.sequence);
+            for event in &page {
+                self.replay(event)?;
+            }
+            self.version = version;
+        }
     }
 }
+
+/// Events replayed per catch-up read. The same bound the service uses to page
+/// a stream, for the same reason: a long session must not be read at once.
+const MAX_CATCH_UP_BATCH: usize = 256;
 
 pub fn attenuate_child_grant(
     parent: &CapabilityGrant,

@@ -34,8 +34,11 @@ mod telemetry;
 pub mod tui;
 
 use arsy_kernel::{
-    domain::{Principal, SessionId},
+    artifact::unix_time_ms,
+    config::Config,
+    domain::{AgentId, Principal, SessionId, TaskId},
     event::EventStore,
+    orchestration::{Budget, TaskGraph, TaskNode, TaskState, WorkspaceRequirement},
     protocol::{ClientRequest, Extensions, IdempotencyKey, ProtocolEnvelope, TurnStart},
     provider::{
         CanonicalModelRequest, ModelContent, ModelEvent, ModelKey, ModelMessage, ModelProvider,
@@ -4076,13 +4079,77 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
     } else {
         task.to_owned()
     };
-    let task = prepare_task(invocation, &task, emitter)?;
-    let root = workspace_root(&invocation.workspace)?;
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let goal = prepare_task(invocation, &task, emitter)?;
+    let mut execution = match TaskRun::open(invocation, None) {
+        Ok(execution) => execution,
+        Err(diagnostic) => return Ok(unusable(diagnostic, emitter)),
+    };
+    emitter.session = Some(execution.session);
+    let task = execution.enqueue(&goal)?;
+    execution.execute(task, Value::Null, emitter)
+}
 
-    // Resolved before the turn is recorded: a misconfiguration is the
-    // operator's to fix, not a failed turn in their session history.
-    let resolved = load_config(&root, &working).and_then(|config| {
+/// A misconfiguration is the operator's to fix, not a failed turn in their
+/// session history, so nothing is recorded before it is reported.
+fn unusable(mut diagnostic: Diagnostic, emitter: &mut Emitter) -> i32 {
+    if diagnostic.code == ARSY_PRV_1000 {
+        diagnostic.remediation = format!(
+            "{}; or use the interactive TUI with a logged-in Codex CLI",
+            diagnostic.remediation
+        );
+    }
+    emitter.diagnostic(&diagnostic);
+    diagnostic.exit_code()
+}
+
+/// How long a task's lease runs before another process may take it over.
+///
+/// A turn still in flight has not lost its lease; a process that died halfway
+/// has, and telling those apart is the whole job of `arsy resume`.
+const TASK_LEASE_MS: u64 = 30 * 60 * 1000;
+
+/// What one task may spend before it is stopped rather than continued.
+///
+/// Wall time matches the lease, because a task that outlives its lease is one
+/// another process may already have taken. Tokens are several turns' worth of
+/// transcript: the point is to stop a runaway, not to second-guess a long task.
+const TASK_BUDGET: Budget = Budget {
+    tokens: CONTEXT_BUDGET_TOKENS as u64 * 4,
+    cost_micros: u64::MAX,
+    wall_ms: TASK_LEASE_MS,
+};
+
+/// One session's execution: the store, the provider it dispatches to, and the
+/// durable graph of tasks it is working through.
+///
+/// `arsy run` and `arsy resume` differ only in where the task comes from — a
+/// new one, or one a dead process left behind — so everything after that point
+/// is this, and a resumed task cannot drift from a fresh one by being executed
+/// somewhere else.
+struct TaskRun<'a> {
+    invocation: &'a Invocation,
+    root: PathBuf,
+    config: Config,
+    resolved: provider::Resolved,
+    model: String,
+    service: AgentService,
+    actor: Principal,
+    session: SessionId,
+    graph: TaskGraph,
+    /// This process's identity as a task holder, so an expired lease can be
+    /// told from one this process still holds.
+    agent: AgentId,
+}
+
+impl<'a> TaskRun<'a> {
+    /// Resolve everything a turn needs, then attach to the session.
+    ///
+    /// Configuration is resolved first and on its own: a provider that cannot
+    /// be reached is a diagnostic before anything is recorded.
+    fn open(invocation: &'a Invocation, session: Option<SessionId>) -> Result<Self, Diagnostic> {
+        let root = workspace_root(&invocation.workspace)?;
+        let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+        let config = load_config(&root, &working)?;
         let resolved = provider::resolve(&config, None)?;
         let model = resolved
             .endpoint
@@ -4099,111 +4166,217 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
                     "set `model` on the provider endpoint, or `model.default`, in config.toml",
                 )
             })?;
-        Ok((resolved, model, config))
-    });
-    let (resolved, model, config) = match resolved {
-        Ok(resolved) => resolved,
-        Err(mut diagnostic) => {
-            if diagnostic.code == ARSY_PRV_1000 {
-                diagnostic.remediation = format!(
-                    "{}; or use the interactive TUI with a logged-in Codex CLI",
-                    diagnostic.remediation
-                );
-            }
-            emitter.diagnostic(&diagnostic);
-            return Ok(diagnostic.exit_code());
-        }
-    };
 
-    // No operator is present, so nothing can be confirmed mid-run: the risk
-    // context says so, and a call that needs an approval is refused by policy
-    // rather than waiting on a keyboard that is not there.
-    let agent = agent_runtime(&root, &config, false)?;
-    let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
-    let request = CanonicalModelRequest {
-        model: ModelKey {
-            provider: resolved.endpoint.id.clone(),
-            model: model.clone(),
-        },
-        system: system_prompt(&root, &resolved.endpoint.id, &model),
-        messages: vec![ModelMessage {
-            role: ModelRole::User,
-            content: vec![ModelContent::Text { text: task }],
-        }],
-        tools: agent.schemas(),
-        max_output_tokens: resolved.endpoint.max_output_tokens,
-        // Reasoning effort is chosen in the TUI with `/effort`. A scripted run
-        // takes the request it always took, so a remembered interactive choice
-        // cannot quietly change what a pipeline sends.
-        effort: None,
-        // The turn id, so a retried attempt is provably the same request.
-        idempotency_key: IdempotencyKey::new(admission.turn.to_string())
-            .map_err(|error| storage_failed(error.to_string()))?,
-    };
+        let store = open_store(&root)?;
+        let session = session.unwrap_or_default();
+        let actor = actor();
+        let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
+            .map_err(storage_failed)?;
+        let graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
+        Ok(Self {
+            invocation,
+            root,
+            config,
+            resolved,
+            model,
+            service,
+            actor,
+            session,
+            graph,
+            agent: AgentId::new(),
+        })
+    }
 
-    let mut recorder = telemetry::Recorder::new(&config, actor.clone())?;
-    let outcome = dispatch(
-        resolved.provider.as_ref(),
-        &agent,
-        &request,
-        &mut recorder,
-        emitter,
-    );
-    let stop = match &outcome {
-        Ok(_) => "answered".to_owned(),
-        Err(error) => format!("provider:{}", error.code()),
-    };
-    let summary = recorder.finish(&stop, &redactor(invocation, emitter)?, emitter);
-    let record = json!({
-        "session": session.to_string(),
-        "turn": admission.turn.to_string(),
-        "provider": resolved.endpoint.id,
-        "model": request.model.model,
-        "telemetry": summary,
-    });
-    // Recorded whether the turn completed or failed: a turn that died halfway
-    // still spent the tokens it spent, and a session's totals are wrong if the
-    // failures are missing from them.
-    service
-        .record_usage(
-            actor.clone(),
-            arsy_kernel::projection::UsageTotals {
-                input_tokens: summary_number(&record, "input_tokens"),
-                output_tokens: summary_number(&record, "output_tokens"),
-                cost_micros: 0,
+    /// Record a new task in the graph and take it.
+    fn enqueue(&mut self, goal: &str) -> Result<TaskId, Diagnostic> {
+        let id = TaskId::new();
+        self.graph
+            .add(TaskNode {
+                id,
+                goal: goal.to_owned(),
+                dependencies: Vec::new(),
+                assignee: Some(self.agent),
+                required_output: "an answer to the task".to_owned(),
+                // One process, one working tree: a scripted run edits the
+                // workspace it was pointed at.
+                workspace: WorkspaceRequirement::IsolatedWriter,
+                budget: TASK_BUDGET,
+                // Authority comes from policy at dispatch, not from the node:
+                // a grant recorded here would be a second, stale answer to the
+                // question `RuleSet::evaluate` already answers per call.
+                authority: Vec::new(),
+                state: TaskState::Pending,
+                lease_expires_at_ms: None,
+            })
+            .map_err(graph_failed)?;
+        Ok(id)
+    }
+
+    /// Run one task to a terminal state, recording what it spent on the way.
+    ///
+    /// `context` is folded into the result: a resumed task reports what its
+    /// recovery found in the same record as its outcome, so one invocation
+    /// still produces exactly one result.
+    fn execute(
+        &mut self,
+        task: TaskId,
+        context: Value,
+        emitter: &mut Emitter,
+    ) -> Result<i32, Diagnostic> {
+        self.graph.ready().map_err(graph_failed)?;
+        self.graph
+            .lease(task, self.agent, unix_time_ms() + TASK_LEASE_MS)
+            .map_err(graph_failed)?;
+        let goal = self
+            .graph
+            .node(task)
+            .map(|node| node.goal.clone())
+            .ok_or_else(|| storage_failed("the task disappeared from its own graph"))?;
+
+        // No operator is present, so nothing can be confirmed mid-run: the risk
+        // context says so, and a call that needs an approval is refused by
+        // policy rather than waiting on a keyboard that is not there.
+        let agent = agent_runtime(&self.root, &self.config, false)?;
+        let admission = self.start_turn(&goal)?;
+        let request = CanonicalModelRequest {
+            model: ModelKey {
+                provider: self.resolved.endpoint.id.clone(),
+                model: self.model.clone(),
             },
-        )
-        .map_err(storage_failed)?;
-    match outcome {
-        Ok(usage) => {
-            let mut outcome = record.clone();
-            merge(&mut outcome, usage);
-            service
-                .complete_turn(actor, admission.turn, &outcome)
-                .map_err(storage_failed)?;
-            let mut result = outcome;
-            merge(&mut result, json!({"status": "completed"}));
-            emitter.result(result);
-            Ok(0)
-        }
-        Err(error) => {
-            let diagnostic = Diagnostic::error(
-                ARSY_PRV_1000,
+            system: system_prompt(&self.root, &self.resolved.endpoint.id, &self.model),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text { text: goal }],
+            }],
+            tools: agent.schemas(),
+            max_output_tokens: self.resolved.endpoint.max_output_tokens,
+            // Reasoning effort is chosen in the TUI with `/effort`. A scripted
+            // run takes the request it always took, so a remembered interactive
+            // choice cannot quietly change what a pipeline sends.
+            effort: None,
+            // The turn id, so a retried attempt is provably the same request.
+            idempotency_key: IdempotencyKey::new(admission.turn.to_string())
+                .map_err(|error| storage_failed(error.to_string()))?,
+        };
+
+        let started = Instant::now();
+        let mut recorder = telemetry::Recorder::new(&self.config, self.actor.clone())?;
+        let outcome = dispatch(
+            self.resolved.provider.as_ref(),
+            &agent,
+            &request,
+            &mut recorder,
+            emitter,
+        );
+        let stop = match &outcome {
+            Ok(_) => "answered".to_owned(),
+            Err(error) => format!("provider:{}", error.code()),
+        };
+        let summary = recorder.finish(&stop, &redactor(self.invocation, emitter)?, emitter);
+        let mut record = json!({
+            "session": self.session.to_string(),
+            "task": task.to_string(),
+            "turn": admission.turn.to_string(),
+            "provider": self.resolved.endpoint.id,
+            "model": request.model.model,
+            "telemetry": summary,
+        });
+        merge(&mut record, context);
+        // Recorded whether the turn completed or failed: a turn that died
+        // halfway still spent the tokens it spent, and a session's totals are
+        // wrong if the failures are missing from them.
+        self.service
+            .record_usage(
+                self.actor.clone(),
+                arsy_kernel::projection::UsageTotals {
+                    input_tokens: summary_number(&record, "input_tokens"),
+                    output_tokens: summary_number(&record, "output_tokens"),
+                    cost_micros: 0,
+                },
+            )
+            .map_err(storage_failed)?;
+        // Charged before the task is closed, so an exhausted budget is on the
+        // record even when the turn it exhausted answered anyway.
+        if let Err(error) = self.graph.consume(
+            task,
+            Budget {
+                tokens: summary_number(&record, "input_tokens")
+                    + summary_number(&record, "output_tokens"),
+                cost_micros: 0,
+                wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            },
+        ) {
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-RET-1000",
                 error.to_string(),
-                "check the provider endpoint, credential, and model in `arsy config explain`",
-            );
-            // The turn is durable before dispatch, so a failure here stays
-            // recoverable through `arsy resume`.
-            service
-                .fail_turn(actor, admission.turn, error.code(), error.to_string())
-                .map_err(storage_failed)?;
-            emitter.diagnostic(&diagnostic);
-            let mut result = record;
-            merge(&mut result, json!({"status": "failed"}));
-            emitter.result(result);
-            Ok(diagnostic.exit_code())
+                "split the task, or raise what one task may spend",
+            ));
+        }
+
+        match outcome {
+            Ok(usage) => {
+                let mut outcome = record.clone();
+                merge(&mut outcome, usage);
+                self.service
+                    .complete_turn(self.actor.clone(), admission.turn, &outcome)
+                    .map_err(storage_failed)?;
+                self.graph
+                    .complete(task, outcome.clone())
+                    .map_err(graph_failed)?;
+                let mut result = outcome;
+                merge(&mut result, json!({"status": "completed"}));
+                emitter.result(result);
+                Ok(0)
+            }
+            Err(error) => {
+                let diagnostic = Diagnostic::error(
+                    ARSY_PRV_1000,
+                    error.to_string(),
+                    "check the provider endpoint, credential, and model in `arsy config explain`",
+                );
+                // The turn is durable before dispatch, so a failure here stays
+                // recoverable through `arsy resume`.
+                self.service
+                    .fail_turn(
+                        self.actor.clone(),
+                        admission.turn,
+                        error.code(),
+                        error.to_string(),
+                    )
+                    .map_err(storage_failed)?;
+                self.graph
+                    .fail(
+                        task,
+                        json!({"code": error.code(), "message": error.to_string()}),
+                    )
+                    .map_err(graph_failed)?;
+                emitter.diagnostic(&diagnostic);
+                let mut result = record;
+                merge(&mut result, json!({"status": "failed"}));
+                emitter.result(result);
+                Ok(diagnostic.exit_code())
+            }
         }
     }
+
+    fn start_turn(&self, goal: &str) -> Result<arsy_kernel::service::TurnAdmission, Diagnostic> {
+        let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+            session: self.session,
+            prompt: goal.to_owned(),
+            extensions: Extensions::new(),
+        }));
+        self.service
+            .start_turn(self.actor.clone(), &envelope)
+            .map_err(storage_failed)
+    }
+}
+
+fn graph_failed(error: arsy_kernel::orchestration::GraphError) -> Diagnostic {
+    Diagnostic::error(
+        "ARSY-STL-1000",
+        format!("the task graph refused the change: {error}"),
+        "inspect the session with `arsy session show --turns`",
+    )
 }
 
 /// The transcript budget, in tokens, before the model's own output is reserved.
@@ -4392,35 +4565,6 @@ fn prepare_task(
         .map_err(secret_failed)
 }
 
-fn record_turn(
-    invocation: &Invocation,
-    task: String,
-    emitter: &mut Emitter,
-) -> Result<
-    (
-        AgentService,
-        Principal,
-        arsy_kernel::service::TurnAdmission,
-        SessionId,
-    ),
-    Diagnostic,
-> {
-    let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    let session = SessionId::new();
-    emitter.session = Some(session);
-    let service = AgentService::attach(store, session).map_err(storage_failed)?;
-    let actor = actor();
-    let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
-        session,
-        prompt: task,
-        extensions: Extensions::new(),
-    }));
-    let admission = service
-        .start_turn(actor.clone(), &envelope)
-        .map_err(storage_failed)?;
-    Ok((service, actor, admission, session))
-}
-
 fn resume(
     invocation: &Invocation,
     session: SessionId,
@@ -4441,10 +4585,15 @@ fn resume(
             "check the ID, or run `arsy run` with the workspace that recorded it",
         ));
     }
-    let service = AgentService::attach(store, session).map_err(storage_failed)?;
+
+    // Recovery needs no provider: closing what a dead process left open is
+    // worth doing even in a workspace that could not dispatch a turn today.
     let actor = actor();
-    // History is never truncated: a turn that was running when the process died
-    // is closed by appending `turn.failed` after the events it already wrote.
+    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
+        .map_err(storage_failed)?;
+    // History is never truncated: a turn that was running when the process
+    // died is closed by appending `turn.failed` after the events it already
+    // wrote.
     let interrupted = service.unfinished_turns().map_err(storage_failed)?;
     for turn in &interrupted {
         service
@@ -4457,15 +4606,51 @@ fn resume(
             .map_err(storage_failed)?;
     }
     let version = service.committed_version().map_err(storage_failed)?;
-    // ponytail: following live events needs the serve loop that phase 2 adds;
-    // the flag is accepted and reports the committed head instead of hanging.
-    emitter.result(json!({
+    drop(service);
+
+    // A task whose lease has run out is one nobody is working on, whatever the
+    // process that took it intended.
+    let mut graph = TaskGraph::new(store, session, actor).map_err(graph_failed)?;
+    let mut recovered = graph
+        .recover_expired(unix_time_ms())
+        .map_err(graph_failed)?;
+    // A turn found open is proof its process is gone, so whatever task it held
+    // is handed back now rather than when the lease would have run out.
+    if !interrupted.is_empty() {
+        recovered.extend(graph.reclaim_running().map_err(graph_failed)?);
+    }
+    let waiting = graph.pending().first().map(|node| node.id);
+    drop(graph);
+
+    let mut report = json!({
         "session": session.to_string(),
         "events": version.0,
         "closed_turns": interrupted.len(),
+        "recovered_tasks": recovered.len(),
+        "continuing": Value::Null,
+        // ponytail: following live events needs the serve loop; the flag is
+        // accepted and reports the committed head instead of hanging.
         "following": follow,
-    }));
-    Ok(0)
+    });
+
+    let Some(task) = waiting else {
+        emitter.result(report);
+        return Ok(0);
+    };
+    // The session has unfinished work. Continuing it needs a provider, so a
+    // workspace that cannot dispatch reports the task as still waiting rather
+    // than losing it.
+    let mut execution = match TaskRun::open(invocation, Some(session)) {
+        Ok(execution) => execution,
+        Err(diagnostic) => {
+            let code = unusable(diagnostic, emitter);
+            merge(&mut report, json!({"blocked": task.to_string()}));
+            emitter.result(report);
+            return Ok(code);
+        }
+    };
+    merge(&mut report, json!({"continuing": task.to_string()}));
+    execution.execute(task, report, emitter)
 }
 
 fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
