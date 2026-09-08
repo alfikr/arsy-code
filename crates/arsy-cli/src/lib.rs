@@ -2906,6 +2906,76 @@ fn effort_line(effort: Option<Effort>) -> String {
     }
 }
 
+/// One interactive turn's durable state: the session it is recorded in, and
+/// the task it is.
+///
+/// The TUI takes the same shape `arsy run` does — a turn is a leased task in
+/// the session's graph — so an interactive turn that dies with its process is
+/// recoverable by `arsy resume` exactly like a scripted one. What it cannot
+/// share is `TaskRun::execute`, which owns the streaming loop a terminal has
+/// its own version of.
+#[cfg(feature = "tui")]
+struct RecordedTurn {
+    service: AgentService,
+    graph: TaskGraph,
+    actor: Principal,
+    admission: arsy_kernel::service::TurnAdmission,
+    session: SessionId,
+    task: TaskId,
+}
+
+#[cfg(feature = "tui")]
+fn record_turn(
+    invocation: &Invocation,
+    task: String,
+    emitter: &mut Emitter,
+) -> Result<RecordedTurn, Diagnostic> {
+    let store = open_store(&workspace_root(&invocation.workspace)?)?;
+    let session = SessionId::new();
+    emitter.session = Some(session);
+    let actor = actor();
+    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
+        .map_err(storage_failed)?;
+    let mut graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
+    let agent = AgentId::new();
+    let id = TaskId::new();
+    graph
+        .add(TaskNode {
+            id,
+            goal: task.clone(),
+            dependencies: Vec::new(),
+            assignee: Some(agent),
+            required_output: "an answer to the task".to_owned(),
+            workspace: WorkspaceRequirement::IsolatedWriter,
+            budget: TASK_BUDGET,
+            authority: Vec::new(),
+            state: TaskState::Pending,
+            lease_expires_at_ms: None,
+        })
+        .map_err(graph_failed)?;
+    graph.ready().map_err(graph_failed)?;
+    graph
+        .lease(id, agent, unix_time_ms() + TASK_LEASE_MS)
+        .map_err(graph_failed)?;
+
+    let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+        session,
+        prompt: task,
+        extensions: Extensions::new(),
+    }));
+    let admission = service
+        .start_turn(actor.clone(), &envelope)
+        .map_err(storage_failed)?;
+    Ok(RecordedTurn {
+        service,
+        graph,
+        actor,
+        admission,
+        session,
+        task: id,
+    })
+}
+
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
@@ -2923,7 +2993,14 @@ fn run_turn(
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
-    let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
+    let RecordedTurn {
+        service,
+        mut graph,
+        actor,
+        admission,
+        session,
+        task: node,
+    } = record_turn(invocation, task.clone(), emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -2984,13 +3061,17 @@ fn run_turn(
     let turn = match outcome {
         Ok(turn) => turn,
         Err(error) => {
+            let reason = format!("could not run {route}: {error}");
+            graph
+                .fail(node, json!({"message": reason.clone()}))
+                .map_err(graph_failed)?;
             fail_turn(
                 &service,
                 actor,
                 admission.turn,
                 session,
                 route,
-                format!("could not run {route}: {error}"),
+                reason,
                 emitter,
             )?;
             return Ok(Turn::default());
@@ -3009,6 +3090,11 @@ fn run_turn(
                 format!("{route} was interrupted"),
             )
             .map_err(storage_failed)?;
+        // Cancelled rather than failed: the operator stopped it, so nothing
+        // should offer to continue it later.
+        graph
+            .cancel(node, "interrupted by the operator")
+            .map_err(graph_failed)?;
         turn_record(
             emitter,
             json!({
@@ -3034,6 +3120,9 @@ fn run_turn(
             service
                 .complete_turn(actor, admission.turn, &outcome)
                 .map_err(storage_failed)?;
+            graph
+                .complete(node, outcome.clone())
+                .map_err(graph_failed)?;
             turn_record(
                 emitter,
                 json!({
@@ -3046,6 +3135,9 @@ fn run_turn(
         }
         Some(failure) => {
             conversation.truncate(base);
+            graph
+                .fail(node, json!({"message": failure.clone()}))
+                .map_err(graph_failed)?;
             fail_turn(
                 &service,
                 actor,
@@ -5135,10 +5227,14 @@ mod tests {
         // Both requests offered the tools, and the second carried the result.
         let seen = scripted.seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "the loop asked again after the tool ran");
+        // The semantic tools are offered between search and editing, and a
+        // build with the WASM feature offers `plugin.invoke` as well; what
+        // this asserts is the order of the rest.
         let offered: Vec<&str> = seen[0]
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
+            .filter(|name| !name.starts_with("code.") && *name != "plugin.invoke")
             .collect();
         assert_eq!(
             offered,
