@@ -105,6 +105,25 @@ pub fn registry(
             retain_until_ms,
         ))?;
     }
+    // The workspace operations. They are registered here rather than by the
+    // agent so that `arsy policy explain`, the MCP server, and a turn all see
+    // the same set: a tool the model can call is a tool an operator can reason
+    // about beforehand.
+    for executor in crate::agent::fsops::executors(workspace, &artifacts, retain_until_ms)
+        .into_iter()
+        .chain(crate::agent::searchops::executors(
+            workspace,
+            &artifacts,
+            retain_until_ms,
+        ))
+    {
+        registry.register(executor)?;
+    }
+    registry.register(crate::agent::patch::PatchExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
     let process = |artifacts| {
         ProcessExecutor::new(
             artifacts,
@@ -114,6 +133,8 @@ pub fn registry(
             DEFAULT_TERMINATION_GRACE,
             retain_until_ms,
         )
+        // A shell command runs where the same turn's file tools read and write.
+        .in_directory(workspace.path())
     };
     // A remote target is only reachable when configuration defined one, so a
     // workspace with none cannot dispatch `remote.exec` at all rather than
@@ -146,11 +167,21 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                "fs.create".to_owned(),
+                "fs.delete".to_owned(),
+                "fs.edit".to_owned(),
+                "fs.list".to_owned(),
+                "fs.move".to_owned(),
+                "fs.patch".to_owned(),
+                "fs.read".to_owned(),
+                "fs.write".to_owned(),
                 "git.blame".to_owned(),
                 "git.diff".to_owned(),
                 "git.log".to_owned(),
                 "git.status".to_owned(),
                 "process.exec".to_owned(),
+                "search.files".to_owned(),
+                "search.text".to_owned(),
             ],
             "a workspace with no remote target cannot dispatch one"
         );

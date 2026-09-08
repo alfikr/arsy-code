@@ -146,7 +146,7 @@ impl McpServer {
         // from the contract is what makes that decision the same one a local
         // caller would get.
         let context = RiskContext {
-            reversible: contract.idempotency == arsy_kernel::operation::Idempotency::Idempotent,
+            reversible: contract.reversible,
             ..self.context
         };
         let grants = self.authorize(&request, digest, context)?;

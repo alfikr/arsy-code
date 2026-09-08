@@ -74,6 +74,7 @@ version = "0.1.0"
 dependencies = [
  "arsy-kernel",
  "cap-std",
+ "globset",
  "ignore",
  "proptest",
  "serde",

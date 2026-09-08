@@ -228,9 +228,6 @@ pub fn apply_with_resolver(
     transaction: &EditTransaction,
     resolver: &dyn SemanticResolver,
 ) -> Result<Vec<FileEdit>, EditError> {
-    if transaction.operations.len() > MAX_OPERATIONS {
-        return Err(EditError::TransactionTooLarge);
-    }
     let root = fs::canonicalize(root)?;
     let actual = workspace_version(&root)?;
     if actual != transaction.base {
@@ -239,15 +236,42 @@ pub fn apply_with_resolver(
             actual,
         });
     }
+    stage_and_commit(&root, &transaction.operations, resolver)
+}
 
+/// Apply operations without first proving the whole workspace is unchanged.
+///
+/// [`workspace_version`] hashes every tracked file, which is the right
+/// precondition for a queued transaction replayed later and the wrong one for
+/// an agent that edits a file it read a moment ago: it costs a full tree read
+/// per edit, and it fails when an unrelated file changed. Each address here
+/// already carries its own precondition — a content digest, or an anchor that
+/// must still be present exactly once — so staleness is caught per file, where
+/// it actually matters.
+pub fn apply_unversioned(
+    root: &Path,
+    operations: &[EditOperation],
+) -> Result<Vec<FileEdit>, EditError> {
+    let root = fs::canonicalize(root)?;
+    stage_and_commit(&root, operations, &NoSemanticResolver)
+}
+
+fn stage_and_commit(
+    root: &Path,
+    operations: &[EditOperation],
+    resolver: &dyn SemanticResolver,
+) -> Result<Vec<FileEdit>, EditError> {
+    if operations.len() > MAX_OPERATIONS {
+        return Err(EditError::TransactionTooLarge);
+    }
     let mut seen = HashSet::new();
-    let mut prepared = Vec::with_capacity(transaction.operations.len());
+    let mut prepared = Vec::with_capacity(operations.len());
     let mut staged_bytes = 0usize;
-    for operation in &transaction.operations {
+    for operation in operations {
         let requested = confined(&operation.path)?;
         let path = fs::canonicalize(root.join(&requested))?;
         let relative = path
-            .strip_prefix(&root)
+            .strip_prefix(root)
             .map_err(|_| EditError::InvalidPath(requested))?
             .to_owned();
         if !seen.insert(relative.clone()) {
@@ -266,7 +290,7 @@ pub fn apply_with_resolver(
 
     let stage = tempfile::Builder::new()
         .prefix(".arsy-edit-")
-        .tempdir_in(&root)?;
+        .tempdir_in(root)?;
     for (relative, path, output, _, _) in &prepared {
         let staged = stage.path().join(relative);
         if let Some(parent) = staged.parent() {

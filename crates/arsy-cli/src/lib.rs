@@ -29,8 +29,6 @@ pub mod provider;
 mod serve;
 mod session;
 #[cfg(feature = "tui")]
-pub mod tools;
-#[cfg(feature = "tui")]
 pub mod tui;
 
 use arsy_kernel::{
@@ -2847,10 +2845,13 @@ fn run_turn(
         role: ModelRole::User,
         content: vec![ModelContent::Text { text: task.clone() }],
     });
+    let root = workspace_root(&invocation.workspace)?;
     let outcome = match native.filter(|_| !route.is_codex()) {
         Some(resolved) => native_turn(
             resolved,
-            &workspace_root(&invocation.workspace)?,
+            // An operator is at the keyboard, so an approval can be asked for;
+            // the risk context says so and policy decides on it.
+            &agent_runtime(&root, &load_config(&root, &root)?, true)?,
             conversation,
             route,
             effort,
@@ -2991,7 +2992,7 @@ enum Answer {
 #[allow(clippy::too_many_arguments)]
 fn native_turn(
     resolved: &provider::Resolved,
-    workspace: &Path,
+    runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
     route: &tui::ModelRoute,
     effort: Option<Effort>,
@@ -3014,8 +3015,34 @@ fn native_turn(
         }
     };
     for round in 0..MAX_TOOL_ROUNDS {
+        // Before the request, not after: a transcript that has outgrown the
+        // window fails at the provider, and the operator is told what was
+        // elided rather than watching the turn shrink invisibly.
+        let trimmed = arsy_code::agent::budget::trim(
+            conversation,
+            context_budget(resolved),
+            &std::collections::HashMap::new(),
+        );
+        if trimmed.changed() {
+            let mut terminal = io::stdout();
+            writeln!(
+                terminal,
+                "{}",
+                tui::tool_result_row(
+                    colour,
+                    "context",
+                    true,
+                    &format!(
+                        "elided {} earlier tool result(s) to stay within {} tokens",
+                        trimmed.elided, trimmed.after
+                    )
+                )
+            )?;
+            terminal.flush()?;
+        }
         let mut outcome = native_status(
             resolved,
+            runtime,
             conversation,
             route,
             effort,
@@ -3058,26 +3085,33 @@ fn native_turn(
         let mut results = Vec::with_capacity(calls.len());
         let mut terminal = io::stdout();
         for (id, name, arguments) in &calls {
-            let summary = tools::summarize(name, arguments);
+            let summary = runtime.summarize(name, arguments);
             // Once the turn is stopped the remaining calls are still answered,
             // because a call the provider sent needs a result; they are simply
             // answered without running anything.
-            let answer = if outcome.interrupted {
-                Answer::No
+            let (content, is_error) = if outcome.interrupted {
+                ("The operator declined to run this call.".to_owned(), true)
             } else {
-                confirm_tool(&mut terminal, colour, name, &summary, keys, decoder)?
-            };
-            let (content, is_error) = match answer {
-                Answer::No => ("The operator declined to run this call.".to_owned(), true),
-                Answer::Stop => {
-                    outcome.interrupted = true;
-                    writeln!(terminal, "{}", tui::interrupted_row(colour))?;
-                    ("The operator stopped the turn.".to_owned(), true)
+                match execute_call(
+                    runtime,
+                    &mut terminal,
+                    colour,
+                    name,
+                    arguments,
+                    &summary,
+                    keys,
+                    decoder,
+                )? {
+                    Executed::Answered(result) => (result.output, !result.success),
+                    Executed::Declined => {
+                        ("The operator declined to run this call.".to_owned(), true)
+                    }
+                    Executed::Stopped => {
+                        outcome.interrupted = true;
+                        writeln!(terminal, "{}", tui::interrupted_row(colour))?;
+                        ("The operator stopped the turn.".to_owned(), true)
+                    }
                 }
-                Answer::Yes => match tools::execute(workspace, name, arguments) {
-                    Ok(output) => (output, false),
-                    Err(error) => (error, true),
-                },
             };
             let detail = content.lines().next_back().unwrap_or_default();
             writeln!(
@@ -3112,6 +3146,72 @@ fn native_turn(
     Ok(Turn::default())
 }
 
+/// What happened to one tool call.
+#[cfg(feature = "tui")]
+enum Executed {
+    Answered(arsy_code::agent::ToolResult),
+    Declined,
+    Stopped,
+}
+
+/// Decide, confirm if the decision says to, and run.
+///
+/// Policy is asked first, so the operator is only interrupted for calls that
+/// actually need a human: a read policy already allows runs without a prompt,
+/// and a call policy denies is refused without one. That is the difference
+/// between an approval and a habit — an operator asked to confirm every read
+/// stops reading the prompts.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn execute_call(
+    runtime: &arsy_code::agent::ToolRuntime,
+    terminal: &mut io::Stdout,
+    colour: bool,
+    name: &str,
+    arguments: &Value,
+    summary: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> io::Result<Executed> {
+    use arsy_code::agent::Authorization;
+
+    let started = std::time::Instant::now();
+    let request = match runtime.prepare(name, arguments) {
+        Ok(request) => request,
+        Err(failure) => return Ok(Executed::Answered(*failure)),
+    };
+    let refused =
+        |reason: String| Executed::Answered(arsy_code::agent::ToolResult::refused(name, reason));
+    let authorization = runtime.authorize(&request);
+    let grants = match &authorization {
+        Authorization::Allowed(grants) => grants.clone(),
+        // A denial is the model's to hear, not the operator's to override from
+        // the keyboard: the rule that produced it is the place to change the
+        // answer.
+        Authorization::Denied(reason) => return Ok(refused(reason.clone())),
+        Authorization::NeedsApproval { .. } => {
+            let reason = authorization.requested();
+            match confirm_tool(terminal, colour, name, summary, &reason, keys, decoder)? {
+                // The "yes" becomes a grant over exactly the resources the
+                // operator was shown, and nothing beside them.
+                Answer::Yes => match authorization.approve() {
+                    Ok(grants) => grants,
+                    Err(error) => {
+                        return Ok(refused(format!(
+                            "the approval could not be turned into a grant: {error}"
+                        )))
+                    }
+                },
+                Answer::No => return Ok(Executed::Declined),
+                Answer::Stop => return Ok(Executed::Stopped),
+            }
+        }
+    };
+    Ok(Executed::Answered(
+        runtime.dispatch(name, &request, &grants, started),
+    ))
+}
+
 /// Ask the operator whether one tool call may run.
 ///
 /// `y` runs it and anything else does not, because the safe answer is the one
@@ -3122,10 +3222,18 @@ fn confirm_tool(
     colour: bool,
     name: &str,
     summary: &str,
+    reason: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
 ) -> io::Result<Answer> {
-    writeln!(terminal, "{}", tui::tool_prompt_row(colour, name, summary))?;
+    // The reason policy gave, not a generic prompt: an operator asked "allow
+    // this?" about every call learns nothing and answers by reflex.
+    let prompt = if reason.trim().is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary} — {reason}")
+    };
+    writeln!(terminal, "{}", tui::tool_prompt_row(colour, name, &prompt))?;
     terminal.flush()?;
     loop {
         match keys.recv() {
@@ -3154,6 +3262,7 @@ fn confirm_tool(
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
+    runtime: &arsy_code::agent::ToolRuntime,
     conversation: &[ModelMessage],
     route: &tui::ModelRoute,
     effort: Option<Effort>,
@@ -3170,9 +3279,12 @@ fn native_status(
             provider: route.provider.clone(),
             model: route.model.clone(),
         },
-        system: None,
+        // The harness's instructions and the project's, discovered by walking
+        // the workspace. Rebuilt per round rather than captured once: an
+        // AGENTS.md the turn just edited is the one the next round should read.
+        system: system_prompt(runtime.workspace(), &route.provider, &route.model),
         messages: conversation.to_vec(),
-        tools: tools::schemas(),
+        tools: runtime.schemas(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
         effort,
         // One turn can take several requests, one per round of tool calls. The
@@ -3957,9 +4069,9 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
                     "set `model` on the provider endpoint, or `model.default`, in config.toml",
                 )
             })?;
-        Ok((resolved, model))
+        Ok((resolved, model, config))
     });
-    let (resolved, model) = match resolved {
+    let (resolved, model, config) = match resolved {
         Ok(resolved) => resolved,
         Err(mut diagnostic) => {
             if diagnostic.code == ARSY_PRV_1000 {
@@ -3973,20 +4085,22 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
         }
     };
 
+    // No operator is present, so nothing can be confirmed mid-run: the risk
+    // context says so, and a call that needs an approval is refused by policy
+    // rather than waiting on a keyboard that is not there.
+    let agent = agent_runtime(&root, &config, false)?;
     let (service, actor, admission, session) = record_turn(invocation, task.clone(), emitter)?;
     let request = CanonicalModelRequest {
         model: ModelKey {
             provider: resolved.endpoint.id.clone(),
-            model,
+            model: model.clone(),
         },
-        system: None,
+        system: system_prompt(&root, &resolved.endpoint.id, &model),
         messages: vec![ModelMessage {
             role: ModelRole::User,
             content: vec![ModelContent::Text { text: task }],
         }],
-        // Operations are not dispatched from this path yet, so offering tools
-        // would invite calls nothing can run.
-        tools: Vec::new(),
+        tools: agent.schemas(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
         // Reasoning effort is chosen in the TUI with `/effort`. A scripted run
         // takes the request it always took, so a remembered interactive choice
@@ -3997,7 +4111,7 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
             .map_err(|error| storage_failed(error.to_string()))?,
     };
 
-    let outcome = dispatch(resolved.provider.as_ref(), &request, emitter);
+    let outcome = dispatch(resolved.provider.as_ref(), &agent, &request, emitter);
     let record = json!({
         "session": session.to_string(),
         "turn": admission.turn.to_string(),
@@ -4036,43 +4150,138 @@ fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32
     }
 }
 
-/// Stream one turn, rendering it as it arrives, and report what it used.
+/// The transcript budget, in tokens, before the model's own output is reserved.
 ///
-/// A tool call cannot be honoured from this path, so one is reported rather
-/// than silently dropped: a caller that sees `stop: tool_use` and no result
-/// would otherwise think the model simply stopped.
+/// Deliberately below the smallest window the supported models offer rather
+/// than read from configuration: the cost of being wrong low is a re-read, and
+/// the cost of being wrong high is a rejected request in the middle of a turn.
+/// A per-model window belongs in `provider.endpoint` when a model that needs a
+/// different number actually appears.
+const CONTEXT_BUDGET_TOKENS: u32 = 96_000;
+
+/// What one turn's transcript may grow to on this endpoint.
+#[cfg(feature = "tui")]
+fn context_budget(resolved: &provider::Resolved) -> u32 {
+    CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
+}
+
+/// How many rounds of tool calls one scripted turn may take.
+///
+/// The same bound the interactive loop uses, for the same reason: a model that
+/// answers every result with another call would otherwise spend the run on its
+/// own loop.
+const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
+
+/// Run one scripted turn to completion, executing the tools the model asks for.
+///
+/// Nobody is at the keyboard, so authority comes from policy alone: a call
+/// policy allows runs, and a call that needs an approval is reported to the
+/// model as a failed result rather than silently skipped. That is what makes a
+/// pipeline's behaviour a property of its configuration instead of a property
+/// of who happened to be watching.
 fn dispatch(
     provider: &dyn ModelProvider,
+    runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
-    let mut usage = json!({});
-    let stream =
-        arsy_kernel::provider::stream_with_retry(provider, request, &mut std::thread::sleep)?;
-    for event in stream {
-        match event? {
-            ModelEvent::TextDelta { text } => emitter.delta(&text),
-            ModelEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
-                usage = json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
+    let mut request = request.clone();
+    let base = request.idempotency_key.as_str().to_owned();
+    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
+    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    for round in 0..MAX_SCRIPTED_TOOL_ROUNDS {
+        // Each round is its own request, so a retry repeats that round rather
+        // than collapsing into the one before it.
+        request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
+            .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+        let mut answer = String::new();
+        let mut calls: Vec<(String, String, Value)> = Vec::new();
+        let stream =
+            arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)?;
+        for event in stream {
+            match event? {
+                ModelEvent::TextDelta { text } => {
+                    emitter.delta(&text);
+                    answer.push_str(&text);
+                }
+                ModelEvent::Usage {
+                    input_tokens: input,
+                    output_tokens: output,
+                } => {
+                    input_tokens += input;
+                    output_tokens += output;
+                }
+                ModelEvent::ToolCallCompleted {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => calls.push((id, name, arguments)),
+                ModelEvent::Completed { .. }
+                | ModelEvent::ToolCallStarted { .. }
+                | ModelEvent::ToolCallDelta { .. }
+                // `arsy run` is a scriptable surface: reasoning is for the
+                // operator watching a stream, not for a pipeline's stdout.
+                | ModelEvent::ThinkingDelta { .. } => {}
             }
-            ModelEvent::ToolCallCompleted { name, .. } => {
-                return Err(ProviderError::InvalidRequest(format!(
-                    "the model called the tool `{name}`, which this path cannot run yet"
-                )))
-            }
-            ModelEvent::Completed { .. }
-            | ModelEvent::ToolCallStarted { .. }
-            | ModelEvent::ToolCallDelta { .. }
-            // `arsy run` is a scriptable surface: reasoning is for the
-            // operator watching a stream, not for a pipeline's stdout.
-            | ModelEvent::ThinkingDelta { .. } => {}
         }
+        if calls.is_empty() {
+            emitter.end_deltas();
+            return Ok(token_usage(input_tokens, output_tokens));
+        }
+        arsy_code::agent::budget::trim(
+            &mut request.messages,
+            budget,
+            &std::collections::HashMap::new(),
+        );
+
+        // The calls are history now, whatever running them produced: a provider
+        // that sent a call and never sees its result rejects the next request.
+        let mut content: Vec<ModelContent> = Vec::new();
+        if !answer.trim().is_empty() {
+            content.push(ModelContent::Text { text: answer });
+        }
+        content.extend(
+            calls
+                .iter()
+                .map(|(id, name, arguments)| ModelContent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+        );
+        request.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content,
+        });
+        let results = calls
+            .iter()
+            .map(|(id, name, arguments)| {
+                let result = runtime.invoke(name, arguments);
+                ModelContent::ToolResult {
+                    id: id.clone(),
+                    content: result.output,
+                    is_error: !result.success,
+                }
+            })
+            .collect();
+        request.messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: results,
+        });
     }
     emitter.end_deltas();
-    Ok(usage)
+    Err(ProviderError::InvalidRequest(format!(
+        "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
+    )))
+}
+
+fn token_usage(input_tokens: u64, output_tokens: u64) -> Value {
+    if input_tokens == 0 && output_tokens == 0 {
+        json!({})
+    } else {
+        json!({"input_tokens": input_tokens, "output_tokens": output_tokens})
+    }
 }
 
 /// Fold `extra`'s fields into `target`, which is always an object here.
@@ -4338,6 +4547,65 @@ fn actor() -> Principal {
     )
 }
 
+/// Build the tool runtime a turn executes through.
+///
+/// The same construction `arsy serve` performs, because a turn and a served
+/// call have to reach the same operations under the same rules; the only
+/// difference is the risk context, which says whether an operator is present to
+/// answer an approval.
+fn agent_runtime(
+    root: &Path,
+    config: &arsy_kernel::config::Config,
+    interactive: bool,
+) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
+    let workspace = arsy_code::resource::Workspace::open(root)
+        .map_err(|error| storage_failed(error.to_string()))?;
+    let artifacts = Arc::new(
+        arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
+            .map_err(|error| storage_failed(error.to_string()))?,
+    );
+    arsy_code::agent::runtime(
+        &workspace,
+        config.policy_rule_set(),
+        artifacts,
+        arsy_kernel::artifact::unix_time_ms(),
+        actor(),
+        arsy_kernel::policy::RiskContext {
+            reversible: interactive,
+            workspace: arsy_code::git::cleanliness(root)
+                .unwrap_or(arsy_kernel::policy::WorkspaceCleanliness::Unknown),
+            sandbox: installed_sandbox_assurance(),
+        },
+        config
+            .remote_targets()
+            .map(|(name, target)| (name.clone(), target.clone())),
+    )
+    .map_err(|error| storage_failed(error.to_string()))
+}
+
+/// The system prompt for one turn: the harness's own instructions, then the
+/// project's, discovered by walking from the workspace root to the working
+/// directory.
+///
+/// Compilation failure is not a reason to lose the turn — a prompt over budget
+/// or an unredactable secret is a degradation, not a fault — so the harness
+/// instructions alone are the floor.
+fn system_prompt(root: &Path, provider: &str, model: &str) -> Option<String> {
+    let workspace = arsy_code::resource::Workspace::open(root).ok()?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let instructions = arsy_code::agent::instructions::discover(&workspace, &working);
+    let family = arsy_code::agent::instructions::family_for(provider, model);
+    let compiled = arsy_code::agent::instructions::system_prompt(
+        family,
+        &instructions,
+        None,
+        &arsy_kernel::secret::Redactor::new(),
+        arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
+    )
+    .ok()?;
+    Some(arsy_code::agent::instructions::render(&compiled))
+}
+
 fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -4413,6 +4681,13 @@ mod tests {
         }
     }
 
+    /// A runtime over a scratch workspace, under whatever policy an unconfigured
+    /// workspace gets — which is what a first run actually sees.
+    #[cfg(feature = "tui")]
+    fn test_runtime(root: &Path) -> arsy_code::agent::ToolRuntime {
+        agent_runtime(root, &load_config(root, root).unwrap(), true).unwrap()
+    }
+
     /// Answers typed at the confirmation prompt. Keys sent while a round is
     /// still streaming belong to the composer, exactly as they do in a
     /// session, so the answers are sent once the prompt is up.
@@ -4480,7 +4755,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
-            workspace.path(),
+            &test_runtime(workspace.path()),
             &mut conversation,
             &route(),
             None,
@@ -4517,14 +4792,31 @@ mod tests {
         // Both requests offered the tools, and the second carried the result.
         let seen = scripted.seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "the loop asked again after the tool ran");
+        let offered: Vec<&str> = seen[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
         assert_eq!(
-            seen[0]
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["bash", "apply_patch"]
+            offered,
+            [
+                "fs.read",
+                "fs.list",
+                "search.files",
+                "search.text",
+                "fs.edit",
+                "apply_patch",
+                "fs.write",
+                "fs.delete",
+                "fs.move",
+                "bash",
+            ],
+            "reading and searching are offered before the shell"
         );
+        // The system prompt is built, not omitted: a turn that tells the model
+        // nothing about the workspace is the bug this replaced.
+        let system = seen[0].system.as_deref().unwrap_or_default();
+        assert!(system.contains("ARSY"), "{system}");
         assert_eq!(seen[1].messages.len(), 3);
         assert_ne!(
             seen[0].idempotency_key, seen[1].idempotency_key,
@@ -4562,7 +4854,7 @@ mod tests {
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,
-            workspace.path(),
+            &test_runtime(workspace.path()),
             &mut conversation,
             &route(),
             None,
@@ -4625,7 +4917,7 @@ mod tests {
         let started = std::time::Instant::now();
         let turn = native_turn(
             &resolved,
-            workspace.path(),
+            &test_runtime(workspace.path()),
             &mut conversation,
             &route(),
             None,

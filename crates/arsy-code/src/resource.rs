@@ -1,4 +1,14 @@
-use arsy_kernel::domain::{ResourceRef, ResourceRefError};
+//! The one place a workspace path is resolved.
+//!
+//! Every file a tool touches goes through [`Workspace`], which owns a cap-std
+//! [`Dir`] for the root. Confinement is therefore two independent checks: a
+//! lexical one that refuses `..`, absolute paths, and prefixes, and the
+//! syscall-level one cap-std performs on every operation, which is what stops a
+//! symlink whose name looks local from resolving outside the tree. Neither
+//! check alone is enough, and nothing else in the crate is allowed to open a
+//! workspace path by another route.
+
+use arsy_kernel::domain::{ResourceRef, ResourceRefError, StateVersion};
 use cap_std::{ambient_authority, fs::Dir};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +27,29 @@ pub struct ResolvedFile {
 #[derive(Debug, Eq, PartialEq)]
 pub struct FileContent {
     pub bytes: Vec<u8>,
-    pub digest: arsy_kernel::domain::StateVersion,
+    pub digest: StateVersion,
+}
+
+impl FileContent {
+    /// Whether the bytes are text a model can be shown.
+    ///
+    /// A NUL byte is the cheap, near-certain marker of a binary file, and it is
+    /// the same test the searcher uses, so a file is never text to one and
+    /// binary to the other.
+    pub fn is_binary(&self) -> bool {
+        self.bytes.contains(&0) || std::str::from_utf8(&self.bytes).is_err()
+    }
+}
+
+/// The harness's own state, kept out of listings, searches, and file finds.
+pub const STATE_DIRECTORY: &str = ".arsy";
+
+/// One entry of a directory listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntry {
+    pub name: String,
+    pub directory: bool,
+    pub bytes: u64,
 }
 
 impl ResolvedFile {
@@ -63,8 +95,117 @@ impl Workspace {
         Dir::open_ambient_dir(&path, ambient_authority()).map(|root| Self { root, path })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The workspace-relative resource a path names, without opening it.
+    ///
+    /// Writes need a name for a file that does not exist yet, which
+    /// [`Self::resolve_file`] cannot give: it canonicalizes, and canonicalizing
+    /// a missing path fails. The lexical check is the same one; the syscall
+    /// check happens when cap-std performs the operation.
+    fn relative(&self, path: impl AsRef<Path>) -> Result<PathBuf, ResolveError> {
+        confined(path.as_ref())
+    }
+
+    /// Read a whole file, bounded.
+    pub fn read(
+        &self,
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<FileContent, ResolveError> {
+        Ok(self.resolve_file(path)?.read(max_bytes)?)
+    }
+
+    /// Replace a file's contents, creating it and any missing parent.
+    ///
+    /// Returns the digest of what was written, which is the precondition a
+    /// later edit of the same file is checked against.
+    pub fn write(
+        &self,
+        path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<StateVersion, ResolveError> {
+        let relative = self.relative(path)?;
+        if let Some(parent) = relative
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            self.root.create_dir_all(parent)?;
+        }
+        self.root.write(&relative, bytes)?;
+        Ok(StateVersion::from_digest(Sha256::digest(bytes).into()))
+    }
+
+    /// Create a file that must not already exist.
+    pub fn create_new(
+        &self,
+        path: impl AsRef<Path>,
+        bytes: &[u8],
+    ) -> Result<StateVersion, ResolveError> {
+        let relative = self.relative(path)?;
+        if self.root.metadata(&relative).is_ok() {
+            return Err(ResolveError::AlreadyExists);
+        }
+        self.write(&relative, bytes)
+    }
+
+    pub fn remove(&self, path: impl AsRef<Path>) -> Result<(), ResolveError> {
+        let relative = self.relative(path)?;
+        Ok(self.root.remove_file(&relative)?)
+    }
+
+    pub fn rename(&self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<(), ResolveError> {
+        let from = self.relative(from)?;
+        let to = self.relative(to)?;
+        if self.root.metadata(&to).is_ok() {
+            return Err(ResolveError::AlreadyExists);
+        }
+        if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            self.root.create_dir_all(parent)?;
+        }
+        Ok(self.root.rename(&from, &self.root, &to)?)
+    }
+
+    /// One directory level, sorted, directories marked.
+    ///
+    /// A relative path of `.` lists the root, which is the only way to name it
+    /// through a checker that refuses an empty path.
+    ///
+    /// The harness's own state directory is left out: `.arsy` holds the session
+    /// store and the artifacts of the very calls being made, so listing it
+    /// shows the model its own exhaust and invites it to read or edit that
+    /// instead of the project.
+    pub fn list(&self, path: impl AsRef<Path>) -> Result<Vec<DirEntry>, ResolveError> {
+        let path = path.as_ref();
+        let root_level = path.as_os_str().is_empty() || path == Path::new(".");
+        let entries = if root_level {
+            self.root.entries()?
+        } else {
+            self.root.read_dir(self.relative(path)?)?
+        };
+        let mut listed = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if root_level && name == STATE_DIRECTORY {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            listed.push(DirEntry {
+                name,
+                directory: metadata.is_dir(),
+                bytes: metadata.len(),
+            });
+        }
+        listed.sort_by(|left, right| {
+            right
+                .directory
+                .cmp(&left.directory)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(listed)
     }
 
     pub fn resolve_file(&self, path: impl AsRef<Path>) -> Result<ResolvedFile, ResolveError> {
@@ -90,6 +231,20 @@ impl Workspace {
     }
 }
 
+/// The one walk every repository-wide traversal uses.
+///
+/// Honours `.gitignore` and the other standard filters, and skips the
+/// harness's own state directory — so a listing, a text search, and a file find
+/// agree about what the workspace contains rather than each drawing its own
+/// boundary.
+pub fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .standard_filters(true)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(STATE_DIRECTORY))
+        .build()
+}
+
 fn confined(path: &Path) -> Result<PathBuf, ResolveError> {
     let mut relative = PathBuf::new();
     for component in path.components() {
@@ -112,6 +267,7 @@ pub enum ResolveError {
     OutsideWorkspace,
     EmptyPath,
     NonUtf8,
+    AlreadyExists,
     Io(io::Error),
     Resource(ResourceRefError),
 }
@@ -122,6 +278,7 @@ impl fmt::Display for ResolveError {
             Self::OutsideWorkspace => formatter.write_str("path escapes the workspace"),
             Self::EmptyPath => formatter.write_str("path must name a workspace file"),
             Self::NonUtf8 => formatter.write_str("canonical workspace path is not UTF-8"),
+            Self::AlreadyExists => formatter.write_str("a file already exists at that path"),
             Self::Io(error) => error.fmt(formatter),
             Self::Resource(error) => error.fmt(formatter),
         }

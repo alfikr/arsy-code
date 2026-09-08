@@ -106,9 +106,17 @@ impl JsonType {
 }
 
 /// The small schema surface needed by the first typed operations.
+///
+/// `optional` exists so a contract can name a field without demanding it.
+/// Without it the only way to accept `limit` alongside `path` is `allow_extra`,
+/// which accepts *every* unknown field and so publishes nothing a caller can
+/// check against — a tool with one optional argument would have no schema at
+/// all.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InputSchema {
     pub required: BTreeMap<String, JsonType>,
+    #[serde(default)]
+    pub optional: BTreeMap<String, JsonType>,
     pub allow_extra: bool,
 }
 
@@ -121,7 +129,23 @@ pub struct OperationContract {
     /// request, not the contract.
     pub actions: Vec<CapabilityAction>,
     pub idempotency: Idempotency,
+    /// Whether the effect can be undone.
+    ///
+    /// Distinct from [`Idempotency`], which says whether *repeating* the call
+    /// repeats its effect. Rewriting a file is effectful and reversible — the
+    /// previous content is still in version control. Removing a file, or
+    /// running a command, is neither. Policy raises an irreversible call to
+    /// approval however permissive a rule is, so equating the two would make
+    /// every edit need a human, which is how an operator learns to say yes
+    /// without reading.
+    #[serde(default = "irreversible")]
+    pub reversible: bool,
     pub concurrency: ConcurrencyRule,
+}
+
+/// The safe answer for a contract that predates the field.
+const fn irreversible() -> bool {
+    false
 }
 
 /// One decoded call, with the effects it will need named up front.
@@ -267,11 +291,20 @@ fn validate_input(schema: &InputSchema, input: &serde_json::Value) -> Result<(),
             }
         }
     }
+    for (field, expected) in &schema.optional {
+        match object.get(field) {
+            Some(value) if !expected.accepts(value) && !value.is_null() => {
+                return Err(OperationError::Schema(format!(
+                    "input field {field} has the wrong type"
+                )))
+            }
+            _ => {}
+        }
+    }
     if !schema.allow_extra {
-        if let Some(field) = object
-            .keys()
-            .find(|field| !schema.required.contains_key(*field))
-        {
+        if let Some(field) = object.keys().find(|field| {
+            !schema.required.contains_key(*field) && !schema.optional.contains_key(*field)
+        }) {
             return Err(OperationError::Schema(format!(
                 "input field {field} is not allowed"
             )));
@@ -344,10 +377,12 @@ mod tests {
                     kind: OperationKind::new(kind).unwrap(),
                     input_schema: InputSchema {
                         required: BTreeMap::from([("path".into(), JsonType::String)]),
+                        optional: BTreeMap::new(),
                         allow_extra: false,
                     },
                     actions: vec![CapabilityAction::FsRead],
                     idempotency: Idempotency::Idempotent,
+                    reversible: true,
                     concurrency: ConcurrencyRule::Parallel,
                 },
                 calls: AtomicUsize::new(0),

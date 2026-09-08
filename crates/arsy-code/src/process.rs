@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
+    path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
     thread,
@@ -56,6 +57,10 @@ pub struct ProcessExecutor {
     grace: Duration,
     retain_until_ms: u64,
     sandbox: Option<SandboxPlan>,
+    /// Where the child starts. Without it a command runs wherever the operator
+    /// happened to launch ARSY, so `ls` answers a different question than the
+    /// workspace the same turn is reading and editing.
+    working_directory: Option<PathBuf>,
 }
 
 impl ProcessExecutor {
@@ -78,10 +83,14 @@ impl ProcessExecutor {
                         ("timeout_ms".into(), JsonType::Number),
                         ("max_output_bytes".into(), JsonType::Number),
                     ]),
+                    optional: BTreeMap::new(),
                     allow_extra: false,
                 },
                 actions: vec![CapabilityAction::ProcessExec],
                 idempotency: Idempotency::Effectful,
+                // A command can do anything, including something nothing here
+                // can undo.
+                reversible: false,
                 concurrency: ConcurrencyRule::Parallel,
             },
             artifacts,
@@ -89,11 +98,18 @@ impl ProcessExecutor {
             grace,
             retain_until_ms,
             sandbox: None,
+            working_directory: None,
         }
     }
 
     pub fn with_sandbox(mut self, plan: SandboxPlan) -> Self {
         self.sandbox = Some(plan);
+        self
+    }
+
+    /// Run children in `directory` rather than the process's own cwd.
+    pub fn in_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(directory.into());
         self
     }
 
@@ -127,6 +143,9 @@ impl ProcessExecutor {
             command.args(args);
             command
         };
+        if let Some(directory) = &self.working_directory {
+            command.current_dir(directory);
+        }
         command
             .env_clear()
             .envs(&self.environment)

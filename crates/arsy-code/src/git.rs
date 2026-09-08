@@ -122,10 +122,13 @@ impl GitExecutor {
                 kind: OperationKind::new(operation.kind()).expect("static operation kind is valid"),
                 input_schema: InputSchema {
                     required,
+                    optional: BTreeMap::new(),
                     allow_extra: false,
                 },
                 actions: vec![CapabilityAction::GitRead],
                 idempotency: Idempotency::Idempotent,
+                // Reading history changes nothing.
+                reversible: true,
                 concurrency: ConcurrencyRule::Parallel,
             },
             workspace: workspace.path().to_owned(),

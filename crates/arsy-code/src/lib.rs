@@ -1,6 +1,7 @@
 //! Filesystem, search, edit, and execution capabilities for ARSY CODE.
 
 pub mod acp;
+pub mod agent;
 pub mod benchmark;
 pub mod compat;
 #[cfg(feature = "dap")]
