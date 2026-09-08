@@ -387,6 +387,46 @@ pub const TOOLS: &[Tool] = &[
         summarize: |arguments| text(arguments, "symbol"),
     },
     Tool {
+        name: "code.diagnostics",
+        operation: "code.diagnostics",
+        description: "What the language server says is wrong with one file: the same errors and warnings a build would report, without running one. Only available where a language server is configured for the file type.",
+        schema: || {
+            object(
+                json!({"path": {"type": "string", "description": "Workspace-relative path."}}),
+                &["path"],
+            )
+        },
+        translate: |arguments| Ok(json!({"path": text(arguments, "path")})),
+        summarize: |arguments| text(arguments, "path"),
+    },
+    Tool {
+        name: "code.rename",
+        operation: "code.rename",
+        description: "Rename a symbol everywhere the language server can prove it is used, in one transaction: either every file changes or none does. Takes a symbol id from `code.symbol`. Refused when no language server serves the file, because a rename that guesses is worse than no rename.",
+        schema: || {
+            object(
+                json!({
+                    "symbol": {"type": "string", "description": "A symbol id from `code.symbol`."},
+                    "new_name": {"type": "string", "description": "The new name."}
+                }),
+                &["symbol", "new_name"],
+            )
+        },
+        translate: |arguments| {
+            Ok(json!({
+                "symbol": text(arguments, "symbol"),
+                "new_name": text(arguments, "new_name"),
+            }))
+        },
+        summarize: |arguments| {
+            format!(
+                "{} → {}",
+                text(arguments, "symbol"),
+                text(arguments, "new_name")
+            )
+        },
+    },
+    Tool {
         name: "fs.edit",
         operation: "fs.edit",
         description: "Replace one occurrence of `old_text` with `new_text` in a file. `old_text` must appear exactly once unless `occurrence` selects which one; an ambiguous edit is refused rather than guessed. Read the file first.",
@@ -1110,13 +1150,13 @@ pub fn runtime(
     retain_until_ms: u64,
     actor: Principal,
     context: RiskContext,
-    remote_targets: impl IntoIterator<Item = (String, arsy_kernel::config::RemoteTarget)>,
+    reachable: crate::operations::Reachable,
 ) -> Result<ToolRuntime, arsy_kernel::operation::RegistrationError> {
     let registry = crate::operations::registry(
         workspace,
         Arc::clone(&artifacts),
         retain_until_ms,
-        remote_targets,
+        reachable,
     )?;
     Ok(ToolRuntime::new(
         registry,

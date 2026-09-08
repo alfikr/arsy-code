@@ -57,9 +57,7 @@ pub fn explain(
         &workspace,
         artifacts,
         0,
-        config
-            .remote_targets()
-            .map(|(name, target)| (name.clone(), target.clone())),
+        arsy_code::operations::Reachable::from_config(&config),
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let contract = registry.contract(&kind).ok_or_else(|| {

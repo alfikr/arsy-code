@@ -71,6 +71,8 @@ Authority classes are:
 | `execution.max_parallel` | positive integer | `4` | min | ceiling |
 | `storage.data_dir` | absolute path | platform data directory | replace | user |
 | `storage.durability` | `"fast"`, `"balanced"`, or `"strict"` | `"balanced"` | max | user |
+| `lsp.server.<name>.command` | array of strings, program first | none | replace | user |
+| `lsp.server.<name>.extensions` | array of file extensions | `[]` | replace | user |
 | `telemetry.sample_every` | positive integer | `1` | replace | intent |
 | `telemetry.capacity` | positive integer | `256` | replace | intent |
 | `telemetry.enabled` | boolean | `false` | replace | user |

@@ -103,7 +103,7 @@ fn run(input: Value) -> Result<Value, String> {
             workspace: WorkspaceCleanliness::Clean,
             sandbox: SandboxAssurance::None,
         },
-        [],
+        arsy_code::operations::Reachable::default(),
     )
     .unwrap();
 
@@ -114,7 +114,7 @@ fn run(input: Value) -> Result<Value, String> {
         &workspace,
         Arc::new(FileArtifactStore::open(root.path().join(".arsy/art"), 0).unwrap()),
         0,
-        [],
+        arsy_code::operations::Reachable::default(),
     )
     .unwrap();
     let kind = OperationKind::new("debug.run").unwrap();
@@ -212,7 +212,8 @@ fn the_launch_is_checked_against_the_adapter_it_would_run() {
     let workspace = Workspace::open(root.path()).unwrap();
     let artifacts: Arc<dyn ArtifactStore> =
         Arc::new(FileArtifactStore::open(root.path().join(".arsy/art"), 0).unwrap());
-    let registry = operations::registry(&workspace, artifacts, 0, []).unwrap();
+    let registry =
+        operations::registry(&workspace, artifacts, 0, operations::Reachable::default()).unwrap();
     let kind = OperationKind::new("debug.run").unwrap();
     let contract = registry.contract(&kind).unwrap();
 

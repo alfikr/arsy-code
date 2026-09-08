@@ -391,6 +391,20 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// `[lsp.server.<name>]`: a language server this workspace may start.
+///
+/// The command is a program ARSY will execute, so it is refused outside the
+/// enterprise and user layers: a repository must not be able to name what runs
+/// on the machine that clones it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageServer {
+    pub name: String,
+    /// The program and its arguments.
+    pub command: Vec<String>,
+    /// File extensions this server answers for, without the dot.
+    pub extensions: BTreeSet<String>,
+}
+
 /// `[telemetry]`: how much of a run is observed, and where it may leave.
 ///
 /// The defaults are the ones a local run wants — every event kept, nothing
@@ -438,6 +452,8 @@ pub struct Config {
     mcp_servers: BTreeMap<String, McpServer>,
     /// `[remote.target.<name>]`, from a trusted layer only.
     remote_targets: BTreeMap<String, RemoteTarget>,
+    /// `[lsp.server.<name>]`, from a trusted layer only.
+    language_servers: BTreeMap<String, LanguageServer>,
     telemetry: TelemetrySettings,
     /// What the layers that spoke agreed on for `telemetry.include_content`.
     /// `None` means none of them did, which is not the same as `Some(false)`.
@@ -509,6 +525,23 @@ impl Config {
     /// `[telemetry]` as the runtime reads it, defaults included.
     pub fn telemetry(&self) -> &TelemetrySettings {
         &self.telemetry
+    }
+
+    /// Configured language servers in name order. Nothing is started.
+    pub fn language_servers(&self) -> impl Iterator<Item = &LanguageServer> {
+        self.language_servers.values()
+    }
+
+    /// The server configured for a file's extension, if any.
+    ///
+    /// First by name order rather than "best": two servers claiming the same
+    /// extension is a configuration mistake, and picking one by a rule nobody
+    /// wrote down would hide it.
+    pub fn language_server_for(&self, path: &Path) -> Option<&LanguageServer> {
+        let extension = path.extension()?.to_str()?;
+        self.language_servers
+            .values()
+            .find(|server| server.extensions.contains(extension))
     }
 
     pub fn remote_target(&self, name: &str) -> Option<&RemoteTarget> {
@@ -695,6 +728,7 @@ impl Config {
                     }
                 }
                 "telemetry" => self.apply_telemetry(layer, path, value)?,
+                "lsp" => self.apply_lsp(layer, path, value)?,
                 "mcp" => self.apply_mcp(layer, path, value)?,
                 "remote" => self.apply_remote(layer, path, value)?,
                 "policy" => self.apply_policy(layer, path, value)?,
@@ -936,6 +970,80 @@ impl Config {
             return Err(reject(
                 "`telemetry.enabled` requires `telemetry.endpoint`".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// `[lsp.server.<name>]`: which language servers this workspace may start.
+    fn apply_lsp(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (key, value) in as_table(value, "lsp", path)? {
+            if key != "server" {
+                return Err(reject(format!("unknown key `lsp.{key}`")));
+            }
+            let servers = as_table(value, "lsp.server", path)?;
+            if !layer.is_trusted() {
+                // Refused, not merged: see the module note on repository
+                // content. A command here is a program that gets executed.
+                for name in servers.keys() {
+                    self.diagnostics.push(Diagnostic {
+                        key: format!("lsp.server.{name}"),
+                        layer,
+                        path: path.to_path_buf(),
+                        message: "a language server may only be defined by the enterprise or user \
+                                  configuration, because it names a program to run"
+                            .to_owned(),
+                    });
+                }
+                return Ok(());
+            }
+            for (name, value) in servers {
+                let prefix = format!("lsp.server.{name}");
+                let table = as_table(value, &prefix, path)?;
+                for key in table.keys() {
+                    if !matches!(key.as_str(), "command" | "extensions") {
+                        return Err(reject(format!("unknown key `{prefix}.{key}`")));
+                    }
+                }
+                let command = model_list(
+                    table
+                        .get("command")
+                        .ok_or_else(|| reject(format!("`{prefix}` requires `command`")))?,
+                    &format!("{prefix}.command"),
+                    path,
+                )?;
+                let extensions: BTreeSet<String> = match table.get("extensions") {
+                    Some(value) => model_list(value, &format!("{prefix}.extensions"), path)?
+                        .into_iter()
+                        // Written either way in a configuration file; stored
+                        // the way `Path::extension` reports one.
+                        .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
+                        .collect(),
+                    None => BTreeSet::new(),
+                };
+                self.record(
+                    layer,
+                    path,
+                    &prefix,
+                    format!("{} · {}", command.join(" "), joined(&extensions)),
+                );
+                self.language_servers.insert(
+                    name.clone(),
+                    LanguageServer {
+                        name: name.clone(),
+                        command,
+                        extensions,
+                    },
+                );
+            }
         }
         Ok(())
     }

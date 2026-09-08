@@ -81,6 +81,31 @@ pub const DEFAULT_ENVIRONMENT_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "TZ
 /// How long a terminated process has to exit before it is killed.
 pub const DEFAULT_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 
+/// What a workspace may reach beyond its own files, as configuration resolved
+/// it.
+///
+/// One parameter rather than two lists, because they are the same decision
+/// made twice: which programs and machines this workspace is allowed to
+/// involve. A registry built with the default reaches nothing outside itself.
+#[derive(Clone, Debug, Default)]
+pub struct Reachable {
+    pub remote_targets: Vec<(String, arsy_kernel::config::RemoteTarget)>,
+    pub language_servers: Vec<arsy_kernel::config::LanguageServer>,
+}
+
+impl Reachable {
+    /// Everything configuration says this workspace may reach.
+    pub fn from_config(config: &arsy_kernel::config::Config) -> Self {
+        Self {
+            remote_targets: config
+                .remote_targets()
+                .map(|(name, target)| (name.clone(), target.clone()))
+                .collect(),
+            language_servers: config.language_servers().cloned().collect(),
+        }
+    }
+}
+
 /// Build the registry for one workspace.
 ///
 /// `retain_until_ms` is stamped on the artifacts operations produce, so `gc`
@@ -89,7 +114,7 @@ pub fn registry(
     workspace: &Workspace,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
-    remote_targets: impl IntoIterator<Item = (String, arsy_kernel::config::RemoteTarget)>,
+    reachable: Reachable,
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
     for operation in [
@@ -120,6 +145,7 @@ pub fn registry(
             workspace,
             &artifacts,
             retain_until_ms,
+            reachable.language_servers,
         ))
     {
         registry.register(executor)?;
@@ -156,10 +182,9 @@ pub fn registry(
     // A remote target is only reachable when configuration defined one, so a
     // workspace with none cannot dispatch `remote.exec` at all rather than
     // dispatching it to nowhere.
-    let remote_targets: Vec<_> = remote_targets.into_iter().collect();
-    if !remote_targets.is_empty() {
+    if !reachable.remote_targets.is_empty() {
         registry.register(Arc::new(RemoteExecutor::new(
-            remote_targets,
+            reachable.remote_targets,
             process(Arc::clone(&artifacts)),
         )))?;
     }
@@ -178,7 +203,8 @@ mod tests {
         let workspace = Workspace::open(temporary.path()).unwrap();
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(temporary.path().join("artifacts"), 0).unwrap());
-        let registry = registry(&workspace, Arc::clone(&artifacts), 0, []).unwrap();
+        let registry =
+            registry(&workspace, Arc::clone(&artifacts), 0, Reachable::default()).unwrap();
 
         let kinds: Vec<_> = registry.kinds().map(ToString::to_string).collect();
         // A WASM build can dispatch a plugin; a build without the feature has
@@ -194,8 +220,10 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
+                "code.diagnostics".to_owned(),
                 "code.explain".to_owned(),
                 "code.references".to_owned(),
+                "code.rename".to_owned(),
                 "code.symbol".to_owned(),
                 "fs.create".to_owned(),
                 "fs.delete".to_owned(),
@@ -220,13 +248,16 @@ mod tests {
             &workspace,
             artifacts,
             0,
-            [(
-                "build".to_owned(),
-                arsy_kernel::config::RemoteTarget::Container {
-                    engine: "docker".to_owned(),
-                    container: "builder".to_owned(),
-                },
-            )],
+            Reachable {
+                remote_targets: vec![(
+                    "build".to_owned(),
+                    arsy_kernel::config::RemoteTarget::Container {
+                        engine: "docker".to_owned(),
+                        container: "builder".to_owned(),
+                    },
+                )],
+                ..Reachable::default()
+            },
         )
         .unwrap();
         assert!(with_remote

@@ -58,9 +58,7 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
         &workspace,
         artifacts,
         arsy_kernel::artifact::unix_time_ms(),
-        config
-            .remote_targets()
-            .map(|(name, target)| (name.clone(), target.clone())),
+        arsy_code::operations::Reachable::from_config(&config),
     )
     .map_err(|error| storage_failed(error.to_string()))?;
 

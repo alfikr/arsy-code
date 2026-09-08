@@ -337,7 +337,13 @@ mod tests {
         let workspace = crate::resource::Workspace::open(directory.path()).unwrap();
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(directory.path().join("artifacts"), 0).unwrap());
-        let registry = operations::registry(&workspace, artifacts, 0, []).unwrap();
+        let registry = operations::registry(
+            &workspace,
+            artifacts,
+            0,
+            crate::operations::Reachable::default(),
+        )
+        .unwrap();
         let server = McpServer::new(
             registry,
             RuleSet::compile(rules),

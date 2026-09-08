@@ -52,7 +52,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
             workspace: WorkspaceCleanliness::Clean,
             sandbox: SandboxAssurance::None,
         },
-        [],
+        arsy_code::operations::Reachable::default(),
     )
     .unwrap()
 }
@@ -118,6 +118,8 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
             "code.symbol",
             "code.explain",
             "code.references",
+            "code.diagnostics",
+            "code.rename",
             "fs.edit",
             "apply_patch",
             "fs.write",

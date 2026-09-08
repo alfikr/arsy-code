@@ -4914,9 +4914,7 @@ fn agent_runtime(
                 .unwrap_or(arsy_kernel::policy::WorkspaceCleanliness::Unknown),
             sandbox: installed_sandbox_assurance(),
         },
-        config
-            .remote_targets()
-            .map(|(name, target)| (name.clone(), target.clone())),
+        arsy_code::operations::Reachable::from_config(config),
     )
     .map_err(|error| storage_failed(error.to_string()))
 }

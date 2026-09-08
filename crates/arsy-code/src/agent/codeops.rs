@@ -24,10 +24,12 @@
 //! confidence that evidence deserves.
 
 use crate::{
+    edit::{self, EditAddress, EditOperation, RangeReplacement},
     intelligence::{
-        CodeIntelligence, GraphCodeIntelligence, IntelligenceError, SymbolId, SymbolQuery,
-        TextCodeIntelligence, MAX_SEMANTIC_RESULTS,
+        CodeIntelligence, GraphCodeIntelligence, IntelligenceError, LspCodeIntelligence, SymbolId,
+        SymbolQuery, TextCodeIntelligence, WorkspaceEditPlan, MAX_SEMANTIC_RESULTS,
     },
+    lsp::{CommandOrigin, LspHost, RestartPolicy, ServerCommand, StdioTransport},
     resource::Workspace,
 };
 use arsy_kernel::{
@@ -39,9 +41,15 @@ use arsy_kernel::{
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
     },
 };
+use arsy_kernel::{config::LanguageServer, domain::StateVersion};
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 const DEFAULT_LIMIT: u64 = 20;
 
@@ -53,16 +61,36 @@ pub enum CodeOperation {
     Explain,
     /// What could be affected by changing it.
     References,
+    /// What a language server says is wrong with a file.
+    Diagnostics,
+    /// Rename a symbol everywhere the server can prove it is used.
+    Rename,
 }
 
 impl CodeOperation {
-    pub const ALL: [Self; 3] = [Self::Symbol, Self::Explain, Self::References];
+    pub const ALL: [Self; 5] = [
+        Self::Symbol,
+        Self::Explain,
+        Self::References,
+        Self::Diagnostics,
+        Self::Rename,
+    ];
 
     const fn kind(self) -> &'static str {
         match self {
             Self::Symbol => "code.symbol",
             Self::Explain => "code.explain",
             Self::References => "code.references",
+            Self::Diagnostics => "code.diagnostics",
+            Self::Rename => "code.rename",
+        }
+    }
+
+    /// A rename writes; everything else reads.
+    fn actions(self) -> Vec<CapabilityAction> {
+        match self {
+            Self::Rename => vec![CapabilityAction::FsRead, CapabilityAction::FsWrite],
+            _ => vec![CapabilityAction::FsRead],
         }
     }
 
@@ -75,6 +103,19 @@ impl CodeOperation {
             },
             Self::Explain | Self::References => InputSchema {
                 required: BTreeMap::from([("symbol".to_owned(), JsonType::String)]),
+                optional: BTreeMap::new(),
+                allow_extra: false,
+            },
+            Self::Diagnostics => InputSchema {
+                required: BTreeMap::from([("path".to_owned(), JsonType::String)]),
+                optional: BTreeMap::new(),
+                allow_extra: false,
+            },
+            Self::Rename => InputSchema {
+                required: BTreeMap::from([
+                    ("symbol".to_owned(), JsonType::String),
+                    ("new_name".to_owned(), JsonType::String),
+                ]),
                 optional: BTreeMap::new(),
                 allow_extra: false,
             },
@@ -97,6 +138,9 @@ pub struct CodeExecutor {
     workspace: PathBuf,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    /// Language servers configuration allows this workspace to start. Empty is
+    /// the ordinary case, and the tiers below still answer.
+    servers: Vec<LanguageServer>,
 }
 
 impl CodeExecutor {
@@ -105,6 +149,7 @@ impl CodeExecutor {
         workspace: &Workspace,
         artifacts: Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
+        servers: Vec<LanguageServer>,
     ) -> Arc<Self> {
         Arc::new(Self {
             operation,
@@ -112,15 +157,25 @@ impl CodeExecutor {
                 kind: OperationKind::new(operation.kind()).expect("static operation kind is valid"),
                 input_schema: operation.schema(),
                 // Reading the repository, however cleverly. A semantic answer
-                // needs no authority a file read does not.
-                actions: vec![CapabilityAction::FsRead],
-                idempotency: Idempotency::Idempotent,
+                // needs no authority a file read does not; a rename writes, and
+                // says so.
+                actions: operation.actions(),
+                idempotency: if operation == CodeOperation::Rename {
+                    Idempotency::Effectful
+                } else {
+                    Idempotency::Idempotent
+                },
                 reversible: true,
-                concurrency: ConcurrencyRule::Parallel,
+                concurrency: if operation == CodeOperation::Rename {
+                    ConcurrencyRule::ExclusiveGlobal
+                } else {
+                    ConcurrencyRule::Parallel
+                },
             },
             workspace: workspace.path().to_owned(),
             artifacts,
             retain_until_ms,
+            servers,
         })
     }
 }
@@ -129,14 +184,92 @@ pub fn executors(
     workspace: &Workspace,
     artifacts: &Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    servers: Vec<LanguageServer>,
 ) -> Vec<Arc<dyn OperationExecutor>> {
     CodeOperation::ALL
         .into_iter()
         .map(|operation| {
-            CodeExecutor::new(operation, workspace, Arc::clone(artifacts), retain_until_ms)
-                as Arc<dyn OperationExecutor>
+            CodeExecutor::new(
+                operation,
+                workspace,
+                Arc::clone(artifacts),
+                retain_until_ms,
+                servers.clone(),
+            ) as Arc<dyn OperationExecutor>
         })
         .collect()
+}
+
+impl CodeExecutor {
+    /// A language server for this file, started and ready to be asked.
+    ///
+    /// `None` when configuration named none for the extension, which is the
+    /// ordinary case: the tiers below still answer, at the confidence their
+    /// evidence deserves.
+    fn language_server<'a>(
+        &self,
+        workspace: &'a Workspace,
+        path: &Path,
+    ) -> Option<LspCodeIntelligence<'a, StdioTransport>> {
+        let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+        let server = self
+            .servers
+            .iter()
+            .find(|server| server.extensions.contains(&extension))?;
+        Some(self.start(workspace, server))
+    }
+
+    /// The first configured server, for a question about no file in
+    /// particular. `workspace/symbol` is workspace-wide, so there is no
+    /// extension to choose by.
+    fn any_language_server<'a>(
+        &self,
+        workspace: &'a Workspace,
+    ) -> Option<LspCodeIntelligence<'a, StdioTransport>> {
+        self.servers
+            .first()
+            .map(|server| self.start(workspace, server))
+    }
+
+    fn start<'a>(
+        &self,
+        workspace: &'a Workspace,
+        server: &LanguageServer,
+    ) -> LspCodeIntelligence<'a, StdioTransport> {
+        let transport = StdioTransport::new(
+            // The same allowlist a subprocess gets: a language server is a
+            // program, and a credential in the operator's shell has no reason
+            // to be in its environment.
+            crate::operations::DEFAULT_ENVIRONMENT_ALLOWLIST
+                .iter()
+                .filter_map(|name| {
+                    std::env::var(name)
+                        .ok()
+                        .map(|value| ((*name).to_owned(), value))
+                })
+                .collect(),
+            Some(workspace.path().to_owned()),
+        )
+        .rooted_at(workspace.path());
+        LspCodeIntelligence::new(
+            server.name.clone(),
+            // Replaced with a digest of the files a plan touches before that
+            // plan is applied; nothing reads it before then.
+            StateVersion::from_digest([0; 32]),
+            LspHost::new(
+                ServerCommand {
+                    argv: server.command.clone(),
+                    // Configuration that may name a program comes from a
+                    // trusted layer, which is the same fact `Installed` states.
+                    origin: CommandOrigin::Installed,
+                    policy_authorized: true,
+                },
+                transport,
+                RestartPolicy::default(),
+            ),
+            workspace,
+        )
+    }
 }
 
 impl OperationExecutor for CodeExecutor {
@@ -160,13 +293,6 @@ impl OperationExecutor for CodeExecutor {
                 .to_owned()
         };
 
-        // Indexing is per call rather than cached because an operation cannot
-        // know what the last one edited; the graph is incremental against a
-        // store this layer does not have, and re-parsing a repository is
-        // cheaper than answering from a stale index.
-        let mut graph = GraphCodeIntelligence::index(&workspace).map_err(semantic)?;
-        let mut fallback = TextCodeIntelligence::new(&workspace);
-
         let outcome = match self.operation {
             CodeOperation::Symbol => {
                 let query = SymbolQuery {
@@ -181,24 +307,34 @@ impl OperationExecutor for CodeExecutor {
                     .unwrap_or(MAX_SEMANTIC_RESULTS)
                     .clamp(1, MAX_SEMANTIC_RESULTS),
                 };
-                // A workspace with no indexed declaration of that name is not
-                // an error: the string may still be there, and finding it is
-                // the text tier's job.
-                let hits = match graph.find_symbol(&query) {
-                    Ok(hits) if !hits.is_empty() => hits,
-                    Ok(_) | Err(IntelligenceError::Unsupported(_)) => {
-                        fallback.find_symbol(&query).map_err(semantic)?
-                    }
-                    Err(error) => return Err(semantic(error)),
-                };
+                // Down the tiers until one has an answer. A server that is
+                // configured but cannot start is a fallback, not a failure:
+                // the question is still answerable, less certainly.
+                let hits = self
+                    .any_language_server(&workspace)
+                    .and_then(|mut server| server.find_symbol(&query).ok())
+                    .filter(|hits| !hits.is_empty())
+                    .or_else(|| {
+                        GraphCodeIntelligence::index(&workspace)
+                            .and_then(|mut graph| graph.find_symbol(&query))
+                            .ok()
+                            .filter(|hits| !hits.is_empty())
+                    })
+                    .map_or_else(
+                        || TextCodeIntelligence::new(&workspace).find_symbol(&query),
+                        Ok,
+                    )
+                    .map_err(semantic)?;
                 CodeOutcome {
                     provider: provider_of(hits.first().map(|hit| hit.provider)),
                     answer: serde_json::json!({"symbols": hits}),
                 }
             }
             CodeOperation::Explain => {
-                let evidence = graph
-                    .explain_symbol(&symbol(&text("symbol"))?)
+                let id = symbol(&text("symbol"))?;
+                let evidence = self
+                    .tier_for(&workspace, &id)?
+                    .explain_symbol(&id)
                     .map_err(semantic)?;
                 CodeOutcome {
                     provider: provider_of(Some(evidence.provider)),
@@ -207,13 +343,43 @@ impl OperationExecutor for CodeExecutor {
                 }
             }
             CodeOperation::References => {
-                let graph_result = graph
-                    .find_callers(&symbol(&text("symbol"))?)
+                let id = symbol(&text("symbol"))?;
+                let found = self
+                    .tier_for(&workspace, &id)?
+                    .find_callers(&id)
                     .map_err(semantic)?;
                 CodeOutcome {
-                    provider: provider_of(graph_result.callers.first().map(|hit| hit.provider)),
-                    answer: serde_json::to_value(graph_result)
+                    provider: provider_of(found.callers.first().map(|hit| hit.provider)),
+                    answer: serde_json::to_value(found)
                         .map_err(|error| OperationError::Execution(error.to_string()))?,
+                }
+            }
+            CodeOperation::Diagnostics => {
+                let path = PathBuf::from(text("path"));
+                let found = self
+                    .language_server(&workspace, &path)
+                    .ok_or_else(|| unserved(&path))?
+                    .diagnostics(&text("path"))
+                    .map_err(semantic)?;
+                CodeOutcome {
+                    provider: provider_of(Some(found.provider)),
+                    answer: serde_json::to_value(found)
+                        .map_err(|error| OperationError::Execution(error.to_string()))?,
+                }
+            }
+            CodeOperation::Rename => {
+                let id = symbol(&text("symbol"))?;
+                let path = lsp_path(&id, &workspace)?;
+                let mut server = self
+                    .language_server(&workspace, &path)
+                    .ok_or_else(|| unserved(&path))?;
+                let plan = server
+                    .plan_rename(&id, &text("new_name"))
+                    .map_err(semantic)?;
+                let applied = apply_rename(&workspace, plan)?;
+                CodeOutcome {
+                    provider: "lsp".to_owned(),
+                    answer: applied,
                 }
             }
         };
@@ -227,13 +393,186 @@ impl OperationExecutor for CodeExecutor {
         Ok(OperationOutcome {
             value: Some(value),
             observed_effects: vec![Effect {
-                action: CapabilityAction::FsRead,
+                action: if self.operation == CodeOperation::Rename {
+                    CapabilityAction::FsWrite
+                } else {
+                    CapabilityAction::FsRead
+                },
                 resource: ResourceRef::new("workspace", "*").expect("a static scheme and value"),
             }],
             evidence: Vec::new(),
             state: None,
         })
     }
+}
+
+impl CodeExecutor {
+    /// The tier that can answer about this id.
+    ///
+    /// An id says which tier produced it — `lsp:` carries a position a server
+    /// understands, `symbol:` names a declaration the graph indexed — so
+    /// routing by prefix asks the tier that can actually resolve it rather
+    /// than the one that happens to be available.
+    fn tier_for<'a>(
+        &self,
+        workspace: &'a Workspace,
+        id: &SymbolId,
+    ) -> Result<Box<dyn CodeIntelligence + 'a>, OperationError> {
+        if id.as_str().starts_with("lsp:") {
+            let path = lsp_path(id, workspace)?;
+            return self
+                .language_server(workspace, &path)
+                .map(|server| Box::new(server) as Box<dyn CodeIntelligence + 'a>)
+                .ok_or_else(|| unserved(&path));
+        }
+        GraphCodeIntelligence::index(workspace)
+            .map(|graph| Box::new(graph) as Box<dyn CodeIntelligence + 'a>)
+            .map_err(semantic)
+    }
+}
+
+/// The workspace-relative file an `lsp:` id names.
+fn lsp_path(id: &SymbolId, workspace: &Workspace) -> Result<PathBuf, OperationError> {
+    let uri = id
+        .as_str()
+        .strip_prefix("lsp:")
+        .and_then(|rest| rest.rsplit_once('#'))
+        .map(|(uri, _)| uri)
+        .ok_or_else(|| {
+            OperationError::Execution(format!(
+                "`{}` is not a symbol id from a language server; find one with code.symbol",
+                id.as_str()
+            ))
+        })?;
+    let path = crate::lsp::uri_path(uri);
+    Ok(path
+        .strip_prefix(workspace.path())
+        .unwrap_or(&path)
+        .to_path_buf())
+}
+
+/// Apply a rename plan as one transaction.
+///
+/// The plan's revision is replaced with a digest of the files it touches, as
+/// they are on disk now, and the transaction re-computes the same digest
+/// before writing anything: a file that changed between planning and applying
+/// invalidates the whole plan rather than half-renaming the workspace. That is
+/// the only reason a rename can be trusted at all — a server computed these
+/// offsets against text it read a moment ago.
+fn apply_rename(
+    workspace: &Workspace,
+    mut plan: WorkspaceEditPlan,
+) -> Result<Value, OperationError> {
+    let mut by_file: BTreeMap<PathBuf, Vec<RangeReplacement>> = BTreeMap::new();
+    for edit in &plan.edits {
+        let path = crate::lsp::uri_path(&edit.uri);
+        let relative = path
+            .strip_prefix(workspace.path())
+            .unwrap_or(&path)
+            .to_path_buf();
+        by_file.entry(relative).or_default().push(RangeReplacement {
+            bytes: edit.bytes.clone(),
+            replacement: edit.new_text.clone().into_bytes(),
+        });
+    }
+    plan.revision = touched_revision(workspace, by_file.keys())?;
+
+    let operations: Vec<EditOperation> = by_file
+        .iter()
+        .map(|(path, edits)| EditOperation {
+            path: path.clone(),
+            address: EditAddress::WorkspaceEdit {
+                server: plan.server.clone(),
+                revision: plan.revision,
+                edits: edits.clone(),
+            },
+            replacement: Vec::new(),
+        })
+        .collect();
+
+    let resolver = PlanRevision {
+        server: plan.server.clone(),
+        revision: plan.revision,
+    };
+    let applied = edit::apply_with_resolver(
+        workspace.path(),
+        &edit::EditTransaction {
+            base: edit::workspace_version(workspace.path())
+                .map_err(|error| OperationError::Execution(error.to_string()))?,
+            operations,
+        },
+        &resolver,
+    )
+    .map_err(|error| OperationError::Execution(error.to_string()))?;
+
+    Ok(serde_json::json!({
+        "renamed": plan.new_name,
+        "server": plan.server,
+        "edits": plan.edits.len(),
+        "files": applied
+            .iter()
+            .map(|file| serde_json::json!({
+                "path": file.path.display().to_string(),
+                "before": file.before.to_string(),
+                "after": file.after.to_string(),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// A digest of the files a plan touches, as they are now.
+fn touched_revision<'a>(
+    workspace: &Workspace,
+    paths: impl Iterator<Item = &'a PathBuf>,
+) -> Result<StateVersion, OperationError> {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let content = workspace
+            .read(path, crate::intelligence::MAX_DOCUMENT_BYTES)
+            .map_err(|error| {
+                OperationError::Execution(format!(
+                    "the rename touches {}, which cannot be read: {error}",
+                    path.display()
+                ))
+            })?;
+        hasher.update(path.to_string_lossy().replace('\\', "/").as_bytes());
+        hasher.update([0]);
+        hasher.update(content.digest.digest());
+    }
+    Ok(StateVersion::from_digest(hasher.finalize().into()))
+}
+
+/// Confirms the files are what the plan was computed against.
+struct PlanRevision {
+    server: String,
+    revision: StateVersion,
+}
+
+impl edit::SemanticResolver for PlanRevision {
+    fn resolve_symbol(
+        &self,
+        _path: &Path,
+        _symbol: &SymbolId,
+    ) -> Result<edit::ResolvedSymbol, edit::EditError> {
+        Err(edit::EditError::SemanticUnavailable)
+    }
+
+    fn server_revision(&self, server: &str) -> Result<StateVersion, edit::EditError> {
+        if server == self.server {
+            Ok(self.revision)
+        } else {
+            Err(edit::EditError::SemanticUnavailable)
+        }
+    }
+}
+
+/// No configured server claims this file's extension.
+fn unserved(path: &Path) -> OperationError {
+    OperationError::Execution(format!(
+        "no language server is configured for {}; add one under `[lsp.server.<name>]` with the \
+         extensions it answers for",
+        path.display()
+    ))
 }
 
 /// The tier that answered. `none` when there was nothing to answer with, which
@@ -311,6 +650,7 @@ mod tests {
             &fixture.workspace,
             Arc::clone(&fixture.artifacts),
             0,
+            Vec::new(),
         );
         let request = OperationRequest {
             id: OperationId::new(),
@@ -392,6 +732,7 @@ mod tests {
             &fixture.workspace,
             Arc::clone(&fixture.artifacts),
             0,
+            Vec::new(),
         );
         let request = OperationRequest {
             id: OperationId::new(),
@@ -404,5 +745,142 @@ mod tests {
         let error = executor.execute(&request, &[]).unwrap_err();
 
         assert!(format!("{error}").contains("symbol:"), "{error}");
+    }
+
+    #[test]
+    fn a_rename_is_applied_as_one_transaction_or_not_at_all() {
+        let fixture = fixture();
+        let root = fixture.workspace.path().to_owned();
+        let engine = root.join("src/engine.rs");
+        let main = root.join("src/main.rs");
+        let plan = |edits: Vec<crate::intelligence::WorkspaceTextEdit>| WorkspaceEditPlan {
+            server: "fake".to_owned(),
+            revision: StateVersion::from_digest([0; 32]),
+            symbol: SymbolId::new("lsp:x#0:0").unwrap(),
+            new_name: "walk".to_owned(),
+            edits,
+        };
+        let edit = |path: &std::path::Path, bytes: std::ops::Range<usize>| {
+            crate::intelligence::WorkspaceTextEdit {
+                uri: crate::lsp::file_uri(path),
+                bytes,
+                new_text: "walk".to_owned(),
+            }
+        };
+
+        // `pub fn run` in engine.rs, `engine::run(1)` in main.rs.
+        let engine_source = std::fs::read_to_string(&engine).unwrap();
+        let main_source = std::fs::read_to_string(&main).unwrap();
+        let in_engine = engine_source.find("run").unwrap();
+        let in_main = main_source.rfind("run").unwrap();
+
+        // One edit addresses a file that is not there: nothing is written.
+        let missing = root.join("src/absent.rs");
+        let refused = apply_rename(
+            &fixture.workspace,
+            plan(vec![
+                edit(&engine, in_engine..in_engine + 3),
+                edit(&missing, 0..1),
+            ]),
+        )
+        .expect_err("an unreadable file invalidates the plan");
+        assert!(format!("{refused}").contains("absent.rs"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&engine).unwrap(), engine_source);
+
+        let applied = apply_rename(
+            &fixture.workspace,
+            plan(vec![
+                edit(&engine, in_engine..in_engine + 3),
+                edit(&main, in_main..in_main + 3),
+            ]),
+        )
+        .expect("the plan applies");
+
+        assert_eq!(applied["edits"], 2);
+        assert_eq!(applied["files"].as_array().unwrap().len(), 2);
+        assert!(std::fs::read_to_string(&engine)
+            .unwrap()
+            .contains("pub fn walk"));
+        assert!(std::fs::read_to_string(&main)
+            .unwrap()
+            .contains("engine::walk"));
+    }
+
+    #[test]
+    fn a_rename_planned_against_a_file_that_has_since_changed_is_refused() {
+        let fixture = fixture();
+        let engine = fixture.workspace.path().join("src/engine.rs");
+        let source = std::fs::read_to_string(&engine).unwrap();
+        let at = source.find("run").unwrap();
+        let mut plan = WorkspaceEditPlan {
+            server: "fake".to_owned(),
+            revision: StateVersion::from_digest([0; 32]),
+            symbol: SymbolId::new("lsp:x#0:0").unwrap(),
+            new_name: "walk".to_owned(),
+            edits: vec![crate::intelligence::WorkspaceTextEdit {
+                uri: crate::lsp::file_uri(&engine),
+                bytes: at..at + 3,
+                new_text: "walk".to_owned(),
+            }],
+        };
+        // The applier recomputes the revision from disk and checks it against
+        // the one on the plan, so a plan carrying a revision from a different
+        // state of the file is refused rather than applied at stale offsets.
+        plan.revision = StateVersion::from_digest([9; 32]);
+
+        let resolver = PlanRevision {
+            server: "fake".to_owned(),
+            revision: StateVersion::from_digest([9; 32]),
+        };
+        let stale = edit::apply_with_resolver(
+            fixture.workspace.path(),
+            &edit::EditTransaction {
+                base: edit::workspace_version(fixture.workspace.path()).unwrap(),
+                operations: vec![EditOperation {
+                    path: PathBuf::from("src/engine.rs"),
+                    address: EditAddress::WorkspaceEdit {
+                        server: "fake".to_owned(),
+                        // Not the revision the resolver will report.
+                        revision: StateVersion::from_digest([1; 32]),
+                        edits: vec![RangeReplacement {
+                            bytes: at..at + 3,
+                            replacement: b"walk".to_vec(),
+                        }],
+                    },
+                    replacement: Vec::new(),
+                }],
+            },
+            &resolver,
+        );
+
+        assert!(stale.is_err(), "a stale plan must not be applied");
+        assert_eq!(std::fs::read_to_string(&engine).unwrap(), source);
+    }
+
+    #[test]
+    fn a_file_no_configured_server_serves_is_refused_by_name() {
+        let fixture = fixture();
+        let executor = CodeExecutor::new(
+            CodeOperation::Diagnostics,
+            &fixture.workspace,
+            Arc::clone(&fixture.artifacts),
+            0,
+            Vec::new(),
+        );
+
+        let error = executor
+            .execute(
+                &OperationRequest {
+                    id: OperationId::new(),
+                    kind: OperationKind::new("code.diagnostics").unwrap(),
+                    actor: Principal::System,
+                    input: serde_json::json!({"path": "src/engine.rs"}),
+                    requirements: Vec::new(),
+                },
+                &[],
+            )
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("lsp.server"), "{error}");
     }
 }
