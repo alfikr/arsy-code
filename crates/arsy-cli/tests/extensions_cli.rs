@@ -181,3 +181,86 @@ fn skills_are_listed_as_data_and_hooks_carry_their_engine_semantics() {
     assert_eq!(report["effect_class"], "observe");
     assert_eq!(report["on_failure"], "fail_open");
 }
+
+/// A module that emits `ok` and nothing else, which is enough to prove the
+/// whole path: install, approve, policy, host, and back with the output.
+#[cfg(feature = "wasm")]
+const EMIT_OK: &str = r#"
+    (module
+      (import "arsy" "emit_byte" (func $emit (param i32) (result i32)))
+      (func (export "run")
+        (drop (call $emit (i32.const 111)))
+        (drop (call $emit (i32.const 107))))
+    )
+"#;
+
+#[cfg(feature = "wasm")]
+#[test]
+fn an_approved_plugin_runs_through_the_same_policy_a_tool_call_does() {
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("plugin.toml"),
+        "manifest_version = 1\nid = \"example.ok\"\nversion = \"1.0.0\"\n\
+         entrypoint = \"plugin.wat\"\napi = \">=1,<2\"\n\
+         capabilities = [\"plugin.invoke:plugin/**\"]\nimports = [\"arsy::emit_byte\"]\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("plugin.wat"), EMIT_OK).unwrap();
+    let source = source.to_str().unwrap();
+
+    // Policy decides whether a plugin may be invoked at all, and the default
+    // is to ask -- which nobody can answer here.
+    let (code, _) = arsy(workspace.path(), &["plugin", "install", source, "--force"]);
+    assert_eq!(code, 0);
+    let (code, refused) = arsy(workspace.path(), &["plugin", "run", "example.ok"]);
+    assert_eq!(code, 6, "{refused}");
+    assert_eq!(refused["ran"], false);
+
+    // Allowing it takes a layer that may grant: a config file inside the
+    // repository is untrusted content and its `allow` is downgraded.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "schema_version = 1\n[policy]\ndefault_effect = \"allow\"\n",
+    )
+    .unwrap();
+    let approved = |args: &[&str]| -> (i32, Value) {
+        let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
+            .args(["--workspace", workspace.path().to_str().unwrap()])
+            .args(["--output", "json"])
+            .args(args)
+            .env("ARSY_CONFIG_HOME", home.path())
+            .output()
+            .expect("the binary runs");
+        let stdout = String::from_utf8(output.stdout).expect("machine output is UTF-8");
+        let record = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|record| record["type"] == "result")
+            .unwrap_or_else(|| panic!("no result record in {stdout}"));
+        (
+            output.status.code().unwrap_or(-1),
+            record["payload"].clone(),
+        )
+    };
+
+    let (code, ran) = approved(&["plugin", "run", "example.ok"]);
+    assert_eq!(code, 0, "{ran}");
+    assert_eq!(ran["ran"], true);
+    assert!(ran["output"].as_str().unwrap().contains("ok"), "{ran}");
+    // The output is evidence like any other operation's.
+    assert!(ran["artifact"].is_string());
+
+    // A plugin nobody installed is refused by name rather than run.
+    let (code, missing) = approved(&["plugin", "run", "example.absent"]);
+    assert_eq!(code, 6);
+    assert!(
+        missing["output"]
+            .as_str()
+            .unwrap()
+            .contains("example.absent"),
+        "{missing}"
+    );
+}

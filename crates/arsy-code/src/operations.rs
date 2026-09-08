@@ -124,6 +124,12 @@ pub fn registry(
     {
         registry.register(executor)?;
     }
+    #[cfg(feature = "wasm")]
+    registry.register(crate::agent::pluginops::PluginExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
     registry.register(crate::agent::patch::PatchExecutor::new(
         workspace,
         Arc::clone(&artifacts),
@@ -169,6 +175,14 @@ mod tests {
         let registry = registry(&workspace, Arc::clone(&artifacts), 0, []).unwrap();
 
         let kinds: Vec<_> = registry.kinds().map(ToString::to_string).collect();
+        // A WASM build can dispatch a plugin; a build without the feature has
+        // no host to run one in and does not offer the operation at all.
+        #[cfg(feature = "wasm")]
+        assert!(kinds.contains(&"plugin.invoke".to_owned()));
+        let kinds: Vec<_> = kinds
+            .into_iter()
+            .filter(|kind| kind != "plugin.invoke")
+            .collect();
         assert_eq!(
             kinds,
             vec![

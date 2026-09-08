@@ -11,7 +11,6 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::mpsc,
     thread,
 };
 

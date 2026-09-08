@@ -104,6 +104,7 @@ Usage:
   arsy plugin list [--capabilities]               installed plugins
   arsy plugin install <SOURCE> [--force]          approve, then install
   arsy plugin inspect <ID> | arsy plugin remove <ID>
+  arsy plugin run <ID> [--to <INPUT>]              invoke an installed plugin
   arsy plugin refresh [ID] [--dry-run]            re-read plugin sources
   arsy serve [--protocol mcp|acp]                offer operations as MCP tools, or
                                                  speak ACP to an editor, on stdio
@@ -340,6 +341,13 @@ pub enum Command {
     },
     PluginInspect {
         id: String,
+    },
+    /// `arsy plugin run <ID>`: invoke an installed plugin through the operation
+    /// registry, so the same policy and audit trail apply as to any other call.
+    PluginRun {
+        id: String,
+        /// What the plugin is given, as text. `--to` carries it.
+        input: String,
     },
     PluginRemove {
         id: String,
@@ -1066,6 +1074,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             extensions::install(invocation, source, *force, tty, emitter)
         }
         Command::PluginInspect { id } => extensions::inspect(invocation, id, emitter),
+        Command::PluginRun { id, input } => extensions::run(invocation, id, input, emitter),
         Command::PluginRemove { id } => extensions::remove(invocation, id, emitter),
         Command::PluginRefresh { id, dry_run } => {
             extensions::refresh(invocation, id.as_deref(), *dry_run, emitter)

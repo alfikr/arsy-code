@@ -100,10 +100,13 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let runtime = permissive(root.path());
 
+    // A WASM build offers `plugin.invoke` as well; the rest of the list is the
+    // same, and what this asserts is that the offer follows registration.
     let offered: Vec<String> = runtime
         .schemas()
         .into_iter()
         .map(|schema| schema.name)
+        .filter(|name| name != "plugin.invoke")
         .collect();
     assert_eq!(
         offered,

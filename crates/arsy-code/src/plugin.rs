@@ -74,6 +74,13 @@ pub struct Manifest {
     /// Host API range the plugin was built against.
     pub api: String,
     pub capabilities: BTreeSet<Request>,
+    /// Host functions the module may import, as `module::name`.
+    ///
+    /// Declared rather than discovered: the WASM host refuses a module that
+    /// imports anything this list does not name, so what a plugin can reach is
+    /// something an operator reads before installing rather than something the
+    /// binary decides afterwards.
+    pub imports: BTreeSet<String>,
 }
 
 impl Manifest {
@@ -127,12 +134,24 @@ impl Manifest {
             })?;
             capabilities.insert(Request::parse(requested)?);
         }
+        let mut imports = BTreeSet::new();
+        for import in table
+            .get("imports")
+            .and_then(toml::Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            let import = import.as_str().ok_or_else(|| {
+                PluginError::Manifest("`imports` entries must be strings".to_owned())
+            })?;
+            imports.insert(import.to_owned());
+        }
         Ok(Self {
             id: string("id")?,
             version: string("version")?,
             entrypoint,
             api: string("api")?,
             capabilities,
+            imports,
         })
     }
 

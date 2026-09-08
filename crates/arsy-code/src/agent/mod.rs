@@ -38,6 +38,8 @@ pub mod codeops;
 pub mod fsops;
 pub mod instructions;
 pub mod patch;
+#[cfg(feature = "wasm")]
+pub mod pluginops;
 pub mod searchops;
 
 use crate::resource::Workspace;
@@ -504,6 +506,28 @@ pub const TOOLS: &[Tool] = &[
             Ok(json!({"from": text(arguments, "from"), "to": text(arguments, "to")}))
         },
         summarize: |arguments| format!("{} → {}", text(arguments, "from"), text(arguments, "to")),
+    },
+    Tool {
+        name: "plugin.invoke",
+        operation: "plugin.invoke",
+        description: "Run an installed WASM plugin on a string and return what it produced. Only plugins this workspace installed and approved can run, and only within the limits the host enforces. Use `arsy plugin list` to see them.",
+        schema: || {
+            object(
+                json!({
+                    "plugin": {"type": "string", "description": "Installed plugin id."},
+                    "input": {"type": "string", "description": "What the plugin is given. Defaults to empty."}
+                }),
+                &["plugin"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"plugin": text(arguments, "plugin")});
+            if let Some(text) = arguments.get("input").and_then(Value::as_str) {
+                input["input"] = json!(text);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "plugin"),
     },
     Tool {
         name: "bash",

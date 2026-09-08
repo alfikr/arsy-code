@@ -54,6 +54,10 @@ pub fn parse_plugin(arguments: &crate::ParsedArguments) -> Result<Command, Diagn
             source: PathBuf::from(one(positional, "<SOURCE>")?),
             force: arguments.force,
         }),
+        "run" => Ok(Command::PluginRun {
+            id: one(positional, "<ID>")?,
+            input: arguments.to.clone().unwrap_or_default(),
+        }),
         "inspect" => Ok(Command::PluginInspect {
             id: one(positional, "<ID>")?,
         }),
@@ -212,6 +216,35 @@ fn human_list(report: &Value) -> String {
         ));
     }
     text
+}
+
+/// `arsy plugin run`: invoke a plugin the same way a model would.
+///
+/// Through the tool runtime rather than the extension host directly, so the
+/// operator's own invocation is policy-checked, recorded, and rendered exactly
+/// as one the model asks for -- a plugin an operator can run by hand and a
+/// plugin the agent can call are the same plugin under the same rules.
+pub fn run(
+    invocation: &Invocation,
+    id: &str,
+    input: &str,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = crate::load_config(&root, &working)?;
+    let runtime = crate::agent_runtime(&root, &config, false)?;
+    let result = runtime.invoke("plugin.invoke", &json!({"plugin": id, "input": input}));
+    emitter.result(json!({
+        "plugin": id,
+        "ran": result.success,
+        "output": result.output,
+        "duration_ms": u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX),
+        "artifact": result.artifact.map(|id| id.to_string()),
+    }));
+    // A plugin that refused or failed is a failed invocation, not a failed
+    // command: the exit code says which so a script can branch on it.
+    Ok(if result.success { 0 } else { 6 })
 }
 
 pub fn inspect(
