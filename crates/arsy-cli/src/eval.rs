@@ -561,9 +561,11 @@ mod tests {
             .unwrap()
             .replace(revision.trim(), "0000000000000000000000000000000000000000");
         fs::write(&elsewhere, body).unwrap();
-        let moved = run(&root, &elsewhere, None, false, None).unwrap();
+        // One trial: what this asserts is the revision report, and a second
+        // trial only costs the suite time.
+        let moved = run(&root, &elsewhere, Some(1), false, None).unwrap();
         assert!(!moved.revision_matches);
-        assert_eq!(moved.tasks[0].passed, 2, "it still measured something");
+        assert_eq!(moved.tasks[0].passed, 1, "it still measured something");
         assert!(run(&root, &elsewhere, None, true, None).is_err());
         env::remove_var("ARSY_EVAL_TEST");
         fs::remove_dir_all(temporary).unwrap();
