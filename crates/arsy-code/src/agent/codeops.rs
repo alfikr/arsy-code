@@ -97,7 +97,10 @@ impl CodeOperation {
         match self {
             Self::Symbol => InputSchema {
                 required: BTreeMap::from([("name".to_owned(), JsonType::String)]),
-                optional: BTreeMap::from([("limit".to_owned(), JsonType::Number)]),
+                optional: BTreeMap::from([
+                    ("limit".to_owned(), JsonType::Number),
+                    ("tier".to_owned(), JsonType::String),
+                ]),
                 allow_extra: false,
             },
             Self::Explain | Self::References => InputSchema {
@@ -283,14 +286,7 @@ impl OperationExecutor for CodeExecutor {
     ) -> Result<OperationOutcome, OperationError> {
         let workspace = Workspace::open(&self.workspace)
             .map_err(|error| OperationError::Execution(error.to_string()))?;
-        let text = |key: &str| {
-            request
-                .input
-                .get(key)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
+        let text = |key: &str| text(&request.input, key);
 
         let outcome = match self.operation {
             CodeOperation::Symbol => {
@@ -309,21 +305,32 @@ impl OperationExecutor for CodeExecutor {
                 // Down the tiers until one has an answer. A server that is
                 // configured but cannot start is a fallback, not a failure:
                 // the question is still answerable, less certainly.
-                let hits = self
-                    .any_language_server(&workspace)
-                    .and_then(|mut server| server.find_symbol(&query).ok())
-                    .filter(|hits| !hits.is_empty())
-                    .or_else(|| {
-                        GraphCodeIntelligence::index(&workspace)
-                            .and_then(|mut graph| graph.find_symbol(&query))
-                            .ok()
-                            .filter(|hits| !hits.is_empty())
-                    })
-                    .map_or_else(
-                        || TextCodeIntelligence::new(&workspace).find_symbol(&query),
-                        Ok,
-                    )
-                    .map_err(semantic)?;
+                //
+                // `tier` pins the answer to one of them. Nothing in a turn
+                // asks for that; a measurement does, because "the semantic
+                // answer is better than the textual one" is a claim that needs
+                // both answers to exist side by side.
+                let floor = text("tier") == "text";
+                let hits = if floor {
+                    TextCodeIntelligence::new(&workspace)
+                        .find_symbol(&query)
+                        .map_err(semantic)?
+                } else {
+                    self.any_language_server(&workspace)
+                        .and_then(|mut server| server.find_symbol(&query).ok())
+                        .filter(|hits| !hits.is_empty())
+                        .or_else(|| {
+                            GraphCodeIntelligence::index(&workspace)
+                                .and_then(|mut graph| graph.find_symbol(&query))
+                                .ok()
+                                .filter(|hits| !hits.is_empty())
+                        })
+                        .map_or_else(
+                            || TextCodeIntelligence::new(&workspace).find_symbol(&query),
+                            Ok,
+                        )
+                        .map_err(semantic)?
+                };
                 CodeOutcome {
                     provider: provider_of(hits.first().map(|hit| hit.provider)),
                     answer: serde_json::json!({"symbols": hits}),
@@ -428,6 +435,15 @@ impl CodeExecutor {
             .map(|graph| Box::new(graph) as Box<dyn CodeIntelligence + 'a>)
             .map_err(semantic)
     }
+}
+
+/// One string field of a call's input, or the empty string.
+fn text(input: &Value, key: &str) -> String {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The workspace-relative file an `lsp:` id names.

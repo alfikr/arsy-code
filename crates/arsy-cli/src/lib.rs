@@ -19,6 +19,7 @@
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
 mod acp;
+mod code;
 mod config_edit;
 mod eval;
 mod evidence;
@@ -99,6 +100,9 @@ Usage:
   arsy memory list [--scope <SCOPE>] [--all]      what this workspace remembers
   arsy memory remember <CLAIM> [--scope <SCOPE>]  record a durable claim
   arsy memory forget <ID> [--to <REASON>]        withdraw one, keeping the tombstone
+  arsy code symbol <NAME> [--tier auto|text]      where a name is declared
+  arsy code explain|references <SYMBOL_ID>        what it is, and what it affects
+  arsy code diagnostics <PATH>                    what a language server sees
   arsy review [REVISION] [--strict]  report what changed since REVISION (default HEAD)
   arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
   arsy skill list [--source <ECOSYSTEM>]          declared skills (data only)
@@ -287,6 +291,19 @@ pub enum Command {
         id: arsy_kernel::domain::MemoryId,
         reason: String,
     },
+    CodeSymbol {
+        name: String,
+        tier: code::Tier,
+        limit: Option<usize>,
+    },
+    CodeInspect {
+        /// `code.explain` or `code.references`; one shape, two questions.
+        operation: &'static str,
+        symbol: String,
+    },
+    CodeDiagnostics {
+        path: String,
+    },
     /// `arsy review`: assess what the working tree changed.
     Review {
         /// What the working tree is compared against. `HEAD` by default.
@@ -416,6 +433,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("gc") => evidence::parse_gc(&parsed)?,
         Some("migrate") => session::parse_migrate(&parsed)?,
         Some("review") => review::parse(&parsed)?,
+        Some("code") => code::parse(&parsed)?,
         Some("memory") => memory::parse(&parsed)?,
         Some("policy") => policy::parse(&parsed)?,
         Some("serve") => serve::parse(&parsed)?,
@@ -464,6 +482,8 @@ struct ParsedArguments {
     to: Option<String>,
     at: Option<String>,
     retention: Option<String>,
+    /// `arsy code symbol --tier`: which tier answers.
+    tier: Option<String>,
     /// `arsy migrate --backup`: where the pre-migration copy goes.
     backup: Option<PathBuf>,
     /// `arsy review --base`: the revision the working tree is compared against.
@@ -574,6 +594,7 @@ fn apply_value_flag(
         "--at" => parsed.at = Some(value(arguments, argument)?),
         "--retention" => parsed.retention = Some(value(arguments, argument)?),
         "--backup" => parsed.backup = Some(PathBuf::from(value(arguments, argument)?)),
+        "--tier" => parsed.tier = Some(value(arguments, argument)?),
         "--base" => parsed.base = Some(value(arguments, argument)?),
         "--resource" => parsed.resource = Some(value(arguments, argument)?),
         "--actor" => parsed.actor = Some(value(arguments, argument)?),
@@ -1046,6 +1067,13 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             retention_ms,
         } => evidence::collect(invocation, *apply, *retention_ms, emitter),
         Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
+        Command::CodeSymbol { name, tier, limit } => {
+            code::symbol(invocation, name, *tier, *limit, emitter)
+        }
+        Command::CodeInspect { operation, symbol } => {
+            code::inspect(invocation, operation, symbol, emitter)
+        }
+        Command::CodeDiagnostics { path } => code::diagnostics(invocation, path, emitter),
         Command::MemoryList { scope, all } => {
             memory::list(invocation, scope.clone(), *all, emitter)
         }
