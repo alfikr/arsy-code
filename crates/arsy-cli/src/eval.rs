@@ -67,7 +67,12 @@ const fn one() -> u32 {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Report {
+    /// The revision the fixture's numbers were measured at.
     revision: String,
+    /// The revision they were measured at *this* time. Equal is what makes two
+    /// reports comparable; unequal is what makes a difference explainable.
+    revision_ran: String,
+    revision_matches: bool,
     trials: u32,
     tasks: Vec<TaskReport>,
     /// Every arm against the first one declared, which is the baseline by
@@ -141,6 +146,7 @@ pub(crate) fn run(
     workspace: &Path,
     suite_path: &Path,
     trial_override: Option<u32>,
+    strict: bool,
     out: Option<&Path>,
 ) -> Result<Report, Diagnostic> {
     let bytes = read_bounded(suite_path)?;
@@ -153,7 +159,21 @@ pub(crate) fn run(
             "eval trials must be between 1 and {MAX_TRIALS}"
         )));
     }
-    verify_revision(workspace, &suite.revision)?;
+    let ran_at = head_revision(workspace)?;
+    // A fixture pins the revision its numbers were measured at. Refusing to
+    // run anywhere else would make every fixture unusable the moment it was
+    // committed -- committing it moves HEAD -- and would forbid the one thing
+    // a pinned baseline is for, which is running it again later to see whether
+    // anything moved. So the mismatch is reported rather than fatal, and
+    // `--strict` is how a pipeline that needs exact comparability says so.
+    let revision_matches = ran_at == suite.revision;
+    if strict && !revision_matches {
+        return Err(usage(format!(
+            "eval fixture pins {} and this workspace is at {ran_at}; drop --strict to run it \
+             anyway, and compare the numbers knowing the revision differs",
+            suite.revision
+        )));
+    }
     verify_environment(&suite.environment)?;
 
     let arms = if suite.arms.is_empty() {
@@ -202,6 +222,8 @@ pub(crate) fn run(
     let comparisons = compare(&tasks, &arms, trials);
     let report = Report {
         revision: suite.revision,
+        revision_ran: ran_at,
+        revision_matches,
         trials,
         tasks,
         comparisons,
@@ -260,7 +282,8 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, Diagnostic> {
     Ok(bytes)
 }
 
-fn verify_revision(workspace: &Path, expected: &str) -> Result<(), Diagnostic> {
+/// The revision this workspace is at, so a report can say what it measured.
+fn head_revision(workspace: &Path) -> Result<String, Diagnostic> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(workspace)
@@ -268,14 +291,12 @@ fn verify_revision(workspace: &Path, expected: &str) -> Result<(), Diagnostic> {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .output()
         .map_err(eval_failed)?;
-    let actual = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() || actual.trim() != expected {
-        return Err(usage(format!(
-            "eval fixture revision mismatch: expected {expected}, found {}",
-            actual.trim()
-        )));
+    if !output.status.success() {
+        return Err(usage(
+            "eval needs a Git repository with at least one commit to record what it measured",
+        ));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn verify_environment(expected: &BTreeMap<String, String>) -> Result<(), Diagnostic> {
@@ -524,11 +545,27 @@ mod tests {
         )
         .unwrap();
         env::set_var("ARSY_EVAL_TEST", "pinned");
-        let report = run(&root, &suite_path, None, Some(&report_path)).unwrap();
-        env::remove_var("ARSY_EVAL_TEST");
+        let report = run(&root, &suite_path, None, false, Some(&report_path)).unwrap();
         assert_eq!(report.tasks[0].passed, 2);
         assert_eq!(report.raw_events.len(), 2);
         assert!(report_path.is_file());
+        // The fixture was written against this workspace's HEAD, so it says so.
+        assert!(report.revision_matches);
+        assert_eq!(report.revision_ran, revision.trim());
+
+        // A fixture pinned elsewhere still runs, and the report says the
+        // numbers came from a different revision. `--strict` is how a caller
+        // refuses that.
+        let elsewhere = temporary.join("elsewhere.json");
+        let body = fs::read_to_string(&suite_path)
+            .unwrap()
+            .replace(revision.trim(), "0000000000000000000000000000000000000000");
+        fs::write(&elsewhere, body).unwrap();
+        let moved = run(&root, &elsewhere, None, false, None).unwrap();
+        assert!(!moved.revision_matches);
+        assert_eq!(moved.tasks[0].passed, 2, "it still measured something");
+        assert!(run(&root, &elsewhere, None, true, None).is_err());
+        env::remove_var("ARSY_EVAL_TEST");
         fs::remove_dir_all(temporary).unwrap();
     }
 

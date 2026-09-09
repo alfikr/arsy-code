@@ -85,7 +85,7 @@ Usage:
   arsy run <TASK>            execute one task non-interactively ('-' reads stdin)
   arsy resume <SESSION_ID>   resume a recorded session
   arsy doctor                report platform, sandbox, credential, and config state
-  arsy eval <SUITE>          run a pinned evaluation fixture
+  arsy eval <SUITE> [--strict]  run an evaluation fixture; --strict needs its revision
   arsy compat explain <KIND> explain claude, codex, omp, or agents imports
   arsy config explain [KEY]  show effective configuration and where it came from
   arsy session list [--limit <N>]      list recorded sessions in this workspace
@@ -231,6 +231,9 @@ pub enum Command {
     Eval {
         suite: PathBuf,
         trials: Option<u32>,
+        /// Refuse to run unless the workspace is at the revision the fixture
+        /// pins, for a pipeline that needs its numbers to be comparable.
+        strict: bool,
         out: Option<PathBuf>,
     },
     CompatExplain {
@@ -423,6 +426,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("eval") => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
             trials: parsed.trials,
+            strict: parsed.strict,
             out: parsed.out,
         },
         Some("compat") => Command::CompatExplain {
@@ -1007,9 +1011,14 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
         Command::AuthList => auth_list(invocation, emitter),
         Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
-        Command::Eval { suite, trials, out } => {
+        Command::Eval {
+            suite,
+            trials,
+            strict,
+            out,
+        } => {
             let workspace = workspace_root(&invocation.workspace)?;
-            let report = eval::run(&workspace, suite, *trials, out.as_deref())?;
+            let report = eval::run(&workspace, suite, *trials, *strict, out.as_deref())?;
             emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
             Ok(0)
         }

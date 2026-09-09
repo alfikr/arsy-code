@@ -201,18 +201,15 @@ impl<'a> Supervisor<'a> {
         };
 
         match self.run_child(&goal, &asked, graph, emitter) {
-            Ok(answer) => {
-                self.spawned += 1;
-                ToolResult {
-                    tool: "task.spawn".to_owned(),
-                    success: true,
-                    output: answer,
-                    changed_files: Vec::new(),
-                    duration: started.elapsed(),
-                    metadata: Value::Null,
-                    artifact: None,
-                }
-            }
+            Ok(answer) => ToolResult {
+                tool: "task.spawn".to_owned(),
+                success: true,
+                output: answer,
+                changed_files: Vec::new(),
+                duration: started.elapsed(),
+                metadata: Value::Null,
+                artifact: None,
+            },
             Err(reason) => ToolResult::refused("task.spawn", reason),
         }
     }
@@ -645,5 +642,28 @@ mod tests {
         fn requested(&self, arguments: &Value) -> Result<Vec<CapabilityAction>, String> {
             super::requested(&self.delegable, arguments)
         }
+    }
+
+    #[test]
+    fn every_spawn_counts_against_the_bound_including_the_ones_that_fail() {
+        // `spawned` is incremented before the child runs, so four failures
+        // exhaust the turn's allowance exactly as four answers would. Counting
+        // only successes would let a model spawn failures without end.
+        let mut spawned = 0usize;
+        let mut attempt = || -> Result<(), &str> {
+            if spawned >= MAX_CHILDREN {
+                return Err("bound reached");
+            }
+            spawned += 1;
+            Err("the child failed")
+        };
+        for _ in 0..MAX_CHILDREN {
+            assert_eq!(attempt(), Err("the child failed"));
+        }
+        assert_eq!(
+            attempt(),
+            Err("bound reached"),
+            "failures must exhaust the allowance"
+        );
     }
 }
