@@ -104,13 +104,14 @@ pub fn resolve_with_route(
             return Ok((endpoint, None));
         }
         if let Some(preset) = arsy_kernel::oauth::presets::get(id) {
+            let canonical_id = preset.id;
             let endpoint = Endpoint {
-                id: id.to_owned(),
+                id: canonical_id.to_owned(),
                 kind: preset.dialect,
                 base_url: preset.base_url.to_owned(),
                 credential: arsy_kernel::secret::SecretHandle::new(
                     arsy_kernel::secret::OS_STORE_ID,
-                    id,
+                    canonical_id,
                 )
                 .ok(),
                 api_key_env: None,

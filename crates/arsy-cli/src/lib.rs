@@ -3437,7 +3437,7 @@ fn run_turn(
         .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok())
         .or_else(|| native.cloned());
 
-    let outcome = match dynamic_provider.as_ref().filter(|_| !route.is_codex()) {
+    let outcome = match dynamic_provider.as_ref() {
         Some(resolved) => native_turn(
             resolved,
             &agent_runtime(
