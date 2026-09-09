@@ -63,6 +63,12 @@ const DELEGABLE: &[(&str, CapabilityAction)] = &[
     ("process.exec", CapabilityAction::ProcessExec),
 ];
 
+/// How many failures in a row mean a child is not working.
+///
+/// Three: one is ordinary, two can be a correction, and a third in a row is a
+/// child repeating itself with the rounds someone else is paying for.
+const CONSECUTIVE_FAILURES: u64 = 3;
+
 /// What an observer may spend on one child, in micro-units of its own budget.
 /// Each intervention costs one; the bound is how many times it may act before
 /// it has to stop watching.
@@ -421,8 +427,17 @@ impl Supervisor<'_> {
         // The rule is small and explainable on purpose: a child whose calls
         // keep failing is not working, and stopping it is worth more than the
         // rounds it would spend proving that.
-        let intervention = if projection.kind == "tool.failed" && projection.sequence >= 3 {
-            Intervention::Deny("three tool calls in a row failed".to_owned())
+        //
+        // The count comes from the payload, not from the sequence: the
+        // sequence is which call this was, and an intervention that recorded a
+        // failure count in its place would be a false entry in the audit.
+        let failures = projection
+            .public_payload
+            .get("consecutive_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let intervention = if projection.kind == "tool.failed" && failures >= CONSECUTIVE_FAILURES {
+            Intervention::Deny(format!("{failures} tool calls in a row failed"))
         } else {
             return None;
         };
@@ -601,6 +616,74 @@ mod tests {
             child.fits_within(parent),
             "a child never exceeds its parent"
         );
+    }
+
+    /// A projection as `child_turn` builds one.
+    fn projection(call: u64, failures: u64, kind: &str) -> RedactedProjection {
+        RedactedProjection {
+            sequence: call,
+            kind: kind.to_owned(),
+            public_payload: json!({"tool": "fs.read", "consecutive_failures": failures}),
+            redacted_fields: 2,
+        }
+    }
+
+    #[test]
+    fn the_sequence_is_which_call_it_was_and_the_count_lives_in_the_payload() {
+        let mut supervisor = Watcher {
+            observer: ObserverSubscription {
+                id: SubscriptionId::new(),
+                observer: AgentId::new(),
+                authority: ObserverAuthority {
+                    may_suggest: true,
+                    may_deny: true,
+                },
+                cost_budget_micros: OBSERVER_BUDGET,
+                cost_used_micros: 0,
+            },
+        };
+
+        // The tenth call, having failed twice in a row: not yet.
+        assert!(supervisor
+            .watch(&projection(10, 2, "tool.failed"))
+            .is_none());
+        // A success at the same sequence is never an intervention.
+        assert!(supervisor
+            .watch(&projection(11, 0, "tool.completed"))
+            .is_none());
+
+        // The third failure in a row stops it, and the reason names the count
+        // rather than the call number.
+        let stopped = supervisor
+            .watch(&projection(12, 3, "tool.failed"))
+            .expect("three in a row is the rule");
+        match stopped {
+            Intervention::Deny(reason) => assert!(reason.starts_with("3 "), "{reason}"),
+            other => panic!("a failing child is denied, not {other:?}"),
+        }
+    }
+
+    /// The observer half of [`Supervisor`], without a workspace behind it.
+    struct Watcher {
+        observer: ObserverSubscription,
+    }
+
+    impl Watcher {
+        fn watch(&mut self, projection: &RedactedProjection) -> Option<Intervention> {
+            let failures = projection
+                .public_payload
+                .get("consecutive_failures")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if projection.kind != "tool.failed" || failures < CONSECUTIVE_FAILURES {
+                return None;
+            }
+            let intervention = Intervention::Deny(format!("{failures} tool calls in a row failed"));
+            self.observer
+                .intervene(projection, intervention.clone(), 1)
+                .ok()
+                .map(|_| intervention)
+        }
     }
 
     #[test]

@@ -4796,6 +4796,9 @@ pub(crate) fn child_turn(
     let base = request.idempotency_key.as_str().to_owned();
     let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
     let mut consecutive_failures = 0u64;
+    // Tool calls this child has made, so an intervention can be correlated
+    // with the call that caused it.
+    let mut calls_made = 0u64;
     let mut answer = String::new();
 
     for round in 0..MAX_CHILD_TOOL_ROUNDS {
@@ -4850,22 +4853,26 @@ pub(crate) fn child_turn(
         let mut results = Vec::with_capacity(calls.len());
         for (id, name, arguments) in &calls {
             let result = runtime.invoke(name, arguments);
+            calls_made += 1;
             consecutive_failures = if result.success {
                 0
             } else {
                 consecutive_failures + 1
             };
-            // What an observer is allowed to see: the tool and the outcome. The
-            // arguments named a path and the result carried its contents, and
-            // neither is the observer's business.
+            // What an observer is allowed to see: which call this was, the
+            // tool, and the outcome. The arguments named a path and the result
+            // carried its contents, and neither is the observer's business.
             let projection = arsy_kernel::observer::RedactedProjection {
-                sequence: consecutive_failures,
+                sequence: calls_made,
                 kind: if result.success {
                     "tool.completed".to_owned()
                 } else {
                     "tool.failed".to_owned()
                 },
-                public_payload: json!({"tool": result.tool}),
+                public_payload: json!({
+                    "tool": result.tool,
+                    "consecutive_failures": consecutive_failures,
+                }),
                 redacted_fields: 2,
             };
             let intervened = watch(&projection);
