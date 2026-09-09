@@ -21,6 +21,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Whether a string is exactly one ordinary path component.
+///
+/// Not `..`, not `.`, not absolute, not a prefix, and containing no separator
+/// on either platform: Windows accepts `\\` where Unix does not, and an id is
+/// carried between them in a manifest.
+fn is_plain_component(value: &str) -> bool {
+    if value.is_empty() || value.contains('/') || value.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 /// The file an installed plugin is described by.
 pub const MANIFEST_FILE: &str = "plugin.toml";
 /// Where a workspace keeps what it has installed.
@@ -112,13 +126,20 @@ impl Manifest {
                 .map(str::to_owned)
                 .ok_or_else(|| PluginError::Manifest(format!("`{key}` is required")))
         };
+        let id = string("id")?;
+        // The id becomes a directory name under `.arsy/plugins`, so a `..` in
+        // it reaches outside the registry -- on install, which copies files, on
+        // invoke, which reads them, and on remove, which deletes a tree. One
+        // ordinary path component, or it is not an id.
+        if !is_plain_component(&id) {
+            return Err(PluginError::Manifest(format!(
+                "`id` must be a single path component with no separator, not `{id}`"
+            )));
+        }
         let entrypoint = string("entrypoint")?;
         // An entrypoint is opened relative to the plugin's own directory, so a
         // traversal in it would read a file the operator never installed.
-        if Path::new(&entrypoint)
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
+        if !is_plain_component(&entrypoint) {
             return Err(PluginError::Manifest(format!(
                 "`entrypoint` must be a plain relative file name, not `{entrypoint}`"
             )));
@@ -146,7 +167,7 @@ impl Manifest {
             imports.insert(import.to_owned());
         }
         Ok(Self {
-            id: string("id")?,
+            id,
             version: string("version")?,
             entrypoint,
             api: string("api")?,
@@ -266,7 +287,22 @@ impl Registry {
         }
     }
 
+    /// Where a plugin's files live.
+    ///
+    /// An id that is not one ordinary component names a directory outside the
+    /// registry, and every caller here either copies into it, reads from it, or
+    /// deletes it. `Manifest::parse` refuses such an id, and so does this: an
+    /// id also arrives from tool arguments and from a directory listing, and
+    /// neither has been through a manifest.
     pub fn directory(&self, id: &str) -> PathBuf {
+        if !is_plain_component(id) {
+            // A path that cannot exist, rather than one outside the registry:
+            // every caller reports "not installed" for it, which is true.
+            return self
+                .root
+                .join("<invalid>")
+                .join(id.replace(['/', '\\'], "_"));
+        }
         self.root.join(id)
     }
 
@@ -767,5 +803,56 @@ capabilities = ["fs.read:workspace/**"]
         let refresh = set.refresh(&registry, None).unwrap().clone();
         assert_eq!(refresh.added, vec!["example.review".to_owned()]);
         assert!(refresh.rejected.contains_key("example.broken"));
+    }
+
+    /// An id becomes a directory name, and three call sites act on that
+    /// directory: install copies into it, invoke reads from it, remove deletes
+    /// it. None of them may be pointed outside the registry.
+    #[test]
+    fn a_plugin_id_that_is_not_one_path_component_is_refused() {
+        let manifest = |id: &str| {
+            format!(
+                "manifest_version = 1\nid = \"{id}\"\nversion = \"1.0.0\"\n\
+                 entrypoint = \"plugin.wasm\"\napi = \"1\"\n"
+            )
+        };
+        for id in ["../../../.ssh", "..", ".", "a/b", "/etc", ""] {
+            let refused = Manifest::parse(&manifest(id))
+                .expect_err(&format!("`{id}` must not name a directory"));
+            assert!(
+                format!("{refused}").contains("single path component") || id.is_empty(),
+                "{id}: {refused}"
+            );
+        }
+        assert!(Manifest::parse(&manifest("example.review")).is_ok());
+
+        // A backslash separates on Windows and is an escape in TOML, so it is
+        // checked against the predicate both call sites use rather than
+        // through a manifest that could not carry it literally.
+        assert!(!is_plain_component("a\\b"));
+        assert!(!is_plain_component("..\\escape"));
+        assert!(is_plain_component("example.review"));
+    }
+
+    #[test]
+    fn a_traversing_id_never_resolves_outside_the_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::open(directory.path());
+        let root = directory.path().join(PLUGIN_DIRECTORY);
+
+        // The id arrives from tool arguments and from a directory listing as
+        // well as from a manifest, so the path builder refuses it too.
+        for id in ["../../escape", "..", "nested/plugin"] {
+            let resolved = registry.directory(id);
+            assert!(
+                resolved.starts_with(&root),
+                "`{id}` resolved to {}",
+                resolved.display()
+            );
+        }
+        assert_eq!(
+            registry.directory("example.review"),
+            root.join("example.review")
+        );
     }
 }

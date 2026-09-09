@@ -1161,6 +1161,37 @@ impl Config {
                             // A rule that already exists keeps the stricter of
                             // the two effects, so a later layer cannot relax
                             // one an earlier layer tightened.
+                            //
+                            // What it covers is not up for redefinition. Taking
+                            // the rest of the rule from the newer layer let a
+                            // repository narrow an enterprise deny to one path
+                            // by reusing its id and keeping the effect: the
+                            // effect check passed and the deny stopped covering
+                            // anything. So a layer that cannot grant may amend
+                            // an authoritative rule's effect and nothing else.
+                            Some(existing) if redefines(&existing, &rule) => {
+                                if policy_source(layer) > existing.source {
+                                    self.diagnostics.push(Diagnostic {
+                                        key: format!("policy.rules.{id}"),
+                                        layer,
+                                        path: path.to_path_buf(),
+                                        message: format!(
+                                            "kept the {} rule: a later layer may tighten a rule's \
+                                             effect, not change what it covers",
+                                            existing.source
+                                        ),
+                                    });
+                                    PolicyRule {
+                                        effect: existing.effect.min(rule.effect),
+                                        ..existing
+                                    }
+                                } else {
+                                    PolicyRule {
+                                        effect: existing.effect.min(rule.effect),
+                                        ..rule
+                                    }
+                                }
+                            }
                             Some(existing) => PolicyRule {
                                 effect: existing.effect.min(rule.effect),
                                 ..rule
@@ -1846,6 +1877,26 @@ fn matches(name: &str, key: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// Whether the later rule changes what the earlier one covers, rather than
+/// only how strictly it answers.
+///
+/// Everything a rule matches on: who it applies to, which action, over which
+/// resources, and the assurance the sandbox must reach. An expiry that arrives
+/// earlier still tightens, so it is not a redefinition; one that arrives later
+/// extends the rule's life and is.
+fn redefines(existing: &PolicyRule, replacement: &PolicyRule) -> bool {
+    existing.actor != replacement.actor
+        || existing.action != replacement.action
+        || existing.pattern.to_string() != replacement.pattern.to_string()
+        || existing.minimum_assurance > replacement.minimum_assurance
+        || existing.delegation_depth < replacement.delegation_depth
+        || match (existing.expires_at_ms, replacement.expires_at_ms) {
+            (Some(held), Some(asked)) => asked > held,
+            (Some(_), None) => true,
+            _ => false,
+        }
+}
+
 /// Enough of a URL check to fail early and visibly. Whether plaintext is
 /// acceptable for a given host is a transport decision, not a parse one.
 fn validate_base_url(raw: &str) -> Result<(), &'static str> {
@@ -2009,6 +2060,84 @@ fn platform_user_config() -> Option<PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn platform_user_config() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod policy_identity_tests {
+    use super::*;
+
+    fn layered(enterprise: &str, workspace: &str) -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("enterprise.toml");
+        let second = directory.path().join("workspace.toml");
+        std::fs::write(&first, enterprise).unwrap();
+        std::fs::write(&second, workspace).unwrap();
+        let config =
+            Config::load(&[(Layer::Enterprise, first), (Layer::Workspace, second)]).unwrap();
+        (directory, config)
+    }
+
+    /// A rule id names a rule, not a licence to rewrite it.
+    #[test]
+    fn a_repository_cannot_narrow_an_enterprise_rule_by_reusing_its_id() {
+        let (_directory, config) = layered(
+            "schema_version = 1\n[[policy.rules]]\nid = \"no-exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+            // Same id, same effect -- so the effect check passes -- but scoped
+            // to one binary, which would leave every other command allowed.
+            "schema_version = 1\n[[policy.rules]]\nid = \"no-exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:/bin/true\"\n",
+        );
+
+        let rules = config.policy_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].pattern.to_string(),
+            "process:**",
+            "the enterprise rule still covers what it covered"
+        );
+        assert_eq!(rules[0].source, PolicySource::Enterprise);
+        assert_eq!(
+            config
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.key == "policy.rules.no-exec")
+                .count(),
+            1,
+            "the attempt is reported rather than silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_repository_may_still_tighten_the_effect_of_a_rule_it_did_not_write() {
+        let (_directory, config) = layered(
+            "schema_version = 1\n[[policy.rules]]\nid = \"exec\"\neffect = \"ask\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+            "schema_version = 1\n[[policy.rules]]\nid = \"exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+        );
+
+        let rules = config.policy_rules();
+        assert_eq!(rules[0].effect, RuleEffect::Deny, "tightening is allowed");
+        assert_eq!(rules[0].pattern.to_string(), "process:**");
+    }
+
+    #[test]
+    fn a_layer_may_refine_a_rule_of_its_own_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.toml");
+        let second = directory.path().join("b.toml");
+        std::fs::write(
+            &first,
+            "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:**\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:src/**\"\n",
+        )
+        .unwrap();
+        // Both from the user layer: nobody is overruling anybody.
+        let config = Config::load(&[(Layer::User, first), (Layer::User, second)]).unwrap();
+
+        assert_eq!(config.policy_rules()[0].pattern.to_string(), "file:src/**");
+    }
 }
 
 #[cfg(test)]

@@ -415,27 +415,37 @@ pub fn file_uri(path: &Path) -> String {
 }
 
 /// The path a `file:` URI names, undoing [`file_uri`].
+///
+/// Decoded into bytes and then read as UTF-8, not into `char`s. A percent
+/// escape is a byte, and a non-ASCII character is several of them: decoding
+/// each escape to `char::from(byte)` would read them as Latin-1 and turn
+/// `caf%C3%A9` into `cafÃ©`. ARSY's own `file_uri` escapes almost nothing, so
+/// a round trip through it never noticed — but every URI decoded here came
+/// from a language server, and rust-analyzer, gopls, and clangd all encode
+/// non-ASCII. A rename touching such a path would then fail to read the file
+/// it had just planned edits for.
 pub fn uri_path(uri: &str) -> PathBuf {
     let rest = uri.strip_prefix("file://").unwrap_or(uri);
-    let mut decoded = String::with_capacity(rest.len());
-    let mut characters = rest.chars();
-    while let Some(character) = characters.next() {
-        if character != '%' {
-            decoded.push(character);
-            continue;
-        }
-        let hex: String = characters.by_ref().take(2).collect();
-        match u8::from_str_radix(&hex, 16) {
-            Ok(byte) => decoded.push(char::from(byte)),
-            // Not an escape after all; keep what was written rather than
-            // dropping it.
-            Err(_) => {
-                decoded.push('%');
-                decoded.push_str(&hex);
+    let raw = rest.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' && index + 2 < raw.len() {
+            let hex = std::str::from_utf8(&raw[index + 1..index + 3])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            if let Some(byte) = hex {
+                decoded.push(byte);
+                index += 3;
+                continue;
             }
         }
+        // Not an escape after all; keep what was written rather than dropping
+        // it.
+        decoded.push(raw[index]);
+        index += 1;
     }
-    PathBuf::from(decoded)
+    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 impl Drop for StdioTransport {

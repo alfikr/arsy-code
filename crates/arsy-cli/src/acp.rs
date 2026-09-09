@@ -127,11 +127,22 @@ fn handle(
 }
 
 /// Run one prompt as a task, streaming what the model says as it says it.
+///
+/// The redactor is installed before the turn starts, not after. `dispatch`
+/// streams every chunk through the emitter as it arrives, so an emitter whose
+/// redactor is still empty delivers a credential the model echoed straight to
+/// the editor -- and the same turn from a terminal would have masked it,
+/// because `arsy run` installs the redactor while preparing the task.
 fn prompt(invocation: &Invocation, session: SessionId, prompt: &str) -> Result<Value, Value> {
-    let mut execution = TaskRun::open(invocation, Some(session)).map_err(|error| failed(&error))?;
-    let task = execution.enqueue(prompt).map_err(|error| failed(&error))?;
     let mut emitter = Emitter::new(Output::Acp);
     emitter.session = Some(session);
+    // Also sanitizes the prompt, for the same reason `arsy run` does: an
+    // editor may paste a key into a message, and it should not reach the
+    // provider or the transcript verbatim.
+    let prompt =
+        crate::prepare_task(invocation, prompt, &mut emitter).map_err(|error| failed(&error))?;
+    let mut execution = TaskRun::open(invocation, Some(session)).map_err(|error| failed(&error))?;
+    let task = execution.enqueue(&prompt).map_err(|error| failed(&error))?;
     let code = execution
         .execute(task, Value::Null, &mut emitter)
         .map_err(|error| failed(&error))?;

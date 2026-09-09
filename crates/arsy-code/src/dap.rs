@@ -7,8 +7,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fmt,
-    io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    io::{BufRead, BufReader, Read, Write},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -327,7 +329,7 @@ impl std::error::Error for DapError {}
 /// [`DapTransport::drain_events`].
 pub struct StdioDapTransport {
     child: Child,
-    channel: DapChannel<BufReader<ChildStdout>, ChildStdin>,
+    channel: DapChannel<ChildStdin>,
 }
 
 /// The protocol itself, over any pair of streams.
@@ -335,8 +337,14 @@ pub struct StdioDapTransport {
 /// Separate from the process so the framing and the correlation can be tested
 /// against a scripted adapter instead of a real one: those are where the bugs
 /// are, and they have nothing to do with spawning.
-pub struct DapChannel<R, W> {
-    reader: R,
+pub struct DapChannel<W> {
+    /// Messages the adapter has sent, framed and parsed by a reader thread.
+    ///
+    /// The thread is what makes the deadline real: `read_line` and `read_exact`
+    /// on a child's pipe block until the child answers, so an adapter that
+    /// stops talking mid-request used to hang the turn forever with the
+    /// deadline check sitting unreached above it.
+    incoming: Receiver<Result<Value, DapError>>,
     writer: W,
     sequence: i64,
     events: Vec<Value>,
@@ -378,10 +386,12 @@ impl StdioDapTransport {
     }
 }
 
-impl<R: BufRead, W: Write> DapChannel<R, W> {
-    pub const fn new(reader: R, writer: W, deadline: Duration) -> Self {
+impl<W: Write> DapChannel<W> {
+    pub fn new(reader: impl BufRead + Send + 'static, writer: W, deadline: Duration) -> Self {
+        let (sender, incoming) = mpsc::channel();
+        thread::spawn(move || frame(reader, &sender));
         Self {
-            reader,
+            incoming,
             writer,
             sequence: 0,
             events: Vec::new(),
@@ -397,23 +407,42 @@ impl<R: BufRead, W: Write> DapChannel<R, W> {
             .map_err(|error| DapError::Transport(error.to_string()))
     }
 
-    /// Read one framed message.
-    fn receive(&mut self) -> Result<Value, DapError> {
+    /// Take the next message the adapter sent, waiting at most `remaining`.
+    ///
+    /// `Ok(None)` means the wait ran out with nothing to show for it; the
+    /// caller decides whether that is a failure or an answer.
+    fn receive(&mut self, remaining: Duration) -> Result<Option<Value>, DapError> {
+        match self.incoming.recv_timeout(remaining) {
+            Ok(message) => message.map(Some),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(DapError::Transport(
+                "the debug adapter closed its output".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Read framed messages until the stream ends, handing each to the channel.
+///
+/// Runs on its own thread, so a blocking read here is one the caller can walk
+/// away from. The first failure is reported and ends the loop: after a framing
+/// error the stream's position is no longer known.
+fn frame(mut reader: impl BufRead, sender: &Sender<Result<Value, DapError>>) {
+    loop {
         let mut length = None;
-        loop {
+        let ended = loop {
             let mut header = String::new();
-            let read = self
-                .reader
-                .read_line(&mut header)
-                .map_err(|error| DapError::Transport(error.to_string()))?;
-            if read == 0 {
-                return Err(DapError::Transport(
-                    "the debug adapter closed its output".to_owned(),
-                ));
+            match reader.read_line(&mut header) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = sender.send(Err(DapError::Transport(error.to_string())));
+                    return;
+                }
             }
             let header = header.trim_end();
             if header.is_empty() {
-                break;
+                break false;
             }
             if let Some(value) = header
                 .strip_prefix("Content-Length:")
@@ -421,22 +450,38 @@ impl<R: BufRead, W: Write> DapChannel<R, W> {
             {
                 length = value.trim().parse::<usize>().ok();
             }
+        };
+        if ended {
+            return;
         }
-        let length = length.ok_or_else(|| {
-            DapError::Transport("an adapter message carried no Content-Length".to_owned())
-        })?;
+        let Some(length) = length else {
+            let _ = sender.send(Err(DapError::Transport(
+                "an adapter message carried no Content-Length".to_owned(),
+            )));
+            return;
+        };
         if length > MAX_DAP_MESSAGE_BYTES {
-            return Err(DapError::MessageTooLarge);
+            let _ = sender.send(Err(DapError::MessageTooLarge));
+            return;
         }
-        let mut body = vec![0; length];
-        self.reader
-            .read_exact(&mut body)
-            .map_err(|error| DapError::Transport(error.to_string()))?;
-        serde_json::from_slice(&body).map_err(|error| DapError::Transport(error.to_string()))
+        let mut body = Vec::with_capacity(length.min(64 * 1024));
+        let read = (&mut reader).take(length as u64).read_to_end(&mut body);
+        let message = match read {
+            Ok(read) if read < length => Err(DapError::Transport(
+                "the debug adapter stopped mid-message".to_owned(),
+            )),
+            Ok(_) => serde_json::from_slice(&body)
+                .map_err(|error| DapError::Transport(error.to_string())),
+            Err(error) => Err(DapError::Transport(error.to_string())),
+        };
+        let failed = message.is_err();
+        if sender.send(message).is_err() || failed {
+            return;
+        }
     }
 }
 
-impl<R: BufRead, W: Write> DapTransport for DapChannel<R, W> {
+impl<W: Write> DapTransport for DapChannel<W> {
     fn initialize(&mut self) -> Result<DapCapabilities, DapError> {
         let body = self.request(
             "initialize",
@@ -471,15 +516,17 @@ impl<R: BufRead, W: Write> DapTransport for DapChannel<R, W> {
             "command": command,
             "arguments": arguments,
         }))?;
-        let started = Instant::now();
+        let deadline = Instant::now() + self.deadline;
         loop {
-            if started.elapsed() > self.deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            let Some(message) = self.receive(remaining)? else {
                 return Err(DapError::Transport(format!(
                     "the debug adapter did not answer {command} within {:?}",
                     self.deadline
                 )));
-            }
-            let message = self.receive()?;
+            };
             match message.get("type").and_then(Value::as_str) {
                 Some("response") if message.get("request_seq") == Some(&json!(sequence)) => {
                     if message.get("success").and_then(Value::as_bool) == Some(false) {
@@ -519,10 +566,14 @@ impl<R: BufRead, W: Write> DapTransport for DapChannel<R, W> {
         if let Some(index) = self.events.iter().position(named) {
             return Ok(Some(self.events.remove(index)));
         }
-        let started = Instant::now();
-        while started.elapsed() < deadline {
-            let message = match self.receive() {
-                Ok(message) => message,
+        let until = Instant::now() + deadline;
+        loop {
+            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            let message = match self.receive(remaining) {
+                Ok(Some(message)) => message,
+                Ok(None) => return Ok(None),
                 // The adapter closing its output is the answer: nothing more
                 // is coming, and that is not an error in a wait.
                 Err(DapError::Transport(_)) => return Ok(None),
@@ -536,7 +587,6 @@ impl<R: BufRead, W: Write> DapTransport for DapChannel<R, W> {
             }
             self.events.push(message);
         }
-        Ok(None)
     }
 }
 
@@ -654,7 +704,7 @@ mod tests {
                 json!({"type": "response", "request_seq": 1, "success": true, "body": {"stackFrames": []}})
             ),
         );
-        let mut channel = DapChannel::new(script.as_bytes(), Vec::new(), Duration::from_secs(5));
+        let mut channel = DapChannel::new(cursor(&script), Vec::new(), Duration::from_secs(5));
 
         let body = channel
             .request("stackTrace", json!({"threadId": 1}))
@@ -677,7 +727,7 @@ mod tests {
             framed(json!({"type": "response", "request_seq": 1, "success": true, "body": {}})),
             framed(json!({"type": "response", "request_seq": 2, "success": true, "body": {}})),
         );
-        let mut channel = DapChannel::new(script.as_bytes(), Vec::new(), Duration::from_secs(5));
+        let mut channel = DapChannel::new(cursor(&script), Vec::new(), Duration::from_secs(5));
 
         channel.request("first", json!({})).unwrap();
         channel.request("second", json!({})).unwrap();
@@ -699,7 +749,7 @@ mod tests {
         let script = framed(
             json!({"type": "response", "request_seq": 1, "success": false, "message": "no such breakpoint"}),
         );
-        let mut channel = DapChannel::new(script.as_bytes(), Vec::new(), Duration::from_secs(5));
+        let mut channel = DapChannel::new(cursor(&script), Vec::new(), Duration::from_secs(5));
 
         let error = channel
             .request("setBreakpoints", json!({}))
@@ -716,7 +766,7 @@ mod tests {
             "success": true,
             "body": {"supportsConfigurationDoneRequest": true, "supportsTerminateRequest": false},
         }));
-        let mut channel = DapChannel::new(script.as_bytes(), Vec::new(), Duration::from_secs(5));
+        let mut channel = DapChannel::new(cursor(&script), Vec::new(), Duration::from_secs(5));
 
         let capabilities = channel.initialize().unwrap();
 
@@ -731,10 +781,64 @@ mod tests {
     #[test]
     fn an_adapter_that_stops_talking_mid_message_is_an_error_not_a_hang() {
         let mut channel = DapChannel::new(
-            "Content-Length: 40\r\n\r\n{\"type\"".as_bytes(),
+            cursor("Content-Length: 40\r\n\r\n{\"type\""),
             Vec::new(),
             Duration::from_secs(5),
         );
         assert!(channel.request("initialize", json!({})).is_err());
+    }
+
+    /// The deadline used to sit above a `read_line` that never returned, so an
+    /// adapter that accepted the request and then went quiet held the turn
+    /// open for as long as it stayed alive.
+    #[test]
+    fn an_adapter_that_goes_quiet_gives_up_at_the_deadline_instead_of_hanging() {
+        // A pipe with a live writing end: reading it blocks the way a child's
+        // stdout does, rather than reporting end of file.
+        let (mut adapter, mut writer, reader) = pipe();
+        let mut channel = DapChannel::new(
+            BufReader::new(reader),
+            Vec::new(),
+            Duration::from_millis(200),
+        );
+
+        let started = Instant::now();
+        let error = channel
+            .request("initialize", json!({}))
+            .expect_err("a silent adapter is a failure, not a wait");
+
+        assert!(format!("{error}").contains("within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline was reached, not slept through: {:?}",
+            started.elapsed()
+        );
+        // Waiting for an event has the same deadline and reports nothing.
+        let waited = Instant::now();
+        assert!(channel
+            .wait_for_event(&["stopped"], Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+        assert!(waited.elapsed() < Duration::from_secs(5));
+        // Keeps the writing end open for the whole test, which is the point.
+        let _ = writer.write_all(b"");
+        let _ = adapter.kill();
+        let _ = adapter.wait();
+    }
+
+    fn cursor(script: &str) -> std::io::Cursor<Vec<u8>> {
+        std::io::Cursor::new(script.as_bytes().to_vec())
+    }
+
+    /// A blocking reader whose writing end the test holds.
+    fn pipe() -> (Child, ChildStdin, std::process::ChildStdout) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat is on the path");
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        (child, stdin, stdout)
     }
 }

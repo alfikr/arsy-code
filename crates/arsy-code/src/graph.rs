@@ -104,6 +104,10 @@ pub struct IndexDelta {
     /// Files whose digest matched, so nothing was reparsed for them.
     pub unchanged: usize,
     /// Files read but not parsed: too large, or a language with no grammar.
+    ///
+    /// Counted where the parse is attempted and nowhere else, so a file that
+    /// is both too large and unchanged is not counted twice — or counted at
+    /// all, since an unchanged file is never read for symbols.
     pub unparsed: usize,
 }
 
@@ -196,9 +200,6 @@ impl KnowledgeGraph {
             let metadata = entry
                 .metadata()
                 .map_err(|error| GraphError::Walk(error.to_string()))?;
-            if metadata.len() > MAX_INDEXED_BYTES {
-                delta.unparsed += 1;
-            }
             let bytes = match std::fs::read(entry.path()) {
                 Ok(bytes) => bytes,
                 // A file that vanished between the walk and the read is simply
@@ -630,6 +631,12 @@ mod tests {
             delta.unparsed, 1,
             "the markdown file is a node, not symbols"
         );
+
+        // A second pass reparses nothing, so it reports nothing unparsed:
+        // `unparsed` counts work skipped, not files that would be skipped.
+        let again = graph.index(&workspace).unwrap();
+        assert_eq!(again.unchanged, 3);
+        assert_eq!(again.unparsed, 0, "an unchanged file was not parsed again");
         assert_eq!(graph.file_count(), 3);
 
         assert_eq!(graph.symbols("helper").len(), 1);

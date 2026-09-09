@@ -198,3 +198,88 @@ fn an_editor_initializes_opens_a_session_prompts_and_sees_the_answer_stream() {
     );
     assert_eq!(unknown["error"]["data"]["arsyCode"], "ARSY-SCH-1004");
 }
+
+/// A model that echoes a stored credential back into its answer.
+fn leaks(secret: &str) -> String {
+    sse(&[
+        json!({"choices": [{"delta": {"content": format!("the key is {secret}")}}]}),
+        json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+    ])
+}
+
+#[test]
+fn a_credential_the_model_echoes_is_masked_before_it_reaches_the_editor() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let secret = "sk-live-0123456789abcdefghij";
+    let port = provider(vec![leaks(secret)]);
+
+    // A credential this workspace has stored. The catalog names the handle;
+    // the file beside it holds the value, which is what the redactor learns.
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "schema_version = 1\n\
+             [provider.endpoint.local]\n\
+             kind = \"openai\"\n\
+             base_url = \"http://127.0.0.1:{port}\"\n\
+             model = \"test-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(home.path().join("deploy.key"), secret).unwrap();
+    std::fs::write(
+        home.path().join("credentials.json"),
+        json!([{
+            "provider": "local",
+            "handle": "secret://file/deploy.key",
+            "created_at": 0,
+            "last_used": null,
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["deploy.key", "credentials.json"] {
+            std::fs::set_permissions(
+                home.path().join(name),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    }
+
+    let mut editor = Editor::open(workspace.path(), home.path());
+    editor.call("initialize", json!({"protocolVersion": 1}));
+    let (_, opened) = editor.call("session/new", json!({"cwd": workspace.path()}));
+    let session = opened["result"]["sessionId"].as_str().unwrap().to_owned();
+
+    let (updates, answered) = editor.call(
+        "session/prompt",
+        json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "what is the key?"}],
+        }),
+    );
+    assert_eq!(
+        answered["result"]["stopReason"], "end_turn",
+        "{answered:#?}"
+    );
+
+    let streamed: String = updates
+        .iter()
+        .filter(|update| update["method"] == "session/update")
+        .filter_map(|update| update["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(
+        !streamed.contains(secret),
+        "a credential reached the editor verbatim: {streamed}"
+    );
+    assert!(
+        streamed.contains("the key is"),
+        "only the secret is masked, not the answer: {streamed}"
+    );
+}

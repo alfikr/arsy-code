@@ -216,6 +216,10 @@ impl MemoryIndex {
     ///
     /// `claim_text` is the claim as it will be read back, checked here because
     /// a credential that reaches memory is a credential in every later prompt.
+    ///
+    /// A caller that has to store the claim somewhere before it can pass an
+    /// [`ArtifactId`] should call [`vet`] first: this refuses the same text,
+    /// but by then the caller has already written it down.
     pub fn remember(
         &mut self,
         new: NewMemory,
@@ -223,7 +227,7 @@ impl MemoryIndex {
         redactor: &Redactor,
         now_ms: u64,
     ) -> Result<MemoryId, MemoryError> {
-        reject_secret_like(claim_text, redactor)?;
+        vet(claim_text, redactor)?;
         // Repository and session content may state things; it may not certify
         // them. Capping rather than rejecting keeps the claim, which is often
         // useful, without letting it outrank an operator's.
@@ -354,6 +358,16 @@ impl MemoryIndex {
             reason: format!("{verb} a {} record", existing.origin),
         })
     }
+}
+
+/// Whether a claim may be stored at all, asked before it is written anywhere.
+///
+/// [`MemoryIndex::remember`] applies exactly this, and takes an artifact id
+/// rather than the text -- so a caller that stored the claim first, to have an
+/// id to pass, has already put a refused credential in the artifact store
+/// where nothing can collect it. Asking first is how that is avoided.
+pub fn vet(claim: &str, redactor: &Redactor) -> Result<(), MemoryError> {
+    reject_secret_like(claim, redactor)
 }
 
 /// Refuse a claim that carries a credential.

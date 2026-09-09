@@ -365,8 +365,20 @@ impl HookEngine {
                 }
                 other => other,
             };
-            if outcome.rank() < dispatch.outcome.rank() {
-                dispatch.outcome = outcome;
+            match outcome {
+                // A grant is the one outcome that loosens, so ranking cannot
+                // merge it: `min` over the ranks left `Allow` unable to beat
+                // the `Continue` a dispatch starts at, which made both the
+                // variant and the guard above it dead. It lifts a dispatch
+                // that nothing has objected to, and never overrules a denial
+                // or an approval another hook asked for.
+                Outcome::Allow => {
+                    if dispatch.outcome == Outcome::Continue {
+                        dispatch.outcome = Outcome::Allow;
+                    }
+                }
+                other if other.rank() < dispatch.outcome.rank() => dispatch.outcome = other,
+                _ => {}
             }
         }
         if let Some(payload) = result.payload {
@@ -639,6 +651,62 @@ mod tests {
         assert_eq!(dispatched.outcome, Outcome::Continue);
         assert_eq!(dispatched.diagnostics.len(), 1);
         assert!(dispatched.diagnostics[0].contains("cannot grant authority"));
+
+        // The same result from an origin that may grant is a grant — which is
+        // what makes the refusal above a refusal rather than an outcome no
+        // hook could ever reach.
+        let mut engine = HookEngine::new(4);
+        engine.register(
+            rule(
+                "user-allow",
+                LifecycleEvent::BeforeOperation,
+                EffectClass::Gate,
+                PolicySource::User,
+            ),
+            Box::new(Scripted(Ok(HandlerResult {
+                outcome: Some(Outcome::Allow),
+                ..HandlerResult::default()
+            }))),
+        );
+        let granted = engine
+            .dispatch(LifecycleEvent::BeforeOperation, "process.exec", json!({}))
+            .unwrap();
+        assert_eq!(granted.outcome, Outcome::Allow);
+        assert!(granted.diagnostics.is_empty());
+
+        // A grant does not overrule another hook's objection.
+        let mut engine = HookEngine::new(4);
+        engine.register(
+            rule(
+                "ask",
+                LifecycleEvent::BeforeOperation,
+                EffectClass::Gate,
+                PolicySource::User,
+            ),
+            Box::new(Scripted(Ok(HandlerResult {
+                outcome: Some(Outcome::RequireApproval("check first".to_owned())),
+                ..HandlerResult::default()
+            }))),
+        );
+        engine.register(
+            rule(
+                "user-allow",
+                LifecycleEvent::BeforeOperation,
+                EffectClass::Gate,
+                PolicySource::User,
+            ),
+            Box::new(Scripted(Ok(HandlerResult {
+                outcome: Some(Outcome::Allow),
+                ..HandlerResult::default()
+            }))),
+        );
+        let contested = engine
+            .dispatch(LifecycleEvent::BeforeOperation, "process.exec", json!({}))
+            .unwrap();
+        assert_eq!(
+            contested.outcome,
+            Outcome::RequireApproval("check first".to_owned())
+        );
 
         let mut engine = HookEngine::new(4);
         engine.register(

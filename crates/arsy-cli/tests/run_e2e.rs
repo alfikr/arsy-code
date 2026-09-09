@@ -515,3 +515,60 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
     let parent = provider.request().to_string();
     assert!(parent.contains("notes.txt says 42."), "{parent}");
 }
+
+#[test]
+fn a_claim_that_looks_like_a_credential_is_never_written_to_the_artifact_store() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let provider = FakeProvider::serving(vec![answers("noted.")]);
+    configure(home.path(), provider.port);
+
+    let artifacts = workspace.path().join(".arsy/artifacts");
+    let count = || -> usize { walk(&artifacts).len() };
+
+    // A claim that is fine is stored, so the comparison below is against a
+    // store that is working rather than one that never writes.
+    let (code, _) = arsy(
+        workspace.path(),
+        home.path(),
+        &["memory", "remember", "the build uses cargo"],
+    );
+    assert_eq!(code, 0);
+    let after_good = count();
+    assert!(after_good > 0, "an accepted claim is stored");
+
+    // A claim carrying something shaped like a key is refused -- and nothing
+    // is left behind, because a memory claim is kept alive by retention rather
+    // than by reachability, so an orphan here is uncollectable forever.
+    let (code, refused) = arsy(
+        workspace.path(),
+        home.path(),
+        &[
+            "memory",
+            "remember",
+            "the deploy token is ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+        ],
+    );
+    assert_eq!(code, 3, "{refused:#?}");
+    assert_eq!(
+        count(),
+        after_good,
+        "a refused claim wrote a blob that nothing can collect"
+    );
+}
+
+/// Every file under a directory, if it exists.
+fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            found.extend(walk(&entry.path()));
+        } else {
+            found.push(entry.path());
+        }
+    }
+    found
+}
