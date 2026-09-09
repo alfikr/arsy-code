@@ -2055,6 +2055,7 @@ pub fn turn_status(
         TurnPhase::Cancelling => "Cancelling…",
         TurnPhase::Connecting => "Connecting…",
         TurnPhase::Working => "Working…",
+        TurnPhase::Answering => "Answering…",
     };
     let mut status = format!(
         "  {} {} · {}s",
@@ -2074,6 +2075,7 @@ pub fn turn_status(
 pub enum TurnPhase {
     Connecting,
     Working,
+    Answering,
     Cancelling,
 }
 
@@ -2081,6 +2083,11 @@ pub enum TurnPhase {
 /// assistant message, so both routes read the same in scrollback.
 pub fn assistant_row(colour: bool, text: &str) -> String {
     paint(colour, sgr_assistant(), text.trim_end())
+}
+
+/// Header for the final assistant response, separating it from tool trace.
+pub fn assistant_header(colour: bool) -> String {
+    paint(colour, sgr_assistant(), "  ✦ Response")
 }
 
 /// Shown when a turn is stopped from the keyboard.

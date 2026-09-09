@@ -3709,7 +3709,15 @@ fn native_turn(
                     decoder,
                     auto_approve,
                 )? {
-                    Executed::Answered(result) => (result.output, !result.success),
+                    Executed::Answered(mut result) => {
+                        if !result.changed_files.is_empty() {
+                            result.output.push_str("\nChanged files:\n");
+                            for path in &result.changed_files {
+                                result.output.push_str(&format!("  • {path}\n"));
+                            }
+                        }
+                        (result.output, !result.success)
+                    }
                     Executed::Stopped => {
                         outcome.interrupted = true;
                         writeln!(terminal, "{}", tui::interrupted_row(colour))?;
@@ -4042,7 +4050,7 @@ fn native_status(
     let mut pending = String::new();
     let mut thinking = String::new();
     let mut thinking_open = false;
-
+    let mut answer_open = false;
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -4051,7 +4059,7 @@ fn native_status(
         tui::turn_status(
             colour,
             if first_event {
-                tui::TurnPhase::Working
+                tui::TurnPhase::Answering
             } else {
                 tui::TurnPhase::Connecting
             },
@@ -4148,6 +4156,15 @@ fn native_status(
             Ok(Ok(Streamed::Text(text))) => {
                 outcome.response.push_str(&text);
                 let width = tui::terminal_width();
+                if !answer_open {
+                    answer_open = true;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::assistant_header(colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
                 // Answer text closes the thinking box cleanly before the prose starts.
                 if thinking_open {
                     thinking_open = false;
