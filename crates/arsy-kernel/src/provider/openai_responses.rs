@@ -90,10 +90,14 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
                 .filter(|system| !system.trim().is_empty())
                 .unwrap_or(DEFAULT_INSTRUCTIONS)),
         );
-        body.insert(
-            "max_output_tokens".to_owned(),
-            json!(request.max_output_tokens),
-        );
+        // The ChatGPT Codex backend rejects caller-supplied output caps.
+        // Generic Responses endpoints accept max_output_tokens normally.
+        if !matches!(self.descriptor.id.as_str(), "codex" | "codex-oauth") {
+            body.insert(
+                "max_output_tokens".to_owned(),
+                json!(request.max_output_tokens),
+            );
+        }
         body.insert("stream".to_owned(), json!(true));
         // The backend requires an explicit `false`: it is stateless, so every
         // turn already carries its whole history in `input`.
