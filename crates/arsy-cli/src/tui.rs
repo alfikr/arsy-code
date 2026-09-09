@@ -2250,7 +2250,7 @@ pub fn bash_box(
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
-    let limit = 25;
+    let limit = 200;
     for line in out_lines.iter().take(limit) {
         let fitted = fit(line, inner);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
@@ -2315,7 +2315,7 @@ pub fn tool_box(
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
-    let limit = 20;
+    let limit = 200;
     for line in out_lines.iter().take(limit) {
         let fitted = fit(line, inner);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));

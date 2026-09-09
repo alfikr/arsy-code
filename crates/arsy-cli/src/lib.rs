@@ -3955,6 +3955,33 @@ fn confirm_tool(
     }
 }
 
+#[cfg(feature = "tui")]
+fn redraw_live_response(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    text: &str,
+    replace: bool,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    if replace {
+        frame.push_str("\x1b[1A\r\x1b[K");
+    }
+    frame.push_str(&tui::assistant_row(colour, text));
+    frame.push('\n');
+    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    write!(terminal, "{frame}")?;
+    terminal.flush()
+}
+
+#[cfg(feature = "tui")]
+fn erase_live_response(terminal: &mut io::Stdout, composer: &mut tui::Composer) -> io::Result<()> {
+    write!(terminal, "{}\x1b[1A\r\x1b[K", composer.clear())?;
+    terminal.flush()
+}
+
 /// Stream one round of a turn from a configured provider, keeping the composer
 /// alive.
 ///
@@ -4057,6 +4084,7 @@ fn native_status(
     let mut thinking = String::new();
     let mut thinking_open = false;
     let mut answer_open = false;
+    let mut live_answer = false;
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -4192,6 +4220,10 @@ fn native_status(
                 }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
+                    if live_answer {
+                        erase_live_response(&mut terminal, composer)?;
+                        live_answer = false;
+                    }
                     let line: String = pending.drain(..=newline).collect();
                     draw(
                         &mut terminal,
@@ -4199,6 +4231,18 @@ fn native_status(
                         Some(&tui::assistant_row(colour, &line)),
                         &status_line(first_event, tick),
                     )?;
+                }
+                if !pending.is_empty() {
+                    redraw_live_response(
+                        &mut terminal,
+                        composer,
+                        colour,
+                        footer,
+                        &status_line(first_event, tick),
+                        &pending,
+                        live_answer,
+                    )?;
+                    live_answer = true;
                 }
                 first_event = true;
             }
