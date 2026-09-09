@@ -173,9 +173,9 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                             let project = value.get("cloudaicompanionProject");
                             return project
                                 .and_then(|p| {
-                                    p.as_str()
-                                        .map(str::to_owned)
-                                        .or_else(|| p.get("id").and_then(Value::as_str).map(str::to_owned))
+                                    p.as_str().map(str::to_owned).or_else(|| {
+                                        p.get("id").and_then(Value::as_str).map(str::to_owned)
+                                    })
                                 })
                                 .filter(|p| !p.is_empty());
                         }
@@ -282,10 +282,20 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         let wire_model = routed_wire_model(&request.model.model, request.effort);
         let is_claude = wire_model.contains("claude");
         let mut labels = Map::new();
-        labels.insert("used_claude".to_owned(), json!(if is_claude { "true" } else { "false" }));
-        labels.insert("used_claude_conservative".to_owned(), json!(if is_claude { "true" } else { "false" }));
+        labels.insert(
+            "used_claude".to_owned(),
+            json!(if is_claude { "true" } else { "false" }),
+        );
+        labels.insert(
+            "used_claude_conservative".to_owned(),
+            json!(if is_claude { "true" } else { "false" }),
+        );
         inner.insert("labels".to_owned(), Value::Object(labels));
-        let hash = request.idempotency_key.as_str().bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+        let hash = request
+            .idempotency_key
+            .as_str()
+            .bytes()
+            .fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
         inner.insert("sessionId".to_owned(), json!(hash.to_string()));
 
         let mut envelope = Map::new();
@@ -296,7 +306,11 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         envelope.insert("request".to_owned(), Value::Object(inner));
         envelope.insert("userAgent".to_owned(), json!("antigravity"));
         envelope.insert("requestType".to_owned(), json!("agent"));
-        let step_id = format!("agent/arsy/{}/{}", crate::artifact::unix_time_ms(), request.idempotency_key.as_str());
+        let step_id = format!(
+            "agent/arsy/{}/{}",
+            crate::artifact::unix_time_ms(),
+            request.idempotency_key.as_str()
+        );
         envelope.insert("requestId".to_owned(), json!(step_id));
 
         WireRequest {

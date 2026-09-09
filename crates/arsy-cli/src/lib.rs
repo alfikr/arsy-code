@@ -1941,10 +1941,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         models.extend(tui::available_models());
         models
     };
-    // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-
+    let mut resolved_providers: std::collections::HashMap<String, provider::Resolved> =
+        std::collections::HashMap::new();
+    if let Some(resolved) = native.clone() {
+        resolved_providers.insert(route.provider.clone(), resolved);
+    }
     let mut effort = saved_effort();
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
@@ -2239,7 +2242,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                 if let Some(action) = dialog.handle_key(key) {
                                     match action {
                                         tui::SessionAction::Resume(id) => {
-                                            conversation = reconstruct_session_conversation(&workspace, id);
+                                            conversation =
+                                                reconstruct_session_conversation(&workspace, id);
                                             state.set_session_id(id);
                                             queued.clear();
                                             writeln!(
@@ -2291,12 +2295,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                         }
                                     }
                                 } else {
-                                    write!(
-                                        stdout,
-                                        "\r\x1b[J{}\n",
-                                        dialog.render(width, colour)
-                                    )
-                                    .map_err(terminal_failed)?;
+                                    write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
+                                        .map_err(terminal_failed)?;
                                     stdout.flush().map_err(terminal_failed)?;
                                 }
                             }
@@ -2347,7 +2347,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             .map_err(terminal_failed)?;
                         }
                         Err(_) => {
-                            writeln!(stdout, "Invalid session ID `{id_str}`.").map_err(terminal_failed)?;
+                            writeln!(stdout, "Invalid session ID `{id_str}`.")
+                                .map_err(terminal_failed)?;
                         }
                     },
                 }
@@ -2370,7 +2371,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     if let Ok(store) = open_store(&workspace) {
                         let _ = store.set_session_title(state.session_id(), title);
                     }
-                    writeln!(stdout, "Renamed session {} to \"{title}\".", state.session_id()).map_err(terminal_failed)?;
+                    writeln!(
+                        stdout,
+                        "Renamed session {} to \"{title}\".",
+                        state.session_id()
+                    )
+                    .map_err(terminal_failed)?;
                 }
             }
             Prompt::Task if line.split_whitespace().next() == Some("/session") => {
@@ -2389,16 +2395,25 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     Some("rename") => {
                         let title = parts.collect::<Vec<_>>().join(" ");
                         if title.is_empty() {
-                            writeln!(stdout, "Usage: /session rename <TITLE>").map_err(terminal_failed)?;
+                            writeln!(stdout, "Usage: /session rename <TITLE>")
+                                .map_err(terminal_failed)?;
                         } else {
                             if let Ok(store) = open_store(&workspace) {
                                 let _ = store.set_session_title(state.session_id(), &title);
                             }
-                            writeln!(stdout, "Renamed session {} to \"{title}\".", state.session_id()).map_err(terminal_failed)?;
+                            writeln!(
+                                stdout,
+                                "Renamed session {} to \"{title}\".",
+                                state.session_id()
+                            )
+                            .map_err(terminal_failed)?;
                         }
                     }
                     Some("delete" | "rm" | "remove") => {
-                        let target_id = parts.next().and_then(|id_str| id_str.parse::<SessionId>().ok()).unwrap_or_else(|| state.session_id());
+                        let target_id = parts
+                            .next()
+                            .and_then(|id_str| id_str.parse::<SessionId>().ok())
+                            .unwrap_or_else(|| state.session_id());
                         let is_current = target_id == state.session_id();
                         if let Ok(store) = open_store(&workspace) {
                             let _ = store.delete_session(target_id);
@@ -2408,13 +2423,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             state.set_session_id(new_session);
                             conversation.clear();
                             queued.clear();
-                            writeln!(stdout, "Deleted current session. Started fresh session {new_session}.").map_err(terminal_failed)?;
+                            writeln!(
+                                stdout,
+                                "Deleted current session. Started fresh session {new_session}."
+                            )
+                            .map_err(terminal_failed)?;
                         } else {
-                            writeln!(stdout, "Deleted session {target_id}.").map_err(terminal_failed)?;
+                            writeln!(stdout, "Deleted session {target_id}.")
+                                .map_err(terminal_failed)?;
                         }
                     }
                     _ => {
-                        writeln!(stdout, "Usage: /session [list | rename <TITLE> | delete [ID]]").map_err(terminal_failed)?;
+                        writeln!(
+                            stdout,
+                            "Usage: /session [list | rename <TITLE> | delete [ID]]"
+                        )
+                        .map_err(terminal_failed)?;
                     }
                 }
             }
@@ -2427,7 +2451,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                     Some("prompt" | "manual" | "ask" | "off") => {
                         auto_approve.store(false, std::sync::atomic::Ordering::Relaxed);
-                        writeln!(stdout, "Interactive approval prompts enabled.").map_err(terminal_failed)?;
+                        writeln!(stdout, "Interactive approval prompts enabled.")
+                            .map_err(terminal_failed)?;
                     }
                     _ => {
                         let cur = if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2435,7 +2460,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         } else {
                             "prompt (ask confirmation)"
                         };
-                        writeln!(stdout, "Current approval mode: {cur}\nUsage: /approval auto | prompt").map_err(terminal_failed)?;
+                        writeln!(
+                            stdout,
+                            "Current approval mode: {cur}\nUsage: /approval auto | prompt"
+                        )
+                        .map_err(terminal_failed)?;
                     }
                 }
             }
@@ -2544,10 +2573,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     colour,
                     tui::branch(&workspace).as_deref(),
                 );
+                let selected_provider = if resolved_providers.contains_key(&route.provider) {
+                    resolved_providers.get(&route.provider)
+                } else {
+                    let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
+                    let resolved = load_config(&workspace, &working)
+                        .ok()
+                        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
+                    if let Some(resolved) = resolved {
+                        resolved_providers.insert(route.provider.clone(), resolved);
+                    }
+                    resolved_providers.get(&route.provider)
+                };
                 match run_turn(
                     invocation,
                     state.session_id(),
-                    native.as_ref(),
+                    selected_provider,
                     &line,
                     &route,
                     effort,
@@ -2797,11 +2838,12 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
             }));
         }
     }
+    // Model discovery must be read-only. Probing the macOS keychain here
+    // triggers an unlock prompt every time `/model` opens; auth state is already
+    // represented by the credential catalog.
     let saved_handles = catalog_handles(invocation);
     for preset in arsy_kernel::oauth::presets::all() {
-        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id))
-            || arsy_kernel::secret::OsCredentialStore.resolve(preset.id).is_ok()
-            || arsy_kernel::secret::FileCredentialStore.resolve(preset.id).is_ok();
+        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
         if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
             choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
                 provider: preset.id.to_string(),
@@ -2892,10 +2934,7 @@ fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
 }
 
 #[cfg(feature = "tui")]
-fn reconstruct_session_conversation(
-    workspace: &Path,
-    session: SessionId,
-) -> Vec<ModelMessage> {
+fn reconstruct_session_conversation(workspace: &Path, session: SessionId) -> Vec<ModelMessage> {
     let Ok(store) = open_store(workspace) else {
         return Vec::new();
     };
@@ -3075,7 +3114,9 @@ fn provider_step(
             if let Ok(mut records) = catalog(store) {
                 let to_remove: Vec<SecretHandle> = records
                     .iter()
-                    .filter(|r| r.handle.name() == name || r.handle.name() == format!("endpoint.{name}"))
+                    .filter(|r| {
+                        r.handle.name() == name || r.handle.name() == format!("endpoint.{name}")
+                    })
                     .map(|r| r.handle.clone())
                     .collect();
                 records.retain(|r| !to_remove.contains(&r.handle));
@@ -3432,22 +3473,10 @@ fn run_turn(
     });
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let dynamic_provider = load_config(&root, &working)
-        .ok()
-        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok())
-        .or_else(|| native.cloned());
-
-    let outcome = match dynamic_provider.as_ref() {
+    let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
-            &agent_runtime(
-                &root,
-                &load_config(
-                    &root,
-                    &working,
-                )?,
-                true,
-            )?,
+            &agent_runtime(&root, &load_config(&root, &working)?, true)?,
             conversation,
             route,
             effort,
@@ -3582,9 +3611,13 @@ const MAX_TOOL_ROUNDS: usize = 24;
 #[cfg(feature = "tui")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
-    Yes { note: Option<String> },
+    Yes {
+        note: Option<String>,
+    },
     /// Refuse this call; the turn carries on and can propose something else.
-    No { note: Option<String> },
+    No {
+        note: Option<String>,
+    },
     /// Refuse this call and end the turn.
     Stop,
 }
@@ -3731,34 +3764,19 @@ fn native_turn(
                     }
                 }
             };
-            if name == "bash" || name == "shell.execute" {
-                writeln!(
-                    terminal,
-                    "{}",
-                    tui::bash_box(
-                        tui::terminal_width(),
-                        colour,
-                        &summary,
-                        &content,
-                        Some(if is_error { 1 } else { 0 }),
-                        std::time::Duration::from_millis(50),
-                    )
-                )?;
-            } else {
-                writeln!(
-                    terminal,
-                    "{}",
-                    tui::tool_box(
-                        tui::terminal_width(),
-                        colour,
-                        name,
-                        &summary,
-                        &content,
-                        !is_error,
-                        std::time::Duration::from_millis(50),
-                    )
-                )?;
-            }
+            writeln!(
+                terminal,
+                "{}",
+                tui::tool_card(
+                    tui::terminal_width(),
+                    colour,
+                    name,
+                    &summary,
+                    &content,
+                    !is_error,
+                    std::time::Duration::from_millis(50),
+                )
+            )?;
             terminal.flush()?;
             results.push(ModelContent::ToolResult {
                 id: id.clone(),
@@ -3849,7 +3867,17 @@ fn execute_call(
             } else {
                 let reason = authorization.requested();
                 let preview = format_tool_preview(name, arguments);
-                match confirm_tool(terminal, colour, name, summary, &reason, preview, keys, decoder, auto_approve)? {
+                match confirm_tool(
+                    terminal,
+                    colour,
+                    name,
+                    summary,
+                    &reason,
+                    preview,
+                    keys,
+                    decoder,
+                    auto_approve,
+                )? {
                     Answer::Yes { note } => match authorization.approve() {
                         Ok(grants) => (grants, note),
                         Err(error) => {
@@ -3861,7 +3889,9 @@ fn execute_call(
                     Answer::No { note } => {
                         let message = note.map_or_else(
                             || "The operator declined to run this call.".to_owned(),
-                            |note| format!("The operator declined to run this call. Feedback: {note}"),
+                            |note| {
+                                format!("The operator declined to run this call. Feedback: {note}")
+                            },
                         );
                         return Ok(refused(message));
                     }
@@ -3871,16 +3901,7 @@ fn execute_call(
         }
     };
     let (mut result, cancelled) = dispatch_tool_live(
-        terminal,
-        colour,
-        runtime,
-        name,
-        &request,
-        &grants,
-        started,
-        summary,
-        keys,
-        decoder,
+        terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
     )?;
     if cancelled {
         return Ok(Executed::Stopped);
@@ -3904,13 +3925,11 @@ fn dispatch_tool_live(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
 ) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
-
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let (output_sender, output_receiver) = std::sync::mpsc::channel();
-    let output_sink: arsy_kernel::operation::OutputSink =
-        std::sync::Arc::new(move |chunk| {
-            let _ = output_sender.send(chunk);
-        });
+    let output_sink: arsy_kernel::operation::OutputSink = std::sync::Arc::new(move |chunk| {
+        let _ = output_sender.send(chunk);
+    });
     runtime.set_output_sink(Some(output_sink));
     let worker_runtime = runtime.clone();
     let name = name.to_owned();
@@ -3929,6 +3948,7 @@ fn dispatch_tool_live(
     let elapsed = std::time::Instant::now();
     let mut rendered = true;
     let mut cancelled = false;
+    let mut expanded = false;
     let mut live_output = String::new();
     let initial = tui::tool_running_frame_with_output(
         colour,
@@ -3937,18 +3957,23 @@ fn dispatch_tool_live(
         summary,
         0,
         "",
+        expanded,
     );
     write!(terminal, "{initial}\n")?;
     terminal.flush()?;
     loop {
         while let Ok(byte) = keys.try_recv() {
-            if decoder.feed(byte) == Some(tui::Key::Interrupt)
-                && request.kind.to_string() == "process.exec"
-            {
-                arsy_code::process::cancel(operation_id);
-                write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
-                terminal.flush()?;
-                cancelled = true;
+            match decoder.feed(byte) {
+                Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
+                    arsy_code::process::cancel(operation_id);
+                    write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
+                    terminal.flush()?;
+                    cancelled = true;
+                }
+                Some(tui::Key::Char('e' | 'E')) => {
+                    expanded = !expanded;
+                }
+                _ => {}
             }
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
@@ -3974,6 +3999,7 @@ fn dispatch_tool_live(
                     summary,
                     elapsed.elapsed().as_millis(),
                     &live_output,
+                    expanded,
                 );
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
@@ -3993,26 +4019,34 @@ fn dispatch_tool_live(
 #[cfg(feature = "tui")]
 fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
     match name {
-        "apply_patch" | "fs.edit" | "edit" => {
-            arguments
-                .get("input")
-                .or_else(|| arguments.get("patch"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }
+        "apply_patch" | "fs.edit" | "edit" => arguments
+            .get("input")
+            .or_else(|| arguments.get("patch"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         "fs.write" | "write" => {
-            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("file");
-            let content = arguments.get("content").and_then(Value::as_str).unwrap_or("");
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let preview: Vec<String> = content.lines().take(12).map(|l| format!("+{l}")).collect();
             let mut text = format!("--- /dev/null\n+++ {path}\n{}", preview.join("\n"));
             if content.lines().count() > 12 {
-                text.push_str(&format!("\n… ({} lines omitted)", content.lines().count() - 12));
+                text.push_str(&format!(
+                    "\n… ({} lines omitted)",
+                    content.lines().count() - 12
+                ));
             }
             Some(text)
         }
-        "bash" | "shell.execute" => {
-            arguments.get("command").and_then(Value::as_str).map(|cmd| format!("$ {cmd}"))
-        }
+        "bash" | "shell.execute" => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|cmd| format!("$ {cmd}")),
         _ => None,
     }
 }
@@ -4046,7 +4080,9 @@ fn confirm_tool(
                         write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
                         terminal.flush()?;
                         match result {
-                            tui::AskDialogResult::Approve { note } => return Ok(Answer::Yes { note }),
+                            tui::AskDialogResult::Approve { note } => {
+                                return Ok(Answer::Yes { note })
+                            }
                             tui::AskDialogResult::AlwaysApprove { note } => {
                                 auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
                                 return Ok(Answer::Yes { note });
@@ -6864,7 +6900,19 @@ mod tests {
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session" | "/approval"
+                "/model"
+                    | "/effort"
+                    | "/theme"
+                    | "/provider"
+                    | "/help"
+                    | "/quit"
+                    | "/new"
+                    | "/clear"
+                    | "/resume"
+                    | "/update"
+                    | "/rename"
+                    | "/session"
+                    | "/approval"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
