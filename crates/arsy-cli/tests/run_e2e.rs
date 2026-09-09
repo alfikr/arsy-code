@@ -479,9 +479,23 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
         .collect();
     assert!(tools.contains(&"task.spawn"), "{tools:?}");
 
+    // What the spawn call actually returned, so a failure here says why.
+    let second = provider.request();
+    let spawn_result = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+        .unwrap_or_default();
+    assert!(
+        !spawn_result.starts_with("error:"),
+        "the spawn failed: {spawn_result}"
+    );
+
     // The child was offered the workspace tools but holds only what was
     // delegated: its write was refused by its own runtime, not by the parent's.
-    drop(provider.request()); // the child asks to read
     drop(provider.request()); // the child has the file and asks to write
     let refused = provider.request();
     let messages = refused["messages"].as_array().unwrap();

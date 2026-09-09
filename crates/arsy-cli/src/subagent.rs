@@ -36,10 +36,10 @@ use arsy_kernel::{
     observer::{Intervention, ObserverAuthority, ObserverSubscription, RedactedProjection},
     orchestration::{Budget, ChildCapabilityRequest, TaskGraph, TaskNode, WorkspaceRequirement},
     policy::{ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance},
+    protocol::IdempotencyKey,
     provider::{
         CanonicalModelRequest, ModelContent, ModelKey, ModelMessage, ModelRole, ToolSchema,
     },
-    protocol::IdempotencyKey,
 };
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, path::PathBuf};
@@ -181,7 +181,9 @@ impl<'a> Supervisor<'a> {
         if self.spawned >= MAX_CHILDREN {
             return ToolResult::refused(
                 "task.spawn",
-                format!("this turn has already spawned {MAX_CHILDREN} subagents; do the rest yourself"),
+                format!(
+                    "this turn has already spawned {MAX_CHILDREN} subagents; do the rest yourself"
+                ),
             );
         }
         let goal = arguments
@@ -214,7 +216,6 @@ impl<'a> Supervisor<'a> {
             Err(reason) => ToolResult::refused("task.spawn", reason),
         }
     }
-
 }
 
 /// The actions asked for, checked against what may be delegated at all.
@@ -270,6 +271,20 @@ impl Supervisor<'_> {
             .node(self.parent)
             .map(|node| node.budget)
             .ok_or_else(|| "the parent task is not in its own graph".to_owned())?;
+        // The parent's authority is written to the graph the first time it
+        // delegates: a child's grants have to be explicable from the record,
+        // and `add_child` attenuates from what the graph holds rather than
+        // from whatever this process happens to be carrying.
+        if graph
+            .node(self.parent)
+            .is_some_and(|node| node.authority.is_empty())
+        {
+            graph
+                .authorize(self.parent, self.delegable.clone())
+                .map_err(|error| {
+                    format!("the parent's authority could not be recorded: {error}")
+                })?;
+        }
         let requests: Vec<ChildCapabilityRequest> = actions
             .iter()
             .filter_map(|action| {
@@ -347,8 +362,8 @@ impl Supervisor<'_> {
         agent: AgentId,
         emitter: &mut Emitter,
     ) -> Result<String, String> {
-        let workspace = arsy_code::resource::Workspace::open(&self.root)
-            .map_err(|error| error.to_string())?;
+        let workspace =
+            arsy_code::resource::Workspace::open(&self.root).map_err(|error| error.to_string())?;
         let artifacts = std::sync::Arc::new(
             arsy_kernel::artifact::FileArtifactStore::open(self.root.join(".arsy/artifacts"), 0)
                 .map_err(|error| error.to_string())?,
@@ -495,7 +510,10 @@ mod tests {
         let supervisor = |delegable: Vec<CapabilityGrant>| Requested { delegable };
 
         // Writing is not on the list at all, whatever the parent holds.
-        let all = supervisor(vec![grant(CapabilityAction::FsRead), grant(CapabilityAction::FsWrite)]);
+        let all = supervisor(vec![
+            grant(CapabilityAction::FsRead),
+            grant(CapabilityAction::FsWrite),
+        ]);
         assert!(all
             .requested(&json!({"capabilities": ["fs.write"]}))
             .unwrap_err()
@@ -582,7 +600,10 @@ mod tests {
         };
         let child = share(parent);
         assert_eq!(child.tokens, 100);
-        assert!(child.fits_within(parent), "a child never exceeds its parent");
+        assert!(
+            child.fits_within(parent),
+            "a child never exceeds its parent"
+        );
     }
 
     #[test]

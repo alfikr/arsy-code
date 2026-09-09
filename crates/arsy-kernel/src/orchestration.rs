@@ -148,6 +148,34 @@ impl TaskGraph {
         Ok(())
     }
 
+    /// Record what a task holds, so it has something to delegate from.
+    ///
+    /// Authority is minted by policy for a caller, not by the graph — but a
+    /// parent cannot attenuate a grant the graph has never seen, and a child's
+    /// authority has to be explicable from the record rather than from whatever
+    /// the process happened to be holding. So the grants are written down
+    /// against the task, once, and every child is derived from what is written.
+    ///
+    /// Refuses to widen: a task's authority is set while it is the only thing
+    /// that could have used it, and replacing it later would let a parent grant
+    /// a child more than it had when its own children were checked.
+    pub fn authorize(
+        &mut self,
+        id: TaskId,
+        authority: Vec<CapabilityGrant>,
+    ) -> Result<(), GraphError> {
+        let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+        if !node.authority.is_empty() {
+            return Err(GraphError::AlreadyAuthorized(id));
+        }
+        self.record(
+            "task.authorized",
+            json!({"task_id": id, "authority": &authority}),
+        )?;
+        self.nodes.get_mut(&id).expect("checked above").authority = authority;
+        Ok(())
+    }
+
     pub fn add_child(
         &mut self,
         parent: TaskId,
@@ -428,6 +456,18 @@ impl TaskGraph {
                 node.lease_expires_at_ms = data.get("expires_at_ms").and_then(Value::as_u64);
                 node.state = TaskState::Running;
             }
+            "task.authorized" => {
+                let id = event_task_id(data)?;
+                let authority: Vec<CapabilityGrant> =
+                    serde_json::from_value(data.get("authority").cloned().ok_or_else(|| {
+                        GraphError::InvalidEvent("task.authorized has no authority".into())
+                    })?)
+                    .map_err(|error| GraphError::InvalidEvent(error.to_string()))?;
+                self.nodes
+                    .get_mut(&id)
+                    .ok_or(GraphError::Unknown(id))?
+                    .authority = authority;
+            }
             "task.lease_expired" | "task.reclaimed" => {
                 let id = event_task_id(data)?;
                 let node = self.nodes.get_mut(&id).ok_or(GraphError::Unknown(id))?;
@@ -528,6 +568,8 @@ pub fn attenuate_child_grant(
 
 #[derive(Debug)]
 pub enum GraphError {
+    /// A task's authority is written once, while nothing has derived from it.
+    AlreadyAuthorized(TaskId),
     Duplicate(TaskId),
     Unknown(TaskId),
     Cycle(TaskId),
@@ -545,6 +587,9 @@ pub enum GraphError {
 impl fmt::Display for GraphError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AlreadyAuthorized(id) => {
+                write!(formatter, "task {id} already holds recorded authority")
+            }
             Self::Duplicate(id) => write!(formatter, "task {id} already exists"),
             Self::Unknown(id) => write!(formatter, "task {id} does not exist"),
             Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),

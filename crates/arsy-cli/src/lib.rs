@@ -4750,7 +4750,9 @@ pub(crate) fn child_turn(
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
-    watch: &mut dyn FnMut(&arsy_kernel::observer::RedactedProjection) -> Option<arsy_kernel::observer::Intervention>,
+    watch: &mut dyn FnMut(
+        &arsy_kernel::observer::RedactedProjection,
+    ) -> Option<arsy_kernel::observer::Intervention>,
     emitter: &mut Emitter,
 ) -> Result<String, String> {
     let mut request = request.clone();
@@ -4760,12 +4762,13 @@ pub(crate) fn child_turn(
     let mut answer = String::new();
 
     for round in 0..MAX_CHILD_TOOL_ROUNDS {
-        request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
-            .map_err(|error| error.to_string())?;
+        request.idempotency_key =
+            IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
-        let stream = arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)
-            .map_err(|error| error.to_string())?;
+        let stream =
+            arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)
+                .map_err(|error| error.to_string())?;
         for event in stream {
             match event.map_err(|error| error.to_string())? {
                 ModelEvent::TextDelta { text } => answer.push_str(&text),
@@ -4793,11 +4796,15 @@ pub(crate) fn child_turn(
                 text: answer.clone(),
             });
         }
-        content.extend(calls.iter().map(|(id, name, arguments)| ModelContent::ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: arguments.clone(),
-        }));
+        content.extend(
+            calls
+                .iter()
+                .map(|(id, name, arguments)| ModelContent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+        );
         request.messages.push(ModelMessage {
             role: ModelRole::Assistant,
             content,
