@@ -23,12 +23,9 @@ use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
 pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
-/// Antigravity User-Agent and client metadata, matching official antigravity/hub client.
+/// Antigravity User-Agent matching official antigravity/hub client.
 const USER_AGENT: &str =
     "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
-const API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
-const CLIENT_METADATA: &str =
-    "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
 
 pub struct GoogleCodeAssistProvider<T> {
     descriptor: ProviderDescriptor,
@@ -91,8 +88,6 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
             ("user-agent".to_owned(), USER_AGENT.to_owned()),
-            ("x-goog-api-client".to_owned(), API_CLIENT.to_owned()),
-            ("client-metadata".to_owned(), CLIENT_METADATA.to_owned()),
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
@@ -284,8 +279,8 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 }),
             );
         }
-
-        let is_claude = request.model.model.contains("claude");
+        let wire_model = routed_wire_model(&request.model.model, request.effort);
+        let is_claude = wire_model.contains("claude");
         let mut labels = Map::new();
         labels.insert("used_claude".to_owned(), json!(if is_claude { "true" } else { "false" }));
         labels.insert("used_claude_conservative".to_owned(), json!(if is_claude { "true" } else { "false" }));
@@ -294,7 +289,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         inner.insert("sessionId".to_owned(), json!(hash.to_string()));
 
         let mut envelope = Map::new();
-        envelope.insert("model".to_owned(), json!(request.model.model));
+        envelope.insert("model".to_owned(), json!(wire_model));
         if !project.is_empty() {
             envelope.insert("project".to_owned(), json!(project));
         }
@@ -309,6 +304,30 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             headers: self.headers(project, true),
             body: Value::Object(envelope).to_string(),
         }
+    }
+}
+
+fn routed_wire_model(model: &str, effort: Option<crate::provider::Effort>) -> &str {
+    use crate::provider::Effort;
+    match (model, effort) {
+        ("gemini-3.8-flash", Some(Effort::Low)) => "gemini-3.8-flash-low",
+        ("gemini-3.8-flash", Some(Effort::Medium)) => "gemini-3.8-flash-medium",
+        ("gemini-3.8-flash", Some(Effort::High)) => "gemini-3.8-flash-high",
+
+        ("gemini-3.7-flash", Some(Effort::Low)) => "gemini-3.7-flash-low",
+        ("gemini-3.7-flash", Some(Effort::Medium)) => "gemini-3.7-flash-medium",
+        ("gemini-3.7-flash", Some(Effort::High)) => "gemini-3.7-flash-high",
+
+        ("gemini-3.1-pro", Some(Effort::Low)) => "gemini-3.1-pro-low",
+        ("gemini-3.1-pro", Some(Effort::High)) => "gemini-pro-agent",
+
+        ("claude-3-7-sonnet", Some(Effort::Medium | Effort::High)) => "claude-3-7-sonnet-thinking",
+        ("claude-sonnet-4-5", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-5-thinking",
+        ("claude-sonnet-4-6", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-6-thinking",
+        ("claude-opus-4-5", Some(Effort::Medium | Effort::High)) => "claude-opus-4-5-thinking",
+        ("claude-opus-4-6", Some(Effort::Medium | Effort::High)) => "claude-opus-4-6-thinking",
+
+        (other, _) => other,
     }
 }
 

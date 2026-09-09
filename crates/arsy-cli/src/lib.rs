@@ -2038,7 +2038,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         );
         // While the theme picker is open, repaint in whichever theme is
         // arrowed onto so it can be seen before Enter takes it.
-        let preview_theme = |name: &str| set_palette(name, &theme_config.roles);
+        let preview_theme = |name: &str| tui::set_palette(name, &theme_config.roles);
         let preview: Option<&dyn Fn(&str)> = match prompt {
             Prompt::Theme => Some(&preview_theme),
             _ => None,
@@ -2075,7 +2075,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         Prompt::Theme => {
                             // The preview left the palette on the last row
                             // arrowed onto; put the committed one back.
-                            set_palette(&theme, &theme_config.roles);
+                            tui::set_palette(&theme, &theme_config.roles);
                             format!("Theme unchanged: {theme}")
                         }
                         Prompt::Provider(_) => {
@@ -2736,23 +2736,6 @@ fn remember_theme(name: &str, emitter: &mut Emitter) {
     }
 }
 
-/// Make `name` (a built-in theme) the live palette, with the `[theme]` role
-/// overrides on top. A bad override was already reported at startup, so here it
-/// falls back to the plain base rather than repeating the warning every frame.
-#[cfg(feature = "tui")]
-fn set_palette(name: &str, roles: &std::collections::BTreeMap<String, String>) {
-    let Some(palette) = tui::builtin_palette(name) else {
-        return;
-    };
-    let palette = palette
-        .with_overrides(roles)
-        .unwrap_or_else(|_| tui::builtin_palette(name).expect("just built it"));
-    tui::activate_palette(palette);
-}
-
-/// Take a `/theme` answer: swap the live palette, remember the choice, and
-/// report it. Returns whether it landed — `false` leaves the picker open so
-/// the answer can be retyped.
 #[cfg(feature = "tui")]
 fn apply_theme(
     answer: &str,
@@ -2768,11 +2751,43 @@ fn apply_theme(
             return Ok(false);
         }
     };
-    set_palette(&picked, roles);
+    tui::set_palette(&picked, roles);
     *current = picked;
     remember_theme(current, emitter);
     writeln!(stdout, "Theme: {current}")?;
     Ok(true)
+}
+
+#[cfg(feature = "tui")]
+fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let mut choices = Vec::new();
+    if let Ok(config) = load_config(&root, &working) {
+        for endpoint in config.endpoints() {
+            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
+                provider: endpoint.id.clone(),
+                slug: slug.clone(),
+                name: format!("on {}", endpoint.id),
+            }));
+        }
+    }
+    let saved_handles = catalog_handles(invocation);
+    for preset in arsy_kernel::oauth::presets::all() {
+        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id))
+            || arsy_kernel::secret::OsCredentialStore.resolve(preset.id).is_ok()
+            || arsy_kernel::secret::FileCredentialStore.resolve(preset.id).is_ok();
+        if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
+            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
+                provider: preset.id.to_string(),
+                slug: (*slug).to_string(),
+                name: format!("on {}", preset.id),
+            }));
+        }
+    }
+    choices
 }
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,
@@ -2814,39 +2829,6 @@ fn configured_default(invocation: &Invocation) -> Option<String> {
         .ok()?
         .provider_default()
         .map(str::to_owned)
-}
-
-/// The models every configured endpoint offers, as picker rows grouped by
-/// provider, so `/model` shows the whole catalog and one answer can move the
-/// turn to another provider as well as to another model. Read fresh each time
-/// the picker opens, so a configuration edit made outside ARSY is offered
-/// without a restart.
-#[cfg(feature = "tui")]
-fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
-        return Vec::new();
-    };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let mut choices = Vec::new();
-    if let Ok(config) = load_config(&root, &working) {
-        for endpoint in config.endpoints() {
-            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-                provider: endpoint.id.clone(),
-                slug: slug.clone(),
-                name: format!("on {}", endpoint.id),
-            }));
-        }
-    }
-    for preset in arsy_kernel::oauth::presets::all() {
-        if !choices.iter().any(|c| c.provider == preset.id) {
-            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
-                provider: preset.id.to_string(),
-                slug: (*slug).to_string(),
-                name: format!("on {}", preset.id),
-            }));
-        }
-    }
-    choices
 }
 
 #[cfg(feature = "tui")]
@@ -3066,14 +3048,33 @@ fn provider_step(
             }
             let name = draft.name.clone();
             write_config(|config| config_edit::remove_endpoint(config, &name))?;
+            let store = CatalogStore::resolve(invocation);
+            if let Ok(mut records) = catalog(store) {
+                let to_remove: Vec<SecretHandle> = records
+                    .iter()
+                    .filter(|r| r.handle.name() == name || r.handle.name() == format!("endpoint.{name}"))
+                    .map(|r| r.handle.clone())
+                    .collect();
+                records.retain(|r| !to_remove.contains(&r.handle));
+                let _ = save_catalog(store, &records);
+                for handle in to_remove {
+                    match handle.store() {
+                        OS_STORE_ID => {
+                            let _ = OsCredentialStore.remove(handle.name());
+                        }
+                        FILE_STORE_ID => {
+                            let _ = FileCredentialStore.remove(handle.name());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Ok(ProviderNext::Done(format!(
-                "Removed provider {name}. Its credential was left in place; \
-                 `arsy auth list` shows it."
+                "Removed provider {name} and its credentials."
             )))
         }
     }
 }
-
 #[cfg(feature = "tui")]
 enum AuthNext {
     Ask(tui::AuthStep),
@@ -3174,6 +3175,15 @@ fn auth_step(
             let mut records = catalog(store).map_err(|e| e.message)?;
             records.retain(|r| r.handle != handle);
             save_catalog(store, &records).map_err(|e| e.message)?;
+            match handle.store() {
+                OS_STORE_ID => {
+                    let _ = OsCredentialStore.remove(handle.name());
+                }
+                FILE_STORE_ID => {
+                    let _ = FileCredentialStore.remove(handle.name());
+                }
+                _ => {}
+            }
             Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
         }
     }

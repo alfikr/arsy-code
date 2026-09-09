@@ -737,15 +737,9 @@ pub mod presets {
             base_url: "https://daily-cloudcode-pa.googleapis.com",
             models: &[
                 "gemini-3.8-flash",
-                "gemini-3.8-flash-low",
-                "gemini-3.8-flash-medium",
-                "gemini-3.8-flash-high",
                 "gemini-3.7-flash",
                 "gemini-3.7-pro",
                 "gemini-3.1-pro",
-                "gemini-3.1-pro-low",
-                "gemini-3.1-pro-high",
-                "gemini-pro-agent",
                 "gemini-3-flash",
                 "gemini-3-pro",
                 "gemini-2.5-flash",
@@ -757,7 +751,6 @@ pub mod presets {
                 "claude-opus-4-6",
                 "gpt-5",
                 "gpt-5-codex",
-                "gpt-oss-120b",
                 "gpt-oss",
             ],
             build_oauth: || OAuth {

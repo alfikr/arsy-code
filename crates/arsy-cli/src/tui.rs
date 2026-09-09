@@ -213,6 +213,18 @@ pub fn activate_palette(palette: Palette) {
     }
 }
 
+/// Activate a built-in theme palette with optional role overrides.
+pub fn set_palette(name: &str, roles: &std::collections::BTreeMap<String, String>) {
+    if let Some(mut palette) = builtin_palette(name) {
+        if !roles.is_empty() {
+            if let Ok(overridden) = palette.clone().with_overrides(roles) {
+                palette = overridden;
+            }
+        }
+        activate_palette(palette);
+    }
+}
+
 fn palette() -> &'static Palette {
     if let Some(active) = ACTIVE_PALETTE.read().ok().and_then(|active| *active) {
         return active;
@@ -961,18 +973,14 @@ impl Composer {
         self.height = rows;
     }
 
-    pub fn menu(&self) -> Vec<(String, String)> {
-        // A secret is characters, not a query: nothing narrows against it.
+    fn all_matches(&self) -> Vec<(String, String)> {
         if self.masked {
             return Vec::new();
         }
-        // An offered list wins: it is the question on screen, and it narrows as
-        // the answer is typed the same way the command table does.
         if let Some(rows) = &self.offered {
             return rows
                 .iter()
                 .filter(|(name, _)| name.starts_with(&self.buffer))
-                .take(self.menu_capacity())
                 .cloned()
                 .collect();
         }
@@ -982,38 +990,63 @@ impl Composer {
         COMMANDS
             .iter()
             .filter(|(name, _)| name.starts_with(&self.buffer))
-            .take(self.menu_capacity())
             .map(|(name, description)| ((*name).to_owned(), (*description).to_owned()))
             .collect()
+    }
+
+    fn menu_window(&self) -> (Vec<(String, String)>, usize) {
+        let capacity = self.menu_capacity();
+        if capacity == 0 {
+            return (Vec::new(), 0);
+        }
+        let matches = self.all_matches();
+        let total = matches.len();
+        if total == 0 {
+            return (Vec::new(), 0);
+        }
+        let selected = self.selected.min(total - 1);
+        if total <= capacity {
+            return (matches, selected);
+        }
+        let start = if selected >= capacity {
+            selected + 1 - capacity
+        } else {
+            0
+        };
+        let window = matches[start..(start + capacity).min(total)].to_vec();
+        (window, selected - start)
+    }
+
+    pub fn menu(&self) -> Vec<(String, String)> {
+        self.all_matches()
     }
 
     /// The row the picker is on right now, for a live preview of a choice
     /// before Enter takes it. `None` when no menu is open.
     pub fn highlighted(&self) -> Option<String> {
-        let menu = self.menu();
-        menu.get(self.selected.min(menu.len().checked_sub(1)?))
-            .map(|(name, _)| name.clone())
+        let matches = self.all_matches();
+        let idx = self.selected.min(matches.len().checked_sub(1)?);
+        matches.get(idx).map(|(name, _)| name.clone())
     }
 
     /// How many menu rows the terminal can hold.
-    ///
-    /// The block is four fixed rows — pad, input, pad, status — and the caret is
-    /// returned to the input row by counting rows upward. A block taller than
-    /// the screen scrolls, that count then lands on the wrong row, and the next
-    /// repaint erases scrollback instead of the block. So the menu takes only
-    /// the rows that are left.
     fn menu_capacity(&self) -> usize {
         match self.height {
             0 => MENU_ROWS,
             rows => MENU_ROWS.min(rows.saturating_sub(4)),
         }
     }
+
     /// Move the mark over the open menu. Both ends wrap, so a short list is
     /// never a dead end in one direction, and the index is clamped to the
     /// current matches first: a selection left over from a wider list must not
     /// step outside a narrowed one.
     fn mark(&mut self, down: bool) -> Action {
-        let last = self.menu().len().saturating_sub(1);
+        let matches = self.all_matches();
+        if matches.is_empty() {
+            return Action::None;
+        }
+        let last = matches.len().saturating_sub(1);
         let selected = self.selected.min(last);
         self.selected = if down {
             if selected >= last {
@@ -1421,17 +1454,18 @@ impl Composer {
 
     /// One row per offered command, marked at the selection.
     fn menu_rows(&self, width: usize, colour: bool) -> Vec<String> {
-        let menu = self.menu();
-        let Some(last) = menu.len().checked_sub(1) else {
+        let (window, visible_selected) = self.menu_window();
+        let Some(last) = window.len().checked_sub(1) else {
             return Vec::new();
         };
-        let selected = self.selected.min(last);
-        let label = menu
+        let selected = visible_selected.min(last);
+        let label = window
             .iter()
             .map(|(name, _)| name.chars().count())
             .max()
             .unwrap_or(0);
-        menu.iter()
+        window
+            .iter()
             .enumerate()
             .map(|(index, (name, description))| {
                 let chosen = index == selected;
@@ -1443,7 +1477,7 @@ impl Composer {
                         if chosen { sgr_accent() } else { sgr_bullet() },
                         name
                     ),
-                    " ".repeat(label - name.chars().count() + 2),
+                    " ".repeat(label.saturating_sub(name.chars().count()) + 2),
                     paint(colour, sgr_dim(), description),
                 );
                 fit(&row, width)
@@ -4077,13 +4111,13 @@ mod tests {
         // to the input row would then land on the wrong one, so the menu takes
         // only the rows the terminal has left after pad, input, pad and status.
         composer.set_height(7);
-        assert_eq!(composer.menu().len(), 3);
+        assert_eq!(composer.menu_window().0.len(), 3);
         assert_eq!(
             composer.render(80, false, "  status").split('\n').count(),
             7
         );
         composer.set_height(4);
-        assert!(composer.menu().is_empty(), "no room leaves no menu");
+        assert!(composer.menu_window().0.is_empty(), "no room leaves no menu");
         let frame = composer.render(80, false, "  status");
         assert_eq!(frame.split('\n').count(), 4);
         assert!(frame.ends_with("\x1b[2A\r\x1b[3C"), "{frame:?}");
