@@ -2133,6 +2133,30 @@ pub fn tool_running_frame(
     )
 }
 
+/// Render a running tool card with a bounded tail of live stdout/stderr.
+pub fn tool_running_frame_with_output(
+    colour: bool,
+    frame: &str,
+    name: &str,
+    summary: &str,
+    elapsed_ms: u128,
+    output: &str,
+) -> String {
+    let tail = output.lines().last().unwrap_or_default();
+    let detail = if tail.is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary} · {tail}")
+    };
+    format!(
+        "  {} {} {} · {}ms · Esc cancel",
+        paint(colour, sgr_run(), frame),
+        paint(colour, sgr_accent(), name),
+        paint(colour, sgr_dim(), &fit(&detail, terminal_width().saturating_sub(24))),
+        elapsed_ms
+    )
+}
+
 /// What a tool call did, once it ran or was declined.
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
     exec_row(

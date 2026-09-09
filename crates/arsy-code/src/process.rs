@@ -7,6 +7,7 @@ use arsy_kernel::{
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
+        OutputSink,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,7 @@ pub struct ProcessExecutor {
     /// happened to launch ARSY, so `ls` answers a different question than the
     /// workspace the same turn is reading and editing.
     working_directory: Option<PathBuf>,
+    output_sink: Mutex<Option<OutputSink>>,
 }
 
 impl ProcessExecutor {
@@ -120,6 +122,7 @@ impl ProcessExecutor {
             retain_until_ms,
             sandbox: None,
             working_directory: None,
+            output_sink: Mutex::new(None),
         }
     }
 
@@ -180,13 +183,20 @@ impl ProcessExecutor {
             command.process_group(0);
         }
         let mut child = command.spawn().map_err(execution)?;
+        let output_sink = self
+            .output_sink
+            .lock()
+            .ok()
+            .and_then(|sink| sink.clone());
         let stdout = drain(
             child.stdout.take().expect("piped stdout is present"),
             input.max_output_bytes,
+            output_sink.clone(),
         );
         let stderr = drain(
             child.stderr.take().expect("piped stderr is present"),
             input.max_output_bytes,
+            output_sink,
         );
         let (status, timed_out, graceful, forced, cleanup) = wait_bounded(
             &mut child,
@@ -282,6 +292,12 @@ impl OperationExecutor for ProcessExecutor {
             .map_err(|error| OperationError::Schema(error.to_string()))?;
         self.run(request.id, input, &request.actor)
     }
+
+    fn set_output_sink(&self, sink: Option<OutputSink>) {
+        if let Ok(mut current) = self.output_sink.lock() {
+            *current = sink;
+        }
+    }
 }
 
 struct BoundedOutput {
@@ -292,6 +308,7 @@ struct BoundedOutput {
 fn drain(
     mut reader: impl Read + Send + 'static,
     limit: u64,
+    sink: Option<OutputSink>,
 ) -> thread::JoinHandle<io::Result<BoundedOutput>> {
     thread::spawn(move || {
         let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -302,6 +319,10 @@ fn drain(
             let count = reader.read(&mut chunk)?;
             if count == 0 {
                 break;
+            }
+            let incoming = String::from_utf8_lossy(&chunk[..count]).into_owned();
+            if let Some(sink) = &sink {
+                sink(incoming);
             }
             let remaining = capacity.saturating_sub(bytes.len());
             bytes.extend_from_slice(&chunk[..count.min(remaining)]);

@@ -3906,7 +3906,13 @@ fn dispatch_tool_live(
 ) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
 
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let runtime = runtime.clone();
+    let (output_sender, output_receiver) = std::sync::mpsc::channel();
+    let output_sink: arsy_kernel::operation::OutputSink =
+        std::sync::Arc::new(move |chunk| {
+            let _ = output_sender.send(chunk);
+        });
+    runtime.set_output_sink(Some(output_sink));
+    let worker_runtime = runtime.clone();
     let name = name.to_owned();
     let worker_name = name.clone();
     let request = request.clone();
@@ -3914,20 +3920,25 @@ fn dispatch_tool_live(
     let worker_request = request.clone();
     let grants = grants.to_vec();
     std::thread::spawn(move || {
-        let result = runtime.dispatch(&worker_name, &worker_request, &grants, started);
+        let result = worker_runtime.dispatch(&worker_name, &worker_request, &grants, started);
         let _ = sender.send(result);
     });
 
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let mut frame = 0usize;
-    let mut elapsed = std::time::Instant::now();
-    let mut rendered = false;
+    let elapsed = std::time::Instant::now();
+    let mut rendered = true;
     let mut cancelled = false;
-    writeln!(
-        terminal,
-        "{}",
-        tui::tool_running_row(colour, name.as_str(), summary)
-    )?;
+    let mut live_output = String::new();
+    let initial = tui::tool_running_frame_with_output(
+        colour,
+        FRAMES[0],
+        name.as_str(),
+        summary,
+        0,
+        "",
+    );
+    write!(terminal, "{initial}\n")?;
     terminal.flush()?;
     loop {
         while let Ok(byte) = keys.try_recv() {
@@ -3942,18 +3953,27 @@ fn dispatch_tool_live(
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
+                runtime.set_output_sink(None);
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
                 }
                 return Ok((result, cancelled));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let status = tui::tool_running_frame(
+                while let Ok(chunk) = output_receiver.try_recv() {
+                    live_output.push_str(&chunk);
+                    if live_output.len() > 16_384 {
+                        let keep_from = live_output.len() - 16_384;
+                        live_output.drain(..keep_from);
+                    }
+                }
+                let status = tui::tool_running_frame_with_output(
                     colour,
                     FRAMES[frame % FRAMES.len()],
                     name.as_str(),
                     summary,
                     elapsed.elapsed().as_millis(),
+                    &live_output,
                 );
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
@@ -3962,7 +3982,6 @@ fn dispatch_tool_live(
                 terminal.flush()?;
                 rendered = true;
                 frame = frame.wrapping_add(1);
-                elapsed = std::time::Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("tool worker disconnected"));
