@@ -2106,6 +2106,16 @@ pub fn tool_prompt_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
+/// Shown while an approved tool is executing.
+pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
+    exec_row(
+        colour,
+        Status::Run,
+        &format!("{name} {summary}"),
+        Some("running…"),
+    )
+}
+
 /// What a tool call did, once it ran or was declined.
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
     exec_row(

@@ -3698,6 +3698,12 @@ fn native_turn(
             let (content, is_error) = if outcome.interrupted {
                 ("The operator declined to run this call.".to_owned(), true)
             } else {
+                writeln!(
+                    terminal,
+                    "{}",
+                    tui::tool_running_row(colour, name, &summary)
+                )?;
+                terminal.flush()?;
                 match execute_call(
                     runtime,
                     &mut terminal,
