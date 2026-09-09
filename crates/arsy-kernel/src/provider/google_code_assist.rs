@@ -354,6 +354,7 @@ fn encode_message(
                 arguments,
             } => parts.push(json!({
                 "functionCall": {"name": name, "args": arguments, "id": id},
+                "thoughtSignature": "skip_thought_signature_validator",
             })),
             ModelContent::ToolResult {
                 id,

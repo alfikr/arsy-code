@@ -3833,6 +3833,7 @@ fn confirm_tool(
 ) -> io::Result<Answer> {
     let mut dialog = tui::AskDialogState::for_approval(name, summary, reason);
     let width = tui::terminal_width();
+    let mut rendered_lines = dialog.render(width, colour).lines().count();
     write!(terminal, "{}\n", dialog.render(width, colour))?;
     terminal.flush()?;
     loop {
@@ -3846,6 +3847,11 @@ fn confirm_tool(
                             tui::AskDialogResult::Other(_) => return Ok(Answer::No),
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
+                    } else {
+                        let frame = dialog.render(width, colour);
+                        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
+                        terminal.flush()?;
+                        rendered_lines = frame.lines().count();
                     }
                 }
                 None => continue,
