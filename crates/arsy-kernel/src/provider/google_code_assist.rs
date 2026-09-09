@@ -21,13 +21,8 @@ use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
-pub const DEFAULT_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
-
-/// Stands in when `:loadCodeAssist` returns no project of the account's own —
-/// which is the common case for a personal Antigravity sign-in.
-const FALLBACK_PROJECT: &str = "rising-fact-p41fc";
-
 /// Antigravity identifies itself as its Electron client. The backend gates the
 /// entitlement on this looking like the real IDE.
 const USER_AGENT: &str =
@@ -90,7 +85,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         )
     }
 
-    fn headers(&self, project: &str, streaming: bool) -> Vec<(String, String)> {
+    fn headers(&self, _project: &str, streaming: bool) -> Vec<(String, String)> {
         let mut headers = vec![
             (
                 "authorization".to_owned(),
@@ -103,9 +98,6 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
-        }
-        if !project.is_empty() {
-            headers.push(("x-goog-user-project".to_owned(), project.to_owned()));
         }
         headers
     }
@@ -122,9 +114,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         if let Some(project) = cached.as_ref() {
             return project.clone();
         }
-        let discovered = self
-            .discover_project()
-            .unwrap_or_else(|| FALLBACK_PROJECT.to_owned());
+        let discovered = self.discover_project().unwrap_or_default();
         *cached = Some(discovered.clone());
         discovered
     }
@@ -220,6 +210,13 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                         .collect::<Vec<_>>(),
                 }]),
             );
+        }
+
+        if request.model.model.contains("claude") {
+            let mut labels = Map::new();
+            labels.insert("used_claude".to_owned(), json!("true"));
+            labels.insert("used_claude_conservative".to_owned(), json!("true"));
+            inner.insert("labels".to_owned(), Value::Object(labels));
         }
 
         let mut envelope = Map::new();
@@ -663,12 +660,8 @@ mod tests {
             .as_u64()
             .unwrap();
         assert!(budget > 0 && budget < 1000);
-        assert!(wire
-            .headers
-            .iter()
-            .any(|(key, value)| key == "x-goog-user-project" && value == "proj-1"));
+        assert_eq!(body["project"], json!("proj-1"));
     }
-
     #[test]
     fn discovery_runs_once_then_streams() {
         let load = r#"{"cloudaicompanionProject":"discovered-proj"}"#;
@@ -785,7 +778,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(provider.project(), FALLBACK_PROJECT);
+        assert_eq!(provider.project(), "");
         assert!(events
             .iter()
             .any(|event| matches!(event, ModelEvent::TextDelta { text } if text == "ok")));
