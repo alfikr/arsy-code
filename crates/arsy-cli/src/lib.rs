@@ -1869,6 +1869,7 @@ enum Prompt {
     Provider(tui::ProviderStep),
     Auth(tui::AuthStep),
     Resume,
+    Session(tui::SessionDialogState),
 }
 
 #[cfg(feature = "tui")]
@@ -1986,7 +1987,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
-        let status = match prompt {
+        let status = match &prompt {
             // The branch is read per line rather than kept, so a checkout made
             // in another terminal shows up on the next prompt.
             Prompt::Task => state.status_row(
@@ -2000,6 +2001,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Provider(step) => step.prompt(&draft, colour),
             Prompt::Auth(step) => step.prompt(&auth_draft, colour),
             Prompt::Resume => tui::session_prompt(&sessions, colour),
+            Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
@@ -2224,6 +2226,87 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Session(mut dialog) => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let width = tui::terminal_width();
+                write!(stdout, "{}\n", dialog.render(width, colour)).map_err(terminal_failed)?;
+                stdout.flush().map_err(terminal_failed)?;
+                loop {
+                    match keys.recv() {
+                        Ok(byte) => {
+                            if let Some(key) = decoder.feed(byte) {
+                                if let Some(action) = dialog.handle_key(key) {
+                                    match action {
+                                        tui::SessionAction::Resume(id) => {
+                                            conversation = reconstruct_session_conversation(&workspace, id);
+                                            state.set_session_id(id);
+                                            queued.clear();
+                                            writeln!(
+                                                stdout,
+                                                "Resumed session {id} ({} message(s) loaded).",
+                                                conversation.len()
+                                            )
+                                            .map_err(terminal_failed)?;
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Rename(id, title) => {
+                                            if let Ok(store) = open_store(&workspace) {
+                                                let _ = store.set_session_title(id, &title);
+                                            }
+                                            writeln!(
+                                                stdout,
+                                                "Renamed session {id} to \"{title}\"."
+                                            )
+                                            .map_err(terminal_failed)?;
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Delete(id) => {
+                                            let is_current = id == state.session_id();
+                                            if let Ok(store) = open_store(&workspace) {
+                                                let _ = store.delete_session(id);
+                                            }
+                                            if is_current {
+                                                let new_session = SessionId::new();
+                                                state.set_session_id(new_session);
+                                                conversation.clear();
+                                                queued.clear();
+                                                writeln!(
+                                                    stdout,
+                                                    "Deleted current session. Started fresh session {new_session}."
+                                                )
+                                                .map_err(terminal_failed)?;
+                                            } else {
+                                                writeln!(stdout, "Deleted session {id}.")
+                                                    .map_err(terminal_failed)?;
+                                            }
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Cancel => {
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    write!(
+                                        stdout,
+                                        "\r\x1b[J{}\n",
+                                        dialog.render(width, colour)
+                                    )
+                                    .map_err(terminal_failed)?;
+                                    stdout.flush().map_err(terminal_failed)?;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            prompt = Prompt::Task;
+                            break;
+                        }
+                    }
+                }
+            }
             Prompt::Task if line.trim() == "/new" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 let new_session = SessionId::new();
@@ -2293,6 +2376,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 let mut parts = line.split_whitespace().skip(1);
                 match parts.next() {
+                    None => {
+                        let sess = load_workspace_sessions(&workspace);
+                        let dialog = tui::SessionDialogState::new(sess, state.session_id());
+                        prompt = Prompt::Session(dialog);
+                    }
                     Some("list") => {
                         sessions = load_workspace_sessions(&workspace);
                         prompt = Prompt::Resume;
@@ -2325,7 +2413,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         }
                     }
                     _ => {
-                        writeln!(stdout, "Usage: /session list | rename <TITLE> | delete [ID]").map_err(terminal_failed)?;
+                        writeln!(stdout, "Usage: /session [list | rename <TITLE> | delete [ID]]").map_err(terminal_failed)?;
                     }
                 }
             }
