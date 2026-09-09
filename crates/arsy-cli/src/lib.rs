@@ -1941,10 +1941,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         models.extend(tui::available_models());
         models
     };
-    // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-
+    let mut resolved_providers: std::collections::HashMap<String, provider::Resolved> =
+        std::collections::HashMap::new();
+    if let Some(resolved) = native.clone() {
+        resolved_providers.insert(route.provider.clone(), resolved);
+    }
     let mut effort = saved_effort();
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
@@ -2544,10 +2547,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     colour,
                     tui::branch(&workspace).as_deref(),
                 );
+                let selected_provider = if resolved_providers.contains_key(&route.provider) {
+                    resolved_providers.get(&route.provider)
+                } else {
+                    let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
+                    let resolved = load_config(&workspace, &working)
+                        .ok()
+                        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
+                    if let Some(resolved) = resolved {
+                        resolved_providers.insert(route.provider.clone(), resolved);
+                    }
+                    resolved_providers.get(&route.provider)
+                };
                 match run_turn(
                     invocation,
                     state.session_id(),
-                    native.as_ref(),
+                    selected_provider,
                     &line,
                     &route,
                     effort,
@@ -2797,11 +2812,12 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
             }));
         }
     }
+    // Model discovery must be read-only. Probing the macOS keychain here
+    // triggers an unlock prompt every time `/model` opens; auth state is already
+    // represented by the credential catalog.
     let saved_handles = catalog_handles(invocation);
     for preset in arsy_kernel::oauth::presets::all() {
-        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id))
-            || arsy_kernel::secret::OsCredentialStore.resolve(preset.id).is_ok()
-            || arsy_kernel::secret::FileCredentialStore.resolve(preset.id).is_ok();
+        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
         if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
             choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
                 provider: preset.id.to_string(),
@@ -3432,12 +3448,7 @@ fn run_turn(
     });
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let dynamic_provider = load_config(&root, &working)
-        .ok()
-        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok())
-        .or_else(|| native.cloned());
-
-    let outcome = match dynamic_provider.as_ref() {
+    let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
             &agent_runtime(
