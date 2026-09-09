@@ -136,11 +136,24 @@ fn configure(home: &Path, port: u16) {
 }
 
 fn arsy(workspace: &Path, home: &Path, args: &[&str]) -> (i32, Vec<Value>) {
+    arsy_with_home(workspace, home, home, args)
+}
+
+/// The same run with the operator's home under the test's control, so the
+/// hooks the engine finds are the ones the test wrote.
+fn arsy_with_home(
+    workspace: &Path,
+    config_home: &Path,
+    home: &Path,
+    args: &[&str],
+) -> (i32, Vec<Value>) {
     let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.to_str().unwrap()])
         .args(args)
         .args(["--output", "json"])
-        .env("ARSY_CONFIG_HOME", home)
+        .env("ARSY_CONFIG_HOME", config_home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         // Long enough that the redactor accepts it: a value short enough to
         // appear in ordinary text cannot be redacted safely and is refused.
         .env("ARSY_TEST_KEY", "test-key-0123456789abcdef")
@@ -571,4 +584,119 @@ fn walk(root: &Path) -> Vec<std::path::PathBuf> {
         }
     }
     found
+}
+
+/// A hook that denies a tool call, on a real turn, from the operator's own
+/// file — the whole path from a declaration on disk to a call that does not
+/// happen.
+#[test]
+fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
+    std::fs::write(
+        home.path().join(".arsy/hooks.json"),
+        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
+            {"type": "command",
+             "command": "echo '{\"decision\": \"deny\", \"reason\": \"notes are off limits\"}'"}
+        ]}]}}"#,
+    )
+    .unwrap();
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+
+    let _first = provider.request();
+    // The second request carries what the tool call produced. The hook denied
+    // it, so it carries the refusal and its reason — and not the file.
+    let second = provider.request();
+    let transcript = second.to_string();
+    assert!(
+        transcript.contains("notes are off limits"),
+        "the model was told why: {transcript}"
+    );
+    assert!(
+        !transcript.contains("the answer is 42"),
+        "the file was never read: {transcript}"
+    );
+}
+
+/// The same file in the repository rather than the operator's home does
+/// nothing until the operator vouches for that directory.
+#[test]
+fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+    std::fs::create_dir_all(workspace.path().join(".arsy")).unwrap();
+    std::fs::write(
+        workspace.path().join(".arsy/hooks.json"),
+        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
+            {"type": "command",
+             "command": "echo '{\"decision\": \"deny\", \"reason\": \"the repo said no\"}'"}
+        ]}]}}"#,
+    )
+    .unwrap();
+
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("42.")]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+
+    let _first = provider.request();
+    let unvouched = provider.request().to_string();
+    assert!(
+        !unvouched.contains("the repo said no"),
+        "an unvouched repository's hook did not run: {unvouched}"
+    );
+    assert!(
+        unvouched.contains("the answer is 42"),
+        "so the read happened: {unvouched}"
+    );
+
+    // Vouched for, the same file denies the same call.
+    let provider = FakeProvider::serving(vec![asks_to_read("notes.txt"), answers("I could not.")]);
+    configure_trusting(home.path(), provider.port, workspace.path());
+
+    let (code, records) = arsy_with_home(
+        workspace.path(),
+        home.path(),
+        home.path(),
+        &["run", "what does notes.txt say?"],
+    );
+    assert_eq!(code, 0, "{:#?}", result(&records));
+    let _first = provider.request();
+    let vouched = provider.request().to_string();
+    assert!(
+        vouched.contains("the repo said no"),
+        "vouched for, it runs: {vouched}"
+    );
+}
+
+/// The same configuration, plus the operator vouching for one directory.
+fn configure_trusting(home: &Path, port: u16, workspace: &Path) {
+    configure(home, port);
+    let mut config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    config.push_str(&format!(
+        "[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+        workspace.display()
+    ));
+    std::fs::write(home.join("config.toml"), config).unwrap();
 }

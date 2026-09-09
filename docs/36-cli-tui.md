@@ -13,8 +13,9 @@ events and matchers, and accepts `--event <original-or-canonical-name>`.
 Unsupported lifecycle events are labelled unsupported. Other hook ecosystems
 and user/enterprise integration configuration are not yet inspected.
 
-Every declaration is labelled `not_loaded`: an inspection result is never a claim
-that an integration is running.
+An MCP declaration is labelled `not_loaded`: reading a definition is not
+connecting. A hook declaration says which it is — `loaded` means it runs on this
+workspace's turns.
 
 Native MCP connections are separate from those imported declarations. They are
 defined in `config.toml` as `[mcp.server.<name>]`, written by `arsy mcp add` and
@@ -32,9 +33,33 @@ refresh as re-discovery without a teardown. Reconnect and refresh cannot widen
 authority: the tools, resources, and prompts adopted on the first connection are
 the ceiling, and anything appearing later outside it is reported and rejected.
 Authentication failure and a disabled connection are excluded from automatic
-retry. Executable hooks are dispatched by the lifecycle engine, which `arsy hook
-list` reports the effect class and failure policy of; the engine is not yet wired
-into the interactive turn loop.
+retry. Executable hooks are dispatched by the lifecycle engine around every tool call
+and at each turn boundary. `arsy hook list` reports the effect class, the
+failure policy, and whether each declaration is loaded, alongside every file the
+engine read.
+
+Hooks come from whichever ecosystem the operator already uses. `~/.claude/settings.json`
+supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one
+lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/hooks.json` is the
+same Claude shape under ARSY's own name, for an operator using neither. Only
+`type: "command"` runs — a `prompt`, `agent`, or `http` handler is reported
+against its file and skipped.
+
+A repository's own hooks — `<workspace>/.arsy/hooks.json` and
+`<workspace>/.claude/settings.json` — are read but not run until the operator
+vouches for that directory:
+
+```toml
+[project."/home/you/src/thing"]
+trust_level = "trusted"
+```
+
+The table is spelled as Codex spells it, and only the enterprise or user layer
+may write it: a repository that could vouch for itself would be no gate at all.
+Trust is compared on resolved paths, so a symlink beside a vouched-for checkout
+does not inherit its trust. Even vouched for, a repository's hook carries
+workspace authority — it may deny an operation or ask for approval, never grant
+one.
 
 The existing provider subprocess owns its own integrations and permissions.
 

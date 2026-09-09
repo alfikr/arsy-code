@@ -22,7 +22,7 @@ use crate::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -475,6 +475,9 @@ pub struct Config {
     remote_targets: BTreeMap<String, RemoteTarget>,
     /// `[lsp.server.<name>]`, from a trusted layer only.
     language_servers: BTreeMap<String, LanguageServer>,
+    /// `[project."<path>"] trust_level = "trusted"`, from a trusted layer only.
+    /// Directories whose own files may run something.
+    trusted_projects: BTreeSet<PathBuf>,
     telemetry: TelemetrySettings,
     /// What the layers that spoke agreed on for `telemetry.include_content`.
     /// `None` means none of them did, which is not the same as `Some(false)`.
@@ -570,6 +573,30 @@ impl Config {
     }
 
     /// Configured MCP connections in name order. Nothing is connected.
+    /// Whether the operator vouched for this directory.
+    ///
+    /// An ancestor's trust covers what is under it, the way Codex's own list
+    /// works: vouching for a checkout should not have to be repeated for every
+    /// crate inside it. Nothing is trusted by default, so a repository that was
+    /// never named runs none of its own hooks.
+    pub fn trusts(&self, directory: &Path) -> bool {
+        // Resolved on both sides before comparing. Two names for one directory
+        // are common and innocent — `/var` is `/private/var` on macOS — but a
+        // textual comparison also means a symlink planted beside a vouched-for
+        // checkout would inherit its trust.
+        let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let directory = resolve(directory);
+        self.trusted_projects
+            .iter()
+            .any(|trusted| directory.starts_with(resolve(trusted)))
+    }
+
+    /// Every directory the operator vouched for, so `config explain` and
+    /// `arsy hook list` can say which list a decision came from.
+    pub fn trusted_projects(&self) -> impl Iterator<Item = &Path> {
+        self.trusted_projects.iter().map(PathBuf::as_path)
+    }
+
     pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServer> {
         self.mcp_servers.values()
     }
@@ -752,6 +779,7 @@ impl Config {
                 "lsp" => self.apply_lsp(layer, path, value)?,
                 "mcp" => self.apply_mcp(layer, path, value)?,
                 "remote" => self.apply_remote(layer, path, value)?,
+                "project" => self.apply_project(layer, path, value)?,
                 "policy" => self.apply_policy(layer, path, value)?,
                 "theme" => self.apply_theme(layer, path, value)?,
                 section if INERT_SECTIONS.contains(&section) => {}
@@ -1074,6 +1102,72 @@ impl Config {
     /// Refused outside the enterprise and user layers, for the same reason a
     /// provider endpoint is: a file that travels with a repository must not be
     /// able to decide which machine the agent's commands execute on.
+    /// `[project."<path>"]`: which directories the operator vouches for.
+    ///
+    /// Spelled as Codex spells it, `trust_level = "trusted"`, because an
+    /// operator who already keeps that list has written it once. It decides
+    /// whether a repository's own files — its hooks — may run anything, so
+    /// only a layer that may grant authority can add to it: a repository that
+    /// could vouch for itself would be no gate at all.
+    fn apply_project(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let projects = as_table(value, "project", path)?;
+        if !layer.is_trusted() {
+            for name in projects.keys() {
+                self.diagnostics.push(Diagnostic {
+                    key: format!("project.{name}"),
+                    layer,
+                    path: path.to_path_buf(),
+                    message: "a project's trust may only be set by the enterprise or user                               configuration, because it decides whether that directory's own                               files may run commands"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        for (directory, value) in projects {
+            let table = as_table(value, &format!("project.{directory}"), path)?;
+            let level = string(
+                table,
+                "trust_level",
+                &format!("project.{directory}.trust_level"),
+                path,
+            )?
+            .map(String::as_str)
+            .unwrap_or("untrusted");
+            match level {
+                "trusted" => {
+                    self.trusted_projects.insert(PathBuf::from(directory));
+                }
+                // Written out, and written down: an operator who revokes trust
+                // by editing the level rather than deleting the table gets the
+                // revocation, and can see in `config explain` that it landed.
+                "untrusted" => {
+                    self.trusted_projects.remove(Path::new(directory));
+                }
+                other => {
+                    return Err(reject(format!(
+                        "project.{directory}.trust_level must be `trusted` or `untrusted`, not                          `{other}`"
+                    )))
+                }
+            }
+            self.record(
+                layer,
+                path,
+                &format!("project.{directory}"),
+                level.to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn apply_remote(
         &mut self,
         layer: Layer,
@@ -2060,6 +2154,85 @@ fn platform_user_config() -> Option<PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn platform_user_config() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod project_trust_tests {
+    use super::*;
+
+    fn layered(user: &str, workspace: &str) -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("user.toml");
+        let second = directory.path().join("workspace.toml");
+        std::fs::write(&first, format!("schema_version = 1\n{user}")).unwrap();
+        std::fs::write(&second, format!("schema_version = 1\n{workspace}")).unwrap();
+        let config = Config::load(&[(Layer::User, first), (Layer::Workspace, second)]).unwrap();
+        (directory, config)
+    }
+
+    /// Trust decides whether a directory's own files may run commands, so a
+    /// file that travels with the directory must not be able to grant it.
+    #[test]
+    fn a_repository_cannot_vouch_for_itself() {
+        let (_directory, config) = layered(
+            "",
+            "[project.\"/repo/theirs\"]\ntrust_level = \"trusted\"\n",
+        );
+
+        assert!(!config.trusts(Path::new("/repo/theirs")));
+        let refused = config
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.key == "project./repo/theirs")
+            .expect("the workspace layer is told why its trust was ignored");
+        assert!(
+            refused.message.contains("may run commands"),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn trust_covers_what_is_under_a_named_directory_and_nothing_else() {
+        let (_directory, config) =
+            layered("[project.\"/repo/mine\"]\ntrust_level = \"trusted\"\n", "");
+
+        assert!(config.trusts(Path::new("/repo/mine")));
+        assert!(
+            config.trusts(Path::new("/repo/mine/crates/inner")),
+            "vouching for a checkout covers the crates inside it"
+        );
+        assert!(!config.trusts(Path::new("/repo/theirs")));
+        // A prefix of the path is not a parent of it.
+        assert!(!config.trusts(Path::new("/repo/mine-other")));
+        // Nothing is trusted by default.
+        let (_directory, empty) = layered("", "");
+        assert!(!empty.trusts(Path::new("/repo/mine")));
+    }
+
+    /// Revoking by editing the level rather than deleting the table has to
+    /// work, or an operator who thinks they revoked trust has not.
+    #[test]
+    fn a_later_layer_may_revoke_what_an_earlier_one_vouched_for() {
+        let (_directory, config) = layered(
+            "[project.\"/repo/mine\"]\ntrust_level = \"untrusted\"\n",
+            "",
+        );
+        assert!(!config.trusts(Path::new("/repo/mine")));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("one.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n[project.\"/repo/mine\"]\ntrust_level = \"sort-of\"\n",
+        )
+        .unwrap();
+        let error = Config::load(&[(Layer::User, path)]).unwrap_err();
+        assert!(
+            format!("{error}").contains("trusted"),
+            "an unknown level is refused by name: {error}"
+        );
+    }
 }
 
 #[cfg(test)]
