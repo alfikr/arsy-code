@@ -33,10 +33,12 @@ refresh as re-discovery without a teardown. Reconnect and refresh cannot widen
 authority: the tools, resources, and prompts adopted on the first connection are
 the ceiling, and anything appearing later outside it is reported and rejected.
 Authentication failure and a disabled connection are excluded from automatic
-retry. Executable hooks are dispatched by the lifecycle engine around every tool call
-and at each turn boundary. `arsy hook list` reports the effect class, the
-failure policy, and whether each declaration is loaded, alongside every file the
-engine read.
+retry. Executable hooks are dispatched by the lifecycle engine around each tool call
+and at both turn boundaries of a scripted turn — `arsy run` and everything built
+on it. The interactive TUI loop and a subagent's own calls do not dispatch them
+yet; a hook that gates `before_operation` therefore gates a pipeline and not a
+keyboard session. `arsy hook list` reports the effect class, the failure policy,
+and whether each declaration is loaded, alongside every file the engine read.
 
 Hooks come from whichever ecosystem the operator already uses. `~/.claude/settings.json`
 supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one

@@ -5548,6 +5548,10 @@ fn turn_boundary(
 
 /// Run one tool call with the lifecycle events around it.
 ///
+/// The scripted turn only. The interactive loop reaches the runtime through
+/// `execute_call`, which asks the operator rather than a hook, and a subagent's
+/// calls go through `child_turn`; neither dispatches these events yet.
+///
 /// `before_operation` sees the call before it happens and may rewrite its
 /// arguments, deny it, or ask for an approval nobody is here to give — which,
 /// on a surface with no operator, is a refusal reported to the model rather

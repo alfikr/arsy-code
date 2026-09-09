@@ -35,7 +35,7 @@ Wasmtime/WASI components receive preopened capability resources via `cap-std`, f
 
 Lifecycle events include harness/session/turn/model/operation/edit/command/commit/agent/compaction stages. Hooks may observe, transform a schema-limited payload, deny, request approval, inject attributed context, or schedule one follow-up. Recursion depth, reentrancy keys, timeout, and origin prevent loops. Hook failure policy is event-specific and explicit.
 
-This build dispatches `before_turn`, `before_operation`, `after_operation`, `operation_failed`, and `after_turn`. A declaration is loaded from the operator's own configuration — Claude's, Codex's, or ARSY's — and from the repository's only where `[project."<path>"] trust_level = "trusted"` vouches for it. See [`arsy hook list`](36-cli-tui.md).
+This build dispatches `before_turn`, `before_operation`, `after_operation`, `operation_failed`, and `after_turn` on a scripted turn; the interactive loop and subagent calls do not dispatch them yet. A declaration is loaded from the operator's own configuration — Claude's, Codex's, or ARSY's — and from the repository's only where `[project."<path>"] trust_level = "trusted"` vouches for it. See [`arsy hook list`](36-cli-tui.md).
 
 ## Refresh
 
