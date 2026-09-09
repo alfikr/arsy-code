@@ -3,7 +3,7 @@ use arsy_kernel::policy::SandboxAssurance;
 use arsy_kernel::{
     artifact::{ArtifactStore, NewArtifact, Sensitivity},
     capability::{CapabilityAction, CapabilityGrant},
-    domain::Principal,
+    domain::{OperationId, Principal},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
@@ -11,17 +11,38 @@ use arsy_kernel::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Read},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+
+static CANCELLED: LazyLock<Mutex<HashSet<OperationId>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cancellation_set() -> &'static Mutex<HashSet<OperationId>> {
+    &CANCELLED
+}
+
+/// Request cancellation of the currently running process operation.
+pub fn cancel(operation: OperationId) {
+    if let Ok(mut cancelled) = cancellation_set().lock() {
+        cancelled.insert(operation);
+    }
+}
+
+fn take_cancelled(operation: OperationId) -> bool {
+    cancellation_set()
+        .lock()
+        .map(|mut cancelled| cancelled.remove(&operation))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Deserialize)]
 struct ProcessInput {
@@ -115,6 +136,7 @@ impl ProcessExecutor {
 
     fn run(
         &self,
+        operation: OperationId,
         input: ProcessInput,
         actor: &Principal,
     ) -> Result<OperationOutcome, OperationError> {
@@ -170,6 +192,7 @@ impl ProcessExecutor {
             &mut child,
             Duration::from_millis(input.timeout_ms),
             self.grace,
+            operation,
         )?;
         let stdout = stdout
             .join()
@@ -257,7 +280,7 @@ impl OperationExecutor for ProcessExecutor {
         }
         let input = serde_json::from_value(request.input.clone())
             .map_err(|error| OperationError::Schema(error.to_string()))?;
-        self.run(input, &request.actor)
+        self.run(request.id, input, &request.actor)
     }
 }
 
@@ -292,9 +315,23 @@ fn wait_bounded(
     child: &mut Child,
     timeout: Duration,
     grace: Duration,
+    operation: OperationId,
 ) -> Result<(ExitStatus, bool, bool, bool, Cleanup), OperationError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if take_cancelled(operation) {
+            let graceful = terminate(child);
+            let grace_deadline = Instant::now() + grace;
+            while Instant::now() < grace_deadline {
+                if let Some(status) = child.try_wait().map_err(execution)? {
+                    return Ok((status, false, graceful, false, Cleanup::Terminated));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            force_kill(child)?;
+            let status = child.wait().map_err(execution)?;
+            return Ok((status, false, graceful, true, Cleanup::Killed));
+        }
         if let Some(status) = child.try_wait().map_err(execution)? {
             return Ok((status, false, false, false, Cleanup::Reaped));
         }
@@ -388,6 +425,7 @@ mod tests {
             ProcessExecutor::new(store.clone(), Vec::new(), Duration::from_millis(20), 0);
         let outcome = executor
             .run(
+                OperationId::new(),
                 ProcessInput {
                     argv,
                     timeout_ms,

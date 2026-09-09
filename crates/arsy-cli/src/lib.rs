@@ -3870,7 +3870,7 @@ fn execute_call(
             }
         }
     };
-    let mut result = dispatch_tool_live(
+    let (mut result, cancelled) = dispatch_tool_live(
         terminal,
         colour,
         runtime,
@@ -3879,7 +3879,12 @@ fn execute_call(
         &grants,
         started,
         summary,
+        keys,
+        decoder,
     )?;
+    if cancelled {
+        return Ok(Executed::Stopped);
+    }
     if let Some(note) = approval_note {
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
@@ -3896,15 +3901,20 @@ fn dispatch_tool_live(
     grants: &[arsy_kernel::capability::CapabilityGrant],
     started: std::time::Instant,
     summary: &str,
-) -> io::Result<arsy_code::agent::ToolResult> {
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
+
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let runtime = runtime.clone();
     let name = name.to_owned();
     let worker_name = name.clone();
     let request = request.clone();
+    let operation_id = request.id;
+    let worker_request = request.clone();
     let grants = grants.to_vec();
     std::thread::spawn(move || {
-        let result = runtime.dispatch(&worker_name, &request, &grants, started);
+        let result = runtime.dispatch(&worker_name, &worker_request, &grants, started);
         let _ = sender.send(result);
     });
 
@@ -3912,6 +3922,7 @@ fn dispatch_tool_live(
     let mut frame = 0usize;
     let mut elapsed = std::time::Instant::now();
     let mut rendered = false;
+    let mut cancelled = false;
     writeln!(
         terminal,
         "{}",
@@ -3919,12 +3930,22 @@ fn dispatch_tool_live(
     )?;
     terminal.flush()?;
     loop {
+        while let Ok(byte) = keys.try_recv() {
+            if decoder.feed(byte) == Some(tui::Key::Interrupt)
+                && request.kind.to_string() == "process.exec"
+            {
+                arsy_code::process::cancel(operation_id);
+                write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
+                terminal.flush()?;
+                cancelled = true;
+            }
+        }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
                 }
-                return Ok(result);
+                return Ok((result, cancelled));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let status = tui::tool_running_frame(
