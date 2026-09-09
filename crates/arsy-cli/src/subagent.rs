@@ -74,6 +74,30 @@ const CONSECUTIVE_FAILURES: u64 = 3;
 /// it has to stop watching.
 const OBSERVER_BUDGET: u64 = 16;
 
+/// How many children one turn may still start.
+///
+/// A type rather than a counter beside a check, because the two have to move
+/// together: the bug this replaces was a check with no increment anywhere, and
+/// nothing about a bare `usize` made that visible.
+#[derive(Debug, Default)]
+struct Allowance {
+    started: usize,
+}
+
+impl Allowance {
+    /// Spend a slot, or say why there is none. Counts the attempt, not the
+    /// outcome.
+    fn take(&mut self) -> Result<(), String> {
+        if self.started >= MAX_CHILDREN {
+            return Err(format!(
+                "this turn has already spawned {MAX_CHILDREN} subagents; do the rest yourself"
+            ));
+        }
+        self.started += 1;
+        Ok(())
+    }
+}
+
 /// The tool a supervisor offers on top of the workspace tools.
 ///
 /// Not a workspace operation: spawning changes no file and runs no command, it
@@ -118,7 +142,7 @@ pub struct Supervisor<'a> {
     /// be delegated, which is the default and refuses every spawn.
     delegable: Vec<CapabilityGrant>,
     observer: ObserverSubscription,
-    spawned: usize,
+    allowance: Allowance,
     /// What the observer did, for the turn's record.
     interventions: Vec<Value>,
 }
@@ -158,7 +182,7 @@ impl<'a> Supervisor<'a> {
                 cost_budget_micros: OBSERVER_BUDGET,
                 cost_used_micros: 0,
             },
-            spawned: 0,
+            allowance: Allowance::default(),
             interventions: Vec::new(),
         }
     }
@@ -184,13 +208,12 @@ impl<'a> Supervisor<'a> {
         emitter: &mut Emitter,
     ) -> ToolResult {
         let started = std::time::Instant::now();
-        if self.spawned >= MAX_CHILDREN {
-            return ToolResult::refused(
-                "task.spawn",
-                format!(
-                    "this turn has already spawned {MAX_CHILDREN} subagents; do the rest yourself"
-                ),
-            );
+        // Taken before anything can go wrong, so a spawn that fails still
+        // spends its slot: a bound that only counted the children that worked
+        // would let a model spawn failures without end, and each one costs the
+        // rounds a child is allowed.
+        if let Err(refusal) = self.allowance.take() {
+            return ToolResult::refused("task.spawn", refusal);
         }
         let goal = arguments
             .get("goal")
@@ -424,23 +447,7 @@ impl Supervisor<'_> {
     /// Returns the intervention the observer made, if any. A `Deny` stops the
     /// child; a `Suggest` is recorded and reaches the parent with the answer.
     fn watch(&mut self, projection: &RedactedProjection) -> Option<Intervention> {
-        // The rule is small and explainable on purpose: a child whose calls
-        // keep failing is not working, and stopping it is worth more than the
-        // rounds it would spend proving that.
-        //
-        // The count comes from the payload, not from the sequence: the
-        // sequence is which call this was, and an intervention that recorded a
-        // failure count in its place would be a false entry in the audit.
-        let failures = projection
-            .public_payload
-            .get("consecutive_failures")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let intervention = if projection.kind == "tool.failed" && failures >= CONSECUTIVE_FAILURES {
-            Intervention::Deny(format!("{failures} tool calls in a row failed"))
-        } else {
-            return None;
-        };
+        let intervention = warranted(projection)?;
         match self.observer.intervene(projection, intervention.clone(), 1) {
             Ok(event) => {
                 self.interventions.push(json!({
@@ -456,6 +463,25 @@ impl Supervisor<'_> {
             Err(_) => None,
         }
     }
+}
+
+/// What this projection warrants, if anything.
+///
+/// The rule is small and explainable on purpose: a child whose calls keep
+/// failing is not working, and stopping it is worth more than the rounds it
+/// would spend proving that.
+///
+/// The count comes from the payload, not from the sequence: the sequence is
+/// which call this was, and an intervention that recorded a failure count in
+/// its place would be a false entry in the audit.
+fn warranted(projection: &RedactedProjection) -> Option<Intervention> {
+    let failures = projection
+        .public_payload
+        .get("consecutive_failures")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (projection.kind == "tool.failed" && failures >= CONSECUTIVE_FAILURES)
+        .then(|| Intervention::Deny(format!("{failures} tool calls in a row failed")))
 }
 
 /// A quarter of what is left, and at least enough to be worth starting.
@@ -630,59 +656,23 @@ mod tests {
 
     #[test]
     fn the_sequence_is_which_call_it_was_and_the_count_lives_in_the_payload() {
-        let mut supervisor = Watcher {
-            observer: ObserverSubscription {
-                id: SubscriptionId::new(),
-                observer: AgentId::new(),
-                authority: ObserverAuthority {
-                    may_suggest: true,
-                    may_deny: true,
-                },
-                cost_budget_micros: OBSERVER_BUDGET,
-                cost_used_micros: 0,
-            },
-        };
+        // `warranted` is the rule the supervisor runs, called here rather than
+        // copied: a test that reimplements the rule passes against a
+        // supervisor that reads the wrong field.
+        assert!(
+            warranted(&projection(10, 2, "tool.failed")).is_none(),
+            "two in a row is not yet a pattern"
+        );
+        assert!(
+            warranted(&projection(11, 0, "tool.completed")).is_none(),
+            "a success is never an intervention"
+        );
 
-        // The tenth call, having failed twice in a row: not yet.
-        assert!(supervisor
-            .watch(&projection(10, 2, "tool.failed"))
-            .is_none());
-        // A success at the same sequence is never an intervention.
-        assert!(supervisor
-            .watch(&projection(11, 0, "tool.completed"))
-            .is_none());
-
-        // The third failure in a row stops it, and the reason names the count
-        // rather than the call number.
-        let stopped = supervisor
-            .watch(&projection(12, 3, "tool.failed"))
-            .expect("three in a row is the rule");
-        match stopped {
-            Intervention::Deny(reason) => assert!(reason.starts_with("3 "), "{reason}"),
-            other => panic!("a failing child is denied, not {other:?}"),
-        }
-    }
-
-    /// The observer half of [`Supervisor`], without a workspace behind it.
-    struct Watcher {
-        observer: ObserverSubscription,
-    }
-
-    impl Watcher {
-        fn watch(&mut self, projection: &RedactedProjection) -> Option<Intervention> {
-            let failures = projection
-                .public_payload
-                .get("consecutive_failures")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if projection.kind != "tool.failed" || failures < CONSECUTIVE_FAILURES {
-                return None;
-            }
-            let intervention = Intervention::Deny(format!("{failures} tool calls in a row failed"));
-            self.observer
-                .intervene(projection, intervention.clone(), 1)
-                .ok()
-                .map(|_| intervention)
+        match warranted(&projection(12, 3, "tool.failed")) {
+            // The reason names the count, not the call number: the two were
+            // once the same field, and that made the audit trail wrong.
+            Some(Intervention::Deny(reason)) => assert!(reason.starts_with("3 "), "{reason}"),
+            other => panic!("three in a row is denied, not {other:?}"),
         }
     }
 
@@ -729,24 +719,16 @@ mod tests {
 
     #[test]
     fn every_spawn_counts_against_the_bound_including_the_ones_that_fail() {
-        // `spawned` is incremented before the child runs, so four failures
-        // exhaust the turn's allowance exactly as four answers would. Counting
-        // only successes would let a model spawn failures without end.
-        let mut spawned = 0usize;
-        let mut attempt = || -> Result<(), &str> {
-            if spawned >= MAX_CHILDREN {
-                return Err("bound reached");
-            }
-            spawned += 1;
-            Err("the child failed")
-        };
+        // Driving the real type, not a copy of its logic: the bug this covers
+        // was a bound that was checked and never incremented, and a test that
+        // counted for itself would have passed against it.
+        let mut allowance = Allowance::default();
         for _ in 0..MAX_CHILDREN {
-            assert_eq!(attempt(), Err("the child failed"));
+            allowance.take().expect("the allowance is not spent yet");
         }
-        assert_eq!(
-            attempt(),
-            Err("bound reached"),
-            "failures must exhaust the allowance"
-        );
+        let refused = allowance
+            .take()
+            .expect_err("the allowance is spent, whatever the children did with it");
+        assert!(refused.contains("already spawned"), "{refused}");
     }
 }
