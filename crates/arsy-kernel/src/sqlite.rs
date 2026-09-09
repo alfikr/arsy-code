@@ -27,11 +27,16 @@ CREATE TABLE IF NOT EXISTS events (
     envelope_json TEXT NOT NULL,
     PRIMARY KEY (stream_id, sequence)
 ) WITHOUT ROWID, STRICT;
-
 CREATE INDEX IF NOT EXISTS events_actor_time
     ON events(actor_json, occurred_at_ms);
 CREATE INDEX IF NOT EXISTS events_correlation
     ON events(correlation_id, stream_id, sequence);
+
+CREATE TABLE IF NOT EXISTS session_metadata (
+    stream_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
 "#;
 
 /// Shape of the schema this binary writes and reads.
@@ -78,13 +83,14 @@ impl Durability {
 
 /// One recorded stream as `arsy session list` reports it. Timestamps are
 /// `None` for a stream whose row exists but whose append did not commit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionSummary {
     pub session: SessionId,
     pub version: StreamVersion,
     pub durability: Durability,
     pub started_at_ms: Option<u64>,
     pub last_event_at_ms: Option<u64>,
+    pub title: Option<String>,
 }
 
 pub struct SqliteEventStore {
@@ -151,9 +157,12 @@ impl SqliteEventStore {
         let mut statement = connection
             .prepare(
                 "SELECT s.stream_id, s.version, s.durability,
-                        MIN(e.occurred_at_ms), MAX(e.occurred_at_ms)
-                 FROM sessions s LEFT JOIN events e ON e.stream_id = s.stream_id
-                 GROUP BY s.stream_id, s.version, s.durability
+                        MIN(e.occurred_at_ms), MAX(e.occurred_at_ms),
+                        m.title
+                 FROM sessions s
+                 LEFT JOIN events e ON e.stream_id = s.stream_id
+                 LEFT JOIN session_metadata m ON m.stream_id = s.stream_id
+                 GROUP BY s.stream_id, s.version, s.durability, m.title
                  ORDER BY MAX(e.occurred_at_ms) DESC, s.stream_id
                  LIMIT ?1",
             )
@@ -166,12 +175,13 @@ impl SqliteEventStore {
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(storage)?;
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, version, durability, first, last) = row.map_err(storage)?;
+            let (id, version, durability, first, last, title) = row.map_err(storage)?;
             sessions.push(SessionSummary {
                 session: id
                     .parse()
@@ -184,9 +194,56 @@ impl SqliteEventStore {
                 durability: Durability::parse(&durability)?,
                 started_at_ms: first.map(unsigned).transpose()?,
                 last_event_at_ms: last.map(unsigned).transpose()?,
+                title,
             });
         }
         Ok(sessions)
+    }
+
+    pub fn set_session_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
+        let connection = self.writer.lock().unwrap();
+        let stream_id = session.to_string();
+        let now = crate::artifact::unix_time_ms();
+        connection
+            .execute(
+                "INSERT INTO session_metadata (stream_id, title, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(stream_id) DO UPDATE SET title = ?2, updated_at_ms = ?3",
+                params![stream_id, title, now as i64],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    pub fn session_title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
+        let connection = self.reader()?;
+        connection
+            .query_row(
+                "SELECT title FROM session_metadata WHERE stream_id = ?1",
+                [session.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)
+    }
+
+    pub fn delete_session(&self, session: SessionId) -> Result<bool, StoreError> {
+        let connection = self.writer.lock().unwrap();
+        let stream_id = session.to_string();
+        let _ = connection.execute(
+            "DELETE FROM session_metadata WHERE stream_id = ?1",
+            params![stream_id],
+        );
+        let events = connection
+            .execute("DELETE FROM events WHERE stream_id = ?1", params![stream_id])
+            .map_err(storage)?;
+        let sess = connection
+            .execute(
+                "DELETE FROM sessions WHERE stream_id = ?1",
+                params![stream_id],
+            )
+            .map_err(storage)?;
+        Ok(events > 0 || sess > 0)
     }
 
     pub fn read_by_actor(

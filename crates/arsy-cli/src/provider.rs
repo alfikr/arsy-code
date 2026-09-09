@@ -63,6 +63,7 @@ impl CredentialSource {
 ///
 /// The adapter is shared rather than owned so a turn can be streamed on its
 /// own thread while the terminal keeps repainting.
+#[derive(Clone)]
 pub struct Resolved {
     pub provider: Arc<dyn ModelProvider>,
     pub endpoint: Endpoint,
@@ -99,11 +100,29 @@ pub fn resolve_with_route(
     {
         // A named provider is used as named, or reported as missing. Routing
         // must never substitute another one for the one that was asked for.
-        return config
-            .endpoint(Some(id))
-            .cloned()
-            .map(|endpoint| (endpoint, None))
-            .ok_or_else(|| unconfigured(Some(id)));
+        if let Some(endpoint) = config.endpoint(Some(id)).cloned() {
+            return Ok((endpoint, None));
+        }
+        if let Some(preset) = arsy_kernel::oauth::presets::get(id) {
+            let canonical_id = preset.id;
+            let endpoint = Endpoint {
+                id: canonical_id.to_owned(),
+                kind: preset.dialect,
+                base_url: preset.base_url.to_owned(),
+                credential: arsy_kernel::secret::SecretHandle::new(
+                    arsy_kernel::secret::OS_STORE_ID,
+                    canonical_id,
+                )
+                .ok(),
+                api_key_env: None,
+                model: preset.models.first().map(|s| (*s).to_owned()),
+                models: preset.models.iter().map(|s| (*s).to_owned()).collect(),
+                max_output_tokens: arsy_kernel::config::DEFAULT_MAX_OUTPUT_TOKENS,
+                oauth: Some(preset.oauth()),
+            };
+            return Ok((endpoint, None));
+        }
+        return Err(unconfigured(Some(id)));
     }
     // Every unnamed choice goes through routing, including the single-endpoint
     // one: that is where `model.allowed` is applied, and an endpoint whose only

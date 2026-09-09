@@ -21,21 +21,11 @@ use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
-pub const DEFAULT_BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
+pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
-
-/// Stands in when `:loadCodeAssist` returns no project of the account's own —
-/// which is the common case for a personal Antigravity sign-in.
-const FALLBACK_PROJECT: &str = "rising-fact-p41fc";
-
-/// Antigravity identifies itself as its Electron client. The backend gates the
-/// entitlement on this looking like the real IDE.
+/// Antigravity User-Agent matching official antigravity/hub client.
 const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
-     Antigravity/1.18.3 Chrome/138.0.7204.235 Electron/37.3.1 Safari/537.36";
-const API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
-const CLIENT_METADATA: &str =
-    r#"{"ideType":"ANTIGRAVITY","platform":"MACOS","pluginType":"GEMINI"}"#;
+    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
 
 pub struct GoogleCodeAssistProvider<T> {
     descriptor: ProviderDescriptor,
@@ -90,7 +80,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         )
     }
 
-    fn headers(&self, project: &str, streaming: bool) -> Vec<(String, String)> {
+    fn headers(&self, _project: &str, streaming: bool) -> Vec<(String, String)> {
         let mut headers = vec![
             (
                 "authorization".to_owned(),
@@ -98,14 +88,9 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
             ("user-agent".to_owned(), USER_AGENT.to_owned()),
-            ("x-goog-api-client".to_owned(), API_CLIENT.to_owned()),
-            ("client-metadata".to_owned(), CLIENT_METADATA.to_owned()),
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
-        }
-        if !project.is_empty() {
-            headers.push(("x-goog-user-project".to_owned(), project.to_owned()));
         }
         headers
     }
@@ -122,25 +107,90 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         if let Some(project) = cached.as_ref() {
             return project.clone();
         }
-        let discovered = self
-            .discover_project()
-            .unwrap_or_else(|| FALLBACK_PROJECT.to_owned());
+        let discovered = self.discover_project().unwrap_or_default();
         *cached = Some(discovered.clone());
         discovered
     }
 
     fn discover_project(&self) -> Option<String> {
-        let request = WireRequest {
+        let load_request = WireRequest {
             url: self.action_url("loadCodeAssist"),
             headers: self.headers("", false),
             body: json!({
                 "metadata": {
-                    "ideType": "IDE_UNSPECIFIED",
-                    "platform": "PLATFORM_UNSPECIFIED",
-                    "pluginType": "GEMINI",
+                    "ideType": "ANTIGRAVITY",
                 }
             })
             .to_string(),
+        };
+
+        if let Ok(response) = self.transport.send(load_request) {
+            if response.status == 200 {
+                let body: String = response.lines.filter_map(Result::ok).collect();
+                if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                    let project = value
+                        .get("cloudaicompanionProject")
+                        .and_then(|p| {
+                            p.as_str()
+                                .map(str::to_owned)
+                                .or_else(|| p.get("id").and_then(Value::as_str).map(str::to_owned))
+                        })
+                        .filter(|p| !p.is_empty());
+                    if let Some(proj) = project {
+                        return Some(proj);
+                    }
+                }
+            } else if response.status == 403 || response.status == 404 {
+                // Onboard free-tier if needed
+                let onboard = WireRequest {
+                    url: self.action_url("onboardUser"),
+                    headers: self.headers("", false),
+                    body: json!({
+                        "tierId": "free-tier",
+                        "metadata": {
+                            "ideType": "ANTIGRAVITY",
+                        }
+                    })
+                    .to_string(),
+                };
+                let _ = self.transport.send(onboard);
+
+                // Retry loadCodeAssist
+                let retry_req = WireRequest {
+                    url: self.action_url("loadCodeAssist"),
+                    headers: self.headers("", false),
+                    body: json!({
+                        "metadata": {
+                            "ideType": "ANTIGRAVITY",
+                        }
+                    })
+                    .to_string(),
+                };
+                if let Ok(retry) = self.transport.send(retry_req) {
+                    if retry.status == 200 {
+                        let body: String = retry.lines.filter_map(Result::ok).collect();
+                        if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                            let project = value.get("cloudaicompanionProject");
+                            return project
+                                .and_then(|p| {
+                                    p.as_str()
+                                        .map(str::to_owned)
+                                        .or_else(|| p.get("id").and_then(Value::as_str).map(str::to_owned))
+                                })
+                                .filter(|p| !p.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn fetch_available_models(&self) -> Option<Vec<String>> {
+        let request = WireRequest {
+            url: self.action_url("fetchAvailableModels"),
+            headers: self.headers("", false),
+            body: "{}".to_owned(),
         };
         let response = self.transport.send(request).ok()?;
         if response.status != 200 {
@@ -148,13 +198,10 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         }
         let body: String = response.lines.filter_map(Result::ok).collect();
         let value: Value = serde_json::from_str(&body).ok()?;
-        let project = value.get("cloudaicompanionProject")?;
-        // The field is a bare id on some responses and an object on others.
-        project
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| project.get("id").and_then(Value::as_str).map(str::to_owned))
-            .filter(|project| !project.is_empty())
+        let models_map = value.get("models")?.as_object()?;
+        let mut list: Vec<String> = models_map.keys().cloned().collect();
+        list.sort();
+        Some(list)
     }
 
     pub fn encode(&self, request: &CanonicalModelRequest, project: &str) -> WireRequest {
@@ -205,7 +252,10 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
         {
             inner.insert(
                 "systemInstruction".to_owned(),
-                json!({"parts": [{"text": system}]}),
+                json!({
+                    "role": "user",
+                    "parts": [{"text": system}]
+                }),
             );
         }
         inner.insert("generationConfig".to_owned(), Value::Object(generation));
@@ -220,25 +270,64 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                         .collect::<Vec<_>>(),
                 }]),
             );
+            inner.insert(
+                "toolConfig".to_owned(),
+                json!({
+                    "functionCallingConfig": {
+                        "mode": "VALIDATED"
+                    }
+                }),
+            );
         }
+        let wire_model = routed_wire_model(&request.model.model, request.effort);
+        let is_claude = wire_model.contains("claude");
+        let mut labels = Map::new();
+        labels.insert("used_claude".to_owned(), json!(if is_claude { "true" } else { "false" }));
+        labels.insert("used_claude_conservative".to_owned(), json!(if is_claude { "true" } else { "false" }));
+        inner.insert("labels".to_owned(), Value::Object(labels));
+        let hash = request.idempotency_key.as_str().bytes().fold(0i64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as i64));
+        inner.insert("sessionId".to_owned(), json!(hash.to_string()));
 
         let mut envelope = Map::new();
-        envelope.insert("model".to_owned(), json!(request.model.model));
+        envelope.insert("model".to_owned(), json!(wire_model));
         if !project.is_empty() {
             envelope.insert("project".to_owned(), json!(project));
         }
         envelope.insert("request".to_owned(), Value::Object(inner));
         envelope.insert("userAgent".to_owned(), json!("antigravity"));
-        envelope.insert(
-            "requestId".to_owned(),
-            json!(request.idempotency_key.as_str()),
-        );
+        envelope.insert("requestType".to_owned(), json!("agent"));
+        let step_id = format!("agent/arsy/{}/{}", crate::artifact::unix_time_ms(), request.idempotency_key.as_str());
+        envelope.insert("requestId".to_owned(), json!(step_id));
 
         WireRequest {
             url: format!("{}?alt=sse", self.action_url("streamGenerateContent")),
             headers: self.headers(project, true),
             body: Value::Object(envelope).to_string(),
         }
+    }
+}
+
+fn routed_wire_model(model: &str, effort: Option<crate::provider::Effort>) -> &str {
+    use crate::provider::Effort;
+    match (model, effort) {
+        ("gemini-3.8-flash", Some(Effort::Low)) => "gemini-3.8-flash-low",
+        ("gemini-3.8-flash", Some(Effort::Medium)) => "gemini-3.8-flash-medium",
+        ("gemini-3.8-flash", Some(Effort::High)) => "gemini-3.8-flash-high",
+
+        ("gemini-3.7-flash", Some(Effort::Low)) => "gemini-3.7-flash-low",
+        ("gemini-3.7-flash", Some(Effort::Medium)) => "gemini-3.7-flash-medium",
+        ("gemini-3.7-flash", Some(Effort::High)) => "gemini-3.7-flash-high",
+
+        ("gemini-3.1-pro", Some(Effort::Low)) => "gemini-3.1-pro-low",
+        ("gemini-3.1-pro", Some(Effort::High)) => "gemini-pro-agent",
+
+        ("claude-3-7-sonnet", Some(Effort::Medium | Effort::High)) => "claude-3-7-sonnet-thinking",
+        ("claude-sonnet-4-5", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-5-thinking",
+        ("claude-sonnet-4-6", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-6-thinking",
+        ("claude-opus-4-5", Some(Effort::Medium | Effort::High)) => "claude-opus-4-5-thinking",
+        ("claude-opus-4-6", Some(Effort::Medium | Effort::High)) => "claude-opus-4-6-thinking",
+
+        (other, _) => other,
     }
 }
 
@@ -265,6 +354,7 @@ fn encode_message(
                 arguments,
             } => parts.push(json!({
                 "functionCall": {"name": name, "args": arguments, "id": id},
+                "thoughtSignature": "skip_thought_signature_validator",
             })),
             ModelContent::ToolResult {
                 id,
@@ -663,12 +753,8 @@ mod tests {
             .as_u64()
             .unwrap();
         assert!(budget > 0 && budget < 1000);
-        assert!(wire
-            .headers
-            .iter()
-            .any(|(key, value)| key == "x-goog-user-project" && value == "proj-1"));
+        assert_eq!(body["project"], json!("proj-1"));
     }
-
     #[test]
     fn discovery_runs_once_then_streams() {
         let load = r#"{"cloudaicompanionProject":"discovered-proj"}"#;
@@ -785,7 +871,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(provider.project(), FALLBACK_PROJECT);
+        assert_eq!(provider.project(), "");
         assert!(events
             .iter()
             .any(|event| matches!(event, ModelEvent::TextDelta { text } if text == "ok")));
