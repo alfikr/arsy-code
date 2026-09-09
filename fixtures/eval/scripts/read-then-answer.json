@@ -1,0 +1,17 @@
+{
+  "replies": [
+    {
+      "text": ["Let me read the file."],
+      "tool_calls": [
+        { "id": "c1", "name": "fs.read", "arguments": { "path": "fixtures/eval/subject.txt" } }
+      ],
+      "input_tokens": 900,
+      "output_tokens": 40
+    },
+    {
+      "text": ["The subject file says: the answer is 42."],
+      "input_tokens": 1100,
+      "output_tokens": 30
+    }
+  ]
+}

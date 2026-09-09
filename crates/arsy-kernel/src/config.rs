@@ -104,6 +104,13 @@ pub enum Dialect {
     /// Google's Cloud Code Assist API, as Antigravity speaks it: a Gemini
     /// `generateContent` payload inside a Code Assist wrapper.
     GoogleCodeAssist,
+    /// A recorded conversation on disk, replayed one reply per request.
+    ///
+    /// Not a network dialect at all: `base_url` names a script file, no
+    /// credential is needed, and nothing leaves the machine. It exists so a
+    /// measurement can hold the model still while the harness changes, and so
+    /// a failing session can be reproduced without one.
+    Replay,
 }
 
 impl Dialect {
@@ -113,6 +120,7 @@ impl Dialect {
             Self::Openai => "openai",
             Self::OpenaiResponses => "openai_responses",
             Self::GoogleCodeAssist => "google_code_assist",
+            Self::Replay => "replay",
         }
     }
 
@@ -123,6 +131,10 @@ impl Dialect {
             Self::Openai => "https://api.openai.com/v1",
             Self::OpenaiResponses => "https://chatgpt.com/backend-api/codex",
             Self::GoogleCodeAssist => "https://cloudcode-pa.googleapis.com",
+            // No default: a replay without a script names nothing to replay,
+            // and an endpoint that has to be told where its script is should
+            // fail rather than silently read a path nobody chose.
+            Self::Replay => "",
         }
     }
 
@@ -132,7 +144,15 @@ impl Dialect {
             Self::Anthropic => "ANTHROPIC_API_KEY",
             Self::Openai | Self::OpenaiResponses => "OPENAI_API_KEY",
             Self::GoogleCodeAssist => "GEMINI_API_KEY",
+            // A replay reads a file. Naming a variable here would invite an
+            // operator to set one and wonder why it is ignored.
+            Self::Replay => "",
         }
+    }
+
+    /// Whether reaching this dialect needs a credential at all.
+    pub const fn needs_credential(self) -> bool {
+        !matches!(self, Self::Replay)
     }
 
     fn parse(raw: &str) -> Option<Self> {
@@ -141,6 +161,7 @@ impl Dialect {
             "openai" => Some(Self::Openai),
             "openai_responses" => Some(Self::OpenaiResponses),
             "google_code_assist" => Some(Self::GoogleCodeAssist),
+            "replay" => Some(Self::Replay),
             _ => None,
         }
     }
@@ -1456,10 +1477,17 @@ impl Config {
         }
 
         if let Some(base_url) = string(table, "base_url", &format!("{prefix}.base_url"), path)? {
-            validate_base_url(base_url).map_err(|message| {
-                reject(format!("`{prefix}.base_url` {message}: \"{base_url}\""))
-            })?;
-            endpoint.base_url = base_url.trim_end_matches('/').to_owned();
+            // A replay's `base_url` is a script on disk, not a host: it is the
+            // one dialect that reaches no network, so the URL check does not
+            // apply to it and a trailing slash is part of no path here.
+            if kind == Dialect::Replay {
+                endpoint.base_url = base_url.clone();
+            } else {
+                validate_base_url(base_url).map_err(|message| {
+                    reject(format!("`{prefix}.base_url` {message}: \"{base_url}\""))
+                })?;
+                endpoint.base_url = base_url.trim_end_matches('/').to_owned();
+            }
             self.record(
                 layer,
                 path,

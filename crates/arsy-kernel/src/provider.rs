@@ -14,6 +14,7 @@ pub mod google_code_assist;
 pub mod http;
 pub mod openai;
 pub mod openai_responses;
+pub mod replay;
 pub mod wire;
 
 use crate::protocol::IdempotencyKey;

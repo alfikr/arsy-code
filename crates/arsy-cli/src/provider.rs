@@ -7,6 +7,7 @@
 //! it by the time a request is built.
 
 use crate::{Diagnostic, ARSY_PRV_1000};
+use arsy_kernel::provider::replay::ReplayProvider;
 use arsy_kernel::{
     config::{Config, Dialect, Endpoint},
     oauth::{self, TokenSet},
@@ -27,6 +28,8 @@ use std::sync::Arc;
 /// tell a keyring entry from an inherited environment variable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CredentialSource {
+    /// The endpoint needs none: a replay reads a file.
+    None,
     ConfiguredEnv,
     Keyring,
     File,
@@ -37,6 +40,7 @@ pub enum CredentialSource {
 impl CredentialSource {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::ConfiguredEnv => "configured_env",
             Self::Keyring => "keyring",
             Self::File => "file",
@@ -185,6 +189,26 @@ fn unconfigured(named: Option<&str>) -> Diagnostic {
 
 /// Assemble the adapter for a chosen endpoint: credential, redaction, dialect.
 fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolved, Diagnostic> {
+    // A replay reads a file. Asking for a credential first would make every
+    // measurement and every reproduction need one to reach a script that no
+    // credential protects.
+    if endpoint.kind == Dialect::Replay {
+        let provider: Arc<dyn ModelProvider> = Arc::new(
+            ReplayProvider::from_base_url(&endpoint.base_url, &endpoint.id).map_err(|error| {
+                Diagnostic::error(
+                    ARSY_PRV_1000,
+                    error.to_string(),
+                    "point `base_url` at a replay script: a JSON file with a `replies` array",
+                )
+            })?,
+        );
+        return Ok(Resolved {
+            provider,
+            endpoint,
+            source: CredentialSource::None,
+            route,
+        });
+    }
     let (secret, source) = credential(&endpoint, &from_env)?;
     let mut redactor = Redactor::new();
     // Registering here, rather than at the wire, means a key echoed back into
@@ -216,6 +240,8 @@ fn build(endpoint: Endpoint, route: Option<routing::Decision>) -> Result<Resolve
                 .with_id(&endpoint.id)
                 .with_redactor(redactor),
         ),
+        // Answered above, before a credential was asked for.
+        Dialect::Replay => unreachable!("a replay endpoint returns before this point"),
     };
     Ok(Resolved {
         provider,
