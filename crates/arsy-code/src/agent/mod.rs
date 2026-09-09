@@ -650,6 +650,11 @@ impl ToolRuntime {
         &self.workspace
     }
 
+    /// Install a bounded live-output sink for long-running executors.
+    pub fn set_output_sink(&self, sink: Option<arsy_kernel::operation::OutputSink>) {
+        self.registry.set_output_sink(sink);
+    }
+
     /// The tools this build can actually dispatch.
     ///
     /// Filtered by the registry rather than listed statically: offering a tool

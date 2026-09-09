@@ -3,25 +3,47 @@ use arsy_kernel::policy::SandboxAssurance;
 use arsy_kernel::{
     artifact::{ArtifactStore, NewArtifact, Sensitivity},
     capability::{CapabilityAction, CapabilityGrant},
-    domain::Principal,
+    domain::{OperationId, Principal},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
+        OutputSink,
     },
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Read},
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+
+static CANCELLED: LazyLock<Mutex<HashSet<OperationId>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cancellation_set() -> &'static Mutex<HashSet<OperationId>> {
+    &CANCELLED
+}
+
+/// Request cancellation of the currently running process operation.
+pub fn cancel(operation: OperationId) {
+    if let Ok(mut cancelled) = cancellation_set().lock() {
+        cancelled.insert(operation);
+    }
+}
+
+fn take_cancelled(operation: OperationId) -> bool {
+    cancellation_set()
+        .lock()
+        .map(|mut cancelled| cancelled.remove(&operation))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Deserialize)]
 struct ProcessInput {
@@ -61,6 +83,7 @@ pub struct ProcessExecutor {
     /// happened to launch ARSY, so `ls` answers a different question than the
     /// workspace the same turn is reading and editing.
     working_directory: Option<PathBuf>,
+    output_sink: Mutex<Option<OutputSink>>,
 }
 
 impl ProcessExecutor {
@@ -99,6 +122,7 @@ impl ProcessExecutor {
             retain_until_ms,
             sandbox: None,
             working_directory: None,
+            output_sink: Mutex::new(None),
         }
     }
 
@@ -115,6 +139,7 @@ impl ProcessExecutor {
 
     fn run(
         &self,
+        operation: OperationId,
         input: ProcessInput,
         actor: &Principal,
     ) -> Result<OperationOutcome, OperationError> {
@@ -158,18 +183,22 @@ impl ProcessExecutor {
             command.process_group(0);
         }
         let mut child = command.spawn().map_err(execution)?;
+        let output_sink = self.output_sink.lock().ok().and_then(|sink| sink.clone());
         let stdout = drain(
             child.stdout.take().expect("piped stdout is present"),
             input.max_output_bytes,
+            output_sink.clone(),
         );
         let stderr = drain(
             child.stderr.take().expect("piped stderr is present"),
             input.max_output_bytes,
+            output_sink,
         );
         let (status, timed_out, graceful, forced, cleanup) = wait_bounded(
             &mut child,
             Duration::from_millis(input.timeout_ms),
             self.grace,
+            operation,
         )?;
         let stdout = stdout
             .join()
@@ -257,7 +286,13 @@ impl OperationExecutor for ProcessExecutor {
         }
         let input = serde_json::from_value(request.input.clone())
             .map_err(|error| OperationError::Schema(error.to_string()))?;
-        self.run(input, &request.actor)
+        self.run(request.id, input, &request.actor)
+    }
+
+    fn set_output_sink(&self, sink: Option<OutputSink>) {
+        if let Ok(mut current) = self.output_sink.lock() {
+            *current = sink;
+        }
     }
 }
 
@@ -269,6 +304,7 @@ struct BoundedOutput {
 fn drain(
     mut reader: impl Read + Send + 'static,
     limit: u64,
+    sink: Option<OutputSink>,
 ) -> thread::JoinHandle<io::Result<BoundedOutput>> {
     thread::spawn(move || {
         let capacity = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -279,6 +315,10 @@ fn drain(
             let count = reader.read(&mut chunk)?;
             if count == 0 {
                 break;
+            }
+            let incoming = String::from_utf8_lossy(&chunk[..count]).into_owned();
+            if let Some(sink) = &sink {
+                sink(incoming);
             }
             let remaining = capacity.saturating_sub(bytes.len());
             bytes.extend_from_slice(&chunk[..count.min(remaining)]);
@@ -292,9 +332,23 @@ fn wait_bounded(
     child: &mut Child,
     timeout: Duration,
     grace: Duration,
+    operation: OperationId,
 ) -> Result<(ExitStatus, bool, bool, bool, Cleanup), OperationError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
+        if take_cancelled(operation) {
+            let graceful = terminate(child);
+            let grace_deadline = Instant::now() + grace;
+            while Instant::now() < grace_deadline {
+                if let Some(status) = child.try_wait().map_err(execution)? {
+                    return Ok((status, false, graceful, false, Cleanup::Terminated));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            force_kill(child)?;
+            let status = child.wait().map_err(execution)?;
+            return Ok((status, false, graceful, true, Cleanup::Killed));
+        }
         if let Some(status) = child.try_wait().map_err(execution)? {
             return Ok((status, false, false, false, Cleanup::Reaped));
         }
@@ -388,6 +442,7 @@ mod tests {
             ProcessExecutor::new(store.clone(), Vec::new(), Duration::from_millis(20), 0);
         let outcome = executor
             .run(
+                OperationId::new(),
                 ProcessInput {
                     argv,
                     timeout_ms,

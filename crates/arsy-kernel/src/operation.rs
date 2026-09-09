@@ -196,10 +196,9 @@ pub struct OperationOutcome {
     pub evidence: Vec<ResourceRef>,
     pub state: Option<StateVersion>,
 }
+/// Optional bounded live output sink for long-running executors.
+pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
 
-/// ponytail: synchronous. `process.exec` is what will demand an async
-/// signature, and that slice introduces the runtime; the first operations
-/// (`fs.read`, `search`) have no reason to carry one.
 pub trait OperationExecutor: Send + Sync {
     fn contract(&self) -> &OperationContract;
 
@@ -208,6 +207,8 @@ pub trait OperationExecutor: Send + Sync {
         request: &OperationRequest,
         grants: &[CapabilityGrant],
     ) -> Result<OperationOutcome, OperationError>;
+
+    fn set_output_sink(&self, _sink: Option<OutputSink>) {}
 }
 
 #[derive(Default)]
@@ -232,6 +233,12 @@ impl OperationRegistry {
         }
         self.executors.insert(kind, executor);
         Ok(())
+    }
+
+    pub fn set_output_sink(&self, sink: Option<OutputSink>) {
+        for executor in self.executors.values() {
+            executor.set_output_sink(sink.clone());
+        }
     }
 
     pub fn contract(&self, kind: &OperationKind) -> Option<&OperationContract> {

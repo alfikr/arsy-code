@@ -4,8 +4,9 @@
 
 **ARSY** is the core platform; this repository contains **ARSY CODE**, its terminal interface.
 
-> [!IMPORTANT]
-> ARSY CODE is still in the product and architecture design stage. The CLI is not yet available.
+> [!NOTE]
+> ARSY CODE is under active development. The Rust CLI and core execution paths are available,
+> while some commands and integrations remain roadmap-gated.
 
 ## Why ARSY CODE?
 
@@ -33,21 +34,95 @@ ARSY CODE · workspace: ~/code/payments · model: auto
 ```
 
 ```console
-arsy                          # interactive TUI
-arsy run "fix bug #42"        # non-interactive execution
-arsy session list             # find a session to resume
-arsy resume <session-id>      # resume a session
-arsy review                   # review local changes
-arsy auth set anthropic       # store a provider credential as a handle
-arsy config explain policy    # show effective config and where it came from
-arsy policy explain fs.write  # ask whether an operation would be allowed
-arsy mcp add docs --transport stdio --command ...   # manage MCP connections
-arsy doctor                   # diagnose the environment
+arsy                                      # interactive TUI (when enabled)
+arsy run "fix bug #42"                    # non-interactive execution
+arsy resume <session-id>                   # resume a session
+arsy session list                          # find a session to resume
+arsy session show <session-id> --turns     # inspect recorded turns
+arsy review                                # review local changes
+arsy auth set anthropic                    # store a provider credential as a handle
+arsy provider list                         # list allowed providers
+arsy model list                            # list allowed models
+arsy config explain policy                 # show effective config and its source
+arsy policy explain fs.write               # ask whether an operation would be allowed
+arsy code symbol Workspace                 # find a declaration
+arsy mcp add docs --transport stdio --command ...  # define an MCP connection
+arsy serve --protocol mcp                   # expose operations over stdio
+arsy doctor                                # diagnose the environment
 ```
 
 The full surface — session, configuration, policy, credentials, connections, extensions, evidence,
-and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-tui.md). ARSY has no
-update command; updates come from the installation channel.
+and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-tui.md). Run
+`arsy --help` for the command surface available in the current build.
+
+### Complete command reference
+
+```console
+arsy
+arsy run <TASK> [--workspace <PATH>] [--output human|json|ci]
+arsy resume <SESSION_ID> [--follow]
+arsy review [REVISION] [--base <REVISION>] [--strict]
+arsy doctor [--strict]
+arsy update [--check]
+
+arsy session list [--workspace-only] [--limit <N>]
+arsy session show <SESSION_ID> [--turns] [--evidence]
+arsy session export <SESSION_ID> [--out <PATH>] [--include-artifacts]
+arsy session rewind <SESSION_ID> --to <EVENT_ID>
+arsy session fork <SESSION_ID> [--at <EVENT_ID>]
+
+arsy config explain [KEY] [--source-only]
+arsy compat explain <claude|codex|omp> [--loss-only]
+arsy policy explain <OPERATION> [--resource <REF>] [--actor <ID>]
+arsy code symbol <NAME> [--tier auto|text] [--limit <N>]
+arsy code explain <SYMBOL_ID>
+arsy code references <SYMBOL_ID>
+arsy code diagnostics <PATH>
+
+arsy auth set <PROVIDER> [--handle <NAME>]
+arsy auth login <PROVIDER>
+arsy auth list
+arsy auth remove <HANDLE> [--force]
+arsy provider list [--all]
+arsy model list [--provider <ID>] [--capability <NAME>]
+
+arsy mcp list [--source <KIND>]
+arsy mcp show <NAME> [--source <KIND>]
+arsy mcp add <NAME> --command <CMD> [-- ARGS...]
+arsy mcp add <NAME> --transport http --url <URL>
+arsy mcp remove <NAME> [--scope user|workspace]
+arsy mcp enable <NAME> [--scope user|workspace]
+arsy mcp disable <NAME> [--scope user|workspace]
+arsy mcp test <NAME> [--timeout <SECONDS>]
+arsy mcp reconnect <NAME> [--all] [--timeout <SECONDS>]
+arsy mcp refresh <NAME> [--all]
+
+arsy skill list [--source <ECOSYSTEM>]
+arsy hook list [--event <NAME>]
+arsy plugin list [--capabilities]
+arsy plugin install <SOURCE> [--scope user|workspace] [--force]
+arsy plugin inspect <ID>
+arsy plugin remove <ID> [--force]
+arsy plugin run <ID> [--to <INPUT>]
+arsy plugin refresh [ID] [--dry-run]
+
+arsy artifact show <REF> [--max-bytes <N>]
+arsy artifact export <REF> --out <PATH>
+arsy memory list [--scope <SCOPE>] [--all]
+arsy memory remember <CLAIM> [--scope <SCOPE>]
+arsy memory forget <ID> [--to <REASON>]
+arsy gc [--apply] [--retention <DURATION>]
+arsy migrate [--apply] [--backup <PATH>]
+arsy eval <SUITE> [--trials <N>] [--strict] [--out <PATH>]
+arsy serve [--protocol mcp|acp] [--transport stdio]
+arsy completions <bash|zsh|fish|powershell>
+```
+
+Global options can be used with commands that support them:
+`--workspace <PATH>`, `--config <PATH>`, `--provider <ID>`, `--model <ID>`,
+`--output human|json|ci`, `--no-color`, `--help`, and `--version`.
+Run `arsy --help` for the exact syntax and availability of the current build. Commands that are
+roadmap-gated report a diagnostic instead of silently behaving differently.
 
 ## Architecture at a glance
 
@@ -106,7 +181,7 @@ See the [threat model](docs/29-threat-model.md).
 | Area | Status |
 |---|---|
 | Product and architecture specification | Complete |
-| CLI implementation | Not started |
+| CLI implementation | Active development |
 | Stable API | Not available |
 
 ## License
