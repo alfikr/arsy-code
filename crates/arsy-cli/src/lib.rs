@@ -3870,11 +3870,84 @@ fn execute_call(
             }
         }
     };
-    let mut result = runtime.dispatch(name, &request, &grants, started);
+    let mut result = dispatch_tool_live(
+        terminal,
+        colour,
+        runtime,
+        name,
+        &request,
+        &grants,
+        started,
+        summary,
+    )?;
     if let Some(note) = approval_note {
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
     Ok(Executed::Answered(result))
+}
+
+#[cfg(feature = "tui")]
+fn dispatch_tool_live(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    request: &arsy_kernel::operation::OperationRequest,
+    grants: &[arsy_kernel::capability::CapabilityGrant],
+    started: std::time::Instant,
+    summary: &str,
+) -> io::Result<arsy_code::agent::ToolResult> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let runtime = runtime.clone();
+    let name = name.to_owned();
+    let worker_name = name.clone();
+    let request = request.clone();
+    let grants = grants.to_vec();
+    std::thread::spawn(move || {
+        let result = runtime.dispatch(&worker_name, &request, &grants, started);
+        let _ = sender.send(result);
+    });
+
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let mut frame = 0usize;
+    let mut elapsed = std::time::Instant::now();
+    let mut rendered = false;
+    writeln!(
+        terminal,
+        "{}",
+        tui::tool_running_row(colour, name.as_str(), summary)
+    )?;
+    terminal.flush()?;
+    loop {
+        match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
+            Ok(result) => {
+                if rendered {
+                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                }
+                return Ok(result);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let status = tui::tool_running_frame(
+                    colour,
+                    FRAMES[frame % FRAMES.len()],
+                    name.as_str(),
+                    summary,
+                    elapsed.elapsed().as_millis(),
+                );
+                if rendered {
+                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                }
+                write!(terminal, "{status}\n")?;
+                terminal.flush()?;
+                rendered = true;
+                frame = frame.wrapping_add(1);
+                elapsed = std::time::Instant::now();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("tool worker disconnected"));
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tui")]

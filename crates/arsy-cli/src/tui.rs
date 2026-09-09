@@ -2116,6 +2116,23 @@ pub fn tool_running_row(colour: bool, name: &str, summary: &str) -> String {
     )
 }
 
+/// Render one animated tool execution frame for a long-running call.
+pub fn tool_running_frame(
+    colour: bool,
+    frame: &str,
+    name: &str,
+    summary: &str,
+    elapsed_ms: u128,
+) -> String {
+    format!(
+        "  {} {} {} · {}ms",
+        paint(colour, sgr_run(), frame),
+        paint(colour, sgr_accent(), name),
+        paint(colour, sgr_dim(), summary),
+        elapsed_ms
+    )
+}
+
 /// What a tool call did, once it ran or was declined.
 pub fn tool_result_row(colour: bool, name: &str, ok: bool, detail: &str) -> String {
     exec_row(
