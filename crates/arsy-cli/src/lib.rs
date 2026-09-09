@@ -3710,9 +3710,6 @@ fn native_turn(
                     auto_approve,
                 )? {
                     Executed::Answered(result) => (result.output, !result.success),
-                    Executed::Declined => {
-                        ("The operator declined to run this call.".to_owned(), true)
-                    }
                     Executed::Stopped => {
                         outcome.interrupted = true;
                         writeln!(terminal, "{}", tui::interrupted_row(colour))?;
@@ -3779,7 +3776,6 @@ fn native_turn(
 #[cfg(feature = "tui")]
 enum Executed {
     Answered(arsy_code::agent::ToolResult),
-    Declined,
     Stopped,
 }
 
