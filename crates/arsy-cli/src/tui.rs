@@ -607,7 +607,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation context in place"),
     ("/resume", "resume a recorded session; [SESSION_ID]"),
     ("/rename", "rename current session; <TITLE>"),
-    ("/session", "manage sessions; list | rename <TITLE> | delete [ID]"),
+    (
+        "/session",
+        "manage sessions; list | rename <TITLE> | delete [ID]",
+    ),
     ("/approval", "set approval mode; auto | prompt"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
@@ -2141,19 +2144,35 @@ pub fn tool_running_frame_with_output(
     summary: &str,
     elapsed_ms: u128,
     output: &str,
+    expanded: bool,
 ) -> String {
-    let tail = output.lines().last().unwrap_or_default();
-    let detail = if tail.is_empty() {
-        summary.to_owned()
+    let detail = if expanded {
+        let lines: Vec<&str> = output.lines().rev().take(8).collect();
+        let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
+        if tail.is_empty() {
+            format!("{summary} │ expanded")
+        } else {
+            format!("{summary} │ {tail}")
+        }
     } else {
-        format!("{summary} · {tail}")
+        let tail = output.lines().last().unwrap_or_default();
+        if tail.is_empty() {
+            summary.to_owned()
+        } else {
+            format!("{summary} │ {tail}")
+        }
     };
     format!(
-        "  {} {} {} · {}ms · Esc cancel",
+        "  {} {} {} · {}ms · {}",
         paint(colour, sgr_run(), frame),
         paint(colour, sgr_accent(), name),
-        paint(colour, sgr_dim(), &fit(&detail, terminal_width().saturating_sub(24))),
-        elapsed_ms
+        paint(
+            colour,
+            sgr_dim(),
+            &fit(&detail, terminal_width().saturating_sub(24))
+        ),
+        elapsed_ms,
+        if expanded { "e collapse" } else { "e expand" }
     )
 }
 
@@ -2315,8 +2334,14 @@ pub fn bash_box(
 
     let (status_text, status_sgr) = match exit_code {
         Some(0) => (format!(" ✓ done ({}ms) ", duration.as_millis()), sgr_ok()),
-        Some(code) => (format!(" ✗ exit {code} ({}ms) ", duration.as_millis()), sgr_err()),
-        None => (format!(" ⚙ running ({}ms) ", duration.as_millis()), sgr_run()),
+        Some(code) => (
+            format!(" ✗ exit {code} ({}ms) ", duration.as_millis()),
+            sgr_err(),
+        ),
+        None => (
+            format!(" ⚙ running ({}ms) ", duration.as_millis()),
+            sgr_run(),
+        ),
     };
     let bot_len = visible_len(&status_text);
     let bot_left = "─".repeat(2);
@@ -2379,9 +2404,15 @@ pub fn tool_box(
     }
 
     let (status_text, status_sgr) = if success {
-        (format!(" ✓ completed ({}ms) ", duration.as_millis()), sgr_ok())
+        (
+            format!(" ✓ completed ({}ms) ", duration.as_millis()),
+            sgr_ok(),
+        )
     } else {
-        (format!(" ✗ failed ({}ms) ", duration.as_millis()), sgr_err())
+        (
+            format!(" ✗ failed ({}ms) ", duration.as_millis()),
+            sgr_err(),
+        )
     };
     let bot_len = visible_len(&status_text);
     let bot_left = "─".repeat(2);
@@ -2394,6 +2425,79 @@ pub fn tool_box(
         paint(colour, sgr_border(), &format!("{bot_right}╯")),
     ));
     lines.join("\n")
+}
+
+/// Tool categories used to keep verbose cards visually consistent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCardKind {
+    Bash,
+    File,
+    Network,
+    Mcp,
+    Search,
+    Generic,
+}
+
+pub fn tool_card_kind(name: &str) -> ToolCardKind {
+    if matches!(name, "bash" | "shell.execute") {
+        ToolCardKind::Bash
+    } else if matches!(
+        name,
+        "fs.read"
+            | "fs.list"
+            | "fs.write"
+            | "fs.edit"
+            | "fs.delete"
+            | "fs.move"
+            | "edit"
+            | "apply_patch"
+    ) {
+        ToolCardKind::File
+    } else if name.starts_with("search.") {
+        ToolCardKind::Search
+    } else if name.starts_with("mcp.") || name == "mcp" {
+        ToolCardKind::Mcp
+    } else if name == "network.connect" || name == "curl" || name == "http" {
+        ToolCardKind::Network
+    } else {
+        ToolCardKind::Generic
+    }
+}
+
+fn tool_card_icon(kind: ToolCardKind) -> &'static str {
+    match kind {
+        ToolCardKind::Bash => "$",
+        ToolCardKind::File => "✎",
+        ToolCardKind::Network => "⇄",
+        ToolCardKind::Mcp => "⌘",
+        ToolCardKind::Search => "⌕",
+        ToolCardKind::Generic => "⚙",
+    }
+}
+
+/// Render one completed verbose card with a typed header and bounded body.
+pub fn tool_card(
+    width: usize,
+    colour: bool,
+    name: &str,
+    summary: &str,
+    output: &str,
+    success: bool,
+    duration: std::time::Duration,
+) -> String {
+    let kind = tool_card_kind(name);
+    let label = format!("{} {name}", tool_card_icon(kind));
+    match kind {
+        ToolCardKind::Bash => bash_box(
+            width,
+            colour,
+            summary,
+            output,
+            Some(i32::from(!success)),
+            duration,
+        ),
+        _ => tool_box(width, colour, &label, summary, output, success, duration),
+    }
 }
 
 /// A diff row showing modified file paths and change stats.
@@ -2455,7 +2559,9 @@ impl AskDialogState {
                 },
                 AskOption {
                     label: "Always approve for this session (auto)".to_owned(),
-                    description: Some("Auto-approve this and all subsequent calls in this session".to_owned()),
+                    description: Some(
+                        "Auto-approve this and all subsequent calls in this session".to_owned(),
+                    ),
                 },
                 AskOption {
                     label: "Deny this call (no)".to_owned(),
@@ -2495,7 +2601,12 @@ impl AskDialogState {
 
         if let Some(diff) = &self.diff_preview {
             lines.push(Self::box_line("", inner, colour, ""));
-            lines.push(Self::box_line("Proposed Changes:", inner, colour, sgr_accent()));
+            lines.push(Self::box_line(
+                "Proposed Changes:",
+                inner,
+                colour,
+                sgr_accent(),
+            ));
             for line in diff.lines().take(15) {
                 lines.push(Self::render_diff_line(line, inner, colour));
             }
@@ -2527,7 +2638,12 @@ impl AskDialogState {
             } else {
                 format!("Note: {}", self.custom_note)
             };
-            lines.push(Self::box_line(&note_display, inner, colour, sgr_assistant()));
+            lines.push(Self::box_line(
+                &note_display,
+                inner,
+                colour,
+                sgr_assistant(),
+            ));
         }
 
         lines.push(Self::box_line("", inner, colour, ""));
@@ -2542,7 +2658,6 @@ impl AskDialogState {
         lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
         lines.join("\n")
     }
-
 
     fn render_diff_line(line: &str, inner: usize, colour: bool) -> String {
         let fitted = fit(line, inner);
@@ -2645,21 +2760,15 @@ impl AskDialogState {
                 self.editing_note = true;
                 None
             }
-            Key::Char('1' | 'y' | 'Y') => {
-                Some(AskDialogResult::Approve {
-                    note: self.current_note(),
-                })
-            }
-            Key::Char('2' | 'a' | 'A') => {
-                Some(AskDialogResult::AlwaysApprove {
-                    note: self.current_note(),
-                })
-            }
-            Key::Char('3' | 'd' | 'D') => {
-                Some(AskDialogResult::Deny {
-                    note: self.current_note(),
-                })
-            }
+            Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve {
+                note: self.current_note(),
+            }),
+            Key::Char('2' | 'a' | 'A') => Some(AskDialogResult::AlwaysApprove {
+                note: self.current_note(),
+            }),
+            Key::Char('3' | 'd' | 'D') => Some(AskDialogResult::Deny {
+                note: self.current_note(),
+            }),
             Key::Enter | Key::Newline | Key::Char(' ') => match self.selected {
                 0 => Some(AskDialogResult::Approve {
                     note: self.current_note(),
@@ -2793,7 +2902,12 @@ impl SessionDialogState {
                 )];
 
                 if self.sessions.is_empty() {
-                    lines.push(Self::box_line("  no recorded sessions found", inner, colour, sgr_dim()));
+                    lines.push(Self::box_line(
+                        "  no recorded sessions found",
+                        inner,
+                        colour,
+                        sgr_dim(),
+                    ));
                 } else {
                     for (idx, s) in self.sessions.iter().enumerate() {
                         let is_sel = idx == self.selected;
@@ -2804,7 +2918,8 @@ impl SessionDialogState {
                             Some(t) => format!(" · \"{t}\""),
                             None => String::new(),
                         };
-                        let row_label = format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
+                        let row_label =
+                            format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
                         let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
                         lines.push(Self::box_line(&row_label, inner, colour, sgr));
                         let detail = format!("     {} events · {}", s.events, s.last_seen);
@@ -4240,7 +4355,11 @@ mod tests {
             4 + COMMANDS.len(),
             "pad, input, pad, one row per command, status"
         );
-        assert!(rows[3].contains(&format!("› {}", COMMANDS[0].0)), "{:?}", rows[3]);
+        assert!(
+            rows[3].contains(&format!("› {}", COMMANDS[0].0)),
+            "{:?}",
+            rows[3]
+        );
         assert!(rows[4].starts_with("    "), "only one row is marked");
         assert!(
             rows.last().unwrap().contains("status"),
@@ -4265,7 +4384,10 @@ mod tests {
             7
         );
         composer.set_height(4);
-        assert!(composer.menu_window().0.is_empty(), "no room leaves no menu");
+        assert!(
+            composer.menu_window().0.is_empty(),
+            "no room leaves no menu"
+        );
         let frame = composer.render(80, false, "  status");
         assert_eq!(frame.split('\n').count(), 4);
         assert!(frame.ends_with("\x1b[2A\r\x1b[3C"), "{frame:?}");
@@ -4490,7 +4612,12 @@ mod tests {
 
     #[test]
     fn ask_dialog_interactive_navigation_and_selection() {
-        let mut dialog = AskDialogState::for_approval("bash", "rm -rf target", "file deletion", Some("$ rm -rf target".to_owned()));
+        let mut dialog = AskDialogState::for_approval(
+            "bash",
+            "rm -rf target",
+            "file deletion",
+            Some("$ rm -rf target".to_owned()),
+        );
         assert_eq!(dialog.selected, 0);
         assert_eq!(dialog.options.len(), 3);
 
@@ -4507,13 +4634,22 @@ mod tests {
         assert_eq!(dialog.selected, 1);
 
         // Number 1 key immediately approves once
-        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve { note: None }));
+        assert_eq!(
+            dialog.handle_key(Key::Char('1')),
+            Some(AskDialogResult::Approve { note: None })
+        );
 
         // Number 2 key always approves for session
-        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::AlwaysApprove { note: None }));
+        assert_eq!(
+            dialog.handle_key(Key::Char('2')),
+            Some(AskDialogResult::AlwaysApprove { note: None })
+        );
 
         // Number 3 key denies
-        assert_eq!(dialog.handle_key(Key::Char('3')), Some(AskDialogResult::Deny { note: None }));
+        assert_eq!(
+            dialog.handle_key(Key::Char('3')),
+            Some(AskDialogResult::Deny { note: None })
+        );
 
         // 'n' opens custom note editing
         assert_eq!(dialog.handle_key(Key::Char('n')), None);
@@ -4523,18 +4659,37 @@ mod tests {
         assert_eq!(dialog.custom_note, "ab");
         assert_eq!(dialog.handle_key(Key::Enter), None);
         assert!(!dialog.editing_note);
-        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve { note: Some("ab".to_owned()) }));
+        assert_eq!(
+            dialog.handle_key(Key::Char('1')),
+            Some(AskDialogResult::Approve {
+                note: Some("ab".to_owned())
+            })
+        );
     }
- 
 
     #[test]
     fn execution_boxes_render_cleanly() {
-        let bash = bash_box(80, false, "cargo build", "Finished dev profile", Some(0), Duration::from_millis(150));
+        let bash = bash_box(
+            80,
+            false,
+            "cargo build",
+            "Finished dev profile",
+            Some(0),
+            Duration::from_millis(150),
+        );
         assert!(bash.contains("$ cargo build"));
         assert!(bash.contains("Finished dev profile"));
         assert!(bash.contains("✓ done (150ms)"));
 
-        let tool = tool_box(80, false, "fs.write", "src/main.rs", "wrote 10 lines", true, Duration::from_millis(20));
+        let tool = tool_box(
+            80,
+            false,
+            "fs.write",
+            "src/main.rs",
+            "wrote 10 lines",
+            true,
+            Duration::from_millis(20),
+        );
         assert!(tool.contains("fs.write src/main.rs"));
         assert!(tool.contains("✓ completed (20ms)"));
 
@@ -4542,6 +4697,32 @@ mod tests {
         assert!(diff.contains("src/lib.rs"));
         assert!(diff.contains("+12"));
         assert!(diff.contains("-3"));
+        assert_eq!(tool_card_kind("bash"), ToolCardKind::Bash);
+        assert_eq!(tool_card_kind("fs.edit"), ToolCardKind::File);
+        assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
+        assert_eq!(tool_card_kind("mcp.search"), ToolCardKind::Mcp);
+        assert_eq!(tool_card_kind("search.text"), ToolCardKind::Search);
+        let running = tool_running_frame_with_output(
+            false,
+            "⠋",
+            "bash",
+            "cargo test",
+            420,
+            "line one\nline two",
+            false,
+        );
+        assert!(running.contains("line two"));
+        assert!(running.contains("e expand"));
+        let expanded = tool_running_frame_with_output(
+            false,
+            "⠙",
+            "bash",
+            "cargo test",
+            840,
+            "line one\nline two",
+            true,
+        );
+        assert!(expanded.contains("line one"));
     }
 
     #[test]
@@ -4572,6 +4753,9 @@ mod tests {
         assert_eq!(resolve_session_answer("2", &choices, s1).unwrap(), s2);
 
         // Direct UUID resolution
-        assert_eq!(resolve_session_answer(&s2.to_string(), &choices, s1).unwrap(), s2);
+        assert_eq!(
+            resolve_session_answer(&s2.to_string(), &choices, s1).unwrap(),
+            s2
+        );
     }
 }

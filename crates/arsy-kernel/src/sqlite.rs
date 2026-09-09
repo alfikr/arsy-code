@@ -235,7 +235,10 @@ impl SqliteEventStore {
             params![stream_id],
         );
         let events = connection
-            .execute("DELETE FROM events WHERE stream_id = ?1", params![stream_id])
+            .execute(
+                "DELETE FROM events WHERE stream_id = ?1",
+                params![stream_id],
+            )
             .map_err(storage)?;
         let sess = connection
             .execute(
