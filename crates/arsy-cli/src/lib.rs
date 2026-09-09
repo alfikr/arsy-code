@@ -3580,14 +3580,12 @@ const MAX_TOOL_ROUNDS: usize = 24;
 
 /// What the operator said about one tool call.
 #[cfg(feature = "tui")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
-    Yes,
+    Yes { note: Option<String> },
     /// Refuse this call; the turn carries on and can propose something else.
-    No,
-    /// Refuse this call and end the turn. Declining one call at a time is no
-    /// way out of a model that keeps asking, so Ctrl-C stops the turn here as
-    /// it does while the provider is streaming.
+    No { note: Option<String> },
+    /// Refuse this call and end the turn.
     Stop,
 }
 
@@ -3814,11 +3812,8 @@ fn execute_call(
     let refused =
         |reason: String| Executed::Answered(arsy_code::agent::ToolResult::refused(name, reason));
     let authorization = runtime.authorize(&request);
-    let grants = match &authorization {
-        Authorization::Allowed(grants) => grants.clone(),
-        // A denial is the model's to hear, not the operator's to override from
-        // the keyboard: the rule that produced it is the place to change the
-        // answer.
+    let (grants, approval_note) = match &authorization {
+        Authorization::Allowed(grants) => (grants.clone(), None),
         Authorization::Denied(reason) => return Ok(refused(reason.clone())),
         Authorization::NeedsApproval { .. } => {
             let is_read = matches!(
@@ -3834,7 +3829,7 @@ fn execute_call(
             );
             if is_read || auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
                 match authorization.approve() {
-                    Ok(grants) => grants,
+                    Ok(grants) => (grants, None),
                     Err(error) => {
                         return Ok(refused(format!(
                             "the approval could not be turned into a grant: {error}"
@@ -3843,30 +3838,63 @@ fn execute_call(
                 }
             } else {
                 let reason = authorization.requested();
-                match confirm_tool(terminal, colour, name, summary, &reason, keys, decoder, auto_approve)? {
-                    Answer::Yes => match authorization.approve() {
-                        Ok(grants) => grants,
+                let preview = format_tool_preview(name, arguments);
+                match confirm_tool(terminal, colour, name, summary, &reason, preview, keys, decoder, auto_approve)? {
+                    Answer::Yes { note } => match authorization.approve() {
+                        Ok(grants) => (grants, note),
                         Err(error) => {
                             return Ok(refused(format!(
                                 "the approval could not be turned into a grant: {error}"
                             )))
                         }
                     },
-                    Answer::No => return Ok(Executed::Declined),
+                    Answer::No { note } => {
+                        let message = note.map_or_else(
+                            || "The operator declined to run this call.".to_owned(),
+                            |note| format!("The operator declined to run this call. Feedback: {note}"),
+                        );
+                        return Ok(refused(message));
+                    }
                     Answer::Stop => return Ok(Executed::Stopped),
                 }
             }
         }
     };
-    Ok(Executed::Answered(
-        runtime.dispatch(name, &request, &grants, started),
-    ))
+    let mut result = runtime.dispatch(name, &request, &grants, started);
+    if let Some(note) = approval_note {
+        result.output = format!("{}\nOperator note: {note}", result.output);
+    }
+    Ok(Executed::Answered(result))
+}
+
+#[cfg(feature = "tui")]
+fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
+    match name {
+        "apply_patch" | "fs.edit" | "edit" => {
+            arguments
+                .get("input")
+                .or_else(|| arguments.get("patch"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        "fs.write" | "write" => {
+            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("file");
+            let content = arguments.get("content").and_then(Value::as_str).unwrap_or("");
+            let preview: Vec<String> = content.lines().take(12).map(|l| format!("+{l}")).collect();
+            let mut text = format!("--- /dev/null\n+++ {path}\n{}", preview.join("\n"));
+            if content.lines().count() > 12 {
+                text.push_str(&format!("\n… ({} lines omitted)", content.lines().count() - 12));
+            }
+            Some(text)
+        }
+        "bash" | "shell.execute" => {
+            arguments.get("command").and_then(Value::as_str).map(|cmd| format!("$ {cmd}"))
+        }
+        _ => None,
+    }
 }
 
 /// Ask the operator whether one tool call may run.
-///
-/// `y` runs it and anything else does not, because the safe answer is the one
-/// a mistyped key gives.
 #[cfg(feature = "tui")]
 fn confirm_tool(
     terminal: &mut io::Stdout,
@@ -3874,14 +3902,15 @@ fn confirm_tool(
     name: &str,
     summary: &str,
     reason: &str,
+    diff_preview: Option<String>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Answer> {
     if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(Answer::Yes);
+        return Ok(Answer::Yes { note: None });
     }
-    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason);
+    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
     write!(terminal, "{}\n", dialog.render(width, colour))?;
@@ -3891,17 +3920,15 @@ fn confirm_tool(
             Ok(byte) => match decoder.feed(byte) {
                 Some(key) => {
                     if let Some(result) = dialog.handle_key(key) {
-                        // Erase dialog from terminal before returning!
                         write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
                         terminal.flush()?;
                         match result {
-                            tui::AskDialogResult::Approve => return Ok(Answer::Yes),
-                            tui::AskDialogResult::AlwaysApprove => {
+                            tui::AskDialogResult::Approve { note } => return Ok(Answer::Yes { note }),
+                            tui::AskDialogResult::AlwaysApprove { note } => {
                                 auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return Ok(Answer::Yes);
+                                return Ok(Answer::Yes { note });
                             }
-                            tui::AskDialogResult::Deny => return Ok(Answer::No),
-                            tui::AskDialogResult::Other(_) => return Ok(Answer::No),
+                            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
                     } else {
@@ -5940,8 +5967,8 @@ mod tests {
                 },
             ],
         ]);
-        // Anything but `y` declines; `n` is what an operator would type.
-        let (typist, keys) = typed(b"n");
+        // `d` denies; `n` now opens the note editor.
+        let (typist, keys) = typed(b"d");
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,

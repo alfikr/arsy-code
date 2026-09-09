@@ -2359,10 +2359,9 @@ pub struct AskOption {
 /// Result of an interactive Ask/Approval dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskDialogResult {
-    Approve,
-    AlwaysApprove,
-    Deny,
-    Other(String),
+    Approve { note: Option<String> },
+    AlwaysApprove { note: Option<String> },
+    Deny { note: Option<String> },
     Cancel,
 }
 
@@ -2372,6 +2371,7 @@ pub struct AskDialogState {
     pub title: String,
     pub summary: String,
     pub reason: String,
+    pub diff_preview: Option<String>,
     pub options: Vec<AskOption>,
     pub selected: usize,
     pub custom_note: String,
@@ -2379,11 +2379,17 @@ pub struct AskDialogState {
 }
 
 impl AskDialogState {
-    pub fn for_approval(name: &str, summary: &str, reason: &str) -> Self {
+    pub fn for_approval(
+        name: &str,
+        summary: &str,
+        reason: &str,
+        diff_preview: Option<String>,
+    ) -> Self {
         Self {
             title: format!("APPROVAL REQUIRED: {name}"),
             summary: summary.to_owned(),
             reason: reason.to_owned(),
+            diff_preview,
             options: vec![
                 AskOption {
                     label: "Approve this call once (yes)".to_owned(),
@@ -2396,10 +2402,6 @@ impl AskDialogState {
                 AskOption {
                     label: "Deny this call (no)".to_owned(),
                     description: Some("Decline this tool call and inform the agent".to_owned()),
-                },
-                AskOption {
-                    label: "Other (add custom note / instruction)".to_owned(),
-                    description: Some("Type feedback to redirect or guide the agent".to_owned()),
                 },
             ],
             selected: 0,
@@ -2432,6 +2434,19 @@ impl AskDialogState {
             let row = format!("Reason:  {}", self.reason);
             lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
         }
+
+        if let Some(diff) = &self.diff_preview {
+            lines.push(Self::box_line("", inner, colour, ""));
+            lines.push(Self::box_line("Proposed Changes:", inner, colour, sgr_accent()));
+            for line in diff.lines().take(15) {
+                lines.push(Self::render_diff_line(line, inner, colour));
+            }
+            if diff.lines().count() > 15 {
+                let more = format!("… ({} more lines omitted)", diff.lines().count() - 15);
+                lines.push(Self::box_line(&more, inner, colour, sgr_dim()));
+            }
+        }
+
         lines.push(Self::box_line("", inner, colour, ""));
 
         for (idx, opt) in self.options.iter().enumerate() {
@@ -2449,21 +2464,64 @@ impl AskDialogState {
 
         if self.editing_note || !self.custom_note.is_empty() {
             lines.push(Self::box_line("", inner, colour, ""));
-            let note_display = format!("Note: {}█", self.custom_note);
+            let note_display = if self.editing_note {
+                format!("Note: {}█", self.custom_note)
+            } else {
+                format!("Note: {}", self.custom_note)
+            };
             lines.push(Self::box_line(&note_display, inner, colour, sgr_assistant()));
         }
 
         lines.push(Self::box_line("", inner, colour, ""));
         let hint = if self.editing_note {
-            "[Enter] Submit Note  [Esc] Cancel Note"
+            "[Enter] Done Note  [Esc] Clear Note"
+        } else if self.custom_note.is_empty() {
+            "[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm"
         } else {
-            "[↑/↓] Navigate  [1-4] Choose  [y] Yes  [a] Auto  [n] No  [Enter] Confirm"
+            "[↑/↓] Navigate  [1-3] Choose  [n] Edit Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm"
         };
         lines.push(Self::box_line(hint, inner, colour, sgr_dim()));
         lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
         lines.join("\n")
     }
 
+
+    fn render_diff_line(line: &str, inner: usize, colour: bool) -> String {
+        let fitted = fit(line, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        if !colour {
+            return format!("│ {fitted}{pad} │");
+        }
+        if line.starts_with('+') {
+            let text = format!("\x1b[38;2;120;225;145m\x1b[48;2;25;50;35m{fitted}\x1b[0m");
+            format!(
+                "{} {text}{pad} {}",
+                paint(true, sgr_border(), "│"),
+                paint(true, sgr_border(), "│")
+            )
+        } else if line.starts_with('-') {
+            let text = format!("\x1b[38;2;255;120;135m\x1b[48;2;55;25;30m{fitted}\x1b[0m");
+            format!(
+                "{} {text}{pad} {}",
+                paint(true, sgr_border(), "│"),
+                paint(true, sgr_border(), "│")
+            )
+        } else if line.starts_with('@') || line.starts_with('[') || line.starts_with('$') {
+            format!(
+                "{} {}{pad} {}",
+                paint(true, sgr_border(), "│"),
+                paint(true, sgr_accent(), &fitted),
+                paint(true, sgr_border(), "│")
+            )
+        } else {
+            format!(
+                "{} {}{pad} {}",
+                paint(true, sgr_border(), "│"),
+                paint(true, sgr_dim(), &fitted),
+                paint(true, sgr_border(), "│")
+            )
+        }
+    }
     fn box_line(content: &str, inner: usize, colour: bool, sgr: &str) -> String {
         let fitted = fit(content, inner);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
@@ -2475,12 +2533,21 @@ impl AskDialogState {
         )
     }
 
+    fn current_note(&self) -> Option<String> {
+        let trimmed = self.custom_note.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
     pub fn handle_key(&mut self, key: Key) -> Option<AskDialogResult> {
         if self.editing_note {
             match key {
-                Key::Enter | Key::Newline | Key::Char('\n' | '\r') => {
-                    let note = self.custom_note.trim().to_owned();
-                    return Some(AskDialogResult::Other(note));
+                Key::Enter | Key::Newline => {
+                    self.editing_note = false;
+                    return None;
                 }
                 Key::Char(c) => {
                     self.custom_note.push(c);
@@ -2492,6 +2559,7 @@ impl AskDialogState {
                 }
                 Key::Interrupt => {
                     self.editing_note = false;
+                    self.custom_note.clear();
                     return None;
                 }
                 _ => return None,
@@ -2515,23 +2583,38 @@ impl AskDialogState {
                 }
                 None
             }
-            Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve),
-            Key::Char('2' | 'a' | 'A') => Some(AskDialogResult::AlwaysApprove),
-            Key::Char('3' | 'n' | 'N' | 'd' | 'D') => Some(AskDialogResult::Deny),
-            Key::Char('4' | 'o' | 'O') => {
-                self.selected = 3;
+            Key::Char('n' | 'N') => {
                 self.editing_note = true;
                 None
             }
-            Key::Enter | Key::Newline | Key::Char('\n' | '\r' | ' ') => match self.selected {
-                0 => Some(AskDialogResult::Approve),
-                1 => Some(AskDialogResult::AlwaysApprove),
-                2 => Some(AskDialogResult::Deny),
-                3 => {
-                    self.editing_note = true;
-                    None
-                }
-                _ => Some(AskDialogResult::Approve),
+            Key::Char('1' | 'y' | 'Y') => {
+                Some(AskDialogResult::Approve {
+                    note: self.current_note(),
+                })
+            }
+            Key::Char('2' | 'a' | 'A') => {
+                Some(AskDialogResult::AlwaysApprove {
+                    note: self.current_note(),
+                })
+            }
+            Key::Char('3' | 'd' | 'D') => {
+                Some(AskDialogResult::Deny {
+                    note: self.current_note(),
+                })
+            }
+            Key::Enter | Key::Newline | Key::Char(' ') => match self.selected {
+                0 => Some(AskDialogResult::Approve {
+                    note: self.current_note(),
+                }),
+                1 => Some(AskDialogResult::AlwaysApprove {
+                    note: self.current_note(),
+                }),
+                2 => Some(AskDialogResult::Deny {
+                    note: self.current_note(),
+                }),
+                _ => Some(AskDialogResult::Approve {
+                    note: self.current_note(),
+                }),
             },
             Key::Interrupt => Some(AskDialogResult::Cancel),
             _ => None,
@@ -4349,14 +4432,16 @@ mod tests {
 
     #[test]
     fn ask_dialog_interactive_navigation_and_selection() {
-        let mut dialog = AskDialogState::for_approval("bash", "rm -rf target", "file deletion");
+        let mut dialog = AskDialogState::for_approval("bash", "rm -rf target", "file deletion", Some("$ rm -rf target".to_owned()));
         assert_eq!(dialog.selected, 0);
-        assert_eq!(dialog.options.len(), 4);
+        assert_eq!(dialog.options.len(), 3);
 
-        // Render output has border and title
+        // Render output has border, title, and diff preview
         let rendered = dialog.render(80, false);
         assert!(rendered.contains("APPROVAL REQUIRED: bash"));
         assert!(rendered.contains("Summary: rm -rf target"));
+        assert!(rendered.contains("Proposed Changes:"));
+        assert!(rendered.contains("$ rm -rf target"));
         assert!(rendered.contains("1. Approve this call once"));
 
         // Down key navigates to next option
@@ -4364,22 +4449,25 @@ mod tests {
         assert_eq!(dialog.selected, 1);
 
         // Number 1 key immediately approves once
-        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve));
+        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve { note: None }));
 
         // Number 2 key always approves for session
-        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::AlwaysApprove));
+        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::AlwaysApprove { note: None }));
 
         // Number 3 key denies
-        assert_eq!(dialog.handle_key(Key::Char('3')), Some(AskDialogResult::Deny));
+        assert_eq!(dialog.handle_key(Key::Char('3')), Some(AskDialogResult::Deny { note: None }));
 
-        // Number 4 opens custom note editing
-        assert_eq!(dialog.handle_key(Key::Char('4')), None);
+        // 'n' opens custom note editing
+        assert_eq!(dialog.handle_key(Key::Char('n')), None);
         assert!(dialog.editing_note);
         dialog.handle_key(Key::Char('a'));
         dialog.handle_key(Key::Char('b'));
         assert_eq!(dialog.custom_note, "ab");
-        assert_eq!(dialog.handle_key(Key::Enter), Some(AskDialogResult::Other("ab".to_owned())));
+        assert_eq!(dialog.handle_key(Key::Enter), None);
+        assert!(!dialog.editing_note);
+        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve { note: Some("ab".to_owned()) }));
     }
+ 
 
     #[test]
     fn execution_boxes_render_cleanly() {
