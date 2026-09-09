@@ -82,14 +82,30 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
             at: arguments.at.as_deref().map(event_id).transpose()?,
             mode: BranchMode::Fork,
         }),
+        "delete" | "remove" | "rm" => Ok(Command::SessionDelete {
+            session: identifier(positional)?,
+        }),
+        "rename" => {
+            if positional.is_empty() {
+                return Err(usage("session rename requires <SESSION_ID> <TITLE>"));
+            }
+            let session_raw = positional.remove(0);
+            let session = session_raw
+                .parse()
+                .map_err(|_| usage(format!("`{session_raw}` is not a canonical session ID")))?;
+            let title = positional.join(" ");
+            if title.trim().is_empty() {
+                return Err(usage("session rename requires a non-empty <TITLE>"));
+            }
+            Ok(Command::SessionRename { session, title })
+        }
         other => Err(usage(format!(
             "unknown session subcommand `{other}`\n{HELP}"
         ))),
     }
 }
 
-const HELP: &str = "session requires `list`, `show <ID>`, `export <ID>`, `rewind <ID> --to <EVENT_ID>`, or `fork <ID> [--at <EVENT_ID>]`";
-
+const HELP: &str = "session requires `list`, `show <ID>`, `export <ID>`, `delete <ID>`, `rename <ID> <TITLE>`, `rewind <ID> --to <EVENT_ID>`, or `fork <ID> [--at <EVENT_ID>]`";
 fn event_id(value: &str) -> Result<EventId, Diagnostic> {
     value
         .parse()
@@ -125,6 +141,57 @@ pub fn list(
     Ok(0)
 }
 
+/// `arsy session delete <ID>`: remove a recorded session stream and its events.
+pub fn delete(
+    invocation: &Invocation,
+    session: SessionId,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let store = crate::open_store(&root)?;
+    let deleted = store.delete_session(session).map_err(storage_failed)?;
+    let report = json!({
+        "session": session.to_string(),
+        "deleted": deleted,
+        "message": if deleted {
+            format!("Deleted session {session}.")
+        } else {
+            format!("Session {session} was not found.")
+        },
+    });
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        json!({"status": if deleted { "deleted" } else { "not_found" }})
+    });
+    Ok(0)
+}
+
+/// `arsy session rename <ID> <TITLE>`: assign a title to a recorded session.
+pub fn rename(
+    invocation: &Invocation,
+    session: SessionId,
+    title: &str,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let store = crate::open_store(&root)?;
+    store
+        .set_session_title(session, title)
+        .map_err(storage_failed)?;
+    let report = json!({
+        "session": session.to_string(),
+        "title": title,
+        "message": format!("Renamed session {session} to \"{title}\"."),
+    });
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        json!({"status": "renamed", "title": title})
+    });
+    Ok(0)
+}
+
 fn row(store: &dyn EventStore, summary: &SessionSummary) -> Result<Value, Diagnostic> {
     let history = AgentService::history(store, summary.session).map_err(storage_failed)?;
     let projection = ProjectionSet::rebuild(summary.session, &history).map_err(storage_failed)?;
@@ -132,6 +199,7 @@ fn row(store: &dyn EventStore, summary: &SessionSummary) -> Result<Value, Diagno
     let ancestry = AgentService::ancestry(store, summary.session).map_err(storage_failed)?;
     Ok(json!({
         "session": summary.session.to_string(),
+        "title": summary.title.clone(),
         "events": summary.version.0,
         "durability": format!("{:?}", summary.durability).to_lowercase(),
         "started_at_ms": summary.started_at_ms,

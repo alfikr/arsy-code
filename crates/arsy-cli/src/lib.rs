@@ -266,6 +266,13 @@ pub enum Command {
         out: Option<PathBuf>,
         include_artifacts: bool,
     },
+    SessionDelete {
+        session: SessionId,
+    },
+    SessionRename {
+        session: SessionId,
+        title: String,
+    },
     /// `arsy session rewind` and `arsy session fork`: one operation, two
     /// documented names, distinguished by whether the branch inherits the
     /// parent's prefix.
@@ -1071,6 +1078,10 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             *include_artifacts,
             emitter,
         ),
+        Command::SessionDelete { session } => session::delete(invocation, *session, emitter),
+        Command::SessionRename { session, title } => {
+            session::rename(invocation, *session, title, emitter)
+        }
         Command::SessionBranch { session, at, mode } => {
             session::branch(invocation, *session, *at, *mode, emitter)
         }
@@ -2266,6 +2277,58 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 )
                 .map_err(terminal_failed)?;
             }
+            Prompt::Task if line.split_whitespace().next() == Some("/rename") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let title = line.trim_start_matches("/rename").trim();
+                if title.is_empty() {
+                    writeln!(stdout, "Usage: /rename <TITLE>").map_err(terminal_failed)?;
+                } else {
+                    if let Ok(store) = open_store(&workspace) {
+                        let _ = store.set_session_title(state.session_id(), title);
+                    }
+                    writeln!(stdout, "Renamed session {} to \"{title}\".", state.session_id()).map_err(terminal_failed)?;
+                }
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/session") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let mut parts = line.split_whitespace().skip(1);
+                match parts.next() {
+                    Some("list") => {
+                        sessions = load_workspace_sessions(&workspace);
+                        prompt = Prompt::Resume;
+                    }
+                    Some("rename") => {
+                        let title = parts.collect::<Vec<_>>().join(" ");
+                        if title.is_empty() {
+                            writeln!(stdout, "Usage: /session rename <TITLE>").map_err(terminal_failed)?;
+                        } else {
+                            if let Ok(store) = open_store(&workspace) {
+                                let _ = store.set_session_title(state.session_id(), &title);
+                            }
+                            writeln!(stdout, "Renamed session {} to \"{title}\".", state.session_id()).map_err(terminal_failed)?;
+                        }
+                    }
+                    Some("delete" | "rm" | "remove") => {
+                        let target_id = parts.next().and_then(|id_str| id_str.parse::<SessionId>().ok()).unwrap_or_else(|| state.session_id());
+                        let is_current = target_id == state.session_id();
+                        if let Ok(store) = open_store(&workspace) {
+                            let _ = store.delete_session(target_id);
+                        }
+                        if is_current {
+                            let new_session = SessionId::new();
+                            state.set_session_id(new_session);
+                            conversation.clear();
+                            queued.clear();
+                            writeln!(stdout, "Deleted current session. Started fresh session {new_session}.").map_err(terminal_failed)?;
+                        } else {
+                            writeln!(stdout, "Deleted session {target_id}.").map_err(terminal_failed)?;
+                        }
+                    }
+                    _ => {
+                        writeln!(stdout, "Usage: /session list | rename <TITLE> | delete [ID]").map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Task if line.trim() == "/auth" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 providers = configured_providers(invocation);
@@ -2727,6 +2790,7 @@ fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
             };
             tui::SessionChoice {
                 id: s.session,
+                title: s.title,
                 events: s.version.0,
                 last_seen,
             }
@@ -6433,7 +6497,7 @@ mod tests {
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update"
+                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

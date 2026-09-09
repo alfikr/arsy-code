@@ -595,6 +595,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a fresh session"),
     ("/clear", "clear conversation context in place"),
     ("/resume", "resume a recorded session; [SESSION_ID]"),
+    ("/rename", "rename current session; <TITLE>"),
+    ("/session", "manage sessions; list | rename <TITLE> | delete [ID]"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -2500,6 +2502,7 @@ impl AskDialogState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionChoice {
     pub id: SessionId,
+    pub title: Option<String>,
     pub events: u64,
     pub last_seen: String,
 }
@@ -2526,7 +2529,10 @@ pub fn session_rows(
             if Some(s.id) == current {
                 selected = idx;
             }
-            let label = s.id.to_string();
+            let label = match &s.title {
+                Some(title) => format!("{} · {}", s.id, title),
+                None => s.id.to_string(),
+            };
             let desc = format!("{} events · {}", s.events, s.last_seen);
             (label, desc)
         })
@@ -4082,11 +4088,13 @@ mod tests {
         let choices = vec![
             SessionChoice {
                 id: s1,
+                title: Some("feature work".to_owned()),
                 events: 10,
                 last_seen: "2m ago".to_owned(),
             },
             SessionChoice {
                 id: s2,
+                title: None,
                 events: 5,
                 last_seen: "1h ago".to_owned(),
             },
