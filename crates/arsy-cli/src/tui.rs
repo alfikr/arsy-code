@@ -2144,15 +2144,26 @@ pub fn tool_running_frame_with_output(
     summary: &str,
     elapsed_ms: u128,
     output: &str,
+    expanded: bool,
 ) -> String {
-    let tail = output.lines().last().unwrap_or_default();
-    let detail = if tail.is_empty() {
-        summary.to_owned()
+    let detail = if expanded {
+        let lines: Vec<&str> = output.lines().rev().take(8).collect();
+        let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
+        if tail.is_empty() {
+            format!("{summary} │ expanded")
+        } else {
+            format!("{summary} │ {tail}")
+        }
     } else {
-        format!("{summary} · {tail}")
+        let tail = output.lines().last().unwrap_or_default();
+        if tail.is_empty() {
+            summary.to_owned()
+        } else {
+            format!("{summary} │ {tail}")
+        }
     };
     format!(
-        "  {} {} {} · {}ms · Esc cancel",
+        "  {} {} {} · {}ms · {}",
         paint(colour, sgr_run(), frame),
         paint(colour, sgr_accent(), name),
         paint(
@@ -2160,7 +2171,8 @@ pub fn tool_running_frame_with_output(
             sgr_dim(),
             &fit(&detail, terminal_width().saturating_sub(24))
         ),
-        elapsed_ms
+        elapsed_ms,
+        if expanded { "e collapse" } else { "e expand" }
     )
 }
 
@@ -4685,6 +4697,32 @@ mod tests {
         assert!(diff.contains("src/lib.rs"));
         assert!(diff.contains("+12"));
         assert!(diff.contains("-3"));
+        assert_eq!(tool_card_kind("bash"), ToolCardKind::Bash);
+        assert_eq!(tool_card_kind("fs.edit"), ToolCardKind::File);
+        assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
+        assert_eq!(tool_card_kind("mcp.search"), ToolCardKind::Mcp);
+        assert_eq!(tool_card_kind("search.text"), ToolCardKind::Search);
+        let running = tool_running_frame_with_output(
+            false,
+            "⠋",
+            "bash",
+            "cargo test",
+            420,
+            "line one\nline two",
+            false,
+        );
+        assert!(running.contains("line two"));
+        assert!(running.contains("e expand"));
+        let expanded = tool_running_frame_with_output(
+            false,
+            "⠙",
+            "bash",
+            "cargo test",
+            840,
+            "line one\nline two",
+            true,
+        );
+        assert!(expanded.contains("line one"));
     }
 
     #[test]

@@ -3948,20 +3948,32 @@ fn dispatch_tool_live(
     let elapsed = std::time::Instant::now();
     let mut rendered = true;
     let mut cancelled = false;
+    let mut expanded = false;
     let mut live_output = String::new();
-    let initial =
-        tui::tool_running_frame_with_output(colour, FRAMES[0], name.as_str(), summary, 0, "");
+    let initial = tui::tool_running_frame_with_output(
+        colour,
+        FRAMES[0],
+        name.as_str(),
+        summary,
+        0,
+        "",
+        expanded,
+    );
     write!(terminal, "{initial}\n")?;
     terminal.flush()?;
     loop {
         while let Ok(byte) = keys.try_recv() {
-            if decoder.feed(byte) == Some(tui::Key::Interrupt)
-                && request.kind.to_string() == "process.exec"
-            {
-                arsy_code::process::cancel(operation_id);
-                write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
-                terminal.flush()?;
-                cancelled = true;
+            match decoder.feed(byte) {
+                Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
+                    arsy_code::process::cancel(operation_id);
+                    write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
+                    terminal.flush()?;
+                    cancelled = true;
+                }
+                Some(tui::Key::Char('e' | 'E')) => {
+                    expanded = !expanded;
+                }
+                _ => {}
             }
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
@@ -3987,6 +3999,7 @@ fn dispatch_tool_live(
                     summary,
                     elapsed.elapsed().as_millis(),
                     &live_output,
+                    expanded,
                 );
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
