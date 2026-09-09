@@ -31,6 +31,7 @@ pub mod provider;
 mod review;
 mod serve;
 mod session;
+mod subagent;
 mod telemetry;
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -4400,6 +4401,18 @@ impl<'a> TaskRun<'a> {
         // context says so, and a call that needs an approval is refused by
         // policy rather than waiting on a keyboard that is not there.
         let agent = agent_runtime(&self.root, &self.config, false)?;
+        // A supervisor exists only when policy actually delegates something,
+        // so a workspace that grants nothing sees no spawn tool rather than one
+        // that always refuses.
+        let supervisor = subagent::Supervisor::new(
+            self.root.clone(),
+            &self.config,
+            &self.resolved,
+            self.model.clone(),
+            task,
+            &agent,
+        );
+        let delegates = supervisor.can_delegate();
         let admission = self.start_turn(&goal)?;
         let request = CanonicalModelRequest {
             model: ModelKey {
@@ -4411,7 +4424,13 @@ impl<'a> TaskRun<'a> {
                 role: ModelRole::User,
                 content: vec![ModelContent::Text { text: goal }],
             }],
-            tools: agent.schemas(),
+            tools: {
+                let mut tools = agent.schemas();
+                if delegates {
+                    tools.push(subagent::schema());
+                }
+                tools
+            },
             max_output_tokens: self.resolved.endpoint.max_output_tokens,
             // Reasoning effort is chosen in the TUI with `/effort`. A scripted
             // run takes the request it always took, so a remembered interactive
@@ -4424,13 +4443,20 @@ impl<'a> TaskRun<'a> {
 
         let started = Instant::now();
         let mut recorder = telemetry::Recorder::new(&self.config, self.actor.clone())?;
+        let mut supervising = delegates.then_some((supervisor, &mut self.graph));
         let outcome = dispatch(
             self.resolved.provider.as_ref(),
             &agent,
             &request,
             &mut recorder,
+            &mut supervising,
             emitter,
         );
+        let interventions: Vec<Value> = supervising
+            .as_ref()
+            .map(|(supervisor, _)| supervisor.interventions().to_vec())
+            .unwrap_or_default();
+        drop(supervising);
         let stop = match &outcome {
             Ok(_) => "answered".to_owned(),
             Err(error) => format!("provider:{}", error.code()),
@@ -4443,6 +4469,7 @@ impl<'a> TaskRun<'a> {
             "provider": self.resolved.endpoint.id,
             "model": request.model.model,
             "telemetry": summary,
+            "interventions": interventions,
         });
         merge(&mut record, context);
         // Recorded whether the turn completed or failed: a turn that died
@@ -4576,6 +4603,7 @@ fn dispatch(
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
     recorder: &mut telemetry::Recorder,
+    supervisor: &mut Option<(subagent::Supervisor<'_>, &mut TaskGraph)>,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let mut request = request.clone();
@@ -4673,7 +4701,16 @@ fn dispatch(
         let results = calls
             .iter()
             .map(|(id, name, arguments)| {
-                let result = runtime.invoke(name, arguments);
+                // Spawning is the one call the tool runtime does not own: it
+                // adds a node to this session's graph rather than touching the
+                // workspace, and the child's own calls go through the runtime
+                // under the authority the graph attenuated for it.
+                let result = match (name.as_str(), supervisor.as_mut()) {
+                    ("task.spawn", Some((supervisor, graph))) => {
+                        supervisor.spawn(arguments, graph, emitter)
+                    }
+                    _ => runtime.invoke(name, arguments),
+                };
                 recorder.tool_call(&result);
                 ModelContent::ToolResult {
                     id: id.clone(),
@@ -4697,6 +4734,126 @@ fn dispatch(
 fn summary_number(record: &Value, key: &str) -> u64 {
     record["telemetry"][key].as_u64().unwrap_or_default()
 }
+
+/// Run one subagent turn to its answer.
+///
+/// A smaller loop than the parent's on purpose: a child has no operator to ask,
+/// no session of its own to record into, and a bound on rounds low enough that
+/// a child which cannot answer gives the parent its rounds back rather than
+/// spending them. Every tool call still goes through the same runtime — the
+/// child's, holding only what was delegated to it.
+///
+/// `watch` sees a redacted projection of each call: the tool and whether it
+/// worked, never the arguments or what came back. Returning
+/// [`Intervention::Deny`] stops the child there.
+pub(crate) fn child_turn(
+    provider: &dyn ModelProvider,
+    runtime: &arsy_code::agent::ToolRuntime,
+    request: &CanonicalModelRequest,
+    watch: &mut dyn FnMut(&arsy_kernel::observer::RedactedProjection) -> Option<arsy_kernel::observer::Intervention>,
+    emitter: &mut Emitter,
+) -> Result<String, String> {
+    let mut request = request.clone();
+    let base = request.idempotency_key.as_str().to_owned();
+    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
+    let mut consecutive_failures = 0u64;
+    let mut answer = String::new();
+
+    for round in 0..MAX_CHILD_TOOL_ROUNDS {
+        request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
+            .map_err(|error| error.to_string())?;
+        answer.clear();
+        let mut calls: Vec<(String, String, Value)> = Vec::new();
+        let stream = arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)
+            .map_err(|error| error.to_string())?;
+        for event in stream {
+            match event.map_err(|error| error.to_string())? {
+                ModelEvent::TextDelta { text } => answer.push_str(&text),
+                ModelEvent::ToolCallCompleted {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => calls.push((id, name, arguments)),
+                _ => {}
+            }
+        }
+        if calls.is_empty() {
+            return Ok(if answer.trim().is_empty() {
+                "the subagent finished without an answer".to_owned()
+            } else {
+                answer
+            });
+        }
+        arsy_code::agent::budget::trim(&mut request.messages, budget);
+
+        let mut content: Vec<ModelContent> = Vec::new();
+        if !answer.trim().is_empty() {
+            content.push(ModelContent::Text {
+                text: answer.clone(),
+            });
+        }
+        content.extend(calls.iter().map(|(id, name, arguments)| ModelContent::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            arguments: arguments.clone(),
+        }));
+        request.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content,
+        });
+
+        let mut results = Vec::with_capacity(calls.len());
+        for (id, name, arguments) in &calls {
+            let result = runtime.invoke(name, arguments);
+            consecutive_failures = if result.success {
+                0
+            } else {
+                consecutive_failures + 1
+            };
+            // What an observer is allowed to see: the tool and the outcome. The
+            // arguments named a path and the result carried its contents, and
+            // neither is the observer's business.
+            let projection = arsy_kernel::observer::RedactedProjection {
+                sequence: consecutive_failures,
+                kind: if result.success {
+                    "tool.completed".to_owned()
+                } else {
+                    "tool.failed".to_owned()
+                },
+                public_payload: json!({"tool": result.tool}),
+                redacted_fields: 2,
+            };
+            let intervened = watch(&projection);
+            results.push(ModelContent::ToolResult {
+                id: id.clone(),
+                content: result.output,
+                is_error: !result.success,
+            });
+            if let Some(arsy_kernel::observer::Intervention::Deny(reason)) = intervened {
+                emitter.diagnostic(&Diagnostic::warning(
+                    "ARSY-RET-1001",
+                    format!("a subagent was stopped: {reason}"),
+                    "the parent keeps whatever the subagent had established before it stopped",
+                ));
+                return Err(format!("stopped by its supervisor: {reason}"));
+            }
+        }
+        request.messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: results,
+        });
+    }
+    Err(format!(
+        "the subagent used its {MAX_CHILD_TOOL_ROUNDS} rounds without answering"
+    ))
+}
+
+/// How many rounds of tool calls one subagent may take.
+///
+/// Fewer than the parent's: a child has one question, and a child that cannot
+/// answer it in this many rounds is one the parent should take back.
+const MAX_CHILD_TOOL_ROUNDS: usize = 8;
 
 fn token_usage(input_tokens: u64, output_tokens: u64) -> Value {
     if input_tokens == 0 && output_tokens == 0 {

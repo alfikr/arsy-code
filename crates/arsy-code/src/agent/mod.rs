@@ -47,7 +47,7 @@ pub mod searchops;
 use crate::resource::Workspace;
 use arsy_kernel::{
     artifact::{unix_time_ms, ArtifactReadLimits, ArtifactStore},
-    capability::{CapabilityGrant, CapabilityRequirement},
+    capability::{CapabilityAction, CapabilityGrant, CapabilityRequirement},
     domain::{ArtifactId, OperationId, Principal},
     operation::{
         OperationError, OperationKind, OperationOutcome, OperationRegistry, OperationRequest,
@@ -712,6 +712,52 @@ impl ToolRuntime {
     ///
     /// Separate from [`Self::invoke`] so a front end can show the operator what
     /// is being asked for, and so a refusal costs nothing.
+    /// The grants this actor holds outright over the whole workspace, for the
+    /// actions asked about.
+    ///
+    /// Delegation needs a grant to attenuate from, and a grant is normally
+    /// minted per call. A supervisor about to hand authority to a child has no
+    /// call yet — it has a decision to make about what the child may do at all —
+    /// so this asks the same engine the same question at workspace scope and
+    /// keeps only what came back allowed.
+    ///
+    /// Anything policy would merely have asked about is left out: an approval
+    /// is an answer from an operator about one operation, and it cannot be
+    /// spent on a child's future calls.
+    pub fn delegable_grants(&self, actions: &[CapabilityAction]) -> Vec<CapabilityGrant> {
+        actions
+            .iter()
+            .filter_map(|action| {
+                let requirement = CapabilityRequirement {
+                    action: *action,
+                    resource: arsy_kernel::domain::ResourceRef::new(action.default_scheme(), "**")
+                        .ok()?,
+                };
+                let query = PolicyQuery {
+                    actor: self.actor.clone(),
+                    operation: OperationKind::new("task.spawn").ok()?,
+                    requirement,
+                    operation_digest: arsy_kernel::domain::StateVersion::from_digest([0; 32]),
+                    resource_version: None,
+                    // Asked as a question about authority, not about an effect.
+                    // Policy raises an irreversible *call* to approval, and
+                    // delegating is not a call: the child's own runtime
+                    // evaluates each of its operations on that operation's own
+                    // contract, and an irreversible one is escalated there,
+                    // where an operator could actually be asked about it.
+                    context: RiskContext {
+                        reversible: true,
+                        ..self.context
+                    },
+                };
+                match self.rules.evaluate(&query).decision {
+                    PolicyDecision::Allow(grant) => Some(grant),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub fn authorize(&self, request: &OperationRequest) -> Authorization {
         let digest = request.digest();
         // Reversibility is the operation's own claim, not a guess from the

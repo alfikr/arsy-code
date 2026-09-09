@@ -388,3 +388,116 @@ fn what_the_workspace_remembers_reaches_the_model_and_can_be_withdrawn() {
         "we moved back to cargo test"
     );
 }
+
+/// A reply that asks for one subagent and stops.
+fn spawns(goal: &str, capabilities: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-spawn",
+            "type": "function",
+            "function": {
+                "name": "task.spawn",
+                "arguments": format!("{{\"goal\": \"{goal}\", \"capabilities\": [{capabilities}]}}")
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// A child reply that asks to write, which its own grants must refuse.
+fn tries_to_write() -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-write",
+            "type": "function",
+            "function": {"name": "fs.write", "arguments": "{\"path\": \"escaped.txt\", \"content\": \"x\"}"}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
+
+    // Parent asks for a subagent; the child reads, then tries to write, then
+    // answers. The parent reports what the child said.
+    let provider = FakeProvider::serving(vec![
+        spawns("what does notes.txt say", "\"fs.read\""),
+        asks_to_read("notes.txt"),
+        tries_to_write(),
+        answers("notes.txt says 42."),
+        answers("the subagent found 42."),
+    ]);
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "schema_version = 1\n\
+             [provider.endpoint.local]\n\
+             kind = \"openai\"\n\
+             base_url = \"http://127.0.0.1:{}\"\n\
+             model = \"test-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n\
+             # Delegation is off unless a rule says otherwise, so the depth is\n\
+             # what makes a subagent possible at all.\n\
+             [[policy.rules]]\n\
+             id = \"delegate-reads\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.read\"\n\
+             resource = \"file:**\"\n\
+             delegation_depth = 2\n\
+             [[policy.rules]]\n\
+             id = \"parent-writes\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.write\"\n\
+             resource = \"file:**\"\n",
+            provider.port
+        ),
+    )
+    .unwrap();
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["run", "find out what notes.txt says"],
+    );
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+    assert_eq!(result["status"], "completed");
+
+    // The parent was offered the spawn tool, because this policy delegates.
+    let first = provider.request();
+    let tools: Vec<&str> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"task.spawn"), "{tools:?}");
+
+    // The child was offered the workspace tools but holds only what was
+    // delegated: its write was refused by its own runtime, not by the parent's.
+    drop(provider.request()); // the child asks to read
+    drop(provider.request()); // the child has the file and asks to write
+    let refused = provider.request();
+    let messages = refused["messages"].as_array().unwrap();
+    let tool_result = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .expect("the child was told what happened");
+    let text = tool_result["content"].as_str().unwrap();
+    assert!(text.starts_with("error:"), "{text}");
+    assert!(
+        !workspace.path().join("escaped.txt").exists(),
+        "a subagent must not be able to write"
+    );
+
+    // The parent's last request carries the child's answer as a tool result.
+    let parent = provider.request().to_string();
+    assert!(parent.contains("notes.txt says 42."), "{parent}");
+}
