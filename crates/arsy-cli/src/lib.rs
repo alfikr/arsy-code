@@ -1955,6 +1955,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut conversation: Vec<ModelMessage> = Vec::new();
     let mut auth_draft = String::new();
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
+    let auto_approve = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
@@ -2417,6 +2418,27 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match line.split_whitespace().nth(1) {
+                    Some("auto" | "all" | "always" | "on") => {
+                        auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
+                        writeln!(stdout, "Auto-approval enabled for this session (all tools will run without prompts).").map_err(terminal_failed)?;
+                    }
+                    Some("prompt" | "manual" | "ask" | "off") => {
+                        auto_approve.store(false, std::sync::atomic::Ordering::Relaxed);
+                        writeln!(stdout, "Interactive approval prompts enabled.").map_err(terminal_failed)?;
+                    }
+                    _ => {
+                        let cur = if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+                            "auto (auto-approve all)"
+                        } else {
+                            "prompt (ask confirmation)"
+                        };
+                        writeln!(stdout, "Current approval mode: {cur}\nUsage: /approval auto | prompt").map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Task if line.trim() == "/auth" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 providers = configured_providers(invocation);
@@ -2535,6 +2557,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &keys,
                     &mut decoder,
                     &mut composer,
+                    &auto_approve,
                     emitter,
                 ) {
                     Ok(turn) if turn.quit => break,
@@ -3387,6 +3410,7 @@ fn run_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    auto_approve: &std::sync::atomic::AtomicBool,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
@@ -3433,6 +3457,7 @@ fn run_turn(
             keys,
             decoder,
             composer,
+            auto_approve,
         ),
         None => external_status(
             &root,
@@ -3589,8 +3614,8 @@ fn native_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Turn> {
-    // One turn now costs one request per round, so the tokens are summed
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
@@ -3684,6 +3709,7 @@ fn native_turn(
                     &summary,
                     keys,
                     decoder,
+                    auto_approve,
                 )? {
                     Executed::Answered(result) => (result.output, !result.success),
                     Executed::Declined => {
@@ -3767,7 +3793,6 @@ enum Executed {
 /// between an approval and a habit — an operator asked to confirm every read
 /// stops reading the prompts.
 #[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
 fn execute_call(
     runtime: &arsy_code::agent::ToolRuntime,
     terminal: &mut io::Stdout,
@@ -3777,6 +3802,7 @@ fn execute_call(
     summary: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Executed> {
     use arsy_code::agent::Authorization;
 
@@ -3795,20 +3821,40 @@ fn execute_call(
         // answer.
         Authorization::Denied(reason) => return Ok(refused(reason.clone())),
         Authorization::NeedsApproval { .. } => {
-            let reason = authorization.requested();
-            match confirm_tool(terminal, colour, name, summary, &reason, keys, decoder)? {
-                // The "yes" becomes a grant over exactly the resources the
-                // operator was shown, and nothing beside them.
-                Answer::Yes => match authorization.approve() {
+            let is_read = matches!(
+                name,
+                "fs.read"
+                    | "fs.list"
+                    | "search.files"
+                    | "search.text"
+                    | "code.symbol"
+                    | "code.inspect"
+                    | "code.references"
+                    | "code.diagnostics"
+            );
+            if is_read || auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+                match authorization.approve() {
                     Ok(grants) => grants,
                     Err(error) => {
                         return Ok(refused(format!(
                             "the approval could not be turned into a grant: {error}"
                         )))
                     }
-                },
-                Answer::No => return Ok(Executed::Declined),
-                Answer::Stop => return Ok(Executed::Stopped),
+                }
+            } else {
+                let reason = authorization.requested();
+                match confirm_tool(terminal, colour, name, summary, &reason, keys, decoder, auto_approve)? {
+                    Answer::Yes => match authorization.approve() {
+                        Ok(grants) => grants,
+                        Err(error) => {
+                            return Ok(refused(format!(
+                                "the approval could not be turned into a grant: {error}"
+                            )))
+                        }
+                    },
+                    Answer::No => return Ok(Executed::Declined),
+                    Answer::Stop => return Ok(Executed::Stopped),
+                }
             }
         }
     };
@@ -3830,7 +3876,11 @@ fn confirm_tool(
     reason: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Answer> {
+    if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Answer::Yes);
+    }
     let mut dialog = tui::AskDialogState::for_approval(name, summary, reason);
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
@@ -3841,8 +3891,15 @@ fn confirm_tool(
             Ok(byte) => match decoder.feed(byte) {
                 Some(key) => {
                     if let Some(result) = dialog.handle_key(key) {
+                        // Erase dialog from terminal before returning!
+                        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+                        terminal.flush()?;
                         match result {
                             tui::AskDialogResult::Approve => return Ok(Answer::Yes),
+                            tui::AskDialogResult::AlwaysApprove => {
+                                auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(Answer::Yes);
+                            }
                             tui::AskDialogResult::Deny => return Ok(Answer::No),
                             tui::AskDialogResult::Other(_) => return Ok(Answer::No),
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
@@ -5794,6 +5851,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         typist.join().unwrap();
@@ -5897,6 +5955,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         typist.join().unwrap();
@@ -5960,6 +6019,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         // Measured before the typist is joined, which outlives the turn on
@@ -6601,7 +6661,7 @@ mod tests {
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session"
+                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session" | "/approval"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

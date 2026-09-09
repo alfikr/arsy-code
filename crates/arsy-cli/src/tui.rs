@@ -592,12 +592,11 @@ impl Keys {
     }
 }
 
-/// What a key means to the session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
-    Redraw,
     Submit(String),
     Quit,
+    Redraw,
     None,
 }
 
@@ -609,6 +608,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a recorded session; [SESSION_ID]"),
     ("/rename", "rename current session; <TITLE>"),
     ("/session", "manage sessions; list | rename <TITLE> | delete [ID]"),
+    ("/approval", "set approval mode; auto | prompt"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -2360,6 +2360,7 @@ pub struct AskOption {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AskDialogResult {
     Approve,
+    AlwaysApprove,
     Deny,
     Other(String),
     Cancel,
@@ -2387,6 +2388,10 @@ impl AskDialogState {
                 AskOption {
                     label: "Approve this call once (yes)".to_owned(),
                     description: Some("Execute this tool call and continue".to_owned()),
+                },
+                AskOption {
+                    label: "Always approve for this session (auto)".to_owned(),
+                    description: Some("Auto-approve this and all subsequent calls in this session".to_owned()),
                 },
                 AskOption {
                     label: "Deny this call (no)".to_owned(),
@@ -2452,7 +2457,7 @@ impl AskDialogState {
         let hint = if self.editing_note {
             "[Enter] Submit Note  [Esc] Cancel Note"
         } else {
-            "[↑/↓] Navigate  [1-3] Choose  [y] Yes  [n] No  [Enter] Confirm"
+            "[↑/↓] Navigate  [1-4] Choose  [y] Yes  [a] Auto  [n] No  [Enter] Confirm"
         };
         lines.push(Self::box_line(hint, inner, colour, sgr_dim()));
         lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
@@ -2511,16 +2516,18 @@ impl AskDialogState {
                 None
             }
             Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve),
-            Key::Char('2' | 'n' | 'N' | 'd' | 'D') => Some(AskDialogResult::Deny),
-            Key::Char('3' | 'o' | 'O') => {
-                self.selected = 2;
+            Key::Char('2' | 'a' | 'A') => Some(AskDialogResult::AlwaysApprove),
+            Key::Char('3' | 'n' | 'N' | 'd' | 'D') => Some(AskDialogResult::Deny),
+            Key::Char('4' | 'o' | 'O') => {
+                self.selected = 3;
                 self.editing_note = true;
                 None
             }
             Key::Enter | Key::Newline | Key::Char('\n' | '\r' | ' ') => match self.selected {
                 0 => Some(AskDialogResult::Approve),
-                1 => Some(AskDialogResult::Deny),
-                2 => {
+                1 => Some(AskDialogResult::AlwaysApprove),
+                2 => Some(AskDialogResult::Deny),
+                3 => {
                     self.editing_note = true;
                     None
                 }
@@ -4344,7 +4351,7 @@ mod tests {
     fn ask_dialog_interactive_navigation_and_selection() {
         let mut dialog = AskDialogState::for_approval("bash", "rm -rf target", "file deletion");
         assert_eq!(dialog.selected, 0);
-        assert_eq!(dialog.options.len(), 3);
+        assert_eq!(dialog.options.len(), 4);
 
         // Render output has border and title
         let rendered = dialog.render(80, false);
@@ -4356,14 +4363,17 @@ mod tests {
         assert_eq!(dialog.handle_key(Key::Down), None);
         assert_eq!(dialog.selected, 1);
 
-        // Number 1 key immediately approves
+        // Number 1 key immediately approves once
         assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve));
 
-        // Number 2 key denies
-        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::Deny));
+        // Number 2 key always approves for session
+        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::AlwaysApprove));
 
-        // Number 3 opens custom note editing
-        assert_eq!(dialog.handle_key(Key::Char('3')), None);
+        // Number 3 key denies
+        assert_eq!(dialog.handle_key(Key::Char('3')), Some(AskDialogResult::Deny));
+
+        // Number 4 opens custom note editing
+        assert_eq!(dialog.handle_key(Key::Char('4')), None);
         assert!(dialog.editing_note);
         dialog.handle_key(Key::Char('a'));
         dialog.handle_key(Key::Char('b'));
