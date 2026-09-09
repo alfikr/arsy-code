@@ -135,8 +135,8 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
             headers: self.headers("", false),
             body: json!({
                 "metadata": {
-                    "ideType": "IDE_UNSPECIFIED",
-                    "platform": "PLATFORM_UNSPECIFIED",
+                    "ideType": "ANTIGRAVITY",
+                    "platform": "MACOS",
                     "pluginType": "GEMINI",
                 }
             })

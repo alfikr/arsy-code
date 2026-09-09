@@ -684,7 +684,12 @@ pub mod presets {
 
     /// The preset `id` names, if any.
     pub fn get(id: &str) -> Option<&'static Preset> {
-        PRESETS.iter().find(|preset| preset.id == id)
+        let canonical = match id {
+            "codex" | "openai-codex" | "codex-oauth" => "codex-oauth",
+            "antigravity" | "google-antigravity" => "antigravity",
+            other => other,
+        };
+        PRESETS.iter().find(|preset| preset.id == canonical)
     }
 
     fn owned(values: &[&str]) -> Vec<String> {
@@ -707,7 +712,14 @@ pub mod presets {
                 device_authorization_url: None,
                 client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),
                 client_secret: None,
-                scopes: owned(&["openid", "profile", "email", "offline_access"]),
+                scopes: owned(&[
+                    "openid",
+                    "profile",
+                    "email",
+                    "offline_access",
+                    "api.connectors.read",
+                    "api.connectors.invoke",
+                ]),
                 redirect_uri: Some("http://localhost:1455/auth/callback".to_owned()),
                 authorize_params: vec![
                     ("id_token_add_organizations".to_owned(), "true".to_owned()),
