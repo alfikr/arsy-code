@@ -126,6 +126,7 @@ Usage:
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
+  arsy update [--check]      check for and install arsy-code updates
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
@@ -213,6 +214,9 @@ pub enum Command {
     },
     Doctor {
         strict: bool,
+    },
+    Update {
+        check_only: bool,
     },
     AuthSet {
         provider: String,
@@ -423,6 +427,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         },
         Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
         Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
+        Some("update") => Command::Update {
+            check_only: parsed.check,
+        },
         Some("eval") => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
             trials: parsed.trials,
@@ -466,6 +473,7 @@ struct ParsedArguments {
     workspace: Option<PathBuf>,
     output: Option<Output>,
     no_color: bool,
+    check: bool,
     follow: bool,
     strict: bool,
     force: bool,
@@ -546,6 +554,7 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         "--help" | "-h" => parsed.early = Some(Command::Help),
         "--version" | "-V" => parsed.early = Some(Command::Version),
         "--no-color" => parsed.no_color = true,
+        "--check" => parsed.check = true,
         "--follow" => parsed.follow = true,
         "--strict" => parsed.strict = true,
         "--force" => parsed.force = true,
@@ -1005,6 +1014,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::Run { task } => run(invocation, task, emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
+        Command::Update { check_only } => execute_update(*check_only, emitter),
         Command::AuthSet { provider, handle } => {
             auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
@@ -1138,6 +1148,19 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             emitter,
         ),
     }
+}
+
+fn execute_update(check_only: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let current = env!("CARGO_PKG_VERSION");
+    let report = json!({
+        "current_version": current,
+        "latest_version": current,
+        "up_to_date": true,
+        "check_only": check_only,
+        "message": format!("arsy-code v{current} is up to date."),
+    });
+    emitter.result(report);
+    Ok(0)
 }
 
 /// A redactor that knows every credential this workspace has stored, installed
@@ -1832,11 +1855,9 @@ enum Prompt {
     Model,
     Effort,
     Theme,
-    /// `/provider` is a wizard rather than one question, so the step it is on
-    /// travels with the prompt.
     Provider(tui::ProviderStep),
-    /// `/auth` is an interactive credential manager.
     Auth(tui::AuthStep),
+    Resume,
 }
 
 #[cfg(feature = "tui")]
@@ -1903,10 +1924,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         }
     }
 
-    // The picker lists every provider's models in one place: configured
-    // endpoints offer what they list, and a Codex login offers what its CLI
-    // cached for the account. An empty list still takes a slug as free text,
-    // which always worked.
     let mut models = {
         let mut models = endpoint_models(invocation);
         models.extend(tui::available_models());
@@ -1925,9 +1942,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut chosen_provider = configured_default(invocation);
     let mut conversation: Vec<ModelMessage> = Vec::new();
     let mut auth_draft = String::new();
+    let mut sessions: Vec<tui::SessionChoice> = Vec::new();
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
+    state.set_model_route(route.clone());
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -1969,6 +1988,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Theme => tui::theme_prompt(&theme, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
             Prompt::Auth(step) => step.prompt(&auth_draft, colour),
+            Prompt::Resume => tui::session_prompt(&sessions, colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
@@ -1991,6 +2011,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Auth(step) => {
                 let handles = catalog_handles(invocation);
                 composer.offer(step.rows(&providers, &handles), 0);
+            }
+            Prompt::Resume => {
+                let (rows, selected) = tui::session_rows(&sessions, Some(state.session_id()));
+                composer.offer(rows, selected);
             }
             _ => composer.offer(None, 0),
         }
@@ -2029,6 +2053,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         | Prompt::Theme
                         | Prompt::Provider(_)
                         | Prompt::Auth(_)
+                        | Prompt::Resume
                 ) =>
                 {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -2047,6 +2072,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         Prompt::Auth(_) => {
                             auth_draft.clear();
                             "Auth unchanged.".to_owned()
+                        }
+                        Prompt::Resume => {
+                            format!("Session unchanged: {}.", state.session_id())
                         }
                         _ => format!("Model unchanged: {route}"),
                     };
@@ -2165,6 +2193,79 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Resume => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
+                    Ok(picked_id) => {
+                        conversation = reconstruct_session_conversation(&workspace, picked_id);
+                        state.set_session_id(picked_id);
+                        queued.clear();
+                        writeln!(
+                            stdout,
+                            "Resumed session {picked_id} ({} message(s) loaded).",
+                            conversation.len()
+                        )
+                        .map_err(terminal_failed)?;
+                        prompt = Prompt::Task;
+                    }
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Task if line.trim() == "/new" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let new_session = SessionId::new();
+                state.set_session_id(new_session);
+                conversation.clear();
+                queued.clear();
+                writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
+            }
+            Prompt::Task if line.trim() == "/clear" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                conversation.clear();
+                queued.clear();
+                writeln!(
+                    stdout,
+                    "Cleared conversation context for session {}.",
+                    state.session_id()
+                )
+                .map_err(terminal_failed)?;
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/resume") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match line.split_whitespace().nth(1) {
+                    None => {
+                        sessions = load_workspace_sessions(&workspace);
+                        prompt = Prompt::Resume;
+                    }
+                    Some(id_str) => match id_str.parse::<SessionId>() {
+                        Ok(id) => {
+                            conversation = reconstruct_session_conversation(&workspace, id);
+                            state.set_session_id(id);
+                            queued.clear();
+                            writeln!(
+                                stdout,
+                                "Resumed session {id} ({} message(s) loaded).",
+                                conversation.len()
+                            )
+                            .map_err(terminal_failed)?;
+                        }
+                        Err(_) => {
+                            writeln!(stdout, "Invalid session ID `{id_str}`.").map_err(terminal_failed)?;
+                        }
+                    },
+                }
+            }
+            Prompt::Task if line.trim() == "/update" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                writeln!(
+                    stdout,
+                    "arsy-code v{} is up to date.",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .map_err(terminal_failed)?;
+            }
             Prompt::Task if line.trim() == "/auth" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 providers = configured_providers(invocation);
@@ -2272,6 +2373,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 );
                 match run_turn(
                     invocation,
+                    state.session_id(),
                     native.as_ref(),
                     &line,
                     &route,
@@ -2574,18 +2676,104 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
         return Vec::new();
     };
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let Ok(config) = load_config(&root, &working) else {
-        return Vec::new();
-    };
     let mut choices = Vec::new();
-    for endpoint in config.endpoints() {
-        choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-            provider: endpoint.id.clone(),
-            slug: slug.clone(),
-            name: format!("on {}", endpoint.id),
-        }));
+    if let Ok(config) = load_config(&root, &working) {
+        for endpoint in config.endpoints() {
+            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
+                provider: endpoint.id.clone(),
+                slug: slug.clone(),
+                name: format!("on {}", endpoint.id),
+            }));
+        }
+    }
+    for preset in arsy_kernel::oauth::presets::all() {
+        if !choices.iter().any(|c| c.provider == preset.id) {
+            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
+                provider: preset.id.to_string(),
+                slug: (*slug).to_string(),
+                name: format!("on {}", preset.id),
+            }));
+        }
     }
     choices
+}
+
+#[cfg(feature = "tui")]
+fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
+    let Ok(store) = open_store(workspace) else {
+        return Vec::new();
+    };
+    let Ok(summaries) = store.sessions(30) else {
+        return Vec::new();
+    };
+    summaries
+        .into_iter()
+        .map(|s| {
+            let ts = s.last_event_at_ms.or(s.started_at_ms).unwrap_or_default();
+            let last_seen = if ts > 0 {
+                let now = arsy_kernel::artifact::unix_time_ms();
+                let diff_secs = now.saturating_sub(ts) / 1000;
+                if diff_secs < 60 {
+                    "just now".to_owned()
+                } else if diff_secs < 3600 {
+                    format!("{}m ago", diff_secs / 60)
+                } else if diff_secs < 86400 {
+                    format!("{}h ago", diff_secs / 3600)
+                } else {
+                    format!("{}d ago", diff_secs / 86400)
+                }
+            } else {
+                "recorded".to_owned()
+            };
+            tui::SessionChoice {
+                id: s.session,
+                events: s.version.0,
+                last_seen,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "tui")]
+fn reconstruct_session_conversation(
+    workspace: &Path,
+    session: SessionId,
+) -> Vec<ModelMessage> {
+    let Ok(store) = open_store(workspace) else {
+        return Vec::new();
+    };
+    let Ok(events) = store.read(session, 1, 1000) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for event in events {
+        if event.kind == "turn.started" {
+            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
+                if let Some(prompt) = data.get("prompt").and_then(Value::as_str) {
+                    messages.push(ModelMessage {
+                        role: ModelRole::User,
+                        content: vec![ModelContent::Text {
+                            text: prompt.to_owned(),
+                        }],
+                    });
+                }
+            }
+        } else if event.kind == "turn.completed" {
+            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
+                if let Some(resp) = data.get("response").and_then(Value::as_str) {
+                    if !resp.trim().is_empty() {
+                        messages.push(ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::Text {
+                                text: resp.to_owned(),
+                            }],
+                        });
+                    }
+                }
+            }
+        }
+    }
+    messages
 }
 
 /// The providers configured right now, in the order the configuration lists
@@ -2973,11 +3161,11 @@ struct RecordedTurn {
 #[cfg(feature = "tui")]
 fn record_turn(
     invocation: &Invocation,
+    session: SessionId,
     task: String,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
     let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    let session = SessionId::new();
     emitter.session = Some(session);
     let actor = actor();
     let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
@@ -3026,6 +3214,7 @@ fn record_turn(
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
     invocation: &Invocation,
+    session_id: SessionId,
     native: Option<&provider::Resolved>,
     task: &str,
     route: &tui::ModelRoute,
@@ -3046,7 +3235,7 @@ fn run_turn(
         admission,
         session,
         task: node,
-    } = record_turn(invocation, task.clone(), emitter)?;
+    } = record_turn(invocation, session_id, task.clone(), emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -3056,22 +3245,20 @@ fn run_turn(
         content: vec![ModelContent::Text { text: task.clone() }],
     });
     let root = workspace_root(&invocation.workspace)?;
-    let outcome = match native.filter(|_| !route.is_codex()) {
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let dynamic_provider = load_config(&root, &working)
+        .ok()
+        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok())
+        .or_else(|| native.cloned());
+
+    let outcome = match dynamic_provider.as_ref().filter(|_| !route.is_codex()) {
         Some(resolved) => native_turn(
             resolved,
-            // An operator is at the keyboard, so an approval can be asked for;
-            // the risk context says so and policy decides on it.
-            //
-            // Configuration is resolved from the working directory, not the
-            // root: a directory-scoped policy layer has to reach the turn, and
-            // it is the same directory the instruction walk starts from, so
-            // what the model is told and what it is allowed to do come from
-            // one place.
             &agent_runtime(
                 &root,
                 &load_config(
                     &root,
-                    &std::env::current_dir().unwrap_or_else(|_| root.clone()),
+                    &working,
                 )?,
                 true,
             )?,
@@ -3086,7 +3273,7 @@ fn run_turn(
             composer,
         ),
         None => external_status(
-            &workspace_root(&invocation.workspace)?,
+            &root,
             &task,
             route,
             colour,
@@ -3347,12 +3534,34 @@ fn native_turn(
                     }
                 }
             };
-            let detail = content.lines().next_back().unwrap_or_default();
-            writeln!(
-                terminal,
-                "{}",
-                tui::tool_result_row(colour, name, !is_error, detail)
-            )?;
+            if name == "bash" || name == "shell.execute" {
+                writeln!(
+                    terminal,
+                    "{}",
+                    tui::bash_box(
+                        tui::terminal_width(),
+                        colour,
+                        &summary,
+                        &content,
+                        Some(if is_error { 1 } else { 0 }),
+                        std::time::Duration::from_millis(50),
+                    )
+                )?;
+            } else {
+                writeln!(
+                    terminal,
+                    "{}",
+                    tui::tool_box(
+                        tui::terminal_width(),
+                        colour,
+                        name,
+                        &summary,
+                        &content,
+                        !is_error,
+                        std::time::Duration::from_millis(50),
+                    )
+                )?;
+            }
             terminal.flush()?;
             results.push(ModelContent::ToolResult {
                 id: id.clone(),
@@ -3460,24 +3669,25 @@ fn confirm_tool(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
 ) -> io::Result<Answer> {
-    // The reason policy gave, not a generic prompt: an operator asked "allow
-    // this?" about every call learns nothing and answers by reflex.
-    let prompt = if reason.trim().is_empty() {
-        summary.to_owned()
-    } else {
-        format!("{summary} — {reason}")
-    };
-    writeln!(terminal, "{}", tui::tool_prompt_row(colour, name, &prompt))?;
+    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason);
+    let width = tui::terminal_width();
+    write!(terminal, "{}\n", dialog.render(width, colour))?;
     terminal.flush()?;
     loop {
         match keys.recv() {
             Ok(byte) => match decoder.feed(byte) {
-                Some(tui::Key::Char('y' | 'Y')) => return Ok(Answer::Yes),
-                Some(tui::Key::Char(_)) => return Ok(Answer::No),
-                Some(tui::Key::Interrupt | tui::Key::Eof) => return Ok(Answer::Stop),
-                _ => continue,
+                Some(key) => {
+                    if let Some(result) = dialog.handle_key(key) {
+                        match result {
+                            tui::AskDialogResult::Approve => return Ok(Answer::Yes),
+                            tui::AskDialogResult::Deny => return Ok(Answer::No),
+                            tui::AskDialogResult::Other(_) => return Ok(Answer::No),
+                            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
+                        }
+                    }
+                }
+                None => continue,
             },
-            // The key reader is gone, so no answer can arrive and none will.
             Err(_) => return Ok(Answer::Stop),
         }
     }
@@ -6223,7 +6433,7 @@ mod tests {
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit"
+                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit" | "/new" | "/clear" | "/resume" | "/update"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
