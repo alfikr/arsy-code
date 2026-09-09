@@ -1,0 +1,32 @@
+{
+  "revision": "e62007aa45d94b1a23364b556686981c5ec8315b",
+  "environment": {
+    "ARSY_EVAL": "1"
+  },
+  "allowed_capabilities": [
+    "process.exec"
+  ],
+  "arms": [
+    {
+      "name": "guesses",
+      "environment": {
+        "ARSY_CONFIG_HOME": "fixtures/eval/homes/guesses"
+      }
+    },
+    {
+      "name": "reads",
+      "environment": {
+        "ARSY_CONFIG_HOME": "fixtures/eval/homes/reads"
+      }
+    }
+  ],
+  "hidden_tests": [
+    [
+      "sh",
+      "-c",
+      "records=$(arsy run 'what does the subject file say?' --output json); printf '%s\\n' \"$records\"; printf '%s' \"$records\" | grep -q 'the answer is 42'"
+    ]
+  ],
+  "timeout_seconds": 120,
+  "trials": 5
+}

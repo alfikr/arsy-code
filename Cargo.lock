@@ -60,6 +60,7 @@ name = "arsy-cli"
 version = "0.1.0"
 dependencies = [
  "arsy-code",
+ "arsy-ide",
  "arsy-kernel",
  "rpassword",
  "serde",
@@ -74,6 +75,7 @@ version = "0.1.0"
 dependencies = [
  "arsy-kernel",
  "cap-std",
+ "globset",
  "ignore",
  "proptest",
  "serde",
@@ -85,6 +87,13 @@ dependencies = [
  "tree-sitter-rust",
  "wasmtime",
  "yaml_serde",
+]
+
+[[package]]
+name = "arsy-ide"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

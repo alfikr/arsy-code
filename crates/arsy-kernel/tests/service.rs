@@ -7,7 +7,7 @@ use arsy_kernel::{
         ClientRequest, IdempotencyKey, ProtocolEnvelope, ServerEvent, TurnStart,
         MAX_SUBSCRIPTION_BATCH,
     },
-    service::{AgentService, ServiceError, TurnFinishedEvidence, TurnStartedEvidence},
+    service::{AgentService, BranchMode, ServiceError, TurnFinishedEvidence, TurnStartedEvidence},
     sqlite::{Durability, SqliteEventStore},
 };
 use serde_json::json;
@@ -216,4 +216,94 @@ fn payload<T: serde::de::DeserializeOwned>(event: &arsy_kernel::event::EventEnve
         panic!("expected inline evidence");
     };
     serde_json::from_value(data.clone()).expect("evidence decodes")
+}
+
+#[test]
+fn branching_records_ancestry_and_leaves_the_parent_intact() {
+    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+    let parent = SessionId::new();
+    let service = AgentService::attach(store.clone(), parent).unwrap();
+    let actor = Principal::User("dev".into());
+    let first = service
+        .start_turn(actor.clone(), &turn_start(parent, "one"))
+        .unwrap();
+    service
+        .complete_turn(actor.clone(), first.turn, &json!({"ok": true}))
+        .unwrap();
+    service
+        .start_turn(actor.clone(), &turn_start(parent, "two"))
+        .unwrap();
+    let parent_history = AgentService::history(store.as_ref(), parent).unwrap();
+    assert_eq!(parent_history.len(), 3);
+
+    // Rewind to the first turn: the branch continues from there, and the
+    // parent keeps the events that came after it.
+    let cut = parent_history[0].id;
+    let (branch, branch_id, evidence) = AgentService::branch(
+        store.clone(),
+        parent,
+        Some(cut),
+        BranchMode::Rewind,
+        actor.clone(),
+    )
+    .unwrap();
+    assert_eq!(evidence.parent, parent);
+    assert_eq!(evidence.at_sequence, 1);
+    assert_eq!(evidence.parent_version, 3);
+    assert!(evidence.mode.inherits_prefix());
+    assert_eq!(
+        AgentService::history(store.as_ref(), parent).unwrap(),
+        parent_history,
+        "branching must not rewrite the parent"
+    );
+
+    let recorded = AgentService::history(store.as_ref(), branch_id).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].kind, "session.branched");
+    assert_eq!(
+        AgentService::ancestry(store.as_ref(), branch_id).unwrap(),
+        Some(evidence)
+    );
+    // The branch is a working session: turns append on top of its own stream.
+    let resumed = branch
+        .start_turn(actor.clone(), &turn_start(branch_id, "three"))
+        .unwrap();
+    assert!(!resumed.replay);
+    assert_eq!(branch.committed_version().unwrap().0, 2);
+
+    // A fork defaults to the parent head and inherits no prefix.
+    let (_, forked, forked_evidence) =
+        AgentService::branch(store.clone(), parent, None, BranchMode::Fork, actor).unwrap();
+    assert_eq!(forked_evidence.at_sequence, 3);
+    assert!(!forked_evidence.mode.inherits_prefix());
+    assert_ne!(forked, branch_id);
+    assert!(AgentService::ancestry(store.as_ref(), parent)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn branching_rejects_an_unknown_point_and_an_empty_parent() {
+    let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+    let empty = SessionId::new();
+    let actor = Principal::System;
+    assert_eq!(
+        AgentService::branch(store.clone(), empty, None, BranchMode::Fork, actor.clone())
+            .err()
+            .expect("an empty parent cannot be branched"),
+        ServiceError::EmptyStream(empty)
+    );
+
+    let parent = SessionId::new();
+    let service = AgentService::attach(store.clone(), parent).unwrap();
+    service
+        .start_turn(actor.clone(), &turn_start(parent, "one"))
+        .unwrap();
+    let unknown = arsy_kernel::domain::EventId::new();
+    assert_eq!(
+        AgentService::branch(store, parent, Some(unknown), BranchMode::Rewind, actor)
+            .err()
+            .expect("an unknown branch point is refused"),
+        ServiceError::UnknownEvent(unknown)
+    );
 }

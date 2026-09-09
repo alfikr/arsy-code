@@ -80,7 +80,53 @@ pub fn append_endpoint(config: &str, endpoint: &Endpoint) -> String {
 /// taken with it. A name that is not there leaves the file untouched.
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn remove_endpoint(config: &str, name: &str) -> String {
-    let header = format!("[provider.endpoint.{name}]");
+    remove_table(config, &format!("[provider.endpoint.{name}]"))
+}
+
+/// Append a table with the given header and `key = value` lines already
+/// formatted, separated from what came before by one blank line.
+pub fn append_table(config: &str, table: &str) -> String {
+    let mut out = config.to_owned();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(table);
+    out
+}
+
+/// Set `key` inside the table whose header is `header`, adding the key when the
+/// table does not have it. A file without that table is returned unchanged, so
+/// the caller decides whether to append one.
+pub fn set_in_table(config: &str, header: &str, key: &str, value: &str) -> Option<String> {
+    let mut lines: Vec<String> = config.lines().map(str::to_owned).collect();
+    let table = lines.iter().position(|line| line.trim() == header)?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(table + 1)
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map_or(lines.len(), |(index, _)| index);
+    let line = format!("{key} = {value}");
+    match lines[table + 1..end]
+        .iter()
+        .position(|existing| existing.trim_start().starts_with(&format!("{key} ")))
+    {
+        Some(offset) => lines[table + 1 + offset] = line,
+        None => lines.insert(end, line),
+    }
+    Some(terminated(lines.join("\n")))
+}
+
+/// Remove the table headed by `header` and the keys under it.
+///
+/// The table ends where the next one begins, so everything from its header to
+/// the following header goes, and one blank line left behind by the removal is
+/// taken with it. A header that is not there leaves the file untouched.
+pub fn remove_table(config: &str, header: &str) -> String {
+    let header = header.to_owned();
     let lines: Vec<&str> = config.lines().collect();
     let Some(start) = lines.iter().position(|line| line.trim() == header) else {
         return config.to_owned();
@@ -104,7 +150,11 @@ pub fn remove_endpoint(config: &str, name: &str) -> String {
         }
         kept.remove(start);
     }
-    let mut out = kept.join("\n");
+    terminated(kept.join("\n"))
+}
+
+/// One trailing newline, never a run of blank lines at the end.
+fn terminated(mut out: String) -> String {
     while out.ends_with("\n\n") {
         out.pop();
     }
@@ -150,14 +200,7 @@ pub fn set_default(config: &str, name: &str) -> String {
         lines.insert(first + 2, line);
         lines.insert(first + 3, String::new());
     }
-    let mut out = lines.join("\n");
-    while out.ends_with("\n\n") {
-        out.pop();
-    }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    terminated(lines.join("\n"))
 }
 
 /// A file ARSY has never written needs the header every layer is rejected
@@ -303,5 +346,51 @@ color = \"always\"
         ] {
             assert!(!is_writable(bad), "{bad:?} was accepted");
         }
+    }
+
+    /// Toggling a key in one table must not leak into the next one.
+    ///
+    /// The insertion point is "before the following header", which is where a
+    /// blank separator line sits — TOML still reads the key as belonging to the
+    /// table above it. Asserted through the real loader, because "the file
+    /// still loads and means what it says" is the only property that matters.
+    #[test]
+    fn setting_a_key_lands_inside_its_own_table() {
+        use arsy_kernel::config::{Config, Layer, CONFIG_FILE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        let load = |body: &str| {
+            std::fs::write(&path, body).unwrap();
+            Config::load(&[(Layer::User, path.clone())]).expect("the file still loads")
+        };
+
+        let config = "\
+schema_version = 1
+
+[mcp.server.first]
+transport = \"stdio\"
+command = \"one\"
+
+[mcp.server.second]
+transport = \"stdio\"
+command = \"two\"
+";
+        let updated = set_in_table(config, "[mcp.server.first]", "enabled", "false").unwrap();
+        let loaded = load(&updated);
+        assert!(!loaded.mcp_server("first").unwrap().enabled);
+        assert!(
+            loaded.mcp_server("second").unwrap().enabled,
+            "the neighbouring table is untouched: {updated}"
+        );
+
+        // Setting it again replaces the key rather than adding a second one.
+        let again = set_in_table(&updated, "[mcp.server.first]", "enabled", "true").unwrap();
+        assert_eq!(again.matches("enabled").count(), 1, "{again}");
+        assert!(load(&again).mcp_server("first").unwrap().enabled);
+
+        // A table that is not there is `None`, so the caller decides whether to
+        // append one rather than getting a silently unchanged file back.
+        assert!(set_in_table(config, "[mcp.server.absent]", "enabled", "false").is_none());
     }
 }

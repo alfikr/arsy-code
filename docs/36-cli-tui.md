@@ -13,9 +13,29 @@ events and matchers, and accepts `--event <original-or-canonical-name>`.
 Unsupported lifecycle events are labelled unsupported. Other hook ecosystems
 and user/enterprise integration configuration are not yet inspected.
 
-Every declaration is labelled `not_loaded`. Native MCP connection management,
-handshakes, discovery, reconnect/refresh, and executable hooks remain unimplemented;
-these inspection results are not a claim that an integration is running.
+Every declaration is labelled `not_loaded`: an inspection result is never a claim
+that an integration is running.
+
+Native MCP connections are separate from those imported declarations. They are
+defined in `config.toml` as `[mcp.server.<name>]`, written by `arsy mcp add` and
+`arsy mcp remove` and toggled by `arsy mcp enable`/`disable`, with `--scope
+user|workspace` selecting the configuration layer that owns the table. The layer
+decides the connection's trust label, so a definition that travels with a
+repository is `workspace` rather than `user`. `arsy mcp list` shows those
+connections alongside the imported declarations; `--source arsy` narrows to the
+native ones. `arsy mcp test <NAME>` is the only command that contacts a server:
+it connects, negotiates, discovers, and disconnects, and never invokes a tool.
+
+The client itself supports stdio and Streamable HTTP, bounded bodies and
+deadlines, reconnect with bounded backoff and an explicit attempt limit, and
+refresh as re-discovery without a teardown. Reconnect and refresh cannot widen
+authority: the tools, resources, and prompts adopted on the first connection are
+the ceiling, and anything appearing later outside it is reported and rejected.
+Authentication failure and a disabled connection are excluded from automatic
+retry. Executable hooks are dispatched by the lifecycle engine, which `arsy hook
+list` reports the effect class and failure policy of; the engine is not yet wired
+into the interactive turn loop.
+
 The existing provider subprocess owns its own integrations and permissions.
 
 Human output lists each declaration as a count line and one row per declaration:
@@ -155,7 +175,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | `arsy` | none | global flags | open the interactive TUI in the workspace | 2 |
 | `arsy run <TASK>` | one required task string; `-` reads it from stdin | global flags | execute one task non-interactively and exit at its terminal state | 1 |
 | `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
-| `arsy review [REVISION]` | optional Git revision; omitted means the working-tree diff | `--base <REVISION>` plus global flags | produce a structured review without modifying the workspace | 6 |
+| `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
 | `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |
 | `arsy session show <SESSION_ID>` | one required session ID | `--turns`, `--evidence` | show turns, recorded evidence, approvals, and totals for one session | 1 |
 | `arsy session export <SESSION_ID>` | one required session ID | `--out <PATH>`, `--include-artifacts` | export canonical events as JSONL for audit or forensic review | 1 |
@@ -217,9 +237,12 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy doctor` | none | `--strict` | check configuration, credentials by handle, sandbox backends, Git, providers without a billable request, and release provenance; `--strict` turns warnings into failure | 1 |
-| `arsy migrate <TARGET>` | one of `config`, `session` | `--apply`, `--backup <PATH>` | report the planned migration and its loss report; `--apply` is required to write | 1 |
+| `arsy migrate` | none; the session store is the only thing with a migration chain | `--apply`, `--backup <PATH>` | report the planned migration and its loss report; `--apply` is required to write, and takes a verified backup first | 1 |
+| `arsy memory list` | none | `--scope <SCOPE>`, `--all` | what this workspace remembers; `--all` includes superseded and revoked records | 9 |
+| `arsy memory remember <CLAIM>` | one required claim | `--scope <SCOPE>` | record a durable claim, stored as an artifact like any other evidence | 9 |
+| `arsy memory forget <ID>` | one required memory ID | `--to <REASON>` | withdraw a record, keeping the tombstone and its reason | 9 |
 | `arsy gc` | none | `--apply`, `--retention <DURATION>` | report artifacts unreachable and past retention; `--apply` is required to delete | 1 |
-| `arsy serve` | none | `--transport <stdio\|socket>` | serve the canonical protocol for an embedding client; defaults to stdio and is never a background daemon | 1 |
+| `arsy serve` | none | `--protocol <mcp\|acp>`, `--transport stdio` | offer operations as MCP tools, or speak ACP to an editor; stdio only, because this is never a background daemon | 1 |
 | `arsy eval <SUITE>` | one suite path or ID | `--trials <N>`, `--out <PATH>` | run an evaluation suite and report outcome, efficiency, and safety metrics | 1 |
 | `arsy completions <SHELL>` | one of `bash`, `zsh`, `fish`, `powershell` | none | print a shell completion script to standard output | 1 |
 

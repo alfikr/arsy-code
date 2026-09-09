@@ -1,0 +1,182 @@
+//! `arsy mcp` end to end: define a connection, list it, probe a real stdio
+//! server over a real pipe, then disable and remove it.
+//!
+//! The server is a small script rather than a mock, so the negotiation, the
+//! newline framing, and the subprocess lifecycle are all genuinely exercised.
+
+use serde_json::Value;
+use std::{path::Path, process::Command};
+
+/// The fixture server is `arsy serve` itself.
+///
+/// Using the build's own MCP server rather than a scripted one keeps the test
+/// free of an interpreter — the suite runs on Windows too — and makes this a
+/// round trip: the client under test negotiates with the server under test.
+fn server_command() -> String {
+    env!("CARGO_BIN_EXE_arsy").to_owned()
+}
+
+fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
+    // Global flags go first: everything after a bare `--` belongs to the
+    // connection's own command line, so appending them would hand ARSY's flags
+    // to the server instead.
+    let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
+        .args(["--workspace", workspace.to_str().unwrap()])
+        .args(["--output", "json"])
+        .args(args)
+        .output()
+        .expect("the binary runs");
+    let stdout = String::from_utf8(output.stdout).expect("machine output is UTF-8");
+    let record = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|record| record["type"] == "result")
+        .unwrap_or_else(|| panic!("no result record in {stdout}"));
+    (
+        output.status.code().unwrap_or(-1),
+        record["payload"].clone(),
+    )
+}
+
+#[test]
+fn a_connection_is_defined_listed_probed_disabled_and_removed() {
+    let workspace = tempfile::tempdir().unwrap();
+    // The server runs in its own directory so the probe cannot see, or be
+    // confused by, the connection definition it is being reached through.
+    let served = tempfile::tempdir().unwrap();
+    let program = server_command();
+    let scoped = ["--scope", "workspace"];
+
+    let (code, added) = arsy(
+        workspace.path(),
+        &[
+            &["mcp", "add", "fixture", "--command", program.as_str()][..],
+            &scoped[..],
+            &[
+                "--",
+                "--workspace",
+                served.path().to_str().unwrap(),
+                "serve",
+            ][..],
+        ]
+        .concat(),
+    );
+    assert_eq!(code, 0, "{added}");
+    assert_eq!(added["transport"], "stdio");
+    assert_eq!(
+        added["trust"], "workspace",
+        "a repository file is untrusted"
+    );
+    assert_eq!(added["connected"], false, "defining is not connecting");
+
+    // The definition appears in the listing without anything being connected.
+    let (code, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
+    assert_eq!(code, 0);
+    let entries = listed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "fixture");
+    assert_eq!(entries[0]["enabled"], true);
+    assert_eq!(entries[0]["runtime_status"], "not_loaded");
+
+    // Adding the same name twice is refused rather than silently duplicated.
+    let (code, _) = arsy(
+        workspace.path(),
+        &[
+            &["mcp", "add", "fixture", "--command", program.as_str()][..],
+            &scoped[..],
+        ]
+        .concat(),
+    );
+    assert_eq!(code, 2);
+
+    let (code, probed) = arsy(workspace.path(), &["mcp", "test", "fixture"]);
+    assert_eq!(code, 0, "{probed}");
+    assert_eq!(probed["server"]["name"], "arsy");
+    assert_eq!(probed["server"]["protocol_version"], "2026-07-28");
+    let discovered: Vec<&str> = probed["discovery"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(discovered.contains(&"process.exec"), "{discovered:?}");
+    assert!(discovered.contains(&"git.status"), "{discovered:?}");
+    // The ceiling a real connection would hold is exactly what was discovered.
+    assert_eq!(
+        probed["would_admit"]["tools"].as_array().unwrap().len(),
+        discovered.len()
+    );
+    assert_eq!(probed["tool_invoked"], false, "a probe never calls a tool");
+
+    // Disabling leaves the definition in place and stops it connecting.
+    let (code, disabled) = arsy(
+        workspace.path(),
+        &[&["mcp", "disable", "fixture"][..], &scoped[..]].concat(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(disabled["enabled"], false);
+    let (code, _) = arsy(workspace.path(), &["mcp", "test", "fixture"]);
+    assert_eq!(code, 3, "a disabled connection is a policy refusal");
+    let (_, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
+    assert_eq!(listed["entries"][0]["enabled"], false);
+
+    let (code, enabled) = arsy(
+        workspace.path(),
+        &[&["mcp", "enable", "fixture"][..], &scoped[..]].concat(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(enabled["enabled"], true);
+
+    let (code, removed) = arsy(
+        workspace.path(),
+        &[&["mcp", "remove", "fixture"][..], &scoped[..]].concat(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(removed["removed"], true);
+    let (_, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
+    assert!(listed["entries"].as_array().unwrap().is_empty());
+
+    // Removing what is not there is an error, not a silent success.
+    let (code, _) = arsy(
+        workspace.path(),
+        &[&["mcp", "remove", "fixture"][..], &scoped[..]].concat(),
+    );
+    assert_eq!(code, 2);
+    let (code, _) = arsy(workspace.path(), &["mcp", "test", "fixture"]);
+    assert_eq!(code, 2);
+}
+
+/// Unix-gated: it needs a program that reads nothing and answers nothing, and
+/// `sleep` is the portable-across-unix way to say that.
+#[cfg(unix)]
+#[test]
+fn a_server_that_never_answers_fails_on_the_deadline() {
+    let workspace = tempfile::tempdir().unwrap();
+
+    let (code, _) = arsy(
+        workspace.path(),
+        &[
+            "mcp",
+            "add",
+            "silent",
+            "--command",
+            "sh",
+            "--timeout",
+            "1",
+            "--scope",
+            "workspace",
+            "--",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert_eq!(code, 0);
+
+    let started = std::time::Instant::now();
+    let (code, _) = arsy(workspace.path(), &["mcp", "test", "silent"]);
+    assert_eq!(code, 5, "a transport failure exits in the protocol class");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the deadline must bound the probe, not the server's own lifetime"
+    );
+}

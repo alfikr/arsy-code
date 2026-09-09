@@ -14,6 +14,7 @@ pub mod google_code_assist;
 pub mod http;
 pub mod openai;
 pub mod openai_responses;
+pub mod replay;
 pub mod wire;
 
 use crate::protocol::IdempotencyKey;
@@ -23,7 +24,7 @@ use std::{fmt, time::Duration};
 
 /// Provider-qualified model name. The provider half selects the adapter; the
 /// model half is passed through to the wire untouched.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ModelKey {
     pub provider: String,
     pub model: String,

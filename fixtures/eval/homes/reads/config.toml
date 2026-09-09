@@ -1,0 +1,11 @@
+schema_version = 1
+
+# A recorded conversation, replayed. The path is relative to the workspace the
+# eval runs in, so this file works in any checkout.
+[provider.endpoint.replay]
+kind = "replay"
+base_url = "fixtures/eval/scripts/read-then-answer.json"
+model = "recorded"
+
+[policy]
+default_effect = "allow"

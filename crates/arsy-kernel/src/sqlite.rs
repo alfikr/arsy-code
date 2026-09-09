@@ -76,6 +76,17 @@ impl Durability {
     }
 }
 
+/// One recorded stream as `arsy session list` reports it. Timestamps are
+/// `None` for a stream whose row exists but whose append did not commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    pub session: SessionId,
+    pub version: StreamVersion,
+    pub durability: Durability,
+    pub started_at_ms: Option<u64>,
+    pub last_event_at_ms: Option<u64>,
+}
+
 pub struct SqliteEventStore {
     path: PathBuf,
     writer: Mutex<Connection>,
@@ -127,6 +138,55 @@ impl SqliteEventStore {
             .map_err(storage)?
             .map(|value| Durability::parse(&value))
             .transpose()
+    }
+
+    /// Every recorded stream in this store, most recently active first.
+    ///
+    /// The event store trait is stream-scoped by design, so enumeration lives
+    /// here rather than on `EventStore`: only a store that owns a catalogue of
+    /// streams can answer it, and an in-memory one has no durable catalogue to
+    /// list. `arsy session list` is the caller.
+    pub fn sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, StoreError> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT s.stream_id, s.version, s.durability,
+                        MIN(e.occurred_at_ms), MAX(e.occurred_at_ms)
+                 FROM sessions s LEFT JOIN events e ON e.stream_id = s.stream_id
+                 GROUP BY s.stream_id, s.version, s.durability
+                 ORDER BY MAX(e.occurred_at_ms) DESC, s.stream_id
+                 LIMIT ?1",
+            )
+            .map_err(storage)?;
+        let rows = statement
+            .query_map([limit_i64(limit)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .map_err(storage)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (id, version, durability, first, last) = row.map_err(storage)?;
+            sessions.push(SessionSummary {
+                session: id
+                    .parse()
+                    .map_err(|_| StoreError::Storage(format!("unreadable stream id {id}")))?,
+                version: StreamVersion(
+                    version
+                        .try_into()
+                        .map_err(|_| StoreError::Storage("negative stream version".into()))?,
+                ),
+                durability: Durability::parse(&durability)?,
+                started_at_ms: first.map(unsigned).transpose()?,
+                last_event_at_ms: last.map(unsigned).transpose()?,
+            });
+        }
+        Ok(sessions)
     }
 
     pub fn read_by_actor(
@@ -350,6 +410,12 @@ fn integer(value: u64) -> Result<i64, StoreError> {
     value
         .try_into()
         .map_err(|_| StoreError::Storage("value exceeds SQLite INTEGER".into()))
+}
+
+fn unsigned(value: i64) -> Result<u64, StoreError> {
+    value
+        .try_into()
+        .map_err(|_| StoreError::Storage("negative timestamp".into()))
 }
 
 fn limit_i64(limit: usize) -> i64 {

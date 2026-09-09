@@ -7,14 +7,14 @@
 use crate::{
     domain::{CorrelationId, EventId, Principal, SessionId, StateVersion, SubscriptionId, TurnId},
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
-    projection::{ProjectionError, ProjectionSet, TurnStatus},
+    projection::{ProjectionError, ProjectionSet, TurnStatus, UsageTotals},
     protocol::{
         ClientRequest, IdempotencyKey, ProtocolEnvelope, ProtocolError, RequestLedger, ServerEvent,
         SubscriptionCursor, MAX_SUBSCRIPTION_BATCH,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
@@ -51,6 +51,46 @@ pub struct TurnFinishedEvidence {
 pub struct TurnFailure {
     pub code: String,
     pub message: String,
+}
+
+/// How a new stream relates to the one it came from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchMode {
+    /// The branch continues from the parent's state at the branch point: a
+    /// reader reconstructs its history by walking ancestry into the parent's
+    /// prefix. Nothing is copied and nothing is truncated.
+    Rewind,
+    /// The branch records where it came from but inherits no history.
+    Fork,
+}
+
+impl BranchMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rewind => "rewind",
+            Self::Fork => "fork",
+        }
+    }
+
+    /// Whether the parent's prefix is part of this branch's history.
+    pub const fn inherits_prefix(self) -> bool {
+        matches!(self, Self::Rewind)
+    }
+}
+
+/// Evidence recorded with `session.branched`: enough to replay the branch's
+/// history without consulting anything but the store.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BranchEvidence {
+    pub mode: BranchMode,
+    pub parent: SessionId,
+    /// The parent event the branch continues from.
+    pub at_event: EventId,
+    pub at_sequence: u64,
+    /// The parent's committed length when the branch was taken, so a later
+    /// reader can tell how much of the parent the branch does not include.
+    pub parent_version: u64,
 }
 
 /// Verdict for a `turn_start` request.
@@ -128,6 +168,79 @@ impl AgentService {
         self.session
     }
 
+    /// Read one stream in full, in sequence order.
+    pub fn history(
+        store: &dyn EventStore,
+        session: SessionId,
+    ) -> Result<Vec<EventEnvelope>, ServiceError> {
+        let mut events = Vec::new();
+        let mut next = 1;
+        loop {
+            let page = store.read(session, next, MAX_SUBSCRIPTION_BATCH)?;
+            let Some(last) = page.last() else {
+                return Ok(events);
+            };
+            next = last
+                .sequence
+                .checked_add(1)
+                .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
+            events.extend(page);
+        }
+    }
+
+    /// Open a new stream that records where it came from.
+    ///
+    /// History is never rewritten: the parent keeps every event it had, and the
+    /// branch begins with one `session.branched` event naming the parent and
+    /// the branch point. A `Rewind` branch continues from the parent's state at
+    /// that point; a `Fork` records the ancestry only.
+    ///
+    /// `at` defaults to the parent's last committed event.
+    pub fn branch(
+        store: Arc<dyn EventStore>,
+        parent: SessionId,
+        at: Option<EventId>,
+        mode: BranchMode,
+        actor: Principal,
+    ) -> Result<(Self, SessionId, BranchEvidence), ServiceError> {
+        let history = Self::history(store.as_ref(), parent)?;
+        let branch_point = match at {
+            Some(id) => history
+                .iter()
+                .find(|event| event.id == id)
+                .ok_or(ServiceError::UnknownEvent(id))?,
+            None => history.last().ok_or(ServiceError::EmptyStream(parent))?,
+        };
+        let evidence = BranchEvidence {
+            mode,
+            parent,
+            at_event: branch_point.id,
+            at_sequence: branch_point.sequence,
+            parent_version: history.last().map_or(0, |event| event.sequence),
+        };
+
+        let session = SessionId::new();
+        let service = Self::attach(store, session)?;
+        {
+            let mut state = service.lock()?;
+            service.append(&mut state, actor, SESSION_BRANCHED, &evidence)?;
+        }
+        Ok((service, session, evidence))
+    }
+
+    /// The `session.branched` evidence this stream opened with, when it is a
+    /// branch of another one.
+    pub fn ancestry(
+        store: &dyn EventStore,
+        session: SessionId,
+    ) -> Result<Option<BranchEvidence>, ServiceError> {
+        let first = store.read(session, 1, 1)?;
+        match first.first() {
+            Some(event) if event.kind == SESSION_BRANCHED => Ok(Some(inline(event)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Admit a `turn_start` request and append `turn.started`.
     ///
     /// A repeated idempotency key with the same body returns the original turn
@@ -201,6 +314,31 @@ impl AgentService {
             message: message.into(),
         };
         self.finish_turn(actor, turn, TURN_FAILED, &Value::Null, Some(failure))
+    }
+
+    /// Append `usage.recorded`, so what a turn spent outlives the process that
+    /// spent it.
+    ///
+    /// Separate from `complete_turn` because a turn that fails has still spent
+    /// tokens, and because the projection folds usage across turns: totals
+    /// belong to the session, not to whichever turn happened to finish last.
+    pub fn record_usage(
+        &self,
+        actor: Principal,
+        usage: UsageTotals,
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(
+            &mut state,
+            actor,
+            USAGE_RECORDED,
+            &json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cost_micros": usage.cost_micros,
+            }),
+        )?;
+        Ok(state.version)
     }
 
     fn finish_turn(
@@ -307,6 +445,14 @@ impl AgentService {
 
     /// Append one event, then fan it out. Fan-out only touches per-subscriber
     /// buffers, so a slow subscriber can never block or fail a commit.
+    ///
+    /// The service is not the only writer a session has — a task graph records
+    /// its own state transitions to the same stream, because resuming a task
+    /// means replaying one history rather than correlating two. A conflict is
+    /// therefore the ordinary case of "someone else appended since we looked":
+    /// the missed events are folded into the projection and the append retried
+    /// once at the sequence that is now free. A second conflict is a genuinely
+    /// contended stream and is reported as one.
     fn append<T: Serialize>(
         &self,
         state: &mut ServiceState,
@@ -314,32 +460,71 @@ impl AgentService {
         kind: &str,
         payload: &T,
     ) -> Result<u64, ServiceError> {
-        let sequence = state
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
         let data = serde_json::to_value(payload)
             .map_err(|error| ServiceError::Store(StoreError::Serialization(error.to_string())))?;
-        let envelope = EventEnvelope::new(
-            self.session,
-            sequence,
-            actor,
-            state.last_event_id(),
-            CorrelationId::new(),
-            SERVICE_SCHEMA,
-            kind,
-            EventPayload::Inline { data },
-        );
-        let version = self
-            .store
-            .append(self.session, state.version, vec![envelope.clone()])?;
-        state.projection.apply(&envelope)?;
-        state.version = version;
-        for subscriber in state.subscribers.values_mut() {
-            subscriber.offer(&envelope);
+        for attempt in 0..2 {
+            let sequence = state
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?;
+            let envelope = EventEnvelope::new(
+                self.session,
+                sequence,
+                actor.clone(),
+                state.last_event_id(),
+                CorrelationId::new(),
+                SERVICE_SCHEMA,
+                kind,
+                EventPayload::Inline { data: data.clone() },
+            );
+            match self
+                .store
+                .append(self.session, state.version, vec![envelope.clone()])
+            {
+                Ok(version) => {
+                    state.projection.apply(&envelope)?;
+                    state.version = version;
+                    for subscriber in state.subscribers.values_mut() {
+                        subscriber.offer(&envelope);
+                    }
+                    return Ok(sequence);
+                }
+                Err(StoreError::Conflict { .. }) if attempt == 0 => self.catch_up(state)?,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(sequence)
+        Err(ServiceError::Store(StoreError::Conflict {
+            expected: state.version,
+            actual: self.store.current_version(self.session)?,
+        }))
+    }
+
+    /// Fold everything appended to this session since the service last looked
+    /// into its projection and its subscribers.
+    fn catch_up(&self, state: &mut ServiceState) -> Result<(), ServiceError> {
+        loop {
+            let page = self.store.read(
+                self.session,
+                state
+                    .version
+                    .0
+                    .checked_add(1)
+                    .ok_or(ServiceError::Store(StoreError::SequenceOverflow))?,
+                MAX_SUBSCRIPTION_BATCH,
+            )?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            let version = StreamVersion(last.sequence);
+            for event in &page {
+                state.projection.apply(event)?;
+                for subscriber in state.subscribers.values_mut() {
+                    subscriber.offer(event);
+                }
+            }
+            state.version = version;
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ServiceState>, ServiceError> {
@@ -420,9 +605,11 @@ impl Subscriber {
     }
 }
 
+const SESSION_BRANCHED: &str = "session.branched";
 const TURN_STARTED: &str = "turn.started";
 const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
+const USAGE_RECORDED: &str = "usage.recorded";
 
 fn digest_of(value: &Value) -> Result<StateVersion, ServiceError> {
     use sha2::{Digest, Sha256};
@@ -449,6 +636,8 @@ pub enum ServiceError {
     UnknownTurn(TurnId),
     TurnNotRunning(TurnId),
     UnknownSubscription(SubscriptionId),
+    UnknownEvent(EventId),
+    EmptyStream(SessionId),
     MissingEvidence(String),
     LedgerDesync,
     Poisoned,
@@ -483,6 +672,10 @@ impl fmt::Display for ServiceError {
             Self::UnknownTurn(turn) => write!(formatter, "turn {turn} does not exist"),
             Self::TurnNotRunning(turn) => write!(formatter, "turn {turn} is already finished"),
             Self::UnknownSubscription(id) => write!(formatter, "subscription {id} does not exist"),
+            Self::UnknownEvent(id) => write!(formatter, "event {id} is not in this session"),
+            Self::EmptyStream(session) => {
+                write!(formatter, "session {session} has no recorded events")
+            }
             Self::MissingEvidence(kind) => {
                 write!(formatter, "{kind} is missing its inline evidence")
             }

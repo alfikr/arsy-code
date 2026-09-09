@@ -413,6 +413,21 @@ impl ApprovalRequest {
         )
     }
 
+    /// The grant an operator's "yes" produces.
+    ///
+    /// Exactly the requirement that was shown and nothing beside it: the scope
+    /// is the literal resource, the depth is zero so the answer cannot be
+    /// delegated onward, and the expiry is the approval's own.
+    ///
+    /// [`ApprovalFlow`] is the durable path — it records who approved what —
+    /// and is what a session with an approval ledger should use. This is the
+    /// same grant for a caller that has already shown the request to the
+    /// operator and holds the answer in hand, so an interactive turn does not
+    /// have to keep a ledger in order to act on a "yes".
+    pub fn grant(&self) -> Result<CapabilityGrant, ApprovalError> {
+        exact_grant(self)
+    }
+
     pub const fn reversibility(&self) -> &'static str {
         if self.reversible {
             "The intended effect is reversible"

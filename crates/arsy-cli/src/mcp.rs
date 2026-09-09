@@ -1,0 +1,661 @@
+//! `arsy mcp`: manage MCP connection definitions, and probe one.
+//!
+//! Definitions live in `config.toml` beside everything else ARSY resolves, so
+//! `--scope user|workspace` is the configuration layer that owns the table and
+//! the layer decides the connection's trust label. Writing a definition is not
+//! connecting: only `test` contacts a server, and it never invokes a tool.
+
+use crate::{load_config, usage, Command, Diagnostic, Emitter, Invocation, Output};
+use arsy_code::mcp::{Connection, McpError, RealChannels};
+use arsy_kernel::config::{
+    self, Layer, McpServer, McpTransport, DEFAULT_MCP_MAX_BODY_BYTES, DEFAULT_MCP_TIMEOUT_MS,
+};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+/// Which configuration layer a definition is written to. Enterprise files are
+/// not writable from here: capping a fleet is an administrator's act, performed
+/// with the administrator's own tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Scope {
+    User,
+    Workspace,
+}
+
+impl Scope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Workspace => "workspace",
+        }
+    }
+
+    fn parse(value: Option<&str>) -> Result<Self, Diagnostic> {
+        match value {
+            // `user` is the default because a connection an operator adds is
+            // theirs, not something a cloned repository inherits.
+            None | Some("user") => Ok(Self::User),
+            Some("workspace") => Ok(Self::Workspace),
+            Some(other) => Err(usage(format!(
+                "--scope must be `user` or `workspace`, not `{other}`"
+            ))),
+        }
+    }
+
+    fn path(self, root: &Path) -> Result<PathBuf, Diagnostic> {
+        match self {
+            Self::Workspace => Ok(root.join(".arsy").join(config::CONFIG_FILE)),
+            Self::User => config::user_config().ok_or_else(|| {
+                Diagnostic::error(
+                    crate::ARSY_CFG_1000,
+                    "this platform has no user configuration directory",
+                    "use `--scope workspace`, or set the platform's configuration home",
+                )
+            }),
+        }
+    }
+
+    const fn layer(self) -> Layer {
+        match self {
+            Self::User => Layer::User,
+            Self::Workspace => Layer::Workspace,
+        }
+    }
+}
+
+const HELP: &str = "mcp requires `list`, `show <NAME>`, `add <NAME> --transport <stdio|http> \
+                    (--command <CMD> [ARGS...] | --url <URL>)`, `remove <NAME>`, `enable <NAME>`, \
+                    `disable <NAME>`, or `test <NAME>`";
+
+pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
+    let mut positional = arguments.positional.clone();
+    let Some(action) = positional.first().cloned() else {
+        return Err(usage(HELP));
+    };
+    positional.remove(0);
+
+    // `list` and `show` also read the declarations imported from other
+    // ecosystems, so they stay on the inspection path.
+    if matches!(action.as_str(), "list" | "show") {
+        return crate::integrations::parse(
+            "mcp",
+            std::iter::once(action).chain(positional).collect(),
+            arguments.source.clone(),
+            arguments.event.clone(),
+        );
+    }
+
+    let scope = Scope::parse(arguments.scope.as_deref())?;
+    let name = if positional.is_empty() {
+        return Err(usage(format!("mcp {action} requires a connection name")));
+    } else {
+        positional.remove(0)
+    };
+    if !crate::config_edit::is_writable(&name) {
+        return Err(usage(format!(
+            "`{name}` cannot be written to a TOML file as a connection name"
+        )));
+    }
+    match action.as_str() {
+        "add" => Ok(Command::McpAdd {
+            server: definition(&name, arguments, positional)?,
+            scope,
+        }),
+        "remove" | "enable" | "disable" => {
+            if !positional.is_empty() {
+                return Err(usage(format!("mcp {action} takes one connection name")));
+            }
+            Ok(match action.as_str() {
+                "remove" => Command::McpRemove { name, scope },
+                other => Command::McpEnable {
+                    name,
+                    enabled: other == "enable",
+                    scope,
+                },
+            })
+        }
+        "test" => {
+            if !positional.is_empty() {
+                return Err(usage("mcp test takes one connection name"));
+            }
+            Ok(Command::McpTest {
+                name,
+                timeout_ms: match arguments.timeout {
+                    None => None,
+                    Some(seconds) => Some(
+                        seconds
+                            .checked_mul(1_000)
+                            .ok_or_else(|| usage("--timeout is too large"))?,
+                    ),
+                },
+            })
+        }
+        other => Err(usage(format!("unknown mcp subcommand `{other}`\n{HELP}"))),
+    }
+}
+
+/// The definition `mcp add` writes. Arguments after the name belong to the
+/// command, which is why they are positional rather than a repeated flag.
+fn definition(
+    name: &str,
+    arguments: &crate::ParsedArguments,
+    args: Vec<String>,
+) -> Result<McpServer, Diagnostic> {
+    let transport = match (
+        arguments.transport.as_deref(),
+        arguments.command.as_deref(),
+        arguments.url.as_deref(),
+    ) {
+        (Some("stdio") | None, Some(command), None) => McpTransport::Stdio {
+            command: command.to_owned(),
+            args,
+        },
+        (Some("http"), None, Some(url)) => {
+            if !args.is_empty() {
+                return Err(usage("an http connection takes no command arguments"));
+            }
+            McpTransport::Http {
+                url: url.to_owned(),
+            }
+        }
+        (Some("stdio"), None, _) => Err(usage("a stdio connection needs --command <CMD>"))?,
+        (Some("http"), _, None) => Err(usage("an http connection needs --url <URL>"))?,
+        (Some(other), _, _) if !matches!(other, "stdio" | "http") => Err(usage(format!(
+            "--transport must be `stdio` or `http`, not `{other}`"
+        )))?,
+        // Both or neither: the transport would be a guess, and a guess here
+        // decides whether a program runs locally or a body leaves the machine.
+        _ => Err(usage(
+            "give exactly one of --command <CMD> (stdio) or --url <URL> (http)",
+        ))?,
+    };
+    for value in [
+        Some(transport.target()),
+        arguments.command.clone(),
+        arguments.url.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !crate::config_edit::is_writable(&value) {
+            return Err(usage(format!(
+                "`{value}` cannot be written to a TOML file; quote-free ASCII only"
+            )));
+        }
+    }
+    Ok(McpServer {
+        name: name.to_owned(),
+        transport,
+        enabled: true,
+        // Replaced by the layer's own authority when the file is read back.
+        trust: arsy_kernel::capability::PolicySource::User,
+        timeout_ms: arguments
+            .timeout
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .unwrap_or(DEFAULT_MCP_TIMEOUT_MS),
+        max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+    })
+}
+
+fn header(name: &str) -> String {
+    format!("[mcp.server.{name}]")
+}
+
+fn table(server: &McpServer) -> String {
+    let mut table = format!("{}\n", header(&server.name));
+    match &server.transport {
+        McpTransport::Stdio { command, args } => {
+            table.push_str("transport = \"stdio\"\n");
+            table.push_str(&format!("command = \"{command}\"\n"));
+            if !args.is_empty() {
+                let listed = args
+                    .iter()
+                    .map(|argument| format!("\"{argument}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                table.push_str(&format!("args = [{listed}]\n"));
+            }
+        }
+        McpTransport::Http { url } => {
+            table.push_str("transport = \"http\"\n");
+            table.push_str(&format!("url = \"{url}\"\n"));
+        }
+    }
+    if server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS {
+        table.push_str(&format!("timeout_ms = {}\n", server.timeout_ms));
+    }
+    table
+}
+
+pub fn add(
+    invocation: &Invocation,
+    server: &McpServer,
+    scope: Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let path = scope.path(&root)?;
+    let current = read(&path)?;
+    if current.contains(&header(&server.name)) {
+        return Err(usage(format!(
+            "`{}` is already defined in {}; remove it first",
+            server.name,
+            path.display()
+        )));
+    }
+    let updated = crate::config_edit::append_table(
+        &crate::config_edit::ensure_schema(&current),
+        &table(server),
+    );
+    write(&path, &updated)?;
+    emitter.result(json!({
+        "connection": server.name,
+        "scope": scope.as_str(),
+        "path": path.display().to_string(),
+        "transport": server.transport.kind(),
+        "target": server.transport.target(),
+        "trust": arsy_kernel::config::policy_source(scope.layer()).to_string(),
+        "connected": false,
+    }));
+    Ok(0)
+}
+
+pub fn remove(
+    invocation: &Invocation,
+    name: &str,
+    scope: Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let path = scope.path(&root)?;
+    let current = read(&path)?;
+    if !current.contains(&header(name)) {
+        return Err(usage(format!(
+            "no connection named `{name}` is defined in {}",
+            path.display()
+        )));
+    }
+    write(
+        &path,
+        &crate::config_edit::remove_table(&current, &header(name)),
+    )?;
+    emitter.result(json!({
+        "connection": name,
+        "scope": scope.as_str(),
+        "path": path.display().to_string(),
+        "removed": true,
+    }));
+    Ok(0)
+}
+
+/// `enable` and `disable`: flip one key, leaving the definition in place.
+pub fn set_enabled(
+    invocation: &Invocation,
+    name: &str,
+    enabled: bool,
+    scope: Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let path = scope.path(&root)?;
+    let current = read(&path)?;
+    let updated = crate::config_edit::set_in_table(
+        &current,
+        &header(name),
+        "enabled",
+        if enabled { "true" } else { "false" },
+    )
+    .ok_or_else(|| {
+        usage(format!(
+            "no connection named `{name}` is defined in {}",
+            path.display()
+        ))
+    })?;
+    write(&path, &updated)?;
+    emitter.result(json!({
+        "connection": name,
+        "scope": scope.as_str(),
+        "path": path.display().to_string(),
+        "enabled": enabled,
+    }));
+    Ok(0)
+}
+
+/// `arsy mcp test`: connect, negotiate, discover, disconnect.
+///
+/// No tool is invoked, and nothing is recorded against a session: this is a
+/// probe an operator runs to find out whether a definition works.
+pub fn test(
+    invocation: &Invocation,
+    name: &str,
+    timeout_ms: Option<u64>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working)?;
+    let mut server = config.mcp_server(name).cloned().ok_or_else(|| {
+        usage(format!(
+            "no connection named `{name}` is configured; list them with `arsy mcp list`"
+        ))
+    })?;
+    if let Some(timeout_ms) = timeout_ms {
+        server.timeout_ms = timeout_ms;
+    }
+
+    let channels = RealChannels {
+        http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
+            Box::new(arsy_kernel::provider::http::HttpTransport::default())
+        },
+    };
+    let started = std::time::Instant::now();
+    // A probe holds no ceiling: it reports everything the server offers so an
+    // operator can see what a real connection would be admitted with.
+    let connection =
+        Connection::open(&server, None, &channels).map_err(|error| failed(name, &error))?;
+    let report = json!({
+        "connection": name,
+        "transport": server.transport.kind(),
+        "target": server.transport.target(),
+        "trust": server.trust.to_string(),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+        "server": connection.server(),
+        "discovery": connection.discovery(),
+        "would_admit": connection.ceiling(),
+        "tool_invoked": false,
+    });
+    connection.close().map_err(|error| failed(name, &error))?;
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        json!({"connection": human_test(&report)})
+    });
+    Ok(0)
+}
+
+fn human_test(report: &Value) -> String {
+    let mut text = format!(
+        "{} · {} · {}\n  reached {} {} speaking {} in {} ms\n",
+        report["connection"].as_str().unwrap_or("?"),
+        report["transport"].as_str().unwrap_or("?"),
+        report["target"].as_str().unwrap_or("?"),
+        report["server"]["name"].as_str().unwrap_or("?"),
+        report["server"]["version"].as_str().unwrap_or("?"),
+        report["server"]["protocol_version"].as_str().unwrap_or("?"),
+        report["elapsed_ms"],
+    );
+    for (label, key) in [
+        ("tools", "tools"),
+        ("resources", "resources"),
+        ("prompts", "prompts"),
+    ] {
+        let entries = report["discovery"][key]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if entries.is_empty() {
+            continue;
+        }
+        text.push_str(&format!(
+            "  {label}: {}\n",
+            entries
+                .iter()
+                .filter_map(|entry| entry["name"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    text.push_str("  no tool was invoked; the connection was closed\n");
+    text
+}
+
+fn failed(name: &str, error: &McpError) -> Diagnostic {
+    Diagnostic::error(
+        error.code(),
+        format!("connection `{name}` failed: {error}"),
+        if error.is_retryable() {
+            "check the command or URL, then retry"
+        } else {
+            "this failure is not retried automatically; fix the credential or enable the connection"
+        },
+    )
+}
+
+fn read(path: &Path) -> Result<String, Diagnostic> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => Ok(body),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(Diagnostic::error(
+            crate::ARSY_CFG_1000,
+            format!("{} is unreadable: {error}", path.display()),
+            "check the file's permissions",
+        )),
+    }
+}
+
+fn write(path: &Path, body: &str) -> Result<(), Diagnostic> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Diagnostic::error(
+                crate::ARSY_CFG_1000,
+                format!("cannot create {}: {error}", parent.display()),
+                "check the directory's permissions",
+            )
+        })?;
+    }
+    std::fs::write(path, body).map_err(|error| {
+        Diagnostic::error(
+            crate::ARSY_CFG_1000,
+            format!("cannot write {}: {error}", path.display()),
+            "check the file's permissions",
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Result<Command, Diagnostic> {
+        crate::parse(args.iter().map(|argument| (*argument).to_owned())).map(|it| it.command)
+    }
+
+    #[test]
+    fn add_demands_exactly_one_transport_target() {
+        let Ok(Command::McpAdd { server, scope }) = command(&[
+            "mcp",
+            "add",
+            "docs",
+            "--command",
+            "mcp-docs",
+            "--",
+            "--root",
+            ".",
+        ]) else {
+            panic!("a stdio definition parses");
+        };
+        assert_eq!(scope, Scope::User, "a definition defaults to the operator");
+        assert_eq!(
+            server.transport,
+            McpTransport::Stdio {
+                command: "mcp-docs".to_owned(),
+                args: vec!["--root".to_owned(), ".".to_owned()],
+            },
+            "arguments after `--` belong to the command, flags of ARSY's do not"
+        );
+        assert!(server.enabled);
+        assert_eq!(server.timeout_ms, DEFAULT_MCP_TIMEOUT_MS);
+
+        let Ok(Command::McpAdd { server, scope }) = command(&[
+            "mcp",
+            "add",
+            "remote",
+            "--transport",
+            "http",
+            "--url",
+            "https://mcp.example.test/mcp",
+            "--scope",
+            "workspace",
+        ]) else {
+            panic!("an http definition parses");
+        };
+        assert_eq!(scope, Scope::Workspace);
+        assert_eq!(
+            server.transport,
+            McpTransport::Http {
+                url: "https://mcp.example.test/mcp".to_owned()
+            }
+        );
+
+        // Neither target, both targets, and a mismatched transport are all
+        // refused rather than guessed at.
+        for refused in [
+            vec!["mcp", "add", "docs"],
+            vec![
+                "mcp",
+                "add",
+                "docs",
+                "--command",
+                "x",
+                "--url",
+                "https://y.test",
+            ],
+            vec![
+                "mcp",
+                "add",
+                "docs",
+                "--transport",
+                "http",
+                "--command",
+                "x",
+            ],
+            vec![
+                "mcp",
+                "add",
+                "docs",
+                "--transport",
+                "stdio",
+                "--url",
+                "https://y.test",
+            ],
+            vec![
+                "mcp",
+                "add",
+                "docs",
+                "--transport",
+                "carrier-pigeon",
+                "--command",
+                "x",
+            ],
+            vec!["mcp", "add"],
+            vec![
+                "mcp",
+                "add",
+                "docs",
+                "--command",
+                "x",
+                "--scope",
+                "enterprise",
+            ],
+            // A name that cannot be written back as TOML would produce a file
+            // that no longer loads.
+            vec!["mcp", "add", "d\"s", "--command", "x"],
+        ] {
+            assert!(command(&refused).is_err(), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_verbs_take_one_name_and_a_scope() {
+        assert_eq!(
+            command(&["mcp", "disable", "docs", "--scope", "workspace"]).unwrap(),
+            Command::McpEnable {
+                name: "docs".to_owned(),
+                enabled: false,
+                scope: Scope::Workspace,
+            }
+        );
+        assert_eq!(
+            command(&["mcp", "remove", "docs"]).unwrap(),
+            Command::McpRemove {
+                name: "docs".to_owned(),
+                scope: Scope::User,
+            }
+        );
+        assert_eq!(
+            command(&["mcp", "test", "docs", "--timeout", "5"]).unwrap(),
+            Command::McpTest {
+                name: "docs".to_owned(),
+                timeout_ms: Some(5_000),
+            }
+        );
+        for refused in [
+            vec!["mcp"],
+            vec!["mcp", "enable"],
+            vec!["mcp", "remove", "docs", "extra"],
+            vec!["mcp", "conjure", "docs"],
+        ] {
+            assert!(command(&refused).is_err(), "{refused:?}");
+        }
+        // `list` and `show` stay on the inspection path, which also reads the
+        // declarations imported from other ecosystems.
+        assert!(matches!(
+            command(&["mcp", "list"]).unwrap(),
+            Command::Inspect { .. }
+        ));
+    }
+
+    #[test]
+    fn a_written_table_round_trips_through_the_configuration_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let stdio = McpServer {
+            name: "docs".to_owned(),
+            transport: McpTransport::Stdio {
+                command: "mcp-docs".to_owned(),
+                args: vec!["--root".to_owned(), ".".to_owned()],
+            },
+            enabled: true,
+            trust: arsy_kernel::capability::PolicySource::User,
+            timeout_ms: 5_000,
+            max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+        };
+        let body = crate::config_edit::append_table(
+            &crate::config_edit::ensure_schema(""),
+            &table(&stdio),
+        );
+        std::fs::write(&path, &body).unwrap();
+        let config = arsy_kernel::config::Config::load(&[(Layer::User, path.clone())]).unwrap();
+        let loaded = config.mcp_server("docs").expect("the table loads back");
+        assert_eq!(loaded.transport, stdio.transport);
+        assert_eq!(loaded.timeout_ms, 5_000);
+        assert!(loaded.enabled);
+        assert_eq!(loaded.trust, arsy_kernel::capability::PolicySource::User);
+
+        // Disabling flips one key and leaves the rest of the table alone.
+        let disabled =
+            crate::config_edit::set_in_table(&body, &header("docs"), "enabled", "false").unwrap();
+        std::fs::write(&path, &disabled).unwrap();
+        let config = arsy_kernel::config::Config::load(&[(Layer::User, path.clone())]).unwrap();
+        assert!(!config.mcp_server("docs").unwrap().enabled);
+        assert_eq!(
+            config.mcp_server("docs").unwrap().transport,
+            stdio.transport,
+            "toggling enabled must not disturb the transport"
+        );
+
+        // A workspace layer may define a connection, but it is untrusted.
+        let config =
+            arsy_kernel::config::Config::load(&[(Layer::Workspace, path.clone())]).unwrap();
+        assert_eq!(
+            config.mcp_server("docs").unwrap().trust,
+            arsy_kernel::capability::PolicySource::Workspace
+        );
+
+        // Removing takes the whole table with it.
+        let removed = crate::config_edit::remove_table(&disabled, &header("docs"));
+        std::fs::write(&path, &removed).unwrap();
+        let config = arsy_kernel::config::Config::load(&[(Layer::User, path)]).unwrap();
+        assert!(config.mcp_server("docs").is_none());
+    }
+}

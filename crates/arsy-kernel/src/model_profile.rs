@@ -51,6 +51,37 @@ impl ModelProfile {
     }
 }
 
+/// Capability names this build declares for every dialect it speaks.
+pub const DECLARED_CAPABILITIES: &[&str] = &["streaming", "tool_calls", "reasoning_effort"];
+
+/// What this build's adapter for `dialect` can do, as a declaration rather
+/// than an observation.
+///
+/// These are facts about ARSY's own adapters, not claims about a vendor's
+/// model: every adapter streams, encodes tool definitions, and forwards a
+/// reasoning effort. Whether a particular model honours the request is what a
+/// probe would observe, so the observation date stays zero until one runs.
+pub fn declared(dialect_max_output_tokens: Option<u64>) -> BTreeMap<String, ModelCapability> {
+    DECLARED_CAPABILITIES
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                ModelCapability {
+                    state: CapabilityState::Supported,
+                    source: CapabilitySource::Declared,
+                    observed_at_unix_seconds: 0,
+                    constraints: CapabilityConstraints {
+                        max_input_tokens: None,
+                        max_output_tokens: dialect_max_output_tokens,
+                        max_schema_bytes: None,
+                    },
+                },
+            )
+        })
+        .collect()
+}
+
 /// A probe can only observe model metadata: it receives no prompt, tool, or
 /// operation payload with which to cause an external effect.
 pub trait ModelCapabilityProbe {

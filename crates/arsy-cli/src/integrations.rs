@@ -12,9 +12,9 @@ pub fn parse(
 ) -> Result<Command, Diagnostic> {
     if source
         .as_deref()
-        .is_some_and(|source| !matches!(source, "claude" | "codex" | "omp"))
+        .is_some_and(|source| !matches!(source, "arsy" | "claude" | "codex" | "omp"))
     {
-        return Err(usage("--source requires claude, codex, or omp"));
+        return Err(usage("--source requires arsy, claude, codex, or omp"));
     }
     if kind == "mcp" && event.is_some() {
         return Err(usage("--event applies only to hook list"));
@@ -58,6 +58,9 @@ pub fn inspect(
     };
     let importer = CompatibilityImporter::new(root);
     let mut entries = Vec::new();
+    if kind == "mcp" && source.is_none_or(|source| source == "arsy") {
+        entries.extend(configured(root, working, name)?);
+    }
     for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
         if source.is_some_and(|source| source != ecosystem.as_str()) {
             continue;
@@ -89,18 +92,21 @@ pub fn inspect(
             }
             entry["ecosystem"] = json!(ecosystem.as_str());
             entry["runtime_status"] = json!("not_loaded");
+            if kind == "hook" {
+                annotate_hook(&mut entry);
+            }
             entries.push(entry);
         }
     }
     if name.is_some() && entries.is_empty() {
         return Err(usage(format!(
-            "no MCP declaration is named `{}`; list the available names with `arsy mcp list` (`/mcp` in the TUI)",
+            "no MCP connection or declaration is named `{}`; list the available names with `arsy mcp list` (`/mcp` in the TUI)",
             name.unwrap_or_default()
         )));
     }
     if name.is_some() && entries.len() > 1 {
         return Err(usage(format!(
-            "`{}` is declared by {} ecosystems; select one with --source claude|codex|omp",
+            "`{}` is declared by {} sources; select one with --source arsy|claude|codex|omp",
             name.unwrap_or_default(),
             entries.len()
         )));
@@ -108,8 +114,67 @@ pub fn inspect(
     Ok(json!({
         "entries": entries,
         "status": "inspection_complete",
-        "notice": "Workspace declarations only; ARSY has not connected or loaded executable hooks. Provider-owned integrations are managed by the provider.",
+        "notice": "Definitions and declarations only; ARSY has not connected or loaded executable hooks. Provider-owned integrations are managed by the provider.",
     }))
+}
+
+/// ARSY's own `[mcp.server.*]` connections, in the same row shape the imported
+/// declarations use so one listing can show both.
+///
+/// Reading a definition is not connecting: `runtime_status` is `not_loaded`
+/// for every row here, exactly as it is for an import.
+fn configured(root: &Path, working: &Path, name: Option<&str>) -> Result<Vec<Value>, Diagnostic> {
+    let config = crate::load_config(root, working)?;
+    let mut entries = Vec::new();
+    for server in config.mcp_servers() {
+        if name.is_some_and(|name| name != server.name) {
+            continue;
+        }
+        let mut entry = json!({
+            "name": server.name,
+            "source": format!("{} ({})", arsy_kernel::config::CONFIG_FILE, server.trust),
+            "ecosystem": "arsy",
+            "transport": server.transport.kind(),
+            "trust": server.trust.to_string(),
+            "level": "native",
+            "enabled": server.enabled,
+            "runtime_status": "not_loaded",
+            "timeout_ms": server.timeout_ms,
+            "max_body_bytes": server.max_body_bytes,
+        });
+        match &server.transport {
+            arsy_kernel::config::McpTransport::Stdio { command, args } => {
+                entry["command"] = json!(command);
+                entry["args"] = json!(args);
+            }
+            arsy_kernel::config::McpTransport::Http { url } => entry["url"] = json!(url),
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Add what the lifecycle engine would make of a declared hook: whether the
+/// event exists in this build, what it may do, and what happens if it fails.
+///
+/// A declaration says what its author intended; these three say what ARSY would
+/// actually do with it, which is the difference `arsy hook list` has to show.
+fn annotate_hook(entry: &mut Value) {
+    use arsy_code::hook::{EffectClass, LifecycleEvent};
+
+    let Some(event) = entry["event"].as_str().and_then(LifecycleEvent::parse) else {
+        entry["effect_class"] = json!("none");
+        entry["on_failure"] = json!("not_dispatched");
+        return;
+    };
+    // An imported hook is repository content: it may observe and it may deny,
+    // but it is registered as a gate only where the event is one that gates.
+    entry["effect_class"] = serde_json::to_value(match event.failure_policy() {
+        arsy_code::hook::FailurePolicy::FailClosed => EffectClass::Gate,
+        arsy_code::hook::FailurePolicy::FailOpen => EffectClass::Observe,
+    })
+    .unwrap_or(Value::Null);
+    entry["on_failure"] = serde_json::to_value(event.failure_policy()).unwrap_or(Value::Null);
 }
 
 /// Render the inspection for a person instead of echoing the machine record.
@@ -218,6 +283,11 @@ fn details(kind: &str, entry: &Value) -> Vec<String> {
             "handlers: {handlers} · effect: {} · level: {}",
             text("effect"),
             text("level")
+        ));
+        rows.push(format!(
+            "engine: {} · on failure: {}",
+            text("effect_class"),
+            text("on_failure")
         ));
     }
     rows

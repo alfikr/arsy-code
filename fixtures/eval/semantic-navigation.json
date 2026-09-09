@@ -1,0 +1,16 @@
+{
+  "revision": "a7a0a274475e0b4be816fe115d790fdf643df4de",
+  "environment": { "ARSY_EVAL": "1" },
+  "allowed_capabilities": ["process.exec"],
+  "arms": [
+    { "name": "text", "environment": { "ARSY_EVAL_TIER": "text" } },
+    { "name": "semantic", "environment": { "ARSY_EVAL_TIER": "auto" } }
+  ],
+  "hidden_tests": [
+    ["sh", "-c", "test $(arsy code symbol TaskGraph --tier \"$ARSY_EVAL_TIER\" --output json | grep -o '\"name\":\"TaskGraph\"' | wc -l) -eq 1"],
+    ["sh", "-c", "test $(arsy code symbol MemoryStore --tier \"$ARSY_EVAL_TIER\" --output json | grep -o '\"name\":\"MemoryStore\"' | wc -l) -eq 1"],
+    ["sh", "-c", "test $(arsy code symbol Supervisor --tier \"$ARSY_EVAL_TIER\" --output json | grep -o '\"name\":\"Supervisor\"' | wc -l) -eq 1"]
+  ],
+  "timeout_seconds": 120,
+  "trials": 3
+}

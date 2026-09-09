@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     thread,
     time::Duration,
@@ -80,6 +80,21 @@ pub trait LspTransport: Send {
     fn start(&mut self, command: &ServerCommand) -> Result<(), LspError>;
     fn stop(&mut self);
     fn request_batch(&mut self, requests: &[LspRequest]) -> Result<Vec<Value>, LspError>;
+
+    /// Send something the server will not answer.
+    ///
+    /// Half of LSP is notifications — `initialized`, `textDocument/didOpen` —
+    /// and waiting for a response to one would hang until the server said
+    /// something unrelated. Defaulted so a scripted transport in a test can
+    /// ignore them.
+    fn notify(&mut self, _method: &str, _params: Value) -> Result<(), LspError> {
+        Ok(())
+    }
+
+    /// What the server said it can do, once the handshake is done.
+    fn capabilities(&self) -> Value {
+        Value::Null
+    }
 }
 
 pub struct LspHost<T> {
@@ -137,6 +152,19 @@ impl<T: LspTransport> LspHost<T> {
         Ok(())
     }
 
+    /// Send a notification to the server, starting it if it is not running.
+    pub fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
+        if self.state == ServerState::Stopped {
+            self.start()?;
+        }
+        self.transport.notify(method, params)
+    }
+
+    /// What the server said it can do. `Null` before the handshake.
+    pub fn capabilities(&self) -> Value {
+        self.transport.capabilities()
+    }
+
     pub fn overlay(&self, uri: &str) -> Option<&Overlay> {
         self.overlays.get(uri)
     }
@@ -190,6 +218,10 @@ pub struct StdioTransport {
     next_id: u64,
     environment: BTreeMap<String, String>,
     working_directory: Option<PathBuf>,
+    /// The workspace the server is opened on. A server initialized without a
+    /// root indexes nothing and answers `workspace/symbol` with nothing.
+    root: Option<PathBuf>,
+    capabilities: Value,
 }
 
 impl StdioTransport {
@@ -201,7 +233,60 @@ impl StdioTransport {
             next_id: 1,
             environment,
             working_directory,
+            root: None,
+            capabilities: Value::Null,
         }
+    }
+
+    /// The workspace root the server is told to index.
+    #[must_use]
+    pub fn rooted_at(mut self, root: impl Into<PathBuf>) -> Self {
+        self.root = Some(root.into());
+        self
+    }
+
+    /// `initialize`, then `initialized`.
+    ///
+    /// A server answers nothing before this, and answers `workspace/symbol`
+    /// with an empty list until it has finished indexing — which it will not
+    /// begin until it is told where the workspace is.
+    fn handshake(&mut self) -> Result<(), LspError> {
+        let root = self
+            .root
+            .clone()
+            .or_else(|| self.working_directory.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let result = self.request(&LspRequest {
+            method: "initialize".into(),
+            params: json!({
+                "processId": std::process::id(),
+                "clientInfo": {"name": "arsy", "version": env!("CARGO_PKG_VERSION")},
+                "rootUri": file_uri(&root),
+                "workspaceFolders": [{"uri": file_uri(&root), "name": "workspace"}],
+                "capabilities": {
+                    "workspace": {
+                        "symbol": {"dynamicRegistration": false},
+                        "workspaceEdit": {"documentChanges": false},
+                        "workspaceFolders": true,
+                    },
+                    "textDocument": {
+                        "synchronization": {"dynamicRegistration": false},
+                        "hover": {"contentFormat": ["plaintext", "markdown"]},
+                        "references": {"dynamicRegistration": false},
+                        "rename": {"dynamicRegistration": false, "prepareSupport": false},
+                        "diagnostic": {"dynamicRegistration": false},
+                        // Byte offsets are what everything inside ARSY uses, and
+                        // UTF-8 is the only encoding that makes a character
+                        // offset convertible to one without guessing. A server
+                        // that refuses stays on UTF-16 and is converted.
+                        "publishDiagnostics": {"relatedInformation": false},
+                    },
+                    "general": {"positionEncodings": ["utf-8", "utf-16"]},
+                },
+            }),
+        })?;
+        self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
+        self.notify("initialized", json!({}))
     }
 
     fn request(&mut self, request: &LspRequest) -> Result<Value, LspError> {
@@ -266,7 +351,7 @@ impl LspTransport for StdioTransport {
         self.input = child.stdin.take();
         self.output = child.stdout.take().map(BufReader::new);
         self.child = Some(child);
-        Ok(())
+        self.handshake()
     }
 
     fn stop(&mut self) {
@@ -284,6 +369,73 @@ impl LspTransport for StdioTransport {
             .map(|request| self.request(request))
             .collect()
     }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|error| LspError::Protocol(error.to_string()))?;
+        if body.len() > MAX_LSP_MESSAGE_BYTES {
+            return Err(LspError::MessageTooLarge);
+        }
+        let input = self.input.as_mut().ok_or(LspError::Crashed)?;
+        write!(input, "Content-Length: {}\r\n\r\n", body.len()).map_err(LspError::Io)?;
+        input.write_all(&body).map_err(LspError::Io)?;
+        input.flush().map_err(LspError::Io)
+    }
+
+    fn capabilities(&self) -> Value {
+        self.capabilities.clone()
+    }
+}
+
+/// A path as the `file:` URI every LSP server expects.
+///
+/// Percent-encoding is deliberately minimal: the characters that would change
+/// how a URI parses, and nothing else. A path is not a URL and re-encoding one
+/// as though it were is how servers end up opening the wrong file.
+pub fn file_uri(path: &Path) -> String {
+    let mut encoded = String::from("file://");
+    let display = path.to_string_lossy().replace('\\', "/");
+    if !display.starts_with('/') {
+        encoded.push('/');
+    }
+    for character in display.chars() {
+        match character {
+            '%' => encoded.push_str("%25"),
+            ' ' => encoded.push_str("%20"),
+            '#' => encoded.push_str("%23"),
+            '?' => encoded.push_str("%3F"),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// The path a `file:` URI names, undoing [`file_uri`].
+pub fn uri_path(uri: &str) -> PathBuf {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    let mut decoded = String::with_capacity(rest.len());
+    let mut characters = rest.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            decoded.push(character);
+            continue;
+        }
+        let hex: String = characters.by_ref().take(2).collect();
+        match u8::from_str_radix(&hex, 16) {
+            Ok(byte) => decoded.push(char::from(byte)),
+            // Not an escape after all; keep what was written rather than
+            // dropping it.
+            Err(_) => {
+                decoded.push('%');
+                decoded.push_str(&hex);
+            }
+        }
+    }
+    PathBuf::from(decoded)
 }
 
 impl Drop for StdioTransport {
