@@ -146,16 +146,39 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
         }
     }
 }
-
 fn encode_tool(tool: &ToolSchema) -> Value {
-    // Responses puts the function fields at the top level of the tool, not
-    // under a nested `function` object.
+    // Codex's Responses backend only accepts alphanumeric, `_`, and `-` in
+    // function names. ARSY's canonical names use dots (`fs.read`, `fs.edit`).
     json!({
         "type": "function",
-        "name": tool.name,
+        "name": codex_tool_name(&tool.name),
         "description": tool.description,
         "parameters": tool.input_schema,
     })
+}
+
+fn codex_tool_name(name: &str) -> String {
+    name.replace('.', "_")
+}
+
+fn arsy_tool_name(name: &str) -> String {
+    match name {
+        "fs_read" => "fs.read",
+        "fs_list" => "fs.list",
+        "fs_edit" => "fs.edit",
+        "fs_write" => "fs.write",
+        "fs_delete" => "fs.delete",
+        "fs_move" => "fs.move",
+        "search_files" => "search.files",
+        "search_text" => "search.text",
+        "code_symbol" => "code.symbol",
+        "code_inspect" => "code.inspect",
+        "code_references" => "code.references",
+        "code_diagnostics" => "code.diagnostics",
+        "plugin_invoke" => "plugin.invoke",
+        other => other,
+    }
+    .to_owned()
 }
 
 /// One canonical message becomes one or more Responses `input` items.
@@ -175,7 +198,7 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
             } => out.push(json!({
                 "type": "function_call",
                 "call_id": id,
-                "name": name,
+                "name": codex_tool_name(name),
                 "arguments": arguments.to_string(),
             })),
             ModelContent::ToolResult { .. } => {}
@@ -342,8 +365,8 @@ impl EventDecoder {
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                    .map(arsy_tool_name)
+                    .unwrap_or_default();
                 *self.slot(index) = Some(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
