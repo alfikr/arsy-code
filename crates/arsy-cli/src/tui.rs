@@ -592,6 +592,9 @@ pub enum Action {
 /// The slash commands the composer offers and `/help` prints. One table, so a
 /// command cannot appear in the menu and not in the help, or the reverse.
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "start a fresh session"),
+    ("/clear", "clear conversation context in place"),
+    ("/resume", "resume a recorded session; [SESSION_ID]"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -617,6 +620,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/compat",
         "explain ecosystem mapping; claude | codex | omp | agents",
     ),
+    ("/update", "check for and install arsy-code updates"),
     ("/help", "show these actions"),
     ("/quit", "exit"),
 ];
@@ -851,7 +855,7 @@ pub const EFFORT_ROWS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 12;
+const MENU_ROWS: usize = 20;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -1227,7 +1231,7 @@ impl Composer {
     /// at the bottom, so model, effort, directory and branch anchor the prompt.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
         let width = width.max(MIN_WIDTH);
-        let status = fit(status, width.saturating_sub(1));
+        let status = fit(status, width);
         let room = width.saturating_sub(3);
         let menu = self.menu_rows(width, colour);
         let (line_idx, col_offset, total_lines) = self.caret_line_col();
@@ -1314,8 +1318,8 @@ impl Composer {
         footer: &str,
     ) -> String {
         let width = width.max(MIN_WIDTH);
-        let status = fit(status, width.saturating_sub(1));
-        let footer = fit(footer, width.saturating_sub(1));
+        let status = fit(status, width);
+        let footer = fit(footer, width);
         let room = width.saturating_sub(3);
         let menu = self.menu_rows(width, colour);
         let (line_idx, col_offset, total_lines) = self.caret_line_col();
@@ -1638,6 +1642,14 @@ impl TuiState {
             model_route: None,
             effort: None,
         }
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.session
+    }
+
+    pub fn set_session_id(&mut self, session: SessionId) {
+        self.session = session;
     }
 
     pub fn set_sandbox_assurance(&mut self, assurance: SandboxAssurance) {
@@ -2161,8 +2173,405 @@ fn item_status(item: &Value) -> Status {
     }
 }
 
-/// Codex wraps most commands as `<shell> -lc "<command>"`; the wrapper is the
-/// same on every row, so showing it buries the command that actually ran.
+/// A styled bash execution frame with command, output, and duration.
+pub fn bash_box(
+    width: usize,
+    colour: bool,
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    duration: std::time::Duration,
+) -> String {
+    let width = width.max(MIN_WIDTH);
+    let inner = width.saturating_sub(4);
+    let header = format!(" $ {command} ");
+    let header_len = visible_len(&header);
+    let top_left = "─".repeat(2);
+    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
+    let mut lines = vec![format!(
+        "{}{}{}{}",
+        paint(colour, sgr_border(), "╭"),
+        paint(colour, sgr_border(), &top_left),
+        paint(colour, sgr_run(), &header),
+        paint(colour, sgr_border(), &format!("{top_right}╮")),
+    )];
+
+    let out_lines: Vec<&str> = output.lines().collect();
+    let limit = 25;
+    for line in out_lines.iter().take(limit) {
+        let fitted = fit(line, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, sgr_border(), "│"),
+            paint(colour, sgr_dim(), &fitted),
+            paint(colour, sgr_border(), "│"),
+        ));
+    }
+    if out_lines.len() > limit {
+        let more = format!("… ({} lines omitted)", out_lines.len() - limit);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, sgr_border(), "│"),
+            paint(colour, sgr_dim(), &more),
+            paint(colour, sgr_border(), "│"),
+        ));
+    }
+
+    let (status_text, status_sgr) = match exit_code {
+        Some(0) => (format!(" ✓ done ({}ms) ", duration.as_millis()), sgr_ok()),
+        Some(code) => (format!(" ✗ exit {code} ({}ms) ", duration.as_millis()), sgr_err()),
+        None => (format!(" ⚙ running ({}ms) ", duration.as_millis()), sgr_run()),
+    };
+    let bot_len = visible_len(&status_text);
+    let bot_left = "─".repeat(2);
+    let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
+    lines.push(format!(
+        "{}{}{}{}",
+        paint(colour, sgr_border(), "╰"),
+        paint(colour, sgr_border(), &bot_left),
+        paint(colour, status_sgr, &status_text),
+        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+    ));
+    lines.join("\n")
+}
+
+/// A styled tool execution box for filesystem, search, or MCP operations.
+pub fn tool_box(
+    width: usize,
+    colour: bool,
+    name: &str,
+    summary: &str,
+    output: &str,
+    success: bool,
+    duration: std::time::Duration,
+) -> String {
+    let width = width.max(MIN_WIDTH);
+    let inner = width.saturating_sub(4);
+    let header = format!(" ⚙ {name} {summary} ");
+    let header_len = visible_len(&header);
+    let top_left = "─".repeat(2);
+    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
+    let mut lines = vec![format!(
+        "{}{}{}{}",
+        paint(colour, sgr_border(), "╭"),
+        paint(colour, sgr_border(), &top_left),
+        paint(colour, sgr_accent(), &header),
+        paint(colour, sgr_border(), &format!("{top_right}╮")),
+    )];
+
+    let out_lines: Vec<&str> = output.lines().collect();
+    let limit = 20;
+    for line in out_lines.iter().take(limit) {
+        let fitted = fit(line, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, sgr_border(), "│"),
+            paint(colour, sgr_dim(), &fitted),
+            paint(colour, sgr_border(), "│"),
+        ));
+    }
+    if out_lines.len() > limit {
+        let more = format!("… ({} lines omitted)", out_lines.len() - limit);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, sgr_border(), "│"),
+            paint(colour, sgr_dim(), &more),
+            paint(colour, sgr_border(), "│"),
+        ));
+    }
+
+    let (status_text, status_sgr) = if success {
+        (format!(" ✓ completed ({}ms) ", duration.as_millis()), sgr_ok())
+    } else {
+        (format!(" ✗ failed ({}ms) ", duration.as_millis()), sgr_err())
+    };
+    let bot_len = visible_len(&status_text);
+    let bot_left = "─".repeat(2);
+    let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
+    lines.push(format!(
+        "{}{}{}{}",
+        paint(colour, sgr_border(), "╰"),
+        paint(colour, sgr_border(), &bot_left),
+        paint(colour, status_sgr, &status_text),
+        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+    ));
+    lines.join("\n")
+}
+
+/// A diff row showing modified file paths and change stats.
+pub fn diff_row(colour: bool, path: &str, added: usize, deleted: usize) -> String {
+    format!(
+        "  {} {} {} {}",
+        paint(colour, sgr_bullet(), "•"),
+        paint(colour, sgr_accent(), path),
+        paint(colour, sgr_ok(), &format!("+{added}")),
+        paint(colour, sgr_err(), &format!("-{deleted}")),
+    )
+}
+
+/// An option in the interactive Ask/Approval dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskOption {
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// Result of an interactive Ask/Approval dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AskDialogResult {
+    Approve,
+    Deny,
+    Other(String),
+    Cancel,
+}
+
+/// State for interactive Ask/Approval modal dialogs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskDialogState {
+    pub title: String,
+    pub summary: String,
+    pub reason: String,
+    pub options: Vec<AskOption>,
+    pub selected: usize,
+    pub custom_note: String,
+    pub editing_note: bool,
+}
+
+impl AskDialogState {
+    pub fn for_approval(name: &str, summary: &str, reason: &str) -> Self {
+        Self {
+            title: format!("APPROVAL REQUIRED: {name}"),
+            summary: summary.to_owned(),
+            reason: reason.to_owned(),
+            options: vec![
+                AskOption {
+                    label: "Approve this call once (yes)".to_owned(),
+                    description: Some("Execute this tool call and continue".to_owned()),
+                },
+                AskOption {
+                    label: "Deny this call (no)".to_owned(),
+                    description: Some("Decline this tool call and inform the agent".to_owned()),
+                },
+                AskOption {
+                    label: "Other (add custom note / instruction)".to_owned(),
+                    description: Some("Type feedback to redirect or guide the agent".to_owned()),
+                },
+            ],
+            selected: 0,
+            custom_note: String::new(),
+            editing_note: false,
+        }
+    }
+
+    pub fn render(&self, width: usize, colour: bool) -> String {
+        let width = width.max(MIN_WIDTH);
+        let inner = width.saturating_sub(4);
+        let rule = "─".repeat(width.saturating_sub(2));
+        let title_disp = format!(" {} ", self.title);
+        let title_len = visible_len(&title_disp);
+        let top_left = "─".repeat(2);
+        let top_right = "─".repeat(width.saturating_sub(2 + 2 + title_len));
+        let mut lines = vec![format!(
+            "{}{}{}{}",
+            paint(colour, sgr_border(), "╭"),
+            paint(colour, sgr_border(), &top_left),
+            paint(colour, BOLD, &title_disp),
+            paint(colour, sgr_border(), &format!("{top_right}╮")),
+        )];
+
+        if !self.summary.is_empty() {
+            let row = format!("Summary: {}", self.summary);
+            lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
+        }
+        if !self.reason.is_empty() {
+            let row = format!("Reason:  {}", self.reason);
+            lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
+        }
+        lines.push(Self::box_line("", inner, colour, ""));
+
+        for (idx, opt) in self.options.iter().enumerate() {
+            let is_sel = idx == self.selected;
+            let radio = if is_sel { "(•)" } else { "( )" };
+            let opt_num = idx + 1;
+            let label_part = format!("{radio} {opt_num}. {}", opt.label);
+            let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
+            lines.push(Self::box_line(&label_part, inner, colour, sgr));
+            if let Some(desc) = &opt.description {
+                let desc_part = format!("     {desc}");
+                lines.push(Self::box_line(&desc_part, inner, colour, sgr_dim()));
+            }
+        }
+
+        if self.editing_note || !self.custom_note.is_empty() {
+            lines.push(Self::box_line("", inner, colour, ""));
+            let note_display = format!("Note: {}█", self.custom_note);
+            lines.push(Self::box_line(&note_display, inner, colour, sgr_assistant()));
+        }
+
+        lines.push(Self::box_line("", inner, colour, ""));
+        let hint = if self.editing_note {
+            "[Enter] Submit Note  [Esc] Cancel Note"
+        } else {
+            "[↑/↓] Navigate  [1-3] Choose  [y] Yes  [n] No  [Enter] Confirm"
+        };
+        lines.push(Self::box_line(hint, inner, colour, sgr_dim()));
+        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
+        lines.join("\n")
+    }
+
+    fn box_line(content: &str, inner: usize, colour: bool, sgr: &str) -> String {
+        let fitted = fit(content, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        format!(
+            "{} {}{pad} {}",
+            paint(colour, sgr_border(), "│"),
+            paint(colour, sgr, &fitted),
+            paint(colour, sgr_border(), "│"),
+        )
+    }
+
+    pub fn handle_key(&mut self, key: Key) -> Option<AskDialogResult> {
+        if self.editing_note {
+            match key {
+                Key::Enter | Key::Newline | Key::Char('\n' | '\r') => {
+                    let note = self.custom_note.trim().to_owned();
+                    return Some(AskDialogResult::Other(note));
+                }
+                Key::Char(c) => {
+                    self.custom_note.push(c);
+                    return None;
+                }
+                Key::Backspace => {
+                    self.custom_note.pop();
+                    return None;
+                }
+                Key::Interrupt => {
+                    self.editing_note = false;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
+        match key {
+            Key::Up => {
+                if self.selected == 0 {
+                    self.selected = self.options.len().saturating_sub(1);
+                } else {
+                    self.selected -= 1;
+                }
+                None
+            }
+            Key::Down => {
+                if self.selected + 1 >= self.options.len() {
+                    self.selected = 0;
+                } else {
+                    self.selected += 1;
+                }
+                None
+            }
+            Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve),
+            Key::Char('2' | 'n' | 'N' | 'd' | 'D') => Some(AskDialogResult::Deny),
+            Key::Char('3' | 'o' | 'O') => {
+                self.selected = 2;
+                self.editing_note = true;
+                None
+            }
+            Key::Enter | Key::Newline | Key::Char('\n' | '\r' | ' ') => match self.selected {
+                0 => Some(AskDialogResult::Approve),
+                1 => Some(AskDialogResult::Deny),
+                2 => {
+                    self.editing_note = true;
+                    None
+                }
+                _ => Some(AskDialogResult::Approve),
+            },
+            Key::Interrupt => Some(AskDialogResult::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// A recorded session choice for `/resume` selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionChoice {
+    pub id: SessionId,
+    pub events: u64,
+    pub last_seen: String,
+}
+
+/// Build rows for `/resume` interactive picker.
+pub fn session_rows(
+    sessions: &[SessionChoice],
+    current: Option<SessionId>,
+) -> (Option<Vec<(String, String)>>, usize) {
+    if sessions.is_empty() {
+        return (
+            Some(vec![(
+                "no recorded sessions".to_owned(),
+                "type a task to create a new session".to_owned(),
+            )]),
+            0,
+        );
+    }
+    let mut selected = 0;
+    let rows: Vec<(String, String)> = sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            if Some(s.id) == current {
+                selected = idx;
+            }
+            let label = s.id.to_string();
+            let desc = format!("{} events · {}", s.events, s.last_seen);
+            (label, desc)
+        })
+        .collect();
+    (Some(rows), selected)
+}
+
+pub fn session_prompt(sessions: &[SessionChoice], colour: bool) -> String {
+    let choices = if sessions.is_empty() {
+        "no sessions".to_owned()
+    } else {
+        format!("Up/Down then Enter, an ID, or 1-{}", sessions.len())
+    };
+    paint(colour, sgr_dim(), &format!("  resume · {choices}"))
+}
+
+pub fn resolve_session_answer(
+    answer: &str,
+    sessions: &[SessionChoice],
+    current: SessionId,
+) -> Result<SessionId, String> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Ok(current);
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return match number.checked_sub(1).and_then(|idx| sessions.get(idx)) {
+            Some(choice) => Ok(choice.id),
+            None if sessions.is_empty() => Err("no sessions found".to_owned()),
+            None => Err(format!("no session {number}; choose 1-{}", sessions.len())),
+        };
+    }
+    if let Ok(id) = answer.parse::<SessionId>() {
+        return Ok(id);
+    }
+    // Prefix search
+    if let Some(choice) = sessions
+        .iter()
+        .find(|s| s.id.to_string().starts_with(answer))
+    {
+        return Ok(choice.id);
+    }
+    Err(format!("`{answer}` is not a valid session ID"))
+}
+
 fn unwrap_shell(command: &str) -> &str {
     let Some((_, inner)) = command.split_once(" -lc ") else {
         return command;
@@ -3370,7 +3779,7 @@ mod tests {
             4 + COMMANDS.len(),
             "pad, input, pad, one row per command, status"
         );
-        assert!(rows[3].contains("› /provider"), "{:?}", rows[3]);
+        assert!(rows[3].contains(&format!("› {}", COMMANDS[0].0)), "{:?}", rows[3]);
         assert!(rows[4].starts_with("    "), "only one row is marked");
         assert!(
             rows.last().unwrap().contains("status"),
@@ -3616,5 +4025,82 @@ mod tests {
         composer.press(Key::WordBackspace);
         assert_eq!(composer.buffer, "hello arsy");
         assert_eq!(composer.caret, 6);
+    }
+
+    #[test]
+    fn ask_dialog_interactive_navigation_and_selection() {
+        let mut dialog = AskDialogState::for_approval("bash", "rm -rf target", "file deletion");
+        assert_eq!(dialog.selected, 0);
+        assert_eq!(dialog.options.len(), 3);
+
+        // Render output has border and title
+        let rendered = dialog.render(80, false);
+        assert!(rendered.contains("APPROVAL REQUIRED: bash"));
+        assert!(rendered.contains("Summary: rm -rf target"));
+        assert!(rendered.contains("1. Approve this call once"));
+
+        // Down key navigates to next option
+        assert_eq!(dialog.handle_key(Key::Down), None);
+        assert_eq!(dialog.selected, 1);
+
+        // Number 1 key immediately approves
+        assert_eq!(dialog.handle_key(Key::Char('1')), Some(AskDialogResult::Approve));
+
+        // Number 2 key denies
+        assert_eq!(dialog.handle_key(Key::Char('2')), Some(AskDialogResult::Deny));
+
+        // Number 3 opens custom note editing
+        assert_eq!(dialog.handle_key(Key::Char('3')), None);
+        assert!(dialog.editing_note);
+        dialog.handle_key(Key::Char('a'));
+        dialog.handle_key(Key::Char('b'));
+        assert_eq!(dialog.custom_note, "ab");
+        assert_eq!(dialog.handle_key(Key::Enter), Some(AskDialogResult::Other("ab".to_owned())));
+    }
+
+    #[test]
+    fn execution_boxes_render_cleanly() {
+        let bash = bash_box(80, false, "cargo build", "Finished dev profile", Some(0), Duration::from_millis(150));
+        assert!(bash.contains("$ cargo build"));
+        assert!(bash.contains("Finished dev profile"));
+        assert!(bash.contains("✓ done (150ms)"));
+
+        let tool = tool_box(80, false, "fs.write", "src/main.rs", "wrote 10 lines", true, Duration::from_millis(20));
+        assert!(tool.contains("fs.write src/main.rs"));
+        assert!(tool.contains("✓ completed (20ms)"));
+
+        let diff = diff_row(false, "src/lib.rs", 12, 3);
+        assert!(diff.contains("src/lib.rs"));
+        assert!(diff.contains("+12"));
+        assert!(diff.contains("-3"));
+    }
+
+    #[test]
+    fn session_choice_resolution_and_rows() {
+        let s1 = SessionId::new();
+        let s2 = SessionId::new();
+        let choices = vec![
+            SessionChoice {
+                id: s1,
+                events: 10,
+                last_seen: "2m ago".to_owned(),
+            },
+            SessionChoice {
+                id: s2,
+                events: 5,
+                last_seen: "1h ago".to_owned(),
+            },
+        ];
+
+        let (rows, selected) = session_rows(&choices, Some(s2));
+        assert_eq!(selected, 1);
+        assert_eq!(rows.unwrap().len(), 2);
+
+        // Direct number resolution
+        assert_eq!(resolve_session_answer("1", &choices, s1).unwrap(), s1);
+        assert_eq!(resolve_session_answer("2", &choices, s1).unwrap(), s2);
+
+        // Direct UUID resolution
+        assert_eq!(resolve_session_answer(&s2.to_string(), &choices, s1).unwrap(), s2);
     }
 }
