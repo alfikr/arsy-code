@@ -183,11 +183,7 @@ impl ProcessExecutor {
             command.process_group(0);
         }
         let mut child = command.spawn().map_err(execution)?;
-        let output_sink = self
-            .output_sink
-            .lock()
-            .ok()
-            .and_then(|sink| sink.clone());
+        let output_sink = self.output_sink.lock().ok().and_then(|sink| sink.clone());
         let stdout = drain(
             child.stdout.take().expect("piped stdout is present"),
             input.max_output_bytes,
