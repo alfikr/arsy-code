@@ -1181,7 +1181,12 @@ fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, 
     broker.register_store(Box::new(OsCredentialStore));
     broker.register_store(Box::new(FileCredentialStore));
     for record in catalog(CatalogStore::resolve(invocation))? {
-        broker.resolve(&record.handle).map_err(secret_failed)?;
+        // A handle that will not open — a locked keychain, a revoked entry, a
+        // record left behind by a provider since removed — has no value that
+        // could reach the output, so there is nothing for the redactor to
+        // miss. Failing the turn here would fail every turn, including the
+        // ones that never touch that provider.
+        let _ = broker.resolve(&record.handle);
     }
     emitter.install_redactor(broker.redactor().clone());
     Ok(broker.redactor().clone())
@@ -1460,13 +1465,20 @@ fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
     options.open(path).map_err(storage_failed)
 }
 
+fn config_home_overridden() -> bool {
+    std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
+}
+
 fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
     let raw = match store.read()? {
         Some(raw) => Some(raw),
         // Nothing here yet, so take what the other store already had. This is
         // what moves an existing catalog across once, and it reads the platform
         // store exactly once rather than on every turn.
-        None if store == CatalogStore::File => {
+        // A run pointed at a throwaway configuration home — a test, a
+        // container, a second account — asked for that home and not for the
+        // operator's own credentials copied into it.
+        None if store == CatalogStore::File && !config_home_overridden() => {
             // A platform store that is unavailable, or whose prompt was
             // declined, means there is nothing to migrate — not that every
             // later turn should fail on a convenience.
@@ -6141,6 +6153,51 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    /// Two things a stored credential must not do to a turn that never asks
+    /// for it: abort the turn because it will not open, and follow a run that
+    /// was pointed at a throwaway configuration home into that home.
+    #[test]
+    fn a_credential_that_will_not_open_neither_fails_the_turn_nor_follows_a_throwaway_home() {
+        let home = std::env::temp_dir().join(format!("arsy-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
+        let path = home.join(CATALOG_FILE);
+        let record = AuthRecord {
+            provider: "unreachable".to_owned(),
+            handle: SecretHandle::new(OS_STORE_ID, "arsy-no-such-credential").unwrap(),
+            created_at: 0,
+            last_used: None,
+            kind: CredentialKind::default(),
+        };
+        let raw = serde_json::to_string(&[record]).unwrap();
+        owner_only(&path)
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            output: None,
+            no_color: true,
+            command: Command::Tui,
+        };
+        redactor(&invocation, &mut Emitter::new(Output::Ci))
+            .expect("a handle that will not open leaves the turn alone");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            catalog(CatalogStore::File).unwrap().is_empty(),
+            "an explicit config home is not backfilled from the operator's platform store"
+        );
+        assert!(
+            !path.exists(),
+            "nothing was migrated into the throwaway home"
+        );
+
+        std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     /// A provider that replays a scripted round per request and records what
     /// it was asked, so a test can assert on the conversation the loop built.
