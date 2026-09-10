@@ -633,8 +633,8 @@ impl Loaded {
 ///
 /// * `~/.claude/settings.json` — the operator's own Claude hooks.
 /// * `~/.codex/config.toml` — Codex's one lifecycle callback, `notify`.
-/// * `~/.arsy/hooks.json` — ARSY's own, for an operator using neither.
-/// * `<root>/.arsy/hooks.json` and `<root>/.claude/settings.json` — the
+/// * `~/.arsy/guard.json` — ARSY's own, for an operator using neither.
+/// * `<root>/.arsy/guard.json` and `<root>/.claude/settings.json` — the
 ///   repository's, which run only where the operator vouched for it.
 ///
 /// A source that is missing is not an error: most machines have one of these
@@ -655,7 +655,7 @@ pub fn load(discovery: &Discovery) -> Loaded {
         for (path, kind) in [
             (home.join(".claude/settings.json"), Kind::ClaudeSettings),
             (home.join(".codex/config.toml"), Kind::CodexNotify),
-            (home.join(".arsy/hooks.json"), Kind::ArsyHooks),
+            (home.join(".arsy/guard.json"), Kind::ArsyGuard),
         ] {
             sources.push(read_source(
                 &mut engine,
@@ -668,7 +668,7 @@ pub fn load(discovery: &Discovery) -> Loaded {
         }
     }
     for (path, kind) in [
-        (discovery.root.join(".arsy/hooks.json"), Kind::ArsyHooks),
+        (discovery.root.join(".arsy/guard.json"), Kind::ArsyGuard),
         (
             discovery.root.join(".claude/settings.json"),
             Kind::ClaudeSettings,
@@ -695,7 +695,7 @@ enum Kind {
     /// A `hooks` object keyed by the external event names.
     ClaudeSettings,
     /// The same shape, under ARSY's own name.
-    ArsyHooks,
+    ArsyGuard,
     /// Codex's `notify`, which is one command on one event.
     CodexNotify,
 }
@@ -719,7 +719,7 @@ fn read_source(
         return report;
     };
     let parsed = match kind {
-        Kind::ClaudeSettings | Kind::ArsyHooks => serde_json::from_str::<Value>(&text)
+        Kind::ClaudeSettings | Kind::ArsyGuard => serde_json::from_str::<Value>(&text)
             .map_err(|error| error.to_string())
             .and_then(|value| claude_rules(&value, origin, path, discovery)),
         Kind::CodexNotify => codex_notify(&text, origin, discovery),
@@ -756,7 +756,7 @@ fn read_source(
 
 type Rules = (Vec<(HookRule, CommandHandler)>, Vec<String>);
 
-/// Read the shape Claude writes, which is also the shape `.arsy/hooks.json`
+/// Read the shape Claude writes, which is also the shape `.arsy/guard.json`
 /// uses: one object keyed by event, each holding entries of a matcher and the
 /// handlers to run.
 ///
@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn arsy_reads_its_own_file_in_the_shape_the_others_use() {
         let home = home_with(&[(
-            ".arsy/hooks.json",
+            ".arsy/guard.json",
             r#"{"hooks": {"PreToolUse": [{"matcher": "process.exec",
                 "hooks": [{"type": "command", "command": "mine"}]}]}}"#,
         )]);
@@ -1178,7 +1178,7 @@ mod tests {
         let home = home_with(&[
             (".claude/settings.json", "{not json"),
             (
-                ".arsy/hooks.json",
+                ".arsy/guard.json",
                 r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "ok"}]}]}}"#,
             ),
         ]);

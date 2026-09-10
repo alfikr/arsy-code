@@ -42,12 +42,12 @@ and whether each declaration is loaded, alongside every file the engine read.
 
 Hooks come from whichever ecosystem the operator already uses. `~/.claude/settings.json`
 supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one
-lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/hooks.json` is the
+lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` is the
 same Claude shape under ARSY's own name, for an operator using neither. Only
 `type: "command"` runs — a `prompt`, `agent`, or `http` handler is reported
 against its file and skipped.
 
-A repository's own hooks — `<workspace>/.arsy/hooks.json` and
+A repository's own hooks — `<workspace>/.arsy/guard.json` and
 `<workspace>/.claude/settings.json` — are read but not run until the operator
 vouches for that directory:
 

@@ -596,7 +596,7 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
     std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
     std::fs::write(
-        home.path().join(".arsy/hooks.json"),
+        home.path().join(".arsy/guard.json"),
         r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
             {"type": "command",
              "command": "echo '{\"decision\": \"deny\", \"reason\": \"notes are off limits\"}'"}
@@ -641,7 +641,7 @@ fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
     std::fs::create_dir_all(workspace.path().join(".arsy")).unwrap();
     std::fs::write(
-        workspace.path().join(".arsy/hooks.json"),
+        workspace.path().join(".arsy/guard.json"),
         r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
             {"type": "command",
              "command": "echo '{\"decision\": \"deny\", \"reason\": \"the repo said no\"}'"}
