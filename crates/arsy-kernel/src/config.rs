@@ -1126,7 +1126,7 @@ impl Config {
                     key: format!("project.{name}"),
                     layer,
                     path: path.to_path_buf(),
-                    message: "a project's trust may only be set by the enterprise or user                               configuration, because it decides whether that directory's own                               files may run commands"
+                    message: "a project's trust may only be set by the enterprise or user configuration, because it decides whether that directory's own files may run commands"
                         .to_owned(),
                 });
             }
@@ -1154,7 +1154,7 @@ impl Config {
                 }
                 other => {
                     return Err(reject(format!(
-                        "project.{directory}.trust_level must be `trusted` or `untrusted`, not                          `{other}`"
+                        "project.{directory}.trust_level must be `trusted` or `untrusted`, not `{other}`"
                     )))
                 }
             }

@@ -646,7 +646,7 @@ pub fn load(discovery: &Discovery) -> Loaded {
     let mut sources = Vec::new();
     let workspace_note = || {
         vec![format!(
-            "`{}` is not a directory this configuration vouches for, so its own hooks are read              and not run",
+            "`{}` is not a directory this configuration vouches for, so its own hooks are read and not run",
             discovery.root.display()
         )]
     };
@@ -798,7 +798,7 @@ fn claude_rules(
                 let kind = handler.get("type").and_then(Value::as_str).unwrap_or("");
                 if kind != "command" {
                     notes.push(format!(
-                        "`{external}[{position}]` handler {index} is `{kind}`, and only `command`                          runs"
+                        "`{external}[{position}]` handler {index} is `{kind}`, and only `command` runs"
                     ));
                     continue;
                 }
