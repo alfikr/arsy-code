@@ -1639,10 +1639,27 @@ fn auth_login(
         tokens.map_err(login_failed)?
     };
 
-    let handle = SecretHandle::new(OS_STORE_ID, provider).map_err(secret_failed)?;
+    let (store_kind, handle_name) = match configured.as_ref().and_then(|e| e.credential.as_ref()) {
+        Some(existing) => (existing.store(), existing.name().to_owned()),
+        None => {
+            if config.credential_store() == FILE_STORE_ID {
+                (FILE_STORE_ID, format!("{provider}.key"))
+            } else {
+                (OS_STORE_ID, provider.to_owned())
+            }
+        }
+    };
+    let handle = SecretHandle::new(store_kind, &handle_name).map_err(secret_failed)?;
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
-    let store = OsCredentialStore;
-    store.set(handle.name(), &raw).map_err(secret_failed)?;
+    if store_kind == FILE_STORE_ID {
+        FileCredentialStore
+            .set(&handle_name, &raw)
+            .map_err(secret_failed)?;
+    } else {
+        OsCredentialStore
+            .set(handle.name(), &raw)
+            .map_err(secret_failed)?;
+    }
     let records_store = CatalogStore::resolve(invocation);
     let mut records = catalog(records_store)?;
     let now = now()?;

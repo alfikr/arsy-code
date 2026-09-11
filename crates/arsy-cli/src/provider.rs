@@ -412,9 +412,25 @@ fn stored(
     // losing it here would cost the operator a re-login on the next run.
     let raw = serde_json::to_string(&refreshed)
         .map_err(|error| credential_failed(&endpoint.id, error))?;
-    OsCredentialStore
-        .set(handle.name(), &raw)
-        .map_err(|error| credential_failed(&endpoint.id, error))?;
+    match handle.store() {
+        OS_STORE_ID => {
+            OsCredentialStore
+                .set(handle.name(), &raw)
+                .map_err(|error| credential_failed(&endpoint.id, error))?;
+        }
+        FILE_STORE_ID => {
+            FileCredentialStore
+                .set(handle.name(), &raw)
+                .map_err(|error| credential_failed(&endpoint.id, error))?;
+        }
+        other => {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("the credential store `{other}` does not support write-back"),
+                "use a store that supports credential storage",
+            ));
+        }
+    }
     Ok((refreshed.access_token, CredentialSource::OAuth))
 }
 
