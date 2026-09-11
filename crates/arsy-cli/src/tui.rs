@@ -381,6 +381,14 @@ impl Drop for RawTerminal {
 }
 
 fn stty(args: &[&str]) -> std::io::Result<String> {
+    #[cfg(unix)]
+    if let Ok(tty) = std::fs::File::open("/dev/tty") {
+        if let Ok(output) = Command::new("stty").args(args).stdin(tty).output() {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+    }
     let output = Command::new("stty")
         .args(args)
         .stdin(Stdio::inherit())
@@ -2297,7 +2305,9 @@ pub fn bash_box(
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let header = format!(" $ {command} ");
+    let max_cmd_len = inner.saturating_sub(4);
+    let fitted_command = fit(command, max_cmd_len);
+    let header = format!(" $ {fitted_command} ");
     let header_len = visible_len(&header);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
@@ -2343,14 +2353,16 @@ pub fn bash_box(
             sgr_run(),
         ),
     };
-    let bot_len = visible_len(&status_text);
+    let max_status_len = inner.saturating_sub(2);
+    let fitted_status = fit(&status_text, max_status_len);
+    let bot_len = visible_len(&fitted_status);
     let bot_left = "─".repeat(2);
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
         paint(colour, sgr_border(), "╰"),
         paint(colour, sgr_border(), &bot_left),
-        paint(colour, status_sgr, &status_text),
+        paint(colour, status_sgr, &fitted_status),
         paint(colour, sgr_border(), &format!("{bot_right}╯")),
     ));
     lines.join("\n")
@@ -2368,7 +2380,15 @@ pub fn tool_box(
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let header = format!(" ⚙ {name} {summary} ");
+    let prefix = format!(" ⚙ {name} ");
+    let prefix_len = visible_len(&prefix);
+    let max_summary_len = inner.saturating_sub(prefix_len + 1);
+    let fitted_summary = fit(summary, max_summary_len);
+    let header = if summary.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}{fitted_summary} ")
+    };
     let header_len = visible_len(&header);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
@@ -2414,14 +2434,16 @@ pub fn tool_box(
             sgr_err(),
         )
     };
-    let bot_len = visible_len(&status_text);
+    let max_status_len = inner.saturating_sub(2);
+    let fitted_status = fit(&status_text, max_status_len);
+    let bot_len = visible_len(&fitted_status);
     let bot_left = "─".repeat(2);
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
         paint(colour, sgr_border(), "╰"),
         paint(colour, sgr_border(), &bot_left),
-        paint(colour, status_sgr, &status_text),
+        paint(colour, status_sgr, &fitted_status),
         paint(colour, sgr_border(), &format!("{bot_right}╯")),
     ));
     lines.join("\n")
