@@ -1,0 +1,70 @@
+name: Bug report
+description: Report something that is broken or behaving incorrectly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to file a bug. Please fill out the fields below.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run arsy ...
+        2. Execute ...
+        3. See error ...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - CLI / TUI (arsy-cli)
+        - Kernel / Agent runtime (arsy-kernel)
+        - Sandbox / Isolation (arsy-sandbox)
+        - IDE integration (arsy-ide)
+        - Other / Not component-specific
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os-detail
+    attributes:
+      label: OS version / distro (optional)
+      placeholder: e.g. macOS 15.2, Ubuntu 24.04, Arch Linux, Windows 11
+  - type: input
+    id: version
+    attributes:
+      label: arsy version
+      description: Output of `arsy --version`, or the commit hash you are on.
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model / Provider (optional)
+      placeholder: e.g. claude-3-7-sonnet, gpt-4o, deepseek-r1, ollama
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any error output or stack traces. Will be formatted as code automatically.
+      render: shell
