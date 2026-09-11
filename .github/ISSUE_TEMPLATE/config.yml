@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or setup help
+    url: https://github.com/suiflex/arsy-code/discussions
+    about: Ask in Discussions — installing ARSY, model setup, credential storage, or checking whether something is a bug before filing one.
+  - name: Report a security vulnerability
+    url: https://github.com/suiflex/arsy-code/security/policy
+    about: Do not open a public issue for security problems. Follow the security policy instead.
