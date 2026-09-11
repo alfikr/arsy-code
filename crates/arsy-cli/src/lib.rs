@@ -3760,12 +3760,6 @@ fn native_turn(
             let (content, is_error) = if outcome.interrupted {
                 ("The operator declined to run this call.".to_owned(), true)
             } else {
-                writeln!(
-                    terminal,
-                    "{}",
-                    tui::tool_running_row(colour, name, &summary)
-                )?;
-                terminal.flush()?;
                 match execute_call(
                     runtime,
                     &mut terminal,
@@ -4147,22 +4141,34 @@ fn redraw_live_response(
     footer: &str,
     status: &str,
     text: &str,
-    replace: bool,
-) -> io::Result<()> {
+    prev_lines: usize,
+) -> io::Result<usize> {
     let mut frame = composer.clear();
-    if replace {
+    for _ in 0..prev_lines {
         frame.push_str("\x1b[1A\r\x1b[K");
     }
     frame.push_str(&tui::assistant_row(colour, text));
     frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    let width = tui::terminal_width();
+    frame.push_str(&composer.render_turn(width, colour, status, footer));
     write!(terminal, "{frame}")?;
-    terminal.flush()
+    terminal.flush()?;
+    let text_len = unicode_width::UnicodeWidthStr::width(text);
+    let lines = text_len.checked_div(width).map_or(1, |div| div + 1);
+    Ok(lines)
 }
 
 #[cfg(feature = "tui")]
-fn erase_live_response(terminal: &mut io::Stdout, composer: &mut tui::Composer) -> io::Result<()> {
-    write!(terminal, "{}\x1b[1A\r\x1b[K", composer.clear())?;
+fn erase_live_response(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    lines: usize,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    for _ in 0..lines.max(1) {
+        frame.push_str("\x1b[1A\r\x1b[K");
+    }
+    write!(terminal, "{frame}")?;
     terminal.flush()
 }
 
@@ -4268,7 +4274,7 @@ fn native_status(
     let mut thinking = String::new();
     let mut thinking_open = false;
     let mut answer_open = false;
-    let mut live_answer = false;
+    let mut live_lines = 0usize;
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -4404,9 +4410,9 @@ fn native_status(
                 }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
-                    if live_answer {
-                        erase_live_response(&mut terminal, composer)?;
-                        live_answer = false;
+                    if live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live_lines)?;
+                        live_lines = 0;
                     }
                     let line: String = pending.drain(..=newline).collect();
                     draw(
@@ -4417,16 +4423,15 @@ fn native_status(
                     )?;
                 }
                 if !pending.is_empty() {
-                    redraw_live_response(
+                    live_lines = redraw_live_response(
                         &mut terminal,
                         composer,
                         colour,
                         footer,
                         &status_line(first_event, tick),
                         &pending,
-                        live_answer,
+                        live_lines,
                     )?;
-                    live_answer = true;
                 }
                 first_event = true;
             }
@@ -4452,6 +4457,9 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
+                    if live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live_lines)?;
+                    }
                     draw(
                         &mut terminal,
                         composer,
@@ -4488,6 +4496,9 @@ fn native_status(
             Some(&tui::thinking_box_bottom(width, colour)),
             &status_line(first_event, tick),
         )?;
+    }
+    if live_lines > 0 {
+        erase_live_response(&mut terminal, composer, live_lines)?;
     }
     if !pending.trim().is_empty() {
         draw(
