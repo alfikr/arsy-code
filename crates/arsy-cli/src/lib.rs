@@ -3974,26 +3974,32 @@ fn dispatch_tool_live(
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let mut frame = 0usize;
     let elapsed = std::time::Instant::now();
-    let mut rendered = true;
     let mut cancelled = false;
     let mut expanded = false;
     let mut live_output = String::new();
-    let initial = tui::tool_running_frame_with_output(
-        colour,
-        FRAMES[0],
-        name.as_str(),
+    let initial_state = tui::RunningToolState {
+        name: name.as_str(),
         summary,
-        0,
-        "",
+        frame: FRAMES[0],
+        elapsed_ms: 0,
+        live_output: "",
         expanded,
-    );
-    writeln!(terminal, "{initial}")?;
+    };
+    let initial = tui::tool_running_box(tui::terminal_width(), colour, &initial_state);
+    for line in &initial {
+        writeln!(terminal, "{line}")?;
+    }
     terminal.flush()?;
+    let mut last_rendered_lines = initial.len();
     loop {
         while let Ok(byte) = keys.try_recv() {
             match decoder.feed(byte) {
                 Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
                     arsy_code::process::cancel(operation_id);
+                    if last_rendered_lines > 0 {
+                        write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                        last_rendered_lines = 0;
+                    }
                     write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
                     terminal.flush()?;
                     cancelled = true;
@@ -4007,8 +4013,9 @@ fn dispatch_tool_live(
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
                 runtime.set_output_sink(None);
-                if rendered {
-                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                if last_rendered_lines > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                    terminal.flush()?;
                 }
                 return Ok((result, cancelled));
             }
@@ -4020,22 +4027,24 @@ fn dispatch_tool_live(
                         live_output.drain(..keep_from);
                     }
                 }
-                let status = tui::tool_running_frame_with_output(
-                    colour,
-                    FRAMES[frame % FRAMES.len()],
-                    name.as_str(),
-                    summary,
-                    elapsed.elapsed().as_millis(),
-                    &live_output,
-                    expanded,
-                );
-                if rendered {
-                    write!(terminal, "\x1b[1A\r\x1b[K")?;
-                }
-                writeln!(terminal, "{status}")?;
-                terminal.flush()?;
-                rendered = true;
                 frame = frame.wrapping_add(1);
+                let state = tui::RunningToolState {
+                    name: name.as_str(),
+                    summary,
+                    frame: FRAMES[frame % FRAMES.len()],
+                    elapsed_ms: elapsed.elapsed().as_millis(),
+                    live_output: &live_output,
+                    expanded,
+                };
+                let status_lines = tui::tool_running_box(tui::terminal_width(), colour, &state);
+                if last_rendered_lines > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                }
+                for line in &status_lines {
+                    writeln!(terminal, "{line}")?;
+                }
+                terminal.flush()?;
+                last_rendered_lines = status_lines.len();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("tool worker disconnected"));
