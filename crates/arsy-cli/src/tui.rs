@@ -124,6 +124,10 @@ pub const THEMES: &[(&str, &str)] = &[
     ("dark", "the original — grey text, cyan accents"),
     ("ocean", "cool — teal and blue"),
     ("sunset", "warm — amber and rose"),
+    (
+        "omp",
+        "oh-my-posh — vivid, high-contrast, multi-colored accents",
+    ),
     ("mono", "greys only, no hue"),
 ];
 
@@ -146,6 +150,20 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;58;58;58m",
             "\x1b[38;2;167;167;167m",
             "\x1b[48;2;53;53;53m",
+        ]),
+        // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
+        "omp" => Palette::from_codes([
+            "\x1b[38;2;230;237;243m",
+            "\x1b[38;2;139;148;158m",
+            "\x1b[38;2;88;166;255m",
+            "\x1b[38;2;63;185;80m",
+            "\x1b[38;2;248;81;73m",
+            "\x1b[38;2;227;179;65m",
+            "\x1b[38;2;210;168;255m",
+            "\x1b[38;2;86;211;100m",
+            "\x1b[38;2;88;166;255m",
+            "\x1b[38;2;255;166;87m",
+            "\x1b[48;2;22;27;34m",
         ]),
         // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
         "ocean" => Palette::from_codes([
@@ -2135,10 +2153,12 @@ pub fn tool_running_frame(
     summary: &str,
     elapsed_ms: u128,
 ) -> String {
+    let kind = tool_card_kind(name);
+    let (accent_sgr, _) = tool_card_colors(kind, colour);
     format!(
         "  {} {} {} · {}ms",
         paint(colour, sgr_run(), frame),
-        paint(colour, sgr_accent(), name),
+        paint(colour, accent_sgr, name),
         paint(colour, sgr_dim(), summary),
         elapsed_ms
     )
@@ -2154,6 +2174,8 @@ pub fn tool_running_frame_with_output(
     output: &str,
     expanded: bool,
 ) -> String {
+    let kind = tool_card_kind(name);
+    let (accent_sgr, _) = tool_card_colors(kind, colour);
     let detail = if expanded {
         let lines: Vec<&str> = output.lines().rev().take(8).collect();
         let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
@@ -2173,7 +2195,7 @@ pub fn tool_running_frame_with_output(
     format!(
         "  {} {} {} · {}ms · {}",
         paint(colour, sgr_run(), frame),
-        paint(colour, sgr_accent(), name),
+        paint(colour, accent_sgr, name),
         paint(
             colour,
             sgr_dim(),
@@ -2309,14 +2331,15 @@ pub fn bash_box(
     let fitted_command = fit(command, max_cmd_len);
     let header = format!(" $ {fitted_command} ");
     let header_len = visible_len(&header);
+    let (accent_sgr, border_sgr) = tool_card_colors(ToolCardKind::Bash, colour);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
     let mut lines = vec![format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╭"),
-        paint(colour, sgr_border(), &top_left),
-        paint(colour, sgr_run(), &header),
-        paint(colour, sgr_border(), &format!("{top_right}╮")),
+        paint(colour, border_sgr, "╭"),
+        paint(colour, border_sgr, &top_left),
+        paint(colour, accent_sgr, &header),
+        paint(colour, border_sgr, &format!("{top_right}╮")),
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
@@ -2326,9 +2349,9 @@ pub fn bash_box(
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &fitted),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
     }
     if out_lines.len() > limit {
@@ -2336,9 +2359,9 @@ pub fn bash_box(
         let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &more),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
     }
 
@@ -2360,14 +2383,15 @@ pub fn bash_box(
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╰"),
-        paint(colour, sgr_border(), &bot_left),
+        paint(colour, border_sgr, "╰"),
+        paint(colour, border_sgr, &bot_left),
         paint(colour, status_sgr, &fitted_status),
-        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+        paint(colour, border_sgr, &format!("{bot_right}╯")),
     ));
     lines.join("\n")
 }
 
+/// A styled tool execution box for filesystem, search, or MCP operations.
 /// A styled tool execution box for filesystem, search, or MCP operations.
 pub fn tool_box(
     width: usize,
@@ -2380,7 +2404,17 @@ pub fn tool_box(
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let prefix = format!(" ⚙ {name} ");
+    let kind = tool_card_kind(name);
+    let icon = tool_card_icon(kind);
+    let clean_name = name
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .trim();
+    let display_name = if clean_name.is_empty() {
+        name
+    } else {
+        clean_name
+    };
+    let prefix = format!(" {icon} {display_name} ");
     let prefix_len = visible_len(&prefix);
     let max_summary_len = inner.saturating_sub(prefix_len + 1);
     let fitted_summary = fit(summary, max_summary_len);
@@ -2390,14 +2424,15 @@ pub fn tool_box(
         format!("{prefix}{fitted_summary} ")
     };
     let header_len = visible_len(&header);
+    let (accent_sgr, border_sgr) = tool_card_colors(kind, colour);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
     let mut lines = vec![format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╭"),
-        paint(colour, sgr_border(), &top_left),
-        paint(colour, sgr_accent(), &header),
-        paint(colour, sgr_border(), &format!("{top_right}╮")),
+        paint(colour, border_sgr, "╭"),
+        paint(colour, border_sgr, &top_left),
+        paint(colour, accent_sgr, &header),
+        paint(colour, border_sgr, &format!("{top_right}╮")),
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
@@ -2407,9 +2442,9 @@ pub fn tool_box(
         let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &fitted),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
     }
     if out_lines.len() > limit {
@@ -2417,9 +2452,9 @@ pub fn tool_box(
         let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &more),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
     }
 
@@ -2441,10 +2476,10 @@ pub fn tool_box(
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╰"),
-        paint(colour, sgr_border(), &bot_left),
+        paint(colour, border_sgr, "╰"),
+        paint(colour, border_sgr, &bot_left),
         paint(colour, status_sgr, &fitted_status),
-        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+        paint(colour, border_sgr, &format!("{bot_right}╯")),
     ));
     lines.join("\n")
 }
@@ -2461,10 +2496,15 @@ pub enum ToolCardKind {
 }
 
 pub fn tool_card_kind(name: &str) -> ToolCardKind {
-    if matches!(name, "bash" | "shell.execute") {
+    let clean = name
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .trim();
+    if matches!(clean, "bash" | "shell.execute") {
         ToolCardKind::Bash
+    } else if clean.starts_with("mcp.") || clean == "mcp" || clean.starts_with("mcp_") {
+        ToolCardKind::Mcp
     } else if matches!(
-        name,
+        clean,
         "fs.read"
             | "fs.list"
             | "fs.write"
@@ -2473,20 +2513,34 @@ pub fn tool_card_kind(name: &str) -> ToolCardKind {
             | "fs.move"
             | "edit"
             | "apply_patch"
-    ) {
+            | "view_file"
+            | "write_to_file"
+            | "replace_file_content"
+            | "list_dir"
+    ) || clean.starts_with("fs.")
+        || clean.ends_with("_file")
+        || clean.ends_with("_dir")
+    {
         ToolCardKind::File
-    } else if name.starts_with("search.") {
+    } else if clean.starts_with("search.")
+        || clean.contains("search")
+        || clean.contains("grep")
+        || clean.contains("find")
+    {
         ToolCardKind::Search
-    } else if name.starts_with("mcp.") || name == "mcp" {
-        ToolCardKind::Mcp
-    } else if name == "network.connect" || name == "curl" || name == "http" {
+    } else if clean == "network.connect"
+        || clean == "curl"
+        || clean == "http"
+        || clean.contains("url")
+        || clean.contains("fetch")
+    {
         ToolCardKind::Network
     } else {
         ToolCardKind::Generic
     }
 }
 
-fn tool_card_icon(kind: ToolCardKind) -> &'static str {
+pub fn tool_card_icon(kind: ToolCardKind) -> &'static str {
     match kind {
         ToolCardKind::Bash => "$",
         ToolCardKind::File => "✎",
@@ -2494,6 +2548,24 @@ fn tool_card_icon(kind: ToolCardKind) -> &'static str {
         ToolCardKind::Mcp => "⌘",
         ToolCardKind::Search => "⌕",
         ToolCardKind::Generic => "⚙",
+    }
+}
+
+/// Category-specific (accent, border) color pair for tool cards.
+pub fn tool_card_colors(kind: ToolCardKind, colour: bool) -> (&'static str, &'static str) {
+    if !colour {
+        return ("", "");
+    }
+    if palette().border == "\x1b[38;2;74;74;74m" && palette().accent == "\x1b[38;2;205;205;205m" {
+        return (sgr_accent(), sgr_border());
+    }
+    match kind {
+        ToolCardKind::Bash => ("\x1b[38;2;97;175;239m", "\x1b[38;2;60;125;190m"),
+        ToolCardKind::File => ("\x1b[38;2;229;192;123m", "\x1b[38;2;176;136;59m"),
+        ToolCardKind::Search => ("\x1b[38;2;198;120;221m", "\x1b[38;2;142;78;163m"),
+        ToolCardKind::Mcp => ("\x1b[38;2;86;182;194m", "\x1b[38;2;53;127;137m"),
+        ToolCardKind::Network => ("\x1b[38;2;152;195;121m", "\x1b[38;2;93;142;67m"),
+        ToolCardKind::Generic => ("\x1b[38;2;224;108;117m", "\x1b[38;2;157;72;80m"),
     }
 }
 
@@ -2508,7 +2580,6 @@ pub fn tool_card(
     duration: std::time::Duration,
 ) -> String {
     let kind = tool_card_kind(name);
-    let label = format!("{} {name}", tool_card_icon(kind));
     match kind {
         ToolCardKind::Bash => bash_box(
             width,
@@ -2518,7 +2589,7 @@ pub fn tool_card(
             Some(i32::from(!success)),
             duration,
         ),
-        _ => tool_box(width, colour, &label, summary, output, success, duration),
+        _ => tool_box(width, colour, name, summary, output, success, duration),
     }
 }
 
@@ -4724,6 +4795,13 @@ mod tests {
         assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
         assert_eq!(tool_card_kind("mcp.search"), ToolCardKind::Mcp);
         assert_eq!(tool_card_kind("search.text"), ToolCardKind::Search);
+        let (bash_acc, bash_brd) = tool_card_colors(ToolCardKind::Bash, true);
+        assert!(!bash_acc.is_empty());
+        assert!(!bash_brd.is_empty());
+        assert_eq!(tool_card_colors(ToolCardKind::Bash, false), ("", ""));
+
+        let omp = builtin_palette("omp").expect("omp theme is built in");
+        assert_eq!(omp.accent, "\x1b[38;2;88;166;255m");
         let running = tool_running_frame_with_output(
             false,
             "⠋",
