@@ -125,9 +125,11 @@ pub const THEMES: &[(&str, &str)] = &[
     ("ocean", "cool — teal and blue"),
     ("sunset", "warm — amber and rose"),
     (
-        "omp",
-        "oh-my-posh — vivid, high-contrast, multi-colored accents",
+        "vivid",
+        "vivid — vibrant, high-contrast, multi-colored accents",
     ),
+    ("dracula", "dracula — iconic purple, cyan, green, and pink"),
+    ("nord", "nord — arctic frost and cool pastel accents"),
     ("mono", "greys only, no hue"),
 ];
 
@@ -152,7 +154,7 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[48;2;53;53;53m",
         ]),
         // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
-        "omp" => Palette::from_codes([
+        "vivid" | "omp" => Palette::from_codes([
             "\x1b[38;2;230;237;243m",
             "\x1b[38;2;139;148;158m",
             "\x1b[38;2;88;166;255m",
@@ -164,6 +166,32 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;88;166;255m",
             "\x1b[38;2;255;166;87m",
             "\x1b[48;2;22;27;34m",
+        ]),
+        "dracula" => Palette::from_codes([
+            "\x1b[38;2;248;248;242m",
+            "\x1b[38;2;98;114;164m",
+            "\x1b[38;2;189;147;249m",
+            "\x1b[38;2;80;250;123m",
+            "\x1b[38;2;255;85;85m",
+            "\x1b[38;2;241;250;140m",
+            "\x1b[38;2;255;121;198m",
+            "\x1b[38;2;139;233;253m",
+            "\x1b[38;2;189;147;249m",
+            "\x1b[38;2;255;184;108m",
+            "\x1b[48;2;40;42;54m",
+        ]),
+        "nord" => Palette::from_codes([
+            "\x1b[38;2;236;239;244m",
+            "\x1b[38;2;129;161;193m",
+            "\x1b[38;2;136;192;208m",
+            "\x1b[38;2;163;190;140m",
+            "\x1b[38;2;191;97;106m",
+            "\x1b[38;2;235;203;139m",
+            "\x1b[38;2;180;142;173m",
+            "\x1b[38;2;143;188;187m",
+            "\x1b[38;2;136;192;208m",
+            "\x1b[38;2;208;135;112m",
+            "\x1b[48;2;46;52;64m",
         ]),
         // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
         "ocean" => Palette::from_codes([
@@ -4944,8 +4972,12 @@ mod tests {
         assert!(!bash_brd.is_empty());
         assert_eq!(tool_card_colors(ToolCardKind::Bash, false), ("", ""));
 
-        let omp = builtin_palette("omp").expect("omp theme is built in");
-        assert_eq!(omp.accent, "\x1b[38;2;88;166;255m");
+        let vivid = builtin_palette("vivid").expect("vivid theme is built in");
+        assert_eq!(vivid.accent, "\x1b[38;2;88;166;255m");
+        let dracula = builtin_palette("dracula").expect("dracula theme is built in");
+        assert_eq!(dracula.accent, "\x1b[38;2;189;147;249m");
+        let nord = builtin_palette("nord").expect("nord theme is built in");
+        assert_eq!(nord.accent, "\x1b[38;2;136;192;208m");
         let running = tool_running_frame_with_output(
             false,
             "⠋",
