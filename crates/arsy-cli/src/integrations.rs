@@ -58,6 +58,16 @@ pub fn inspect(
     };
     let importer = CompatibilityImporter::new(root);
     let mut entries = Vec::new();
+    // What the engine actually built, so a listing can say which declarations
+    // run rather than repeating that none do.
+    let loaded = if kind == "hook" {
+        Some(crate::hook_engine(
+            root,
+            &crate::load_config(root, working)?,
+        ))
+    } else {
+        None
+    };
     if kind == "mcp" && source.is_none_or(|source| source == "arsy") {
         entries.extend(configured(root, working, name)?);
     }
@@ -91,7 +101,10 @@ pub fn inspect(
                 continue;
             }
             entry["ecosystem"] = json!(ecosystem.as_str());
-            entry["runtime_status"] = json!("not_loaded");
+            entry["runtime_status"] = json!(match &loaded {
+                Some(loaded) => runtime_status(loaded, root, entry["source"].as_str()),
+                None => "not_loaded",
+            });
             if kind == "hook" {
                 annotate_hook(&mut entry);
             }
@@ -111,11 +124,55 @@ pub fn inspect(
             entries.len()
         )));
     }
-    Ok(json!({
+    let mut report = json!({
         "entries": entries,
         "status": "inspection_complete",
-        "notice": "Definitions and declarations only; ARSY has not connected or loaded executable hooks. Provider-owned integrations are managed by the provider.",
-    }))
+        "notice": match &loaded {
+            // A hook listing is no longer only a reading of files: some of what
+            // it names will run, and saying otherwise would be false.
+            Some(loaded) if !loaded.is_empty() => "Hooks marked `loaded` run on this workspace's turns. A repository's own hooks run only where `[project.\"<path>\"] trust_level = \"trusted\"` vouches for it.",
+            Some(_) => "No executable hook is loaded for this workspace. Provider-owned integrations are managed by the provider.",
+            None => "Definitions and declarations only; ARSY has not connected. Provider-owned integrations are managed by the provider.",
+        },
+    });
+    if let Some(loaded) = loaded {
+        // Where the engine looked, including the operator's own files, which
+        // an import of this workspace never sees.
+        report["sources"] = json!(loaded.sources);
+    }
+    Ok(report)
+}
+
+/// Whether the file a declaration came from is one the engine loaded.
+///
+/// Matched on the whole path rather than its tail: the operator's own
+/// `~/.claude/settings.json` and the repository's end in the same characters,
+/// and taking the first of those to match reported one file's status against
+/// the other's declarations.
+fn runtime_status(
+    loaded: &arsy_code::hook::Loaded,
+    root: &Path,
+    source: Option<&str>,
+) -> &'static str {
+    let Some(source) = source else {
+        return "not_loaded";
+    };
+    let declared = root.join(source);
+    let same = |candidate: &Path| {
+        candidate == declared
+            || std::fs::canonicalize(candidate).ok() == std::fs::canonicalize(&declared).ok()
+    };
+    loaded
+        .sources
+        .iter()
+        .find(|candidate| same(&candidate.path))
+        .map_or("not_loaded", |candidate| {
+            if candidate.status == "loaded" {
+                "loaded"
+            } else {
+                "not_loaded"
+            }
+        })
 }
 
 /// ARSY's own `[mcp.server.*]` connections, in the same row shape the imported
@@ -208,7 +265,12 @@ pub fn human_report(
             .as_str()
             .or_else(|| entry["matcher"].as_str())
             .unwrap_or("");
-        listing.push_str(&format!("\n  {label} · {detail} · not loaded\n"));
+        let status = if entry["runtime_status"] == "loaded" {
+            "loaded"
+        } else {
+            "not loaded"
+        };
+        listing.push_str(&format!("\n  {label} · {detail} · {status}\n"));
         for line in details(kind, entry) {
             listing.push_str(&format!("    {line}\n"));
         }

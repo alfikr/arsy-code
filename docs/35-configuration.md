@@ -168,7 +168,12 @@ provider names, and timestamps that `arsy auth list` prints — is kept: `file`
 catalog holds no secret value, so the default costs no unlock prompt to read it;
 `os` keeps everything in one place for an operator who prefers that. The names
 are the same two the `secret://` handles use. Switching to `file` migrates an
-existing catalog out of the platform store on first read, once. A store that is
+existing catalog out of the platform store on first read, once — except when
+`ARSY_CONFIG_HOME` is set, because a run pointed at a throwaway configuration
+home asked for that home and not for the operator's own catalog copied into it.
+A record the catalog names but the platform store will not open is skipped
+rather than failing the turn: a handle that cannot be read has no value that
+could reach the output, so there is nothing left unredacted. A store that is
 neither is refused when the file loads, so a typo cannot quietly send
 credentials somewhere else. Path and URL keys are canonicalized and validated before merge. Duplicate rule IDs in one file, type mismatches, invalid enum values, and out-of-scope nested paths reject that file.
 

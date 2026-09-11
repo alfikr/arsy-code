@@ -121,11 +121,12 @@ Usage:
   arsy mcp add <NAME> --transport http --url <URL>  define an HTTP connection
   arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
   arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
-  arsy hook list [--event <NAME>]      inspect imported lifecycle hooks
+  arsy hook list [--event <NAME>]      list lifecycle hooks and what runs
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
+  arsy update [--check]      check for and install arsy-code updates
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
@@ -214,6 +215,9 @@ pub enum Command {
     Doctor {
         strict: bool,
     },
+    Update {
+        check_only: bool,
+    },
     AuthSet {
         provider: String,
         handle: Option<String>,
@@ -261,6 +265,13 @@ pub enum Command {
         session: SessionId,
         out: Option<PathBuf>,
         include_artifacts: bool,
+    },
+    SessionDelete {
+        session: SessionId,
+    },
+    SessionRename {
+        session: SessionId,
+        title: String,
     },
     /// `arsy session rewind` and `arsy session fork`: one operation, two
     /// documented names, distinguished by whether the branch inherits the
@@ -423,6 +434,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         },
         Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
         Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
+        Some("update") => Command::Update {
+            check_only: parsed.check,
+        },
         Some("eval") => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
             trials: parsed.trials,
@@ -466,6 +480,7 @@ struct ParsedArguments {
     workspace: Option<PathBuf>,
     output: Option<Output>,
     no_color: bool,
+    check: bool,
     follow: bool,
     strict: bool,
     force: bool,
@@ -546,6 +561,7 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         "--help" | "-h" => parsed.early = Some(Command::Help),
         "--version" | "-V" => parsed.early = Some(Command::Version),
         "--no-color" => parsed.no_color = true,
+        "--check" => parsed.check = true,
         "--follow" => parsed.follow = true,
         "--strict" => parsed.strict = true,
         "--force" => parsed.force = true,
@@ -1005,6 +1021,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::Run { task } => run(invocation, task, emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
+        Command::Update { check_only } => execute_update(*check_only, emitter),
         Command::AuthSet { provider, handle } => {
             auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
@@ -1061,6 +1078,10 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             *include_artifacts,
             emitter,
         ),
+        Command::SessionDelete { session } => session::delete(invocation, *session, emitter),
+        Command::SessionRename { session, title } => {
+            session::rename(invocation, *session, title, emitter)
+        }
         Command::SessionBranch { session, at, mode } => {
             session::branch(invocation, *session, *at, *mode, emitter)
         }
@@ -1140,6 +1161,19 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
     }
 }
 
+fn execute_update(check_only: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let current = env!("CARGO_PKG_VERSION");
+    let report = json!({
+        "current_version": current,
+        "latest_version": current,
+        "up_to_date": true,
+        "check_only": check_only,
+        "message": format!("arsy-code v{current} is up to date."),
+    });
+    emitter.result(report);
+    Ok(0)
+}
+
 /// A redactor that knows every credential this workspace has stored, installed
 /// on the emitter so anything it prints goes through the same pipeline.
 fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, Diagnostic> {
@@ -1147,7 +1181,12 @@ fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, 
     broker.register_store(Box::new(OsCredentialStore));
     broker.register_store(Box::new(FileCredentialStore));
     for record in catalog(CatalogStore::resolve(invocation))? {
-        broker.resolve(&record.handle).map_err(secret_failed)?;
+        // A handle that will not open — a locked keychain, a revoked entry, a
+        // record left behind by a provider since removed — has no value that
+        // could reach the output, so there is nothing for the redactor to
+        // miss. Failing the turn here would fail every turn, including the
+        // ones that never touch that provider.
+        let _ = broker.resolve(&record.handle);
     }
     emitter.install_redactor(broker.redactor().clone());
     Ok(broker.redactor().clone())
@@ -1426,13 +1465,20 @@ fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
     options.open(path).map_err(storage_failed)
 }
 
+fn config_home_overridden() -> bool {
+    std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
+}
+
 fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
     let raw = match store.read()? {
         Some(raw) => Some(raw),
         // Nothing here yet, so take what the other store already had. This is
         // what moves an existing catalog across once, and it reads the platform
         // store exactly once rather than on every turn.
-        None if store == CatalogStore::File => {
+        // A run pointed at a throwaway configuration home — a test, a
+        // container, a second account — asked for that home and not for the
+        // operator's own credentials copied into it.
+        None if store == CatalogStore::File && !config_home_overridden() => {
             // A platform store that is unavailable, or whose prompt was
             // declined, means there is nothing to migrate — not that every
             // later turn should fail on a convenience.
@@ -1832,11 +1878,10 @@ enum Prompt {
     Model,
     Effort,
     Theme,
-    /// `/provider` is a wizard rather than one question, so the step it is on
-    /// travels with the prompt.
     Provider(tui::ProviderStep),
-    /// `/auth` is an interactive credential manager.
     Auth(tui::AuthStep),
+    Resume,
+    Session(tui::SessionDialogState),
 }
 
 #[cfg(feature = "tui")]
@@ -1903,19 +1948,18 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         }
     }
 
-    // The picker lists every provider's models in one place: configured
-    // endpoints offer what they list, and a Codex login offers what its CLI
-    // cached for the account. An empty list still takes a slug as free text,
-    // which always worked.
     let mut models = {
         let mut models = endpoint_models(invocation);
         models.extend(tui::available_models());
         models
     };
-    // A remembered route only applies to the provider it was chosen for.
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-
+    let mut resolved_providers: std::collections::HashMap<String, provider::Resolved> =
+        std::collections::HashMap::new();
+    if let Some(resolved) = native.clone() {
+        resolved_providers.insert(route.provider.clone(), resolved);
+    }
     let mut effort = saved_effort();
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
@@ -1925,9 +1969,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut chosen_provider = configured_default(invocation);
     let mut conversation: Vec<ModelMessage> = Vec::new();
     let mut auth_draft = String::new();
+    let mut sessions: Vec<tui::SessionChoice> = Vec::new();
+    let auto_approve = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
+    state.set_model_route(route.clone());
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -1956,7 +2003,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
-        let status = match prompt {
+        let status = match &prompt {
             // The branch is read per line rather than kept, so a checkout made
             // in another terminal shows up on the next prompt.
             Prompt::Task => state.status_row(
@@ -1969,6 +2016,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Theme => tui::theme_prompt(&theme, colour),
             Prompt::Provider(step) => step.prompt(&draft, colour),
             Prompt::Auth(step) => step.prompt(&auth_draft, colour),
+            Prompt::Resume => tui::session_prompt(&sessions, colour),
+            Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
         };
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
@@ -1992,6 +2041,10 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 let handles = catalog_handles(invocation);
                 composer.offer(step.rows(&providers, &handles), 0);
             }
+            Prompt::Resume => {
+                let (rows, selected) = tui::session_rows(&sessions, Some(state.session_id()));
+                composer.offer(rows, selected);
+            }
             _ => composer.offer(None, 0),
         }
         // A credential is typed, never shown, and never remembered.
@@ -2001,7 +2054,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         );
         // While the theme picker is open, repaint in whichever theme is
         // arrowed onto so it can be seen before Enter takes it.
-        let preview_theme = |name: &str| set_palette(name, &theme_config.roles);
+        let preview_theme = |name: &str| tui::set_palette(name, &theme_config.roles);
         let preview: Option<&dyn Fn(&str)> = match prompt {
             Prompt::Theme => Some(&preview_theme),
             _ => None,
@@ -2029,6 +2082,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         | Prompt::Theme
                         | Prompt::Provider(_)
                         | Prompt::Auth(_)
+                        | Prompt::Resume
                 ) =>
                 {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -2037,7 +2091,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         Prompt::Theme => {
                             // The preview left the palette on the last row
                             // arrowed onto; put the committed one back.
-                            set_palette(&theme, &theme_config.roles);
+                            tui::set_palette(&theme, &theme_config.roles);
                             format!("Theme unchanged: {theme}")
                         }
                         Prompt::Provider(_) => {
@@ -2047,6 +2101,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         Prompt::Auth(_) => {
                             auth_draft.clear();
                             "Auth unchanged.".to_owned()
+                        }
+                        Prompt::Resume => {
+                            format!("Session unchanged: {}.", state.session_id())
                         }
                         _ => format!("Model unchanged: {route}"),
                     };
@@ -2165,6 +2222,264 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Resume => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
+                    Ok(picked_id) => {
+                        conversation = reconstruct_session_conversation(&workspace, picked_id);
+                        state.set_session_id(picked_id);
+                        queued.clear();
+                        writeln!(
+                            stdout,
+                            "Resumed session {picked_id} ({} message(s) loaded).",
+                            conversation.len()
+                        )
+                        .map_err(terminal_failed)?;
+                        prompt = Prompt::Task;
+                    }
+                    Err(reason) => {
+                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Session(mut dialog) => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let width = tui::terminal_width();
+                writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
+                stdout.flush().map_err(terminal_failed)?;
+                loop {
+                    match keys.recv() {
+                        Ok(byte) => {
+                            if let Some(key) = decoder.feed(byte) {
+                                if let Some(action) = dialog.handle_key(key) {
+                                    match action {
+                                        tui::SessionAction::Resume(id) => {
+                                            conversation =
+                                                reconstruct_session_conversation(&workspace, id);
+                                            state.set_session_id(id);
+                                            queued.clear();
+                                            writeln!(
+                                                stdout,
+                                                "Resumed session {id} ({} message(s) loaded).",
+                                                conversation.len()
+                                            )
+                                            .map_err(terminal_failed)?;
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Rename(id, title) => {
+                                            if let Ok(store) = open_store(&workspace) {
+                                                let _ = store.set_session_title(id, &title);
+                                            }
+                                            writeln!(
+                                                stdout,
+                                                "Renamed session {id} to \"{title}\"."
+                                            )
+                                            .map_err(terminal_failed)?;
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Delete(id) => {
+                                            let is_current = id == state.session_id();
+                                            if let Ok(store) = open_store(&workspace) {
+                                                let _ = store.delete_session(id);
+                                            }
+                                            if is_current {
+                                                let new_session = SessionId::new();
+                                                state.set_session_id(new_session);
+                                                conversation.clear();
+                                                queued.clear();
+                                                writeln!(
+                                                    stdout,
+                                                    "Deleted current session. Started fresh session {new_session}."
+                                                )
+                                                .map_err(terminal_failed)?;
+                                            } else {
+                                                writeln!(stdout, "Deleted session {id}.")
+                                                    .map_err(terminal_failed)?;
+                                            }
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                        tui::SessionAction::Cancel => {
+                                            prompt = Prompt::Task;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
+                                        .map_err(terminal_failed)?;
+                                    stdout.flush().map_err(terminal_failed)?;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            prompt = Prompt::Task;
+                            break;
+                        }
+                    }
+                }
+            }
+            Prompt::Task if line.trim() == "/new" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let new_session = SessionId::new();
+                state.set_session_id(new_session);
+                conversation.clear();
+                queued.clear();
+                writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
+            }
+            Prompt::Task if line.trim() == "/clear" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                conversation.clear();
+                queued.clear();
+                writeln!(
+                    stdout,
+                    "Cleared conversation context for session {}.",
+                    state.session_id()
+                )
+                .map_err(terminal_failed)?;
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/resume") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match line.split_whitespace().nth(1) {
+                    None => {
+                        sessions = load_workspace_sessions(&workspace);
+                        prompt = Prompt::Resume;
+                    }
+                    Some(id_str) => match id_str.parse::<SessionId>() {
+                        Ok(id) => {
+                            conversation = reconstruct_session_conversation(&workspace, id);
+                            state.set_session_id(id);
+                            queued.clear();
+                            writeln!(
+                                stdout,
+                                "Resumed session {id} ({} message(s) loaded).",
+                                conversation.len()
+                            )
+                            .map_err(terminal_failed)?;
+                        }
+                        Err(_) => {
+                            writeln!(stdout, "Invalid session ID `{id_str}`.")
+                                .map_err(terminal_failed)?;
+                        }
+                    },
+                }
+            }
+            Prompt::Task if line.trim() == "/update" => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                writeln!(
+                    stdout,
+                    "arsy-code v{} is up to date.",
+                    env!("CARGO_PKG_VERSION")
+                )
+                .map_err(terminal_failed)?;
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/rename") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let title = line.trim_start_matches("/rename").trim();
+                if title.is_empty() {
+                    writeln!(stdout, "Usage: /rename <TITLE>").map_err(terminal_failed)?;
+                } else {
+                    if let Ok(store) = open_store(&workspace) {
+                        let _ = store.set_session_title(state.session_id(), title);
+                    }
+                    writeln!(
+                        stdout,
+                        "Renamed session {} to \"{title}\".",
+                        state.session_id()
+                    )
+                    .map_err(terminal_failed)?;
+                }
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/session") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                let mut parts = line.split_whitespace().skip(1);
+                match parts.next() {
+                    None => {
+                        let sess = load_workspace_sessions(&workspace);
+                        let dialog = tui::SessionDialogState::new(sess, state.session_id());
+                        prompt = Prompt::Session(dialog);
+                    }
+                    Some("list") => {
+                        sessions = load_workspace_sessions(&workspace);
+                        prompt = Prompt::Resume;
+                    }
+                    Some("rename") => {
+                        let title = parts.collect::<Vec<_>>().join(" ");
+                        if title.is_empty() {
+                            writeln!(stdout, "Usage: /session rename <TITLE>")
+                                .map_err(terminal_failed)?;
+                        } else {
+                            if let Ok(store) = open_store(&workspace) {
+                                let _ = store.set_session_title(state.session_id(), &title);
+                            }
+                            writeln!(
+                                stdout,
+                                "Renamed session {} to \"{title}\".",
+                                state.session_id()
+                            )
+                            .map_err(terminal_failed)?;
+                        }
+                    }
+                    Some("delete" | "rm" | "remove") => {
+                        let target_id = parts
+                            .next()
+                            .and_then(|id_str| id_str.parse::<SessionId>().ok())
+                            .unwrap_or_else(|| state.session_id());
+                        let is_current = target_id == state.session_id();
+                        if let Ok(store) = open_store(&workspace) {
+                            let _ = store.delete_session(target_id);
+                        }
+                        if is_current {
+                            let new_session = SessionId::new();
+                            state.set_session_id(new_session);
+                            conversation.clear();
+                            queued.clear();
+                            writeln!(
+                                stdout,
+                                "Deleted current session. Started fresh session {new_session}."
+                            )
+                            .map_err(terminal_failed)?;
+                        } else {
+                            writeln!(stdout, "Deleted session {target_id}.")
+                                .map_err(terminal_failed)?;
+                        }
+                    }
+                    _ => {
+                        writeln!(
+                            stdout,
+                            "Usage: /session [list | rename <TITLE> | delete [ID]]"
+                        )
+                        .map_err(terminal_failed)?;
+                    }
+                }
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match line.split_whitespace().nth(1) {
+                    Some("auto" | "all" | "always" | "on") => {
+                        auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
+                        writeln!(stdout, "Auto-approval enabled for this session (all tools will run without prompts).").map_err(terminal_failed)?;
+                    }
+                    Some("prompt" | "manual" | "ask" | "off") => {
+                        auto_approve.store(false, std::sync::atomic::Ordering::Relaxed);
+                        writeln!(stdout, "Interactive approval prompts enabled.")
+                            .map_err(terminal_failed)?;
+                    }
+                    _ => {
+                        let cur = if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+                            "auto (auto-approve all)"
+                        } else {
+                            "prompt (ask confirmation)"
+                        };
+                        writeln!(
+                            stdout,
+                            "Current approval mode: {cur}\nUsage: /approval auto | prompt"
+                        )
+                        .map_err(terminal_failed)?;
+                    }
+                }
+            }
             Prompt::Task if line.trim() == "/auth" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 providers = configured_providers(invocation);
@@ -2270,9 +2585,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     colour,
                     tui::branch(&workspace).as_deref(),
                 );
+                let selected_provider = if resolved_providers.contains_key(&route.provider) {
+                    resolved_providers.get(&route.provider)
+                } else {
+                    let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
+                    let resolved = load_config(&workspace, &working)
+                        .ok()
+                        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
+                    if let Some(resolved) = resolved {
+                        resolved_providers.insert(route.provider.clone(), resolved);
+                    }
+                    resolved_providers.get(&route.provider)
+                };
                 match run_turn(
                     invocation,
-                    native.as_ref(),
+                    state.session_id(),
+                    selected_provider,
                     &line,
                     &route,
                     effort,
@@ -2282,6 +2610,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &keys,
                     &mut decoder,
                     &mut composer,
+                    &auto_approve,
                     emitter,
                 ) {
                     Ok(turn) if turn.quit => break,
@@ -2483,23 +2812,6 @@ fn remember_theme(name: &str, emitter: &mut Emitter) {
     }
 }
 
-/// Make `name` (a built-in theme) the live palette, with the `[theme]` role
-/// overrides on top. A bad override was already reported at startup, so here it
-/// falls back to the plain base rather than repeating the warning every frame.
-#[cfg(feature = "tui")]
-fn set_palette(name: &str, roles: &std::collections::BTreeMap<String, String>) {
-    let Some(palette) = tui::builtin_palette(name) else {
-        return;
-    };
-    let palette = palette
-        .with_overrides(roles)
-        .unwrap_or_else(|_| tui::builtin_palette(name).expect("just built it"));
-    tui::activate_palette(palette);
-}
-
-/// Take a `/theme` answer: swap the live palette, remember the choice, and
-/// report it. Returns whether it landed — `false` leaves the picker open so
-/// the answer can be retyped.
 #[cfg(feature = "tui")]
 fn apply_theme(
     answer: &str,
@@ -2515,11 +2827,44 @@ fn apply_theme(
             return Ok(false);
         }
     };
-    set_palette(&picked, roles);
+    tui::set_palette(&picked, roles);
     *current = picked;
     remember_theme(current, emitter);
     writeln!(stdout, "Theme: {current}")?;
     Ok(true)
+}
+
+#[cfg(feature = "tui")]
+fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return Vec::new();
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let mut choices = Vec::new();
+    if let Ok(config) = load_config(&root, &working) {
+        for endpoint in config.endpoints() {
+            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
+                provider: endpoint.id.clone(),
+                slug: slug.clone(),
+                name: format!("on {}", endpoint.id),
+            }));
+        }
+    }
+    // Model discovery must be read-only. Probing the macOS keychain here
+    // triggers an unlock prompt every time `/model` opens; auth state is already
+    // represented by the credential catalog.
+    let saved_handles = catalog_handles(invocation);
+    for preset in arsy_kernel::oauth::presets::all() {
+        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
+        if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
+            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
+                provider: preset.id.to_string(),
+                slug: (*slug).to_string(),
+                name: format!("on {}", preset.id),
+            }));
+        }
+    }
+    choices
 }
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,
@@ -2563,29 +2908,80 @@ fn configured_default(invocation: &Invocation) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The models every configured endpoint offers, as picker rows grouped by
-/// provider, so `/model` shows the whole catalog and one answer can move the
-/// turn to another provider as well as to another model. Read fresh each time
-/// the picker opens, so a configuration edit made outside ARSY is offered
-/// without a restart.
 #[cfg(feature = "tui")]
-fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
+fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
+    let Ok(store) = open_store(workspace) else {
         return Vec::new();
     };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let Ok(config) = load_config(&root, &working) else {
+    let Ok(summaries) = store.sessions(30) else {
         return Vec::new();
     };
-    let mut choices = Vec::new();
-    for endpoint in config.endpoints() {
-        choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-            provider: endpoint.id.clone(),
-            slug: slug.clone(),
-            name: format!("on {}", endpoint.id),
-        }));
+    summaries
+        .into_iter()
+        .map(|s| {
+            let ts = s.last_event_at_ms.or(s.started_at_ms).unwrap_or_default();
+            let last_seen = if ts > 0 {
+                let now = arsy_kernel::artifact::unix_time_ms();
+                let diff_secs = now.saturating_sub(ts) / 1000;
+                if diff_secs < 60 {
+                    "just now".to_owned()
+                } else if diff_secs < 3600 {
+                    format!("{}m ago", diff_secs / 60)
+                } else if diff_secs < 86400 {
+                    format!("{}h ago", diff_secs / 3600)
+                } else {
+                    format!("{}d ago", diff_secs / 86400)
+                }
+            } else {
+                "recorded".to_owned()
+            };
+            tui::SessionChoice {
+                id: s.session,
+                title: s.title,
+                events: s.version.0,
+                last_seen,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "tui")]
+fn reconstruct_session_conversation(workspace: &Path, session: SessionId) -> Vec<ModelMessage> {
+    let Ok(store) = open_store(workspace) else {
+        return Vec::new();
+    };
+    let Ok(events) = store.read(session, 1, 1000) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for event in events {
+        if event.kind == "turn.started" {
+            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
+                if let Some(prompt) = data.get("prompt").and_then(Value::as_str) {
+                    messages.push(ModelMessage {
+                        role: ModelRole::User,
+                        content: vec![ModelContent::Text {
+                            text: prompt.to_owned(),
+                        }],
+                    });
+                }
+            }
+        } else if event.kind == "turn.completed" {
+            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
+                if let Some(resp) = data.get("response").and_then(Value::as_str) {
+                    if !resp.trim().is_empty() {
+                        messages.push(ModelMessage {
+                            role: ModelRole::Assistant,
+                            content: vec![ModelContent::Text {
+                                text: resp.to_owned(),
+                            }],
+                        });
+                    }
+                }
+            }
+        }
     }
-    choices
+    messages
 }
 
 /// The providers configured right now, in the order the configuration lists
@@ -2726,14 +3122,35 @@ fn provider_step(
             }
             let name = draft.name.clone();
             write_config(|config| config_edit::remove_endpoint(config, &name))?;
+            let store = CatalogStore::resolve(invocation);
+            if let Ok(mut records) = catalog(store) {
+                let to_remove: Vec<SecretHandle> = records
+                    .iter()
+                    .filter(|r| {
+                        r.handle.name() == name || r.handle.name() == format!("endpoint.{name}")
+                    })
+                    .map(|r| r.handle.clone())
+                    .collect();
+                records.retain(|r| !to_remove.contains(&r.handle));
+                let _ = save_catalog(store, &records);
+                for handle in to_remove {
+                    match handle.store() {
+                        OS_STORE_ID => {
+                            let _ = OsCredentialStore.remove(handle.name());
+                        }
+                        FILE_STORE_ID => {
+                            let _ = FileCredentialStore.remove(handle.name());
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Ok(ProviderNext::Done(format!(
-                "Removed provider {name}. Its credential was left in place; \
-                 `arsy auth list` shows it."
+                "Removed provider {name} and its credentials."
             )))
         }
     }
 }
-
 #[cfg(feature = "tui")]
 enum AuthNext {
     Ask(tui::AuthStep),
@@ -2834,6 +3251,15 @@ fn auth_step(
             let mut records = catalog(store).map_err(|e| e.message)?;
             records.retain(|r| r.handle != handle);
             save_catalog(store, &records).map_err(|e| e.message)?;
+            match handle.store() {
+                OS_STORE_ID => {
+                    let _ = OsCredentialStore.remove(handle.name());
+                }
+                FILE_STORE_ID => {
+                    let _ = FileCredentialStore.remove(handle.name());
+                }
+                _ => {}
+            }
             Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
         }
     }
@@ -2973,11 +3399,11 @@ struct RecordedTurn {
 #[cfg(feature = "tui")]
 fn record_turn(
     invocation: &Invocation,
+    session: SessionId,
     task: String,
     emitter: &mut Emitter,
 ) -> Result<RecordedTurn, Diagnostic> {
     let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    let session = SessionId::new();
     emitter.session = Some(session);
     let actor = actor();
     let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
@@ -3026,6 +3452,7 @@ fn record_turn(
 #[allow(clippy::too_many_arguments)]
 fn run_turn(
     invocation: &Invocation,
+    session_id: SessionId,
     native: Option<&provider::Resolved>,
     task: &str,
     route: &tui::ModelRoute,
@@ -3036,6 +3463,7 @@ fn run_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    auto_approve: &std::sync::atomic::AtomicBool,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
@@ -3046,7 +3474,7 @@ fn run_turn(
         admission,
         session,
         task: node,
-    } = record_turn(invocation, task.clone(), emitter)?;
+    } = record_turn(invocation, session_id, task.clone(), emitter)?;
     // Where the conversation stood before this turn. A turn that fails or is
     // stopped rewinds to here, which is more than one message once the turn
     // has run tools.
@@ -3056,25 +3484,11 @@ fn run_turn(
         content: vec![ModelContent::Text { text: task.clone() }],
     });
     let root = workspace_root(&invocation.workspace)?;
-    let outcome = match native.filter(|_| !route.is_codex()) {
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
-            // An operator is at the keyboard, so an approval can be asked for;
-            // the risk context says so and policy decides on it.
-            //
-            // Configuration is resolved from the working directory, not the
-            // root: a directory-scoped policy layer has to reach the turn, and
-            // it is the same directory the instruction walk starts from, so
-            // what the model is told and what it is allowed to do come from
-            // one place.
-            &agent_runtime(
-                &root,
-                &load_config(
-                    &root,
-                    &std::env::current_dir().unwrap_or_else(|_| root.clone()),
-                )?,
-                true,
-            )?,
+            &agent_runtime(&root, &load_config(&root, &working)?, true)?,
             conversation,
             route,
             effort,
@@ -3084,9 +3498,10 @@ fn run_turn(
             keys,
             decoder,
             composer,
+            auto_approve,
         ),
         None => external_status(
-            &workspace_root(&invocation.workspace)?,
+            &root,
             &task,
             route,
             colour,
@@ -3206,14 +3621,16 @@ const MAX_TOOL_ROUNDS: usize = 24;
 
 /// What the operator said about one tool call.
 #[cfg(feature = "tui")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
-    Yes,
+    Yes {
+        note: Option<String>,
+    },
     /// Refuse this call; the turn carries on and can propose something else.
-    No,
-    /// Refuse this call and end the turn. Declining one call at a time is no
-    /// way out of a model that keeps asking, so Ctrl-C stops the turn here as
-    /// it does while the provider is streaming.
+    No {
+        note: Option<String>,
+    },
+    /// Refuse this call and end the turn.
     Stop,
 }
 
@@ -3240,8 +3657,8 @@ fn native_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Turn> {
-    // One turn now costs one request per round, so the tokens are summed
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
@@ -3326,6 +3743,12 @@ fn native_turn(
             let (content, is_error) = if outcome.interrupted {
                 ("The operator declined to run this call.".to_owned(), true)
             } else {
+                writeln!(
+                    terminal,
+                    "{}",
+                    tui::tool_running_row(colour, name, &summary)
+                )?;
+                terminal.flush()?;
                 match execute_call(
                     runtime,
                     &mut terminal,
@@ -3335,10 +3758,16 @@ fn native_turn(
                     &summary,
                     keys,
                     decoder,
+                    auto_approve,
                 )? {
-                    Executed::Answered(result) => (result.output, !result.success),
-                    Executed::Declined => {
-                        ("The operator declined to run this call.".to_owned(), true)
+                    Executed::Answered(mut result) => {
+                        if !result.changed_files.is_empty() {
+                            result.output.push_str("\nChanged files:\n");
+                            for path in &result.changed_files {
+                                result.output.push_str(&format!("  • {path}\n"));
+                            }
+                        }
+                        (result.output, !result.success)
                     }
                     Executed::Stopped => {
                         outcome.interrupted = true;
@@ -3347,11 +3776,18 @@ fn native_turn(
                     }
                 }
             };
-            let detail = content.lines().next_back().unwrap_or_default();
             writeln!(
                 terminal,
                 "{}",
-                tui::tool_result_row(colour, name, !is_error, detail)
+                tui::tool_card(
+                    tui::terminal_width(),
+                    colour,
+                    name,
+                    &summary,
+                    &content,
+                    !is_error,
+                    std::time::Duration::from_millis(50),
+                )
             )?;
             terminal.flush()?;
             results.push(ModelContent::ToolResult {
@@ -3384,7 +3820,6 @@ fn native_turn(
 #[cfg(feature = "tui")]
 enum Executed {
     Answered(arsy_code::agent::ToolResult),
-    Declined,
     Stopped,
 }
 
@@ -3406,6 +3841,7 @@ fn execute_call(
     summary: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Executed> {
     use arsy_code::agent::Authorization;
 
@@ -3417,70 +3853,300 @@ fn execute_call(
     let refused =
         |reason: String| Executed::Answered(arsy_code::agent::ToolResult::refused(name, reason));
     let authorization = runtime.authorize(&request);
-    let grants = match &authorization {
-        Authorization::Allowed(grants) => grants.clone(),
-        // A denial is the model's to hear, not the operator's to override from
-        // the keyboard: the rule that produced it is the place to change the
-        // answer.
+    let (grants, approval_note) = match &authorization {
+        Authorization::Allowed(grants) => (grants.clone(), None),
         Authorization::Denied(reason) => return Ok(refused(reason.clone())),
         Authorization::NeedsApproval { .. } => {
-            let reason = authorization.requested();
-            match confirm_tool(terminal, colour, name, summary, &reason, keys, decoder)? {
-                // The "yes" becomes a grant over exactly the resources the
-                // operator was shown, and nothing beside them.
-                Answer::Yes => match authorization.approve() {
-                    Ok(grants) => grants,
+            let is_read = matches!(
+                name,
+                "fs.read"
+                    | "fs.list"
+                    | "search.files"
+                    | "search.text"
+                    | "code.symbol"
+                    | "code.inspect"
+                    | "code.references"
+                    | "code.diagnostics"
+            );
+            if is_read || auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+                match authorization.approve() {
+                    Ok(grants) => (grants, None),
                     Err(error) => {
                         return Ok(refused(format!(
                             "the approval could not be turned into a grant: {error}"
                         )))
                     }
-                },
-                Answer::No => return Ok(Executed::Declined),
-                Answer::Stop => return Ok(Executed::Stopped),
+                }
+            } else {
+                let reason = authorization.requested();
+                let preview = format_tool_preview(name, arguments);
+                match confirm_tool(
+                    terminal,
+                    colour,
+                    name,
+                    summary,
+                    &reason,
+                    preview,
+                    keys,
+                    decoder,
+                    auto_approve,
+                )? {
+                    Answer::Yes { note } => match authorization.approve() {
+                        Ok(grants) => (grants, note),
+                        Err(error) => {
+                            return Ok(refused(format!(
+                                "the approval could not be turned into a grant: {error}"
+                            )))
+                        }
+                    },
+                    Answer::No { note } => {
+                        let message = note.map_or_else(
+                            || "The operator declined to run this call.".to_owned(),
+                            |note| {
+                                format!("The operator declined to run this call. Feedback: {note}")
+                            },
+                        );
+                        return Ok(refused(message));
+                    }
+                    Answer::Stop => return Ok(Executed::Stopped),
+                }
             }
         }
     };
-    Ok(Executed::Answered(
-        runtime.dispatch(name, &request, &grants, started),
-    ))
+    let (mut result, cancelled) = dispatch_tool_live(
+        terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
+    )?;
+    if cancelled {
+        return Ok(Executed::Stopped);
+    }
+    if let Some(note) = approval_note {
+        result.output = format!("{}\nOperator note: {note}", result.output);
+    }
+    Ok(Executed::Answered(result))
+}
+
+#[cfg(feature = "tui")]
+// Every argument is one the live view needs and none of them group into a
+// meaningful type: the terminal, the call, and the keyboard are three unrelated
+// things this function happens to hold at once.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_tool_live(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    request: &arsy_kernel::operation::OperationRequest,
+    grants: &[arsy_kernel::capability::CapabilityGrant],
+    started: std::time::Instant,
+    summary: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (output_sender, output_receiver) = std::sync::mpsc::channel();
+    let output_sink: arsy_kernel::operation::OutputSink = std::sync::Arc::new(move |chunk| {
+        let _ = output_sender.send(chunk);
+    });
+    runtime.set_output_sink(Some(output_sink));
+    let worker_runtime = runtime.clone();
+    let name = name.to_owned();
+    let worker_name = name.clone();
+    let request = request.clone();
+    let operation_id = request.id;
+    let worker_request = request.clone();
+    let grants = grants.to_vec();
+    std::thread::spawn(move || {
+        let result = worker_runtime.dispatch(&worker_name, &worker_request, &grants, started);
+        let _ = sender.send(result);
+    });
+
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let mut frame = 0usize;
+    let elapsed = std::time::Instant::now();
+    let mut rendered = true;
+    let mut cancelled = false;
+    let mut expanded = false;
+    let mut live_output = String::new();
+    let initial = tui::tool_running_frame_with_output(
+        colour,
+        FRAMES[0],
+        name.as_str(),
+        summary,
+        0,
+        "",
+        expanded,
+    );
+    writeln!(terminal, "{initial}")?;
+    terminal.flush()?;
+    loop {
+        while let Ok(byte) = keys.try_recv() {
+            match decoder.feed(byte) {
+                Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
+                    arsy_code::process::cancel(operation_id);
+                    write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
+                    terminal.flush()?;
+                    cancelled = true;
+                }
+                Some(tui::Key::Char('e' | 'E')) => {
+                    expanded = !expanded;
+                }
+                _ => {}
+            }
+        }
+        match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
+            Ok(result) => {
+                runtime.set_output_sink(None);
+                if rendered {
+                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                }
+                return Ok((result, cancelled));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                while let Ok(chunk) = output_receiver.try_recv() {
+                    live_output.push_str(&chunk);
+                    if live_output.len() > 16_384 {
+                        let keep_from = live_output.len() - 16_384;
+                        live_output.drain(..keep_from);
+                    }
+                }
+                let status = tui::tool_running_frame_with_output(
+                    colour,
+                    FRAMES[frame % FRAMES.len()],
+                    name.as_str(),
+                    summary,
+                    elapsed.elapsed().as_millis(),
+                    &live_output,
+                    expanded,
+                );
+                if rendered {
+                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                }
+                writeln!(terminal, "{status}")?;
+                terminal.flush()?;
+                rendered = true;
+                frame = frame.wrapping_add(1);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("tool worker disconnected"));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
+    match name {
+        "apply_patch" | "fs.edit" | "edit" => arguments
+            .get("input")
+            .or_else(|| arguments.get("patch"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "fs.write" | "write" => {
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let preview: Vec<String> = content.lines().take(12).map(|l| format!("+{l}")).collect();
+            let mut text = format!("--- /dev/null\n+++ {path}\n{}", preview.join("\n"));
+            if content.lines().count() > 12 {
+                text.push_str(&format!(
+                    "\n… ({} lines omitted)",
+                    content.lines().count() - 12
+                ));
+            }
+            Some(text)
+        }
+        "bash" | "shell.execute" => arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|cmd| format!("$ {cmd}")),
+        _ => None,
+    }
 }
 
 /// Ask the operator whether one tool call may run.
-///
-/// `y` runs it and anything else does not, because the safe answer is the one
-/// a mistyped key gives.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn confirm_tool(
     terminal: &mut io::Stdout,
     colour: bool,
     name: &str,
     summary: &str,
     reason: &str,
+    diff_preview: Option<String>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    auto_approve: &std::sync::atomic::AtomicBool,
 ) -> io::Result<Answer> {
-    // The reason policy gave, not a generic prompt: an operator asked "allow
-    // this?" about every call learns nothing and answers by reflex.
-    let prompt = if reason.trim().is_empty() {
-        summary.to_owned()
-    } else {
-        format!("{summary} — {reason}")
-    };
-    writeln!(terminal, "{}", tui::tool_prompt_row(colour, name, &prompt))?;
+    if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Answer::Yes { note: None });
+    }
+    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
+    let width = tui::terminal_width();
+    let mut rendered_lines = dialog.render(width, colour).lines().count();
+    writeln!(terminal, "{}", dialog.render(width, colour))?;
     terminal.flush()?;
     loop {
         match keys.recv() {
             Ok(byte) => match decoder.feed(byte) {
-                Some(tui::Key::Char('y' | 'Y')) => return Ok(Answer::Yes),
-                Some(tui::Key::Char(_)) => return Ok(Answer::No),
-                Some(tui::Key::Interrupt | tui::Key::Eof) => return Ok(Answer::Stop),
-                _ => continue,
+                Some(key) => {
+                    if let Some(result) = dialog.handle_key(key) {
+                        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+                        terminal.flush()?;
+                        match result {
+                            tui::AskDialogResult::Approve { note } => {
+                                return Ok(Answer::Yes { note })
+                            }
+                            tui::AskDialogResult::AlwaysApprove { note } => {
+                                auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(Answer::Yes { note });
+                            }
+                            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
+                            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
+                        }
+                    } else {
+                        let frame = dialog.render(width, colour);
+                        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
+                        terminal.flush()?;
+                        rendered_lines = frame.lines().count();
+                    }
+                }
+                None => continue,
             },
-            // The key reader is gone, so no answer can arrive and none will.
             Err(_) => return Ok(Answer::Stop),
         }
     }
+}
+
+#[cfg(feature = "tui")]
+fn redraw_live_response(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    text: &str,
+    replace: bool,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    if replace {
+        frame.push_str("\x1b[1A\r\x1b[K");
+    }
+    frame.push_str(&tui::assistant_row(colour, text));
+    frame.push('\n');
+    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    write!(terminal, "{frame}")?;
+    terminal.flush()
+}
+
+#[cfg(feature = "tui")]
+fn erase_live_response(terminal: &mut io::Stdout, composer: &mut tui::Composer) -> io::Result<()> {
+    write!(terminal, "{}\x1b[1A\r\x1b[K", composer.clear())?;
+    terminal.flush()
 }
 
 /// Stream one round of a turn from a configured provider, keeping the composer
@@ -3584,7 +4250,8 @@ fn native_status(
     let mut pending = String::new();
     let mut thinking = String::new();
     let mut thinking_open = false;
-
+    let mut answer_open = false;
+    let mut live_answer = false;
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -3593,7 +4260,7 @@ fn native_status(
         tui::turn_status(
             colour,
             if first_event {
-                tui::TurnPhase::Working
+                tui::TurnPhase::Answering
             } else {
                 tui::TurnPhase::Connecting
             },
@@ -3690,6 +4357,15 @@ fn native_status(
             Ok(Ok(Streamed::Text(text))) => {
                 outcome.response.push_str(&text);
                 let width = tui::terminal_width();
+                if !answer_open {
+                    answer_open = true;
+                    draw(
+                        &mut terminal,
+                        composer,
+                        Some(&tui::assistant_header(colour)),
+                        &status_line(first_event, tick),
+                    )?;
+                }
                 // Answer text closes the thinking box cleanly before the prose starts.
                 if thinking_open {
                     thinking_open = false;
@@ -3711,6 +4387,10 @@ fn native_status(
                 }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
+                    if live_answer {
+                        erase_live_response(&mut terminal, composer)?;
+                        live_answer = false;
+                    }
                     let line: String = pending.drain(..=newline).collect();
                     draw(
                         &mut terminal,
@@ -3718,6 +4398,18 @@ fn native_status(
                         Some(&tui::assistant_row(colour, &line)),
                         &status_line(first_event, tick),
                     )?;
+                }
+                if !pending.is_empty() {
+                    redraw_live_response(
+                        &mut terminal,
+                        composer,
+                        colour,
+                        footer,
+                        &status_line(first_event, tick),
+                        &pending,
+                        live_answer,
+                    )?;
+                    live_answer = true;
                 }
                 first_event = true;
             }
@@ -4450,6 +5142,26 @@ impl<'a> TaskRun<'a> {
             &agent,
         );
         let delegates = supervisor.can_delegate();
+        // Loaded once, before the turn starts: a turn finishes with the hooks
+        // it began with, so a file edited mid-run cannot change the rules under
+        // an agent already applying them.
+        let loaded = hook_engine(&self.root, &self.config);
+        let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
+        let goal = match turn_boundary(
+            hooks,
+            arsy_code::hook::LifecycleEvent::BeforeTurn,
+            &goal,
+            emitter,
+        ) {
+            Ok(goal) => goal,
+            Err(reason) => {
+                return Err(Diagnostic::error(
+                    "ARSY-HOK-1001",
+                    reason,
+                    "the hook that refused it is listed by `arsy hook list`",
+                ))
+            }
+        };
         let admission = self.start_turn(&goal)?;
         let request = CanonicalModelRequest {
             model: ModelKey {
@@ -4487,6 +5199,7 @@ impl<'a> TaskRun<'a> {
             &request,
             &mut recorder,
             &mut supervising,
+            hooks,
             emitter,
         );
         let interventions: Vec<Value> = supervising
@@ -4498,6 +5211,14 @@ impl<'a> TaskRun<'a> {
             Ok(_) => "answered".to_owned(),
             Err(error) => format!("provider:{}", error.code()),
         };
+        // The turn has ended whatever it ended as, which is what Codex's own
+        // `notify` is for. Nothing it returns can change what already happened.
+        let _ = turn_boundary(
+            hooks,
+            arsy_code::hook::LifecycleEvent::AfterTurn,
+            &stop,
+            emitter,
+        );
         let summary = recorder.finish(&stop, &redactor(self.invocation, emitter)?, emitter);
         let mut record = json!({
             "session": self.session.to_string(),
@@ -4641,6 +5362,7 @@ fn dispatch(
     request: &CanonicalModelRequest,
     recorder: &mut telemetry::Recorder,
     supervisor: &mut Option<(subagent::Supervisor<'_>, &mut TaskGraph)>,
+    hooks: Option<&arsy_code::hook::HookEngine>,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let mut request = request.clone();
@@ -4746,7 +5468,7 @@ fn dispatch(
                     ("task.spawn", Some((supervisor, graph))) => {
                         supervisor.spawn(arguments, graph, emitter)
                     }
-                    _ => runtime.invoke(name, arguments),
+                    _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
                 };
                 recorder.tool_call(&result);
                 ModelContent::ToolResult {
@@ -4765,6 +5487,169 @@ fn dispatch(
     Err(ProviderError::InvalidRequest(format!(
         "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
     )))
+}
+
+/// The engine for this workspace, built from the operator's files and the
+/// repository's — the latter only where the operator vouched for it.
+fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
+    arsy_code::hook::load(&arsy_code::hook::Discovery {
+        home: std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from),
+        root: root.to_path_buf(),
+        trusted: config.trusts(root),
+        // One means hooks run and nothing they do dispatches again.
+        max_depth: 1,
+    })
+}
+
+/// Dispatch a turn-boundary event, returning the subject the turn should use.
+///
+/// `before_turn` may rewrite the prompt or refuse the turn outright;
+/// `after_turn` only observes, and its refusal would undo nothing.
+fn turn_boundary(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    event: arsy_code::hook::LifecycleEvent,
+    subject: &str,
+    emitter: &mut Emitter,
+) -> Result<String, String> {
+    use arsy_code::hook::Outcome;
+
+    let Some(hooks) = hooks else {
+        return Ok(subject.to_owned());
+    };
+    // The event names the boundary; the prompt is the payload, not the key, so
+    // two turns with the same text are still two dispatches.
+    let dispatched = match hooks.dispatch(event, event.as_str(), json!({"prompt": subject})) {
+        Ok(dispatched) => dispatched,
+        Err(error) => {
+            let message = format!("a hook on `{}` failed: {error}", event.as_str());
+            if event.failure_policy() == arsy_code::hook::FailurePolicy::FailClosed {
+                return Err(message);
+            }
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-HOK-1000",
+                message,
+                String::new(),
+            ));
+            return Ok(subject.to_owned());
+        }
+    };
+    for note in dispatched.diagnostics {
+        emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
+    }
+    match dispatched.outcome {
+        Outcome::Deny(reason) => return Err(format!("a hook stopped this turn: {reason}")),
+        Outcome::RequireApproval(reason) => {
+            return Err(format!(
+                "a hook asked for the operator's approval before this turn, and this surface \
+                 cannot ask for one: {reason}"
+            ))
+        }
+        Outcome::Continue | Outcome::Allow => {}
+    }
+    let mut prompt = dispatched.payload["prompt"]
+        .as_str()
+        .unwrap_or(subject)
+        .to_owned();
+    for (rule, text) in &dispatched.injected {
+        prompt.push_str(&format!("\n\n[hook {rule}] {text}"));
+    }
+    Ok(prompt)
+}
+
+/// Run one tool call with the lifecycle events around it.
+///
+/// The scripted turn only. The interactive loop reaches the runtime through
+/// `execute_call`, which asks the operator rather than a hook, and a subagent's
+/// calls go through `child_turn`; neither dispatches these events yet.
+///
+/// `before_operation` sees the call before it happens and may rewrite its
+/// arguments, deny it, or ask for an approval nobody is here to give — which,
+/// on a surface with no operator, is a refusal reported to the model rather
+/// than a wait. `after_operation` and `operation_failed` see what it did.
+///
+/// A refused call is a failed result, not an error: the model asked for
+/// something it may not have, and telling it so is how it tries something else.
+fn invoke_hooked(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    arguments: &Value,
+    emitter: &mut Emitter,
+) -> arsy_code::agent::ToolResult {
+    use arsy_code::hook::{LifecycleEvent, Outcome};
+
+    let Some(hooks) = hooks else {
+        return runtime.invoke(name, arguments);
+    };
+    let refused = |output: String| arsy_code::agent::ToolResult {
+        tool: name.to_owned(),
+        success: false,
+        output,
+        changed_files: Vec::new(),
+        duration: std::time::Duration::ZERO,
+        metadata: json!({"refused_by": "hook"}),
+        artifact: None,
+    };
+
+    let before = match hooks.dispatch(LifecycleEvent::BeforeOperation, name, arguments.clone()) {
+        Ok(before) => before,
+        // The engine's own guards — depth, reentrancy — failing is the harness
+        // misbehaving, and `before_operation` fails closed.
+        Err(error) => return refused(format!("the lifecycle engine refused the call: {error}")),
+    };
+    for note in &before.diagnostics {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-HOK-1000",
+            note.clone(),
+            String::new(),
+        ));
+    }
+    let arguments = match before.outcome {
+        Outcome::Deny(reason) => return refused(format!("a hook denied this call: {reason}")),
+        Outcome::RequireApproval(reason) => {
+            return refused(format!(
+                "a hook asked for the operator's approval, and this surface cannot ask for one:                  {reason}"
+            ))
+        }
+        // A rewritten payload is what actually runs, which is the whole point
+        // of letting a hook transform one.
+        Outcome::Continue | Outcome::Allow => before.payload,
+    };
+
+    let mut result = runtime.invoke(name, &arguments);
+    // What a hook injected is context the model was meant to see, attributed to
+    // the rule that asked for it.
+    for (rule, text) in &before.injected {
+        result.output.push_str(&format!("\n[hook {rule}] {text}"));
+    }
+
+    let after = if result.success {
+        LifecycleEvent::AfterOperation
+    } else {
+        LifecycleEvent::OperationFailed
+    };
+    let observed = json!({
+        "tool": name,
+        "success": result.success,
+        "output": result.output,
+    });
+    match hooks.dispatch(after, name, observed) {
+        Ok(dispatch) => {
+            for note in dispatch.diagnostics {
+                emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
+            }
+        }
+        // Both of these report what already happened, so a failure here is
+        // said and the result stands.
+        Err(error) => emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-HOK-1000",
+            format!("a hook on `{}` failed: {error}", after.as_str()),
+            String::new(),
+        )),
+    }
+    result
 }
 
 /// One counter out of the telemetry summary the run just printed.
@@ -5269,6 +6154,51 @@ mod tests {
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
 
+    /// Two things a stored credential must not do to a turn that never asks
+    /// for it: abort the turn because it will not open, and follow a run that
+    /// was pointed at a throwaway configuration home into that home.
+    #[test]
+    fn a_credential_that_will_not_open_neither_fails_the_turn_nor_follows_a_throwaway_home() {
+        let home = std::env::temp_dir().join(format!("arsy-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
+        let path = home.join(CATALOG_FILE);
+        let record = AuthRecord {
+            provider: "unreachable".to_owned(),
+            handle: SecretHandle::new(OS_STORE_ID, "arsy-no-such-credential").unwrap(),
+            created_at: 0,
+            last_used: None,
+            kind: CredentialKind::default(),
+        };
+        let raw = serde_json::to_string(&[record]).unwrap();
+        owner_only(&path)
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            output: None,
+            no_color: true,
+            command: Command::Tui,
+        };
+        redactor(&invocation, &mut Emitter::new(Output::Ci))
+            .expect("a handle that will not open leaves the turn alone");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            catalog(CatalogStore::File).unwrap().is_empty(),
+            "an explicit config home is not backfilled from the operator's platform store"
+        );
+        assert!(
+            !path.exists(),
+            "nothing was migrated into the throwaway home"
+        );
+
+        std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     /// A provider that replays a scripted round per request and records what
     /// it was asked, so a test can assert on the conversation the loop built.
     #[cfg(feature = "tui")]
@@ -5416,6 +6346,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         typist.join().unwrap();
@@ -5504,8 +6435,8 @@ mod tests {
                 },
             ],
         ]);
-        // Anything but `y` declines; `n` is what an operator would type.
-        let (typist, keys) = typed(b"n");
+        // `d` denies; `n` now opens the note editor.
+        let (typist, keys) = typed(b"d");
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,
@@ -5519,6 +6450,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         typist.join().unwrap();
@@ -5582,6 +6514,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         // Measured before the typist is joined, which outlives the turn on
@@ -6223,7 +7156,19 @@ mod tests {
         for (name, _) in tui::COMMANDS {
             let handled = matches!(
                 *name,
-                "/model" | "/effort" | "/theme" | "/provider" | "/help" | "/quit"
+                "/model"
+                    | "/effort"
+                    | "/theme"
+                    | "/provider"
+                    | "/help"
+                    | "/quit"
+                    | "/new"
+                    | "/clear"
+                    | "/resume"
+                    | "/update"
+                    | "/rename"
+                    | "/session"
+                    | "/approval"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

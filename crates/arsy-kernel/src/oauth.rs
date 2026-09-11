@@ -684,7 +684,12 @@ pub mod presets {
 
     /// The preset `id` names, if any.
     pub fn get(id: &str) -> Option<&'static Preset> {
-        PRESETS.iter().find(|preset| preset.id == id)
+        let canonical = match id {
+            "codex" | "openai-codex" | "codex-oauth" => "codex-oauth",
+            "antigravity" | "google-antigravity" => "antigravity",
+            other => other,
+        };
+        PRESETS.iter().find(|preset| preset.id == canonical)
     }
 
     fn owned(values: &[&str]) -> Vec<String> {
@@ -707,7 +712,14 @@ pub mod presets {
                 device_authorization_url: None,
                 client_id: "app_EMoamEEZ73f0CkXaXp7hrann".to_owned(),
                 client_secret: None,
-                scopes: owned(&["openid", "profile", "email", "offline_access"]),
+                scopes: owned(&[
+                    "openid",
+                    "profile",
+                    "email",
+                    "offline_access",
+                    "api.connectors.read",
+                    "api.connectors.invoke",
+                ]),
                 redirect_uri: Some("http://localhost:1455/auth/callback".to_owned()),
                 authorize_params: vec![
                     ("id_token_add_organizations".to_owned(), "true".to_owned()),
@@ -722,8 +734,25 @@ pub mod presets {
             id: "antigravity",
             label: "Google Antigravity — sign in with a Google account",
             dialect: Dialect::GoogleCodeAssist,
-            base_url: "https://cloudcode-pa.googleapis.com",
-            models: &["gemini-3-pro", "gemini-2.5-flash", "gemini-2.5-pro"],
+            base_url: "https://daily-cloudcode-pa.googleapis.com",
+            models: &[
+                "gemini-3.8-flash",
+                "gemini-3.7-flash",
+                "gemini-3.7-pro",
+                "gemini-3.1-pro",
+                "gemini-3-flash",
+                "gemini-3-pro",
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "claude-3-7-sonnet",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-6",
+                "claude-opus-4-5",
+                "claude-opus-4-6",
+                "gpt-5",
+                "gpt-5-codex",
+                "gpt-oss",
+            ],
             build_oauth: || OAuth {
                 authorize_url: "https://accounts.google.com/o/oauth2/auth".to_owned(),
                 token_url: "https://oauth2.googleapis.com/token".to_owned(),

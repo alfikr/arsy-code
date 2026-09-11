@@ -739,17 +739,11 @@ fn claude_hooks(
         .ok_or_else(|| CompatError::Parse("hooks must be an object".into()))?;
     let mut mapped = Vec::new();
     for (original_event, entries) in hooks {
-        let event = match original_event.as_str() {
-            "PreToolUse" => "before_operation",
-            "PostToolUse" => "after_operation",
-            "PostToolUseFailure" => "operation_failed",
-            "SessionStart" => "session_started",
-            "SessionEnd" => "session_ended",
-            "UserPromptSubmit" => "before_turn",
-            "Stop" => "after_turn",
-            "PreCompact" => "before_compaction",
-            _ => "unsupported",
-        };
+        // The mapping lives with the engine that dispatches it: a declaration
+        // reported here as `before_operation` has to be the one the engine
+        // will actually run.
+        let event = crate::hook::LifecycleEvent::from_external(original_event)
+            .map_or("unsupported", crate::hook::LifecycleEvent::as_str);
         let entries = entries
             .as_array()
             .ok_or_else(|| CompatError::Parse("hook event must contain an array".into()))?;
@@ -959,7 +953,7 @@ fn front_matter(input: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn map_tool(value: &str) -> Option<&'static str> {
+pub(crate) fn map_tool(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "read" => Some("fs.read"),
         "grep" => Some("search.text"),
