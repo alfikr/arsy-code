@@ -227,5 +227,15 @@ fn a_file_credential_resolves_only_when_its_owner_alone_can_read_it() {
         "removing what is already gone is not found, not a failure"
     );
 
+    // FileCredentialStore::set writes owner-only file and makes value resolvable.
+    FileCredentialStore
+        .set(&name, "sk-written-by-set\n")
+        .unwrap();
+    assert_eq!(
+        FileCredentialStore.resolve(&name).unwrap(),
+        "sk-written-by-set"
+    );
+    FileCredentialStore.remove(&name).unwrap();
+
     std::fs::remove_dir_all(&root).unwrap();
 }

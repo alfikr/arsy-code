@@ -252,6 +252,61 @@ impl FileCredentialStore {
         Ok(())
     }
 
+    /// Write a secret into a file credential, ensuring owner-only permissions.
+    pub fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
+        let path = Self::path(name).ok_or_else(|| SecretError::Store {
+            handle: Self::handle(name),
+            message: "this platform has no user configuration directory".to_owned(),
+        })?;
+        if !Path::new(name).is_absolute()
+            && (name.contains("..") || name.contains('/') || name.contains('\\'))
+        {
+            return Err(SecretError::Store {
+                handle: Self::handle(name),
+                message: "credential name must not traverse parent directories".to_owned(),
+            });
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|error| SecretError::Store {
+                    handle: Self::handle(name),
+                    message: error.to_string(),
+                })?;
+            file.write_all(value.as_bytes())
+                .map_err(|error| SecretError::Store {
+                    handle: Self::handle(name),
+                    message: error.to_string(),
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).map_err(|error| SecretError::Store {
+                handle: Self::handle(name),
+                message: error.to_string(),
+            })?;
+            file.write_all(value.as_bytes())
+                .map_err(|error| SecretError::Store {
+                    handle: Self::handle(name),
+                    message: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Delete the file a handle names, so `auth remove` means the same thing
     /// for both stores rather than leaving a file store one-way.
     pub fn remove(&self, name: &str) -> Result<(), SecretError> {

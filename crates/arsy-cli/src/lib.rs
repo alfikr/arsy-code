@@ -1639,10 +1639,27 @@ fn auth_login(
         tokens.map_err(login_failed)?
     };
 
-    let handle = SecretHandle::new(OS_STORE_ID, provider).map_err(secret_failed)?;
+    let (store_kind, handle_name) = match configured.as_ref().and_then(|e| e.credential.as_ref()) {
+        Some(existing) => (existing.store(), existing.name().to_owned()),
+        None => {
+            if config.credential_store() == FILE_STORE_ID {
+                (FILE_STORE_ID, format!("{provider}.key"))
+            } else {
+                (OS_STORE_ID, provider.to_owned())
+            }
+        }
+    };
+    let handle = SecretHandle::new(store_kind, &handle_name).map_err(secret_failed)?;
     let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
-    let store = OsCredentialStore;
-    store.set(handle.name(), &raw).map_err(secret_failed)?;
+    if store_kind == FILE_STORE_ID {
+        FileCredentialStore
+            .set(&handle_name, &raw)
+            .map_err(secret_failed)?;
+    } else {
+        OsCredentialStore
+            .set(handle.name(), &raw)
+            .map_err(secret_failed)?;
+    }
     let records_store = CatalogStore::resolve(invocation);
     let mut records = catalog(records_store)?;
     let now = now()?;
@@ -3743,12 +3760,6 @@ fn native_turn(
             let (content, is_error) = if outcome.interrupted {
                 ("The operator declined to run this call.".to_owned(), true)
             } else {
-                writeln!(
-                    terminal,
-                    "{}",
-                    tui::tool_running_row(colour, name, &summary)
-                )?;
-                terminal.flush()?;
                 match execute_call(
                     runtime,
                     &mut terminal,
@@ -3963,26 +3974,32 @@ fn dispatch_tool_live(
     const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let mut frame = 0usize;
     let elapsed = std::time::Instant::now();
-    let mut rendered = true;
     let mut cancelled = false;
     let mut expanded = false;
     let mut live_output = String::new();
-    let initial = tui::tool_running_frame_with_output(
-        colour,
-        FRAMES[0],
-        name.as_str(),
+    let initial_state = tui::RunningToolState {
+        name: name.as_str(),
         summary,
-        0,
-        "",
+        frame: FRAMES[0],
+        elapsed_ms: 0,
+        live_output: "",
         expanded,
-    );
-    writeln!(terminal, "{initial}")?;
+    };
+    let initial = tui::tool_running_box(tui::terminal_width(), colour, &initial_state);
+    for line in &initial {
+        writeln!(terminal, "{line}")?;
+    }
     terminal.flush()?;
+    let mut last_rendered_lines = initial.len();
     loop {
         while let Ok(byte) = keys.try_recv() {
             match decoder.feed(byte) {
                 Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
                     arsy_code::process::cancel(operation_id);
+                    if last_rendered_lines > 0 {
+                        write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                        last_rendered_lines = 0;
+                    }
                     write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
                     terminal.flush()?;
                     cancelled = true;
@@ -3996,8 +4013,9 @@ fn dispatch_tool_live(
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
                 runtime.set_output_sink(None);
-                if rendered {
-                    write!(terminal, "\x1b[1A\r\x1b[K")?;
+                if last_rendered_lines > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                    terminal.flush()?;
                 }
                 return Ok((result, cancelled));
             }
@@ -4009,22 +4027,24 @@ fn dispatch_tool_live(
                         live_output.drain(..keep_from);
                     }
                 }
-                let status = tui::tool_running_frame_with_output(
-                    colour,
-                    FRAMES[frame % FRAMES.len()],
-                    name.as_str(),
-                    summary,
-                    elapsed.elapsed().as_millis(),
-                    &live_output,
-                    expanded,
-                );
-                if rendered {
-                    write!(terminal, "\x1b[1A\r\x1b[K")?;
-                }
-                writeln!(terminal, "{status}")?;
-                terminal.flush()?;
-                rendered = true;
                 frame = frame.wrapping_add(1);
+                let state = tui::RunningToolState {
+                    name: name.as_str(),
+                    summary,
+                    frame: FRAMES[frame % FRAMES.len()],
+                    elapsed_ms: elapsed.elapsed().as_millis(),
+                    live_output: &live_output,
+                    expanded,
+                };
+                let status_lines = tui::tool_running_box(tui::terminal_width(), colour, &state);
+                if last_rendered_lines > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
+                }
+                for line in &status_lines {
+                    writeln!(terminal, "{line}")?;
+                }
+                terminal.flush()?;
+                last_rendered_lines = status_lines.len();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("tool worker disconnected"));
@@ -4130,22 +4150,34 @@ fn redraw_live_response(
     footer: &str,
     status: &str,
     text: &str,
-    replace: bool,
-) -> io::Result<()> {
+    prev_lines: usize,
+) -> io::Result<usize> {
     let mut frame = composer.clear();
-    if replace {
+    for _ in 0..prev_lines {
         frame.push_str("\x1b[1A\r\x1b[K");
     }
     frame.push_str(&tui::assistant_row(colour, text));
     frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    let width = tui::terminal_width();
+    frame.push_str(&composer.render_turn(width, colour, status, footer));
     write!(terminal, "{frame}")?;
-    terminal.flush()
+    terminal.flush()?;
+    let text_len = unicode_width::UnicodeWidthStr::width(text);
+    let lines = text_len.checked_div(width).map_or(1, |div| div + 1);
+    Ok(lines)
 }
 
 #[cfg(feature = "tui")]
-fn erase_live_response(terminal: &mut io::Stdout, composer: &mut tui::Composer) -> io::Result<()> {
-    write!(terminal, "{}\x1b[1A\r\x1b[K", composer.clear())?;
+fn erase_live_response(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    lines: usize,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    for _ in 0..lines.max(1) {
+        frame.push_str("\x1b[1A\r\x1b[K");
+    }
+    write!(terminal, "{frame}")?;
     terminal.flush()
 }
 
@@ -4251,7 +4283,7 @@ fn native_status(
     let mut thinking = String::new();
     let mut thinking_open = false;
     let mut answer_open = false;
-    let mut live_answer = false;
+    let mut live_lines = 0usize;
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -4387,9 +4419,9 @@ fn native_status(
                 }
                 pending.push_str(&text);
                 while let Some(newline) = pending.find('\n') {
-                    if live_answer {
-                        erase_live_response(&mut terminal, composer)?;
-                        live_answer = false;
+                    if live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live_lines)?;
+                        live_lines = 0;
                     }
                     let line: String = pending.drain(..=newline).collect();
                     draw(
@@ -4400,16 +4432,15 @@ fn native_status(
                     )?;
                 }
                 if !pending.is_empty() {
-                    redraw_live_response(
+                    live_lines = redraw_live_response(
                         &mut terminal,
                         composer,
                         colour,
                         footer,
                         &status_line(first_event, tick),
                         &pending,
-                        live_answer,
+                        live_lines,
                     )?;
-                    live_answer = true;
                 }
                 first_event = true;
             }
@@ -4435,6 +4466,9 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
+                    if live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live_lines)?;
+                    }
                     draw(
                         &mut terminal,
                         composer,
@@ -4471,6 +4505,9 @@ fn native_status(
             Some(&tui::thinking_box_bottom(width, colour)),
             &status_line(first_event, tick),
         )?;
+    }
+    if live_lines > 0 {
+        erase_live_response(&mut terminal, composer, live_lines)?;
     }
     if !pending.trim().is_empty() {
         draw(

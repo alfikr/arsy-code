@@ -124,6 +124,12 @@ pub const THEMES: &[(&str, &str)] = &[
     ("dark", "the original — grey text, cyan accents"),
     ("ocean", "cool — teal and blue"),
     ("sunset", "warm — amber and rose"),
+    (
+        "vivid",
+        "vivid — vibrant, high-contrast, multi-colored accents",
+    ),
+    ("dracula", "dracula — iconic purple, cyan, green, and pink"),
+    ("nord", "nord — arctic frost and cool pastel accents"),
     ("mono", "greys only, no hue"),
 ];
 
@@ -146,6 +152,46 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
             "\x1b[38;2;58;58;58m",
             "\x1b[38;2;167;167;167m",
             "\x1b[48;2;53;53;53m",
+        ]),
+        // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
+        "vivid" | "omp" => Palette::from_codes([
+            "\x1b[38;2;230;237;243m",
+            "\x1b[38;2;139;148;158m",
+            "\x1b[38;2;88;166;255m",
+            "\x1b[38;2;63;185;80m",
+            "\x1b[38;2;248;81;73m",
+            "\x1b[38;2;227;179;65m",
+            "\x1b[38;2;210;168;255m",
+            "\x1b[38;2;86;211;100m",
+            "\x1b[38;2;88;166;255m",
+            "\x1b[38;2;255;166;87m",
+            "\x1b[48;2;22;27;34m",
+        ]),
+        "dracula" => Palette::from_codes([
+            "\x1b[38;2;248;248;242m",
+            "\x1b[38;2;98;114;164m",
+            "\x1b[38;2;189;147;249m",
+            "\x1b[38;2;80;250;123m",
+            "\x1b[38;2;255;85;85m",
+            "\x1b[38;2;241;250;140m",
+            "\x1b[38;2;255;121;198m",
+            "\x1b[38;2;139;233;253m",
+            "\x1b[38;2;189;147;249m",
+            "\x1b[38;2;255;184;108m",
+            "\x1b[48;2;40;42;54m",
+        ]),
+        "nord" => Palette::from_codes([
+            "\x1b[38;2;236;239;244m",
+            "\x1b[38;2;129;161;193m",
+            "\x1b[38;2;136;192;208m",
+            "\x1b[38;2;163;190;140m",
+            "\x1b[38;2;191;97;106m",
+            "\x1b[38;2;235;203;139m",
+            "\x1b[38;2;180;142;173m",
+            "\x1b[38;2;143;188;187m",
+            "\x1b[38;2;136;192;208m",
+            "\x1b[38;2;208;135;112m",
+            "\x1b[48;2;46;52;64m",
         ]),
         // assistant, dim, accent, ok, err, run, model, cwd, border, bullet, input_bg
         "ocean" => Palette::from_codes([
@@ -381,6 +427,14 @@ impl Drop for RawTerminal {
 }
 
 fn stty(args: &[&str]) -> std::io::Result<String> {
+    #[cfg(unix)]
+    if let Ok(tty) = std::fs::File::open("/dev/tty") {
+        if let Ok(output) = Command::new("stty").args(args).stdin(tty).output() {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+    }
     let output = Command::new("stty")
         .args(args)
         .stdin(Stdio::inherit())
@@ -2127,10 +2181,12 @@ pub fn tool_running_frame(
     summary: &str,
     elapsed_ms: u128,
 ) -> String {
+    let kind = tool_card_kind(name);
+    let (accent_sgr, _) = tool_card_colors(kind, colour);
     format!(
         "  {} {} {} · {}ms",
         paint(colour, sgr_run(), frame),
-        paint(colour, sgr_accent(), name),
+        paint(colour, accent_sgr, name),
         paint(colour, sgr_dim(), summary),
         elapsed_ms
     )
@@ -2146,6 +2202,8 @@ pub fn tool_running_frame_with_output(
     output: &str,
     expanded: bool,
 ) -> String {
+    let kind = tool_card_kind(name);
+    let (accent_sgr, _) = tool_card_colors(kind, colour);
     let detail = if expanded {
         let lines: Vec<&str> = output.lines().rev().take(8).collect();
         let tail = lines.into_iter().rev().collect::<Vec<_>>().join(" │ ");
@@ -2165,7 +2223,7 @@ pub fn tool_running_frame_with_output(
     format!(
         "  {} {} {} · {}ms · {}",
         paint(colour, sgr_run(), frame),
-        paint(colour, sgr_accent(), name),
+        paint(colour, accent_sgr, name),
         paint(
             colour,
             sgr_dim(),
@@ -2174,6 +2232,121 @@ pub fn tool_running_frame_with_output(
         elapsed_ms,
         if expanded { "e collapse" } else { "e expand" }
     )
+}
+
+/// Execution state passed to format the live running tool card.
+pub struct RunningToolState<'a> {
+    pub name: &'a str,
+    pub summary: &'a str,
+    pub frame: &'a str,
+    pub elapsed_ms: u128,
+    pub live_output: &'a str,
+    pub expanded: bool,
+}
+
+/// Render an in-progress animated box for an actively executing tool call.
+pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
+    let width = width.max(MIN_WIDTH);
+    let inner = width.saturating_sub(4);
+    let kind = tool_card_kind(state.name);
+    let icon = tool_card_icon(kind);
+    let (accent_sgr, border_sgr) = tool_card_colors(kind, colour);
+
+    let clean_name = state
+        .name
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .trim();
+    let display_name = if clean_name.is_empty() {
+        state.name
+    } else {
+        clean_name
+    };
+
+    let header = if matches!(kind, ToolCardKind::Bash) {
+        let max_cmd_len = inner.saturating_sub(4);
+        let fitted_cmd = fit(state.summary, max_cmd_len);
+        format!(" $ {fitted_cmd} ")
+    } else if state.summary.is_empty() {
+        format!(" {icon} {display_name} ")
+    } else {
+        let max_sum_len = inner.saturating_sub(visible_len(display_name) + 5);
+        let fitted_sum = fit(state.summary, max_sum_len);
+        format!(" {icon} {display_name} {fitted_sum} ")
+    };
+
+    let header_len = visible_len(&header);
+    let top_left = "─".repeat(2);
+    let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
+
+    let mut lines = vec![format!(
+        "{}{}{}{}",
+        paint(colour, border_sgr, "╭"),
+        paint(colour, border_sgr, &top_left),
+        paint(colour, accent_sgr, &header),
+        paint(colour, border_sgr, &format!("{top_right}╮")),
+    )];
+
+    let status_lead = format!(" {} running ({}ms)", state.frame, state.elapsed_ms);
+    if !state.expanded {
+        let tail = state.live_output.lines().last().unwrap_or_default().trim();
+        let status_row = if tail.is_empty() {
+            status_lead
+        } else {
+            let max_tail = inner.saturating_sub(visible_len(&status_lead) + 3);
+            let fitted_tail = fit(tail, max_tail);
+            format!("{status_lead} · {fitted_tail}")
+        };
+        let fitted = fit(&status_row, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, border_sgr, "│"),
+            paint(colour, sgr_dim(), &fitted),
+            paint(colour, border_sgr, "│"),
+        ));
+    } else {
+        let status_fitted = fit(&status_lead, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&status_fitted)));
+        lines.push(format!(
+            "{} {}{pad} {}",
+            paint(colour, border_sgr, "│"),
+            paint(colour, sgr_run(), &status_fitted),
+            paint(colour, border_sgr, "│"),
+        ));
+
+        let out_lines: Vec<&str> = state.live_output.lines().collect();
+        let tail_count = 6;
+        let start = out_lines.len().saturating_sub(tail_count);
+        for line in out_lines.iter().skip(start) {
+            let line_fmt = format!("   {line}");
+            let fitted = fit(&line_fmt, inner);
+            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+            lines.push(format!(
+                "{} {}{pad} {}",
+                paint(colour, border_sgr, "│"),
+                paint(colour, sgr_dim(), &fitted),
+                paint(colour, border_sgr, "│"),
+            ));
+        }
+    }
+
+    let toggle_hint = if state.expanded {
+        " [e: collapse] "
+    } else {
+        " [e: expand] "
+    };
+    let toggle_len = visible_len(toggle_hint);
+    let bot_fill = width.saturating_sub(2 + toggle_len);
+    let bot_bar = "─".repeat(bot_fill);
+    lines.push(format!(
+        "{}{}{}{}",
+        paint(colour, border_sgr, "╰"),
+        paint(colour, border_sgr, &bot_bar),
+        paint(colour, sgr_dim(), toggle_hint),
+        paint(colour, border_sgr, "╯"),
+    ));
+
+    lines
 }
 
 /// What a tool call did, once it ran or was declined.
@@ -2297,61 +2470,83 @@ pub fn bash_box(
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let header = format!(" $ {command} ");
+    let max_cmd_len = inner.saturating_sub(4);
+    let fitted_command = fit(command, max_cmd_len);
+    let header = format!(" $ {fitted_command} ");
     let header_len = visible_len(&header);
+    let (accent_sgr, border_sgr) = tool_card_colors(ToolCardKind::Bash, colour);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
     let mut lines = vec![format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╭"),
-        paint(colour, sgr_border(), &top_left),
-        paint(colour, sgr_run(), &header),
-        paint(colour, sgr_border(), &format!("{top_right}╮")),
+        paint(colour, border_sgr, "╭"),
+        paint(colour, border_sgr, &top_left),
+        paint(colour, accent_sgr, &header),
+        paint(colour, border_sgr, &format!("{top_right}╮")),
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
-    let limit = 200;
-    for line in out_lines.iter().take(limit) {
-        let fitted = fit(line, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
-            paint(colour, sgr_dim(), &fitted),
-            paint(colour, sgr_border(), "│"),
-        ));
-    }
-    if out_lines.len() > limit {
-        let more = format!("… ({} lines omitted)", out_lines.len() - limit);
+    let max_preview = 10;
+    if out_lines.len() <= max_preview {
+        for line in &out_lines {
+            let fitted = fit(line, inner);
+            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+            lines.push(format!(
+                "{} {}{pad} {}",
+                paint(colour, border_sgr, "│"),
+                paint(colour, sgr_dim(), &fitted),
+                paint(colour, border_sgr, "│"),
+            ));
+        }
+    } else {
+        let omitted = out_lines.len() - max_preview;
+        let more = format!("… ({} earlier lines omitted)", omitted);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &more),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
+        for line in out_lines.iter().skip(omitted) {
+            let fitted = fit(line, inner);
+            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+            lines.push(format!(
+                "{} {}{pad} {}",
+                paint(colour, border_sgr, "│"),
+                paint(colour, sgr_dim(), &fitted),
+                paint(colour, border_sgr, "│"),
+            ));
+        }
     }
 
-    let (status_text, status_sgr) = match exit_code {
-        Some(0) => (format!(" ✓ done ({}ms) ", duration.as_millis()), sgr_ok()),
-        Some(code) => (
-            format!(" ✗ exit {code} ({}ms) ", duration.as_millis()),
-            sgr_err(),
-        ),
-        None => (
-            format!(" ⚙ running ({}ms) ", duration.as_millis()),
-            sgr_run(),
-        ),
+    let total_lines = out_lines.len();
+    let status_lead = match exit_code {
+        Some(0) => format!(" ✓ done ({}ms)", duration.as_millis()),
+        Some(code) => format!(" ✗ exit {code} ({}ms)", duration.as_millis()),
+        None => format!(" ⚙ running ({}ms)", duration.as_millis()),
     };
-    let bot_len = visible_len(&status_text);
+    let status_text = if total_lines > max_preview {
+        format!(" {status_lead} · {total_lines} lines ")
+    } else {
+        format!(" {status_lead} ")
+    };
+    let status_sgr = match exit_code {
+        Some(0) => sgr_ok(),
+        Some(_) => sgr_err(),
+        None => sgr_run(),
+    };
+    let max_status_len = inner.saturating_sub(2);
+    let fitted_status = fit(&status_text, max_status_len);
+    let bot_len = visible_len(&fitted_status);
     let bot_left = "─".repeat(2);
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╰"),
-        paint(colour, sgr_border(), &bot_left),
-        paint(colour, status_sgr, &status_text),
-        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+        paint(colour, border_sgr, "╰"),
+        paint(colour, border_sgr, &bot_left),
+        paint(colour, status_sgr, &fitted_status),
+        paint(colour, border_sgr, &format!("{bot_right}╯")),
     ));
     lines.join("\n")
 }
@@ -2368,61 +2563,95 @@ pub fn tool_box(
 ) -> String {
     let width = width.max(MIN_WIDTH);
     let inner = width.saturating_sub(4);
-    let header = format!(" ⚙ {name} {summary} ");
+    let kind = tool_card_kind(name);
+    let icon = tool_card_icon(kind);
+    let clean_name = name
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .trim();
+    let display_name = if clean_name.is_empty() {
+        name
+    } else {
+        clean_name
+    };
+    let prefix = format!(" {icon} {display_name} ");
+    let prefix_len = visible_len(&prefix);
+    let max_summary_len = inner.saturating_sub(prefix_len + 1);
+    let fitted_summary = fit(summary, max_summary_len);
+    let header = if summary.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}{fitted_summary} ")
+    };
     let header_len = visible_len(&header);
+    let (accent_sgr, border_sgr) = tool_card_colors(kind, colour);
     let top_left = "─".repeat(2);
     let top_right = "─".repeat(width.saturating_sub(2 + 2 + header_len));
     let mut lines = vec![format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╭"),
-        paint(colour, sgr_border(), &top_left),
-        paint(colour, sgr_accent(), &header),
-        paint(colour, sgr_border(), &format!("{top_right}╮")),
+        paint(colour, border_sgr, "╭"),
+        paint(colour, border_sgr, &top_left),
+        paint(colour, accent_sgr, &header),
+        paint(colour, border_sgr, &format!("{top_right}╮")),
     )];
 
     let out_lines: Vec<&str> = output.lines().collect();
-    let limit = 200;
-    for line in out_lines.iter().take(limit) {
-        let fitted = fit(line, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-        lines.push(format!(
-            "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
-            paint(colour, sgr_dim(), &fitted),
-            paint(colour, sgr_border(), "│"),
-        ));
-    }
-    if out_lines.len() > limit {
-        let more = format!("… ({} lines omitted)", out_lines.len() - limit);
+    let max_preview = 10;
+    if out_lines.len() <= max_preview {
+        for line in &out_lines {
+            let fitted = fit(line, inner);
+            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+            lines.push(format!(
+                "{} {}{pad} {}",
+                paint(colour, border_sgr, "│"),
+                paint(colour, sgr_dim(), &fitted),
+                paint(colour, border_sgr, "│"),
+            ));
+        }
+    } else {
+        let omitted = out_lines.len() - max_preview;
+        let more = format!("… ({} earlier lines omitted)", omitted);
         let pad = " ".repeat(inner.saturating_sub(visible_len(&more)));
         lines.push(format!(
             "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
             paint(colour, sgr_dim(), &more),
-            paint(colour, sgr_border(), "│"),
+            paint(colour, border_sgr, "│"),
         ));
+        for line in out_lines.iter().skip(omitted) {
+            let fitted = fit(line, inner);
+            let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+            lines.push(format!(
+                "{} {}{pad} {}",
+                paint(colour, border_sgr, "│"),
+                paint(colour, sgr_dim(), &fitted),
+                paint(colour, border_sgr, "│"),
+            ));
+        }
     }
 
-    let (status_text, status_sgr) = if success {
-        (
-            format!(" ✓ completed ({}ms) ", duration.as_millis()),
-            sgr_ok(),
-        )
+    let total_lines = out_lines.len();
+    let status_lead = if success {
+        format!(" ✓ completed ({}ms)", duration.as_millis())
     } else {
-        (
-            format!(" ✗ failed ({}ms) ", duration.as_millis()),
-            sgr_err(),
-        )
+        format!(" ✗ failed ({}ms)", duration.as_millis())
     };
-    let bot_len = visible_len(&status_text);
+    let status_text = if total_lines > max_preview {
+        format!(" {status_lead} · {total_lines} lines ")
+    } else {
+        format!(" {status_lead} ")
+    };
+    let status_sgr = if success { sgr_ok() } else { sgr_err() };
+    let max_status_len = inner.saturating_sub(2);
+    let fitted_status = fit(&status_text, max_status_len);
+    let bot_len = visible_len(&fitted_status);
     let bot_left = "─".repeat(2);
     let bot_right = "─".repeat(width.saturating_sub(2 + 2 + bot_len));
     lines.push(format!(
         "{}{}{}{}",
-        paint(colour, sgr_border(), "╰"),
-        paint(colour, sgr_border(), &bot_left),
-        paint(colour, status_sgr, &status_text),
-        paint(colour, sgr_border(), &format!("{bot_right}╯")),
+        paint(colour, border_sgr, "╰"),
+        paint(colour, border_sgr, &bot_left),
+        paint(colour, status_sgr, &fitted_status),
+        paint(colour, border_sgr, &format!("{bot_right}╯")),
     ));
     lines.join("\n")
 }
@@ -2439,10 +2668,15 @@ pub enum ToolCardKind {
 }
 
 pub fn tool_card_kind(name: &str) -> ToolCardKind {
-    if matches!(name, "bash" | "shell.execute") {
+    let clean = name
+        .trim_start_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        .trim();
+    if matches!(clean, "bash" | "shell.execute") {
         ToolCardKind::Bash
+    } else if clean.starts_with("mcp.") || clean == "mcp" || clean.starts_with("mcp_") {
+        ToolCardKind::Mcp
     } else if matches!(
-        name,
+        clean,
         "fs.read"
             | "fs.list"
             | "fs.write"
@@ -2451,20 +2685,34 @@ pub fn tool_card_kind(name: &str) -> ToolCardKind {
             | "fs.move"
             | "edit"
             | "apply_patch"
-    ) {
+            | "view_file"
+            | "write_to_file"
+            | "replace_file_content"
+            | "list_dir"
+    ) || clean.starts_with("fs.")
+        || clean.ends_with("_file")
+        || clean.ends_with("_dir")
+    {
         ToolCardKind::File
-    } else if name.starts_with("search.") {
+    } else if clean.starts_with("search.")
+        || clean.contains("search")
+        || clean.contains("grep")
+        || clean.contains("find")
+    {
         ToolCardKind::Search
-    } else if name.starts_with("mcp.") || name == "mcp" {
-        ToolCardKind::Mcp
-    } else if name == "network.connect" || name == "curl" || name == "http" {
+    } else if clean == "network.connect"
+        || clean == "curl"
+        || clean == "http"
+        || clean.contains("url")
+        || clean.contains("fetch")
+    {
         ToolCardKind::Network
     } else {
         ToolCardKind::Generic
     }
 }
 
-fn tool_card_icon(kind: ToolCardKind) -> &'static str {
+pub fn tool_card_icon(kind: ToolCardKind) -> &'static str {
     match kind {
         ToolCardKind::Bash => "$",
         ToolCardKind::File => "✎",
@@ -2472,6 +2720,24 @@ fn tool_card_icon(kind: ToolCardKind) -> &'static str {
         ToolCardKind::Mcp => "⌘",
         ToolCardKind::Search => "⌕",
         ToolCardKind::Generic => "⚙",
+    }
+}
+
+/// Category-specific (accent, border) color pair for tool cards.
+pub fn tool_card_colors(kind: ToolCardKind, colour: bool) -> (&'static str, &'static str) {
+    if !colour {
+        return ("", "");
+    }
+    if palette().border == "\x1b[38;2;74;74;74m" && palette().accent == "\x1b[38;2;205;205;205m" {
+        return (sgr_accent(), sgr_border());
+    }
+    match kind {
+        ToolCardKind::Bash => ("\x1b[38;2;97;175;239m", "\x1b[38;2;60;125;190m"),
+        ToolCardKind::File => ("\x1b[38;2;229;192;123m", "\x1b[38;2;176;136;59m"),
+        ToolCardKind::Search => ("\x1b[38;2;198;120;221m", "\x1b[38;2;142;78;163m"),
+        ToolCardKind::Mcp => ("\x1b[38;2;86;182;194m", "\x1b[38;2;53;127;137m"),
+        ToolCardKind::Network => ("\x1b[38;2;152;195;121m", "\x1b[38;2;93;142;67m"),
+        ToolCardKind::Generic => ("\x1b[38;2;224;108;117m", "\x1b[38;2;157;72;80m"),
     }
 }
 
@@ -2486,7 +2752,6 @@ pub fn tool_card(
     duration: std::time::Duration,
 ) -> String {
     let kind = tool_card_kind(name);
-    let label = format!("{} {name}", tool_card_icon(kind));
     match kind {
         ToolCardKind::Bash => bash_box(
             width,
@@ -2496,7 +2761,7 @@ pub fn tool_card(
             Some(i32::from(!success)),
             duration,
         ),
-        _ => tool_box(width, colour, &label, summary, output, success, duration),
+        _ => tool_box(width, colour, name, summary, output, success, duration),
     }
 }
 
@@ -4702,6 +4967,17 @@ mod tests {
         assert_eq!(tool_card_kind("curl"), ToolCardKind::Network);
         assert_eq!(tool_card_kind("mcp.search"), ToolCardKind::Mcp);
         assert_eq!(tool_card_kind("search.text"), ToolCardKind::Search);
+        let (bash_acc, bash_brd) = tool_card_colors(ToolCardKind::Bash, true);
+        assert!(!bash_acc.is_empty());
+        assert!(!bash_brd.is_empty());
+        assert_eq!(tool_card_colors(ToolCardKind::Bash, false), ("", ""));
+
+        let vivid = builtin_palette("vivid").expect("vivid theme is built in");
+        assert_eq!(vivid.accent, "\x1b[38;2;88;166;255m");
+        let dracula = builtin_palette("dracula").expect("dracula theme is built in");
+        assert_eq!(dracula.accent, "\x1b[38;2;189;147;249m");
+        let nord = builtin_palette("nord").expect("nord theme is built in");
+        assert_eq!(nord.accent, "\x1b[38;2;136;192;208m");
         let running = tool_running_frame_with_output(
             false,
             "⠋",
@@ -4723,6 +4999,35 @@ mod tests {
             true,
         );
         assert!(expanded.contains("line one"));
+
+        let state = RunningToolState {
+            name: "bash",
+            summary: "cargo test",
+            frame: "⠋",
+            elapsed_ms: 120,
+            live_output: "running test",
+            expanded: false,
+        };
+        let running_box = tool_running_box(80, false, &state);
+        assert_eq!(running_box.len(), 3);
+        assert!(running_box[0].contains("$ cargo test"));
+        assert!(running_box[1].contains("running (120ms)"));
+        assert!(running_box[2].contains("[e: expand]"));
+
+        let long_output = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded_box = bash_box(
+            80,
+            false,
+            "test_cmd",
+            &long_output,
+            Some(0),
+            Duration::from_millis(50),
+        );
+        assert!(bounded_box.contains("earlier lines omitted"));
+        assert!(bounded_box.contains("20 lines"));
     }
 
     #[test]

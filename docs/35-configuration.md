@@ -84,7 +84,7 @@ Authority classes are:
 | `git.respect_ignore` | boolean | `true` | replace | intent |
 | `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
 | `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |
-| `theme.base` | `"dark"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | user |
+| `theme.base` | `"dark"`, `"vivid"`, `"dracula"`, `"nord"`, `"ocean"`, `"sunset"`, or `"mono"` | `"dark"` | replace | user |
 | `theme.<role>` | `#rrggbb` colour | the base theme's | replace | user |
 
 For boolean `intersection`, every authoritative layer must permit `true`; an absent layer does not veto. Restriction order for `policy.default_effect` is `allow < ask < deny`; durability order is `fast < balanced < strict`. Empty allowlists deny the corresponding capability unless enterprise policy explicitly defines an unconstrained set.
@@ -180,7 +180,7 @@ credentials somewhere else. Path and URL keys are canonicalized and validated be
 ## Theme
 
 `[theme]` colours the interactive TUI. `base` picks one of the built-in themes
-(`dark`, `ocean`, `sunset`, `mono` — all designed for a dark terminal); any
+(`dark`, `vivid`, `dracula`, `nord`, `ocean`, `sunset`, `mono` — all designed for a dark terminal); any
 other key is a role whose colour it replaces, given as `#rrggbb`. The roles are
 `assistant`, `dim`, `accent`, `ok`, `err`, `run`, `model`, `cwd`, `border`,
 `bullet`, and `input_bg` (a background).
