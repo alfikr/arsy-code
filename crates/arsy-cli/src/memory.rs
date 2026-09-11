@@ -135,6 +135,12 @@ pub fn remember(
     let redactor = crate::redactor(invocation, emitter)?;
     let artifacts = crate::artifact_store(&root)?;
     let author = crate::actor();
+    // Asked before the claim is written anywhere. `remember` applies the same
+    // check, but it takes an artifact id -- so storing first and asking after
+    // leaves a refused credential in the artifact store, which nothing
+    // collects because a memory claim is kept by retention rather than by
+    // reachability.
+    arsy_kernel::memory::vet(claim, &redactor).map_err(refused)?;
     let stored = artifacts
         .put(
             claim.as_bytes(),

@@ -121,7 +121,7 @@ Usage:
   arsy mcp add <NAME> --transport http --url <URL>  define an HTTP connection
   arsy mcp remove|enable|disable <NAME> [--scope <user|workspace>]
   arsy mcp test <NAME> [--timeout <SECONDS>]  connect, negotiate, disconnect
-  arsy hook list [--event <NAME>]      inspect imported lifecycle hooks
+  arsy hook list [--event <NAME>]      list lifecycle hooks and what runs
   arsy auth set <PROVIDER>   store a credential in the OS credential store
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
@@ -1181,7 +1181,12 @@ fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, 
     broker.register_store(Box::new(OsCredentialStore));
     broker.register_store(Box::new(FileCredentialStore));
     for record in catalog(CatalogStore::resolve(invocation))? {
-        broker.resolve(&record.handle).map_err(secret_failed)?;
+        // A handle that will not open — a locked keychain, a revoked entry, a
+        // record left behind by a provider since removed — has no value that
+        // could reach the output, so there is nothing for the redactor to
+        // miss. Failing the turn here would fail every turn, including the
+        // ones that never touch that provider.
+        let _ = broker.resolve(&record.handle);
     }
     emitter.install_redactor(broker.redactor().clone());
     Ok(broker.redactor().clone())
@@ -1460,13 +1465,20 @@ fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
     options.open(path).map_err(storage_failed)
 }
 
+fn config_home_overridden() -> bool {
+    std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
+}
+
 fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
     let raw = match store.read()? {
         Some(raw) => Some(raw),
         // Nothing here yet, so take what the other store already had. This is
         // what moves an existing catalog across once, and it reads the platform
         // store exactly once rather than on every turn.
-        None if store == CatalogStore::File => {
+        // A run pointed at a throwaway configuration home — a test, a
+        // container, a second account — asked for that home and not for the
+        // operator's own credentials copied into it.
+        None if store == CatalogStore::File && !config_home_overridden() => {
             // A platform store that is unavailable, or whose prompt was
             // declined, means there is nothing to migrate — not that every
             // later turn should fail on a convenience.
@@ -2233,7 +2245,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Session(mut dialog) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 let width = tui::terminal_width();
-                write!(stdout, "{}\n", dialog.render(width, colour)).map_err(terminal_failed)?;
+                writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
                 stdout.flush().map_err(terminal_failed)?;
                 loop {
                     match keys.recv() {
@@ -3819,6 +3831,7 @@ enum Executed {
 /// between an approval and a habit — an operator asked to confirm every read
 /// stops reading the prompts.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn execute_call(
     runtime: &arsy_code::agent::ToolRuntime,
     terminal: &mut io::Stdout,
@@ -3913,6 +3926,10 @@ fn execute_call(
 }
 
 #[cfg(feature = "tui")]
+// Every argument is one the live view needs and none of them group into a
+// meaningful type: the terminal, the call, and the keyboard are three unrelated
+// things this function happens to hold at once.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_tool_live(
     terminal: &mut io::Stdout,
     colour: bool,
@@ -3959,7 +3976,7 @@ fn dispatch_tool_live(
         "",
         expanded,
     );
-    write!(terminal, "{initial}\n")?;
+    writeln!(terminal, "{initial}")?;
     terminal.flush()?;
     loop {
         while let Ok(byte) = keys.try_recv() {
@@ -4004,7 +4021,7 @@ fn dispatch_tool_live(
                 if rendered {
                     write!(terminal, "\x1b[1A\r\x1b[K")?;
                 }
-                write!(terminal, "{status}\n")?;
+                writeln!(terminal, "{status}")?;
                 terminal.flush()?;
                 rendered = true;
                 frame = frame.wrapping_add(1);
@@ -4053,6 +4070,7 @@ fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
 
 /// Ask the operator whether one tool call may run.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn confirm_tool(
     terminal: &mut io::Stdout,
     colour: bool,
@@ -4070,7 +4088,7 @@ fn confirm_tool(
     let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
-    write!(terminal, "{}\n", dialog.render(width, colour))?;
+    writeln!(terminal, "{}", dialog.render(width, colour))?;
     terminal.flush()?;
     loop {
         match keys.recv() {
@@ -5124,6 +5142,26 @@ impl<'a> TaskRun<'a> {
             &agent,
         );
         let delegates = supervisor.can_delegate();
+        // Loaded once, before the turn starts: a turn finishes with the hooks
+        // it began with, so a file edited mid-run cannot change the rules under
+        // an agent already applying them.
+        let loaded = hook_engine(&self.root, &self.config);
+        let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
+        let goal = match turn_boundary(
+            hooks,
+            arsy_code::hook::LifecycleEvent::BeforeTurn,
+            &goal,
+            emitter,
+        ) {
+            Ok(goal) => goal,
+            Err(reason) => {
+                return Err(Diagnostic::error(
+                    "ARSY-HOK-1001",
+                    reason,
+                    "the hook that refused it is listed by `arsy hook list`",
+                ))
+            }
+        };
         let admission = self.start_turn(&goal)?;
         let request = CanonicalModelRequest {
             model: ModelKey {
@@ -5161,6 +5199,7 @@ impl<'a> TaskRun<'a> {
             &request,
             &mut recorder,
             &mut supervising,
+            hooks,
             emitter,
         );
         let interventions: Vec<Value> = supervising
@@ -5172,6 +5211,14 @@ impl<'a> TaskRun<'a> {
             Ok(_) => "answered".to_owned(),
             Err(error) => format!("provider:{}", error.code()),
         };
+        // The turn has ended whatever it ended as, which is what Codex's own
+        // `notify` is for. Nothing it returns can change what already happened.
+        let _ = turn_boundary(
+            hooks,
+            arsy_code::hook::LifecycleEvent::AfterTurn,
+            &stop,
+            emitter,
+        );
         let summary = recorder.finish(&stop, &redactor(self.invocation, emitter)?, emitter);
         let mut record = json!({
             "session": self.session.to_string(),
@@ -5315,6 +5362,7 @@ fn dispatch(
     request: &CanonicalModelRequest,
     recorder: &mut telemetry::Recorder,
     supervisor: &mut Option<(subagent::Supervisor<'_>, &mut TaskGraph)>,
+    hooks: Option<&arsy_code::hook::HookEngine>,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let mut request = request.clone();
@@ -5420,7 +5468,7 @@ fn dispatch(
                     ("task.spawn", Some((supervisor, graph))) => {
                         supervisor.spawn(arguments, graph, emitter)
                     }
-                    _ => runtime.invoke(name, arguments),
+                    _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
                 };
                 recorder.tool_call(&result);
                 ModelContent::ToolResult {
@@ -5439,6 +5487,169 @@ fn dispatch(
     Err(ProviderError::InvalidRequest(format!(
         "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
     )))
+}
+
+/// The engine for this workspace, built from the operator's files and the
+/// repository's — the latter only where the operator vouched for it.
+fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
+    arsy_code::hook::load(&arsy_code::hook::Discovery {
+        home: std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from),
+        root: root.to_path_buf(),
+        trusted: config.trusts(root),
+        // One means hooks run and nothing they do dispatches again.
+        max_depth: 1,
+    })
+}
+
+/// Dispatch a turn-boundary event, returning the subject the turn should use.
+///
+/// `before_turn` may rewrite the prompt or refuse the turn outright;
+/// `after_turn` only observes, and its refusal would undo nothing.
+fn turn_boundary(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    event: arsy_code::hook::LifecycleEvent,
+    subject: &str,
+    emitter: &mut Emitter,
+) -> Result<String, String> {
+    use arsy_code::hook::Outcome;
+
+    let Some(hooks) = hooks else {
+        return Ok(subject.to_owned());
+    };
+    // The event names the boundary; the prompt is the payload, not the key, so
+    // two turns with the same text are still two dispatches.
+    let dispatched = match hooks.dispatch(event, event.as_str(), json!({"prompt": subject})) {
+        Ok(dispatched) => dispatched,
+        Err(error) => {
+            let message = format!("a hook on `{}` failed: {error}", event.as_str());
+            if event.failure_policy() == arsy_code::hook::FailurePolicy::FailClosed {
+                return Err(message);
+            }
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-HOK-1000",
+                message,
+                String::new(),
+            ));
+            return Ok(subject.to_owned());
+        }
+    };
+    for note in dispatched.diagnostics {
+        emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
+    }
+    match dispatched.outcome {
+        Outcome::Deny(reason) => return Err(format!("a hook stopped this turn: {reason}")),
+        Outcome::RequireApproval(reason) => {
+            return Err(format!(
+                "a hook asked for the operator's approval before this turn, and this surface \
+                 cannot ask for one: {reason}"
+            ))
+        }
+        Outcome::Continue | Outcome::Allow => {}
+    }
+    let mut prompt = dispatched.payload["prompt"]
+        .as_str()
+        .unwrap_or(subject)
+        .to_owned();
+    for (rule, text) in &dispatched.injected {
+        prompt.push_str(&format!("\n\n[hook {rule}] {text}"));
+    }
+    Ok(prompt)
+}
+
+/// Run one tool call with the lifecycle events around it.
+///
+/// The scripted turn only. The interactive loop reaches the runtime through
+/// `execute_call`, which asks the operator rather than a hook, and a subagent's
+/// calls go through `child_turn`; neither dispatches these events yet.
+///
+/// `before_operation` sees the call before it happens and may rewrite its
+/// arguments, deny it, or ask for an approval nobody is here to give — which,
+/// on a surface with no operator, is a refusal reported to the model rather
+/// than a wait. `after_operation` and `operation_failed` see what it did.
+///
+/// A refused call is a failed result, not an error: the model asked for
+/// something it may not have, and telling it so is how it tries something else.
+fn invoke_hooked(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    arguments: &Value,
+    emitter: &mut Emitter,
+) -> arsy_code::agent::ToolResult {
+    use arsy_code::hook::{LifecycleEvent, Outcome};
+
+    let Some(hooks) = hooks else {
+        return runtime.invoke(name, arguments);
+    };
+    let refused = |output: String| arsy_code::agent::ToolResult {
+        tool: name.to_owned(),
+        success: false,
+        output,
+        changed_files: Vec::new(),
+        duration: std::time::Duration::ZERO,
+        metadata: json!({"refused_by": "hook"}),
+        artifact: None,
+    };
+
+    let before = match hooks.dispatch(LifecycleEvent::BeforeOperation, name, arguments.clone()) {
+        Ok(before) => before,
+        // The engine's own guards — depth, reentrancy — failing is the harness
+        // misbehaving, and `before_operation` fails closed.
+        Err(error) => return refused(format!("the lifecycle engine refused the call: {error}")),
+    };
+    for note in &before.diagnostics {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-HOK-1000",
+            note.clone(),
+            String::new(),
+        ));
+    }
+    let arguments = match before.outcome {
+        Outcome::Deny(reason) => return refused(format!("a hook denied this call: {reason}")),
+        Outcome::RequireApproval(reason) => {
+            return refused(format!(
+                "a hook asked for the operator's approval, and this surface cannot ask for one:                  {reason}"
+            ))
+        }
+        // A rewritten payload is what actually runs, which is the whole point
+        // of letting a hook transform one.
+        Outcome::Continue | Outcome::Allow => before.payload,
+    };
+
+    let mut result = runtime.invoke(name, &arguments);
+    // What a hook injected is context the model was meant to see, attributed to
+    // the rule that asked for it.
+    for (rule, text) in &before.injected {
+        result.output.push_str(&format!("\n[hook {rule}] {text}"));
+    }
+
+    let after = if result.success {
+        LifecycleEvent::AfterOperation
+    } else {
+        LifecycleEvent::OperationFailed
+    };
+    let observed = json!({
+        "tool": name,
+        "success": result.success,
+        "output": result.output,
+    });
+    match hooks.dispatch(after, name, observed) {
+        Ok(dispatch) => {
+            for note in dispatch.diagnostics {
+                emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
+            }
+        }
+        // Both of these report what already happened, so a failure here is
+        // said and the result stands.
+        Err(error) => emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-HOK-1000",
+            format!("a hook on `{}` failed: {error}", after.as_str()),
+            String::new(),
+        )),
+    }
+    result
 }
 
 /// One counter out of the telemetry summary the run just printed.
@@ -5942,6 +6153,51 @@ mod tests {
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
+
+    /// Two things a stored credential must not do to a turn that never asks
+    /// for it: abort the turn because it will not open, and follow a run that
+    /// was pointed at a throwaway configuration home into that home.
+    #[test]
+    fn a_credential_that_will_not_open_neither_fails_the_turn_nor_follows_a_throwaway_home() {
+        let home = std::env::temp_dir().join(format!("arsy-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
+        let path = home.join(CATALOG_FILE);
+        let record = AuthRecord {
+            provider: "unreachable".to_owned(),
+            handle: SecretHandle::new(OS_STORE_ID, "arsy-no-such-credential").unwrap(),
+            created_at: 0,
+            last_used: None,
+            kind: CredentialKind::default(),
+        };
+        let raw = serde_json::to_string(&[record]).unwrap();
+        owner_only(&path)
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+
+        let invocation = Invocation {
+            workspace: PathBuf::from("."),
+            output: None,
+            no_color: true,
+            command: Command::Tui,
+        };
+        redactor(&invocation, &mut Emitter::new(Output::Ci))
+            .expect("a handle that will not open leaves the turn alone");
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            catalog(CatalogStore::File).unwrap().is_empty(),
+            "an explicit config home is not backfilled from the operator's platform store"
+        );
+        assert!(
+            !path.exists(),
+            "nothing was migrated into the throwaway home"
+        );
+
+        std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     /// A provider that replays a scripted round per request and records what
     /// it was asked, so a test can assert on the conversation the loop built.

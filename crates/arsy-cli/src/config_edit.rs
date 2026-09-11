@@ -110,10 +110,15 @@ pub fn set_in_table(config: &str, header: &str, key: &str, value: &str) -> Optio
         .find(|(_, line)| line.trim_start().starts_with('['))
         .map_or(lines.len(), |(index, _)| index);
     let line = format!("{key} = {value}");
-    match lines[table + 1..end]
-        .iter()
-        .position(|existing| existing.trim_start().starts_with(&format!("{key} ")))
-    {
+    // The key is what stands to the left of the first `=`, whatever spacing a
+    // person wrote around it. Matching `"{key} "` missed `enabled=false` and
+    // `enabled\t= false`, and the second key this then appended made the file
+    // fail to load — TOML refuses a duplicate.
+    match lines[table + 1..end].iter().position(|existing| {
+        existing
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == key)
+    }) {
         Some(offset) => lines[table + 1 + offset] = line,
         None => lines.insert(end, line),
     }
@@ -392,5 +397,38 @@ command = \"two\"
         // A table that is not there is `None`, so the caller decides whether to
         // append one rather than getting a silently unchanged file back.
         assert!(set_in_table(config, "[mcp.server.absent]", "enabled", "false").is_none());
+    }
+
+    /// A key is a key however it was spaced. Requiring a space after the name
+    /// meant `enabled=false` was not seen, a second `enabled` was appended,
+    /// and the config then failed to parse at all.
+    #[test]
+    fn a_key_written_without_the_spacing_is_replaced_not_duplicated() {
+        use arsy_kernel::config::{Config, Layer, CONFIG_FILE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        let load = |body: &str| {
+            std::fs::write(&path, body).unwrap();
+            Config::load(&[(Layer::User, path.clone())]).expect("the file still loads")
+        };
+
+        for written in ["enabled=false", "enabled\t=  false", "  enabled = false"] {
+            let config = format!(
+                "schema_version = 1\n\n[mcp.server.first]\ntransport = \"stdio\"\ncommand = \"one\"\n{written}\n"
+            );
+
+            let updated = set_in_table(&config, "[mcp.server.first]", "enabled", "true").unwrap();
+
+            assert_eq!(
+                updated.matches("enabled").count(),
+                1,
+                "`{written}` was duplicated: {updated}"
+            );
+            assert!(
+                load(&updated).mcp_server("first").unwrap().enabled,
+                "{updated}"
+            );
+        }
     }
 }

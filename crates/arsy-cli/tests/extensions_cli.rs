@@ -16,10 +16,20 @@ capabilities = ["fs.read:workspace/**"]
 "#;
 
 fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
+    // A home of its own, so the operator's real hooks are not what the test
+    // measures — and are not run by it either.
+    let home = tempfile::tempdir().unwrap();
+    arsy_in(workspace, home.path(), args)
+}
+
+fn arsy_in(workspace: &Path, home: &Path, args: &[&str]) -> (i32, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.to_str().unwrap()])
         .args(["--output", "json"])
         .args(args)
+        .env("ARSY_CONFIG_HOME", home)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         .output()
         .expect("the binary runs");
     let stdout = String::from_utf8(output.stdout).expect("machine output is UTF-8");
@@ -180,6 +190,64 @@ fn skills_are_listed_as_data_and_hooks_carry_their_engine_semantics() {
         .expect("Stop maps to after_turn");
     assert_eq!(report["effect_class"], "observe");
     assert_eq!(report["on_failure"], "fail_open");
+    // The listing says where it looked, including the operator's own files,
+    // which an import of this workspace never reads.
+    assert!(
+        hooks["sources"]
+            .as_array()
+            .expect("a hook listing reports its sources")
+            .iter()
+            .any(|source| source["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(".claude/settings.json"))),
+        "{hooks:#?}"
+    );
+}
+
+/// `not_loaded` has to stop being a constant: once the operator vouches for a
+/// directory, the same declaration runs, and a listing that still said `not
+/// loaded` would be telling them the opposite of what happens.
+#[test]
+fn a_vouched_for_workspace_reports_its_hooks_as_loaded() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join(".claude")).unwrap();
+    std::fs::write(
+        workspace.path().join(".claude/settings.json"),
+        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash",
+             "hooks": [{"type": "command", "command": "check.sh"}]}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "schema_version = 1\n[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+            workspace.path().display()
+        ),
+    )
+    .unwrap();
+
+    let (code, hooks) = arsy_in(workspace.path(), home.path(), &["hook", "list"]);
+
+    assert_eq!(code, 0, "{hooks:#?}");
+    let entry = &hooks["entries"].as_array().unwrap()[0];
+    assert_eq!(entry["runtime_status"], "loaded", "{hooks:#?}");
+    assert!(
+        hooks["notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("run on this workspace")),
+        "{hooks:#?}"
+    );
+
+    // Without the vouching, the same file is read and not run.
+    let bare = tempfile::tempdir().unwrap();
+    std::fs::write(bare.path().join("config.toml"), "schema_version = 1\n").unwrap();
+    let (_, unvouched) = arsy_in(workspace.path(), bare.path(), &["hook", "list"]);
+    assert_eq!(
+        unvouched["entries"].as_array().unwrap()[0]["runtime_status"],
+        "not_loaded",
+        "{unvouched:#?}"
+    );
 }
 
 /// A module that emits `ok` and nothing else, which is enough to prove the

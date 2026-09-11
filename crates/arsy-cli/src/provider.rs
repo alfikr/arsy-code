@@ -179,8 +179,12 @@ fn route(config: &Config) -> routing::Decision {
     routing::decide(
         &candidates,
         &routing::Constraints {
-            allowed_providers: config.provider_allowed().cloned().unwrap_or_default(),
-            allowed_models: config.model_allowed().cloned().unwrap_or_default(),
+            // Threaded as the Option configuration resolved it: a layer that
+            // wrote `allowed = []` capped everything out, and flattening that
+            // to "no ceiling" would route to an endpoint it forbade and then
+            // report the endpoint as unconfigured.
+            allowed_providers: config.provider_allowed().cloned(),
+            allowed_models: config.model_allowed().cloned(),
             ..routing::Constraints::default()
         },
         // Nothing is persisted across processes yet, so a routed choice is

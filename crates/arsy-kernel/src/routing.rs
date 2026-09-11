@@ -112,12 +112,17 @@ impl Observations {
 /// The policy the choice happens inside.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Constraints {
-    /// Providers policy allows. Empty means no ceiling was set.
-    pub allowed_providers: BTreeSet<String>,
-    /// Models policy allows. Empty means no ceiling was set.
-    pub allowed_models: BTreeSet<String>,
-    /// Regions policy allows. Empty means no ceiling was set.
-    pub residency: BTreeSet<String>,
+    /// Providers policy allows. `None` is no ceiling.
+    ///
+    /// An `Option`, not an empty set, because the two are opposite answers: a
+    /// layer that wrote `allowed = []`, or two layers whose allowlists
+    /// intersect to nothing, permit no provider at all — and reading that as
+    /// "unconstrained" routes to an endpoint the configuration forbids.
+    pub allowed_providers: Option<BTreeSet<String>>,
+    /// Models policy allows. `None` is no ceiling; see `allowed_providers`.
+    pub allowed_models: Option<BTreeSet<String>>,
+    /// Regions policy allows. `None` is no ceiling.
+    pub residency: Option<BTreeSet<String>>,
     /// Capabilities the turn cannot proceed without.
     pub required_capabilities: BTreeSet<String>,
     /// Cap on the mean cost of a turn.
@@ -127,20 +132,26 @@ pub struct Constraints {
 impl Constraints {
     /// Why this candidate is not eligible, or `None` when it is.
     fn rejects(&self, candidate: &Candidate) -> Option<String> {
-        if !self.allowed_providers.is_empty()
-            && !self.allowed_providers.contains(&candidate.key.provider)
+        if self
+            .allowed_providers
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&candidate.key.provider))
         {
             return Some("provider.allowed does not include it".to_owned());
         }
-        if !self.allowed_models.is_empty() && !self.allowed_models.contains(&candidate.key.model) {
+        if self
+            .allowed_models
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&candidate.key.model))
+        {
             return Some("model.allowed does not include it".to_owned());
         }
-        if !self.residency.is_empty() {
+        if let Some(residency) = &self.residency {
             match &candidate.residency {
                 // An unstated region cannot be shown to satisfy a residency
                 // ceiling, so it does not.
                 None => return Some("its residency is unstated".to_owned()),
-                Some(region) if !self.residency.contains(region) => {
+                Some(region) if !residency.contains(region) => {
                     return Some(format!("its region `{region}` is not allowed"))
                 }
                 Some(_) => {}
@@ -390,7 +401,7 @@ mod tests {
         let candidates = [candidate("acme", "fast"), candidate("other", "slow")];
         let pinned = candidates[1].key.clone();
         let constraints = Constraints {
-            allowed_providers: ["acme".to_owned()].into(),
+            allowed_providers: Some(["acme".to_owned()].into()),
             ..Constraints::default()
         };
         let decision = decide(
@@ -428,7 +439,7 @@ mod tests {
     fn disabling_routing_still_applies_policy() {
         let candidates = [candidate("acme", "fast"), candidate("other", "slow")];
         let constraints = Constraints {
-            allowed_models: ["fast".to_owned()].into(),
+            allowed_models: Some(["fast".to_owned()].into()),
             ..Constraints::default()
         };
         let decision = decide(
@@ -480,7 +491,7 @@ mod tests {
                 incapable.clone(),
             ],
             &Constraints {
-                residency: ["eu".to_owned()].into(),
+                residency: Some(["eu".to_owned()].into()),
                 required_capabilities: ["tool_calls".to_owned()].into(),
                 ..Constraints::default()
             },
@@ -628,5 +639,46 @@ mod tests {
         );
         assert!(matches!(&decision, Decision::Refused { reason, .. }
             if reason.contains("no default model")));
+    }
+
+    /// An allowlist a layer wrote as empty forbids everything. Reading it as
+    /// "no ceiling" routed to an endpoint the configuration had capped out,
+    /// and the refusal then blamed the endpoint for not existing.
+    #[test]
+    fn an_empty_allowlist_is_a_ceiling_that_admits_nothing() {
+        let candidates = [candidate("acme", "fast")];
+
+        let capped = decide(
+            &candidates,
+            &Constraints {
+                allowed_providers: Some(BTreeSet::new()),
+                ..Constraints::default()
+            },
+            &Observations::new(),
+            &Preference {
+                route: true,
+                ..Preference::default()
+            },
+        );
+        assert!(capped.key().is_none(), "an empty allowlist admits nothing");
+        let Decision::Refused { excluded, .. } = &capped else {
+            panic!("a capped-out set is a refusal, not a route");
+        };
+        assert_eq!(
+            excluded[0].reason, "provider.allowed does not include it",
+            "the refusal names the ceiling that did it"
+        );
+
+        // Unset is the opposite answer, and still routes.
+        let open = decide(
+            &candidates,
+            &Constraints::default(),
+            &Observations::new(),
+            &Preference {
+                route: true,
+                ..Preference::default()
+            },
+        );
+        assert!(open.key().is_some(), "no ceiling is not an empty ceiling");
     }
 }

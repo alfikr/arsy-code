@@ -84,20 +84,24 @@ fn diff(root: &Path, base: &str) -> Result<String, Diagnostic> {
                 "install Git, or review a workspace that is a Git repository",
             )
         })?;
-    let mut output = String::new();
-    child
-        .stdout
-        .take()
-        .expect("stdout is piped")
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut bytes = Vec::new();
+    (&mut stdout)
         .take(MAX_DIFF_BYTES as u64)
-        .read_to_string(&mut output)
+        .read_to_end(&mut bytes)
         .map_err(|error| {
             Diagnostic::error(
                 "ARSY-VER-1000",
-                format!("the diff is not UTF-8 text: {error}"),
+                format!("the diff could not be read: {error}"),
                 "review a workspace whose changed files are text",
             )
         })?;
+    // Read the rest into nothing rather than dropping the pipe: git writing
+    // into a closed one dies of SIGPIPE, and the failed status that follows
+    // would be reported as `{base}` not naming a revision — which sends the
+    // caller after a problem they do not have.
+    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    let output = decode(bytes, MAX_DIFF_BYTES)?;
     let status = child.wait().map_err(crate::storage_failed)?;
     if !status.success() {
         return Err(Diagnostic::error(
@@ -108,6 +112,33 @@ fn diff(root: &Path, base: &str) -> Result<String, Diagnostic> {
         ));
     }
     Ok(output)
+}
+
+/// The diff as text, cut at a character boundary when it was cut at all.
+///
+/// The byte cap can land in the middle of a multi-byte character, which is not
+/// the diff being binary — so a diff that was truncated keeps everything whole
+/// up to the cut, and only a diff that is genuinely not text is refused.
+fn decode(bytes: Vec<u8>, cap: usize) -> Result<String, Diagnostic> {
+    let truncated = bytes.len() == cap;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            // A character is at most four bytes, so a cut one can only sit in
+            // the last three. Anything earlier is a diff that is not text.
+            if !truncated || bytes.len() - valid > 3 {
+                return Err(Diagnostic::error(
+                    "ARSY-VER-1000",
+                    "the diff is not UTF-8 text".to_owned(),
+                    "review a workspace whose changed files are text",
+                ));
+            }
+            bytes.truncate(valid);
+            Ok(String::from_utf8(bytes).expect("every byte up to here decoded"))
+        }
+    }
 }
 
 fn human(review: &Review) -> String {
@@ -147,6 +178,27 @@ fn kind(kind: FindingKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap is a byte count, so it can land inside a character. That is a
+    /// diff that was cut, not a diff that is binary, and the two get different
+    /// answers.
+    #[test]
+    fn a_cut_character_is_dropped_but_a_binary_diff_is_still_refused() {
+        let mut cut = "café".repeat(3).into_bytes();
+        cut.truncate(cut.len() - 1);
+        let cap = cut.len();
+
+        let text = decode(cut.clone(), cap).expect("a cut character is not a binary file");
+        assert_eq!(text, "cafécafécaf");
+
+        // The same bytes without having hit the cap are a file that is not text.
+        assert!(decode(cut, cap + 1).is_err());
+        // So is one whose invalid bytes are nowhere near the end.
+        let mut binary = vec![0xff, 0xfe];
+        binary.extend_from_slice(&[b'a'; 32]);
+        let length = binary.len();
+        assert!(decode(binary, length).is_err());
+    }
 
     #[test]
     fn review_takes_one_revision_either_way_and_defaults_to_head() {

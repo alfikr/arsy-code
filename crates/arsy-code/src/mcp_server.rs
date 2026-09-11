@@ -267,10 +267,16 @@ fn describe(contract: &OperationContract) -> String {
 }
 
 /// The contract's input schema as JSON Schema, which is what MCP expects.
+///
+/// Both the required and the optional arguments are advertised: with
+/// `additionalProperties: false`, a client that trusts the schema will not send
+/// what the schema does not name, so leaving the optional ones out made
+/// `offset`, `limit`, and `occurrence` unreachable over `arsy serve`.
 fn schema(input: &InputSchema) -> Value {
     let properties: serde_json::Map<String, Value> = input
         .required
         .iter()
+        .chain(input.optional.iter())
         .map(|(name, kind)| {
             (
                 name.clone(),
@@ -413,6 +419,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("process.exec"));
+
+        // An optional argument is advertised too. With `additionalProperties`
+        // closed, a schema that named only the required ones told every client
+        // that `offset` and `limit` were not accepted, putting a whole tier of
+        // the operation out of reach over `arsy serve`.
+        let read = tools
+            .iter()
+            .find(|tool| tool["name"] == "fs.read")
+            .expect("fs.read is registered");
+        let properties = read["inputSchema"]["properties"]
+            .as_object()
+            .expect("a schema has properties");
+        assert_eq!(properties["path"]["type"], "string");
+        assert_eq!(properties["offset"]["type"], "number", "{properties:?}");
+        assert_eq!(properties["limit"]["type"], "number", "{properties:?}");
+        // Only the required ones are required.
+        let required: Vec<&str> = read["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|name| name.as_str().unwrap())
+            .collect();
+        assert_eq!(required, ["path"]);
     }
 
     #[test]

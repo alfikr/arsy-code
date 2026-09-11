@@ -107,3 +107,36 @@ fn a_working_tree_change_is_read_assessed_and_can_gate_a_pipeline() {
     let (code, _) = arsy(root, &["review", "no-such-branch"]);
     assert_eq!(code, 7);
 }
+
+/// A change bigger than the byte cap is still a review.
+///
+/// The cap was applied by dropping the pipe, so git wrote into a closed one,
+/// died of SIGPIPE, and the non-zero status was reported as the base revision
+/// not existing — a remediation about naming a revision, for a repository
+/// where the revision was fine.
+#[test]
+fn a_diff_past_the_cap_is_still_read_rather_than_blamed_on_the_revision() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    git(root, &["init", "--quiet"]);
+    std::fs::write(root.join("seed.txt"), "seed\n").unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "--quiet", "-m", "first"]);
+
+    // Comfortably past the 8 MiB cap, and non-ASCII so the cut lands inside a
+    // character rather than neatly between two.
+    let line = "café ".repeat(200);
+    std::fs::write(root.join("big.txt"), format!("{line}\n").repeat(12_000)).unwrap();
+    // Staged, because `git diff HEAD` is what a review reads and an untracked
+    // file is not in it.
+    git(root, &["add", "big.txt"]);
+
+    let (code, review) = arsy(root, &["review"]);
+
+    assert_eq!(code, 0, "{review}");
+    let files = review["files"].as_array().unwrap();
+    assert!(
+        files.iter().any(|file| file["path"] == "big.txt"),
+        "{review}"
+    );
+}

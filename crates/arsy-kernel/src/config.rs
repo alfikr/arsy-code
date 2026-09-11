@@ -22,7 +22,7 @@ use crate::{
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -475,6 +475,9 @@ pub struct Config {
     remote_targets: BTreeMap<String, RemoteTarget>,
     /// `[lsp.server.<name>]`, from a trusted layer only.
     language_servers: BTreeMap<String, LanguageServer>,
+    /// `[project."<path>"] trust_level = "trusted"`, from a trusted layer only.
+    /// Directories whose own files may run something.
+    trusted_projects: BTreeSet<PathBuf>,
     telemetry: TelemetrySettings,
     /// What the layers that spoke agreed on for `telemetry.include_content`.
     /// `None` means none of them did, which is not the same as `Some(false)`.
@@ -570,6 +573,30 @@ impl Config {
     }
 
     /// Configured MCP connections in name order. Nothing is connected.
+    /// Whether the operator vouched for this directory.
+    ///
+    /// An ancestor's trust covers what is under it, the way Codex's own list
+    /// works: vouching for a checkout should not have to be repeated for every
+    /// crate inside it. Nothing is trusted by default, so a repository that was
+    /// never named runs none of its own hooks.
+    pub fn trusts(&self, directory: &Path) -> bool {
+        // Resolved on both sides before comparing. Two names for one directory
+        // are common and innocent — `/var` is `/private/var` on macOS — but a
+        // textual comparison also means a symlink planted beside a vouched-for
+        // checkout would inherit its trust.
+        let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let directory = resolve(directory);
+        self.trusted_projects
+            .iter()
+            .any(|trusted| directory.starts_with(resolve(trusted)))
+    }
+
+    /// Every directory the operator vouched for, so `config explain` and
+    /// `arsy hook list` can say which list a decision came from.
+    pub fn trusted_projects(&self) -> impl Iterator<Item = &Path> {
+        self.trusted_projects.iter().map(PathBuf::as_path)
+    }
+
     pub fn mcp_servers(&self) -> impl Iterator<Item = &McpServer> {
         self.mcp_servers.values()
     }
@@ -752,6 +779,7 @@ impl Config {
                 "lsp" => self.apply_lsp(layer, path, value)?,
                 "mcp" => self.apply_mcp(layer, path, value)?,
                 "remote" => self.apply_remote(layer, path, value)?,
+                "project" => self.apply_project(layer, path, value)?,
                 "policy" => self.apply_policy(layer, path, value)?,
                 "theme" => self.apply_theme(layer, path, value)?,
                 section if INERT_SECTIONS.contains(&section) => {}
@@ -1074,6 +1102,72 @@ impl Config {
     /// Refused outside the enterprise and user layers, for the same reason a
     /// provider endpoint is: a file that travels with a repository must not be
     /// able to decide which machine the agent's commands execute on.
+    /// `[project."<path>"]`: which directories the operator vouches for.
+    ///
+    /// Spelled as Codex spells it, `trust_level = "trusted"`, because an
+    /// operator who already keeps that list has written it once. It decides
+    /// whether a repository's own files — its hooks — may run anything, so
+    /// only a layer that may grant authority can add to it: a repository that
+    /// could vouch for itself would be no gate at all.
+    fn apply_project(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let projects = as_table(value, "project", path)?;
+        if !layer.is_trusted() {
+            for name in projects.keys() {
+                self.diagnostics.push(Diagnostic {
+                    key: format!("project.{name}"),
+                    layer,
+                    path: path.to_path_buf(),
+                    message: "a project's trust may only be set by the enterprise or user configuration, because it decides whether that directory's own files may run commands"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        for (directory, value) in projects {
+            let table = as_table(value, &format!("project.{directory}"), path)?;
+            let level = string(
+                table,
+                "trust_level",
+                &format!("project.{directory}.trust_level"),
+                path,
+            )?
+            .map(String::as_str)
+            .unwrap_or("untrusted");
+            match level {
+                "trusted" => {
+                    self.trusted_projects.insert(PathBuf::from(directory));
+                }
+                // Written out, and written down: an operator who revokes trust
+                // by editing the level rather than deleting the table gets the
+                // revocation, and can see in `config explain` that it landed.
+                "untrusted" => {
+                    self.trusted_projects.remove(Path::new(directory));
+                }
+                other => {
+                    return Err(reject(format!(
+                        "project.{directory}.trust_level must be `trusted` or `untrusted`, not `{other}`"
+                    )))
+                }
+            }
+            self.record(
+                layer,
+                path,
+                &format!("project.{directory}"),
+                level.to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn apply_remote(
         &mut self,
         layer: Layer,
@@ -1161,6 +1255,37 @@ impl Config {
                             // A rule that already exists keeps the stricter of
                             // the two effects, so a later layer cannot relax
                             // one an earlier layer tightened.
+                            //
+                            // What it covers is not up for redefinition. Taking
+                            // the rest of the rule from the newer layer let a
+                            // repository narrow an enterprise deny to one path
+                            // by reusing its id and keeping the effect: the
+                            // effect check passed and the deny stopped covering
+                            // anything. So a layer that cannot grant may amend
+                            // an authoritative rule's effect and nothing else.
+                            Some(existing) if redefines(&existing, &rule) => {
+                                if policy_source(layer) > existing.source {
+                                    self.diagnostics.push(Diagnostic {
+                                        key: format!("policy.rules.{id}"),
+                                        layer,
+                                        path: path.to_path_buf(),
+                                        message: format!(
+                                            "kept the {} rule: a later layer may tighten a rule's \
+                                             effect, not change what it covers",
+                                            existing.source
+                                        ),
+                                    });
+                                    PolicyRule {
+                                        effect: existing.effect.min(rule.effect),
+                                        ..existing
+                                    }
+                                } else {
+                                    PolicyRule {
+                                        effect: existing.effect.min(rule.effect),
+                                        ..rule
+                                    }
+                                }
+                            }
                             Some(existing) => PolicyRule {
                                 effect: existing.effect.min(rule.effect),
                                 ..rule
@@ -1846,6 +1971,26 @@ fn matches(name: &str, key: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// Whether the later rule changes what the earlier one covers, rather than
+/// only how strictly it answers.
+///
+/// Everything a rule matches on: who it applies to, which action, over which
+/// resources, and the assurance the sandbox must reach. An expiry that arrives
+/// earlier still tightens, so it is not a redefinition; one that arrives later
+/// extends the rule's life and is.
+fn redefines(existing: &PolicyRule, replacement: &PolicyRule) -> bool {
+    existing.actor != replacement.actor
+        || existing.action != replacement.action
+        || existing.pattern.to_string() != replacement.pattern.to_string()
+        || existing.minimum_assurance > replacement.minimum_assurance
+        || existing.delegation_depth < replacement.delegation_depth
+        || match (existing.expires_at_ms, replacement.expires_at_ms) {
+            (Some(held), Some(asked)) => asked > held,
+            (Some(_), None) => true,
+            _ => false,
+        }
+}
+
 /// Enough of a URL check to fail early and visibly. Whether plaintext is
 /// acceptable for a given host is a transport decision, not a parse one.
 fn validate_base_url(raw: &str) -> Result<(), &'static str> {
@@ -2009,6 +2154,163 @@ fn platform_user_config() -> Option<PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn platform_user_config() -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod project_trust_tests {
+    use super::*;
+
+    fn layered(user: &str, workspace: &str) -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("user.toml");
+        let second = directory.path().join("workspace.toml");
+        std::fs::write(&first, format!("schema_version = 1\n{user}")).unwrap();
+        std::fs::write(&second, format!("schema_version = 1\n{workspace}")).unwrap();
+        let config = Config::load(&[(Layer::User, first), (Layer::Workspace, second)]).unwrap();
+        (directory, config)
+    }
+
+    /// Trust decides whether a directory's own files may run commands, so a
+    /// file that travels with the directory must not be able to grant it.
+    #[test]
+    fn a_repository_cannot_vouch_for_itself() {
+        let (_directory, config) = layered(
+            "",
+            "[project.\"/repo/theirs\"]\ntrust_level = \"trusted\"\n",
+        );
+
+        assert!(!config.trusts(Path::new("/repo/theirs")));
+        let refused = config
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.key == "project./repo/theirs")
+            .expect("the workspace layer is told why its trust was ignored");
+        assert!(
+            refused.message.contains("may run commands"),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn trust_covers_what_is_under_a_named_directory_and_nothing_else() {
+        let (_directory, config) =
+            layered("[project.\"/repo/mine\"]\ntrust_level = \"trusted\"\n", "");
+
+        assert!(config.trusts(Path::new("/repo/mine")));
+        assert!(
+            config.trusts(Path::new("/repo/mine/crates/inner")),
+            "vouching for a checkout covers the crates inside it"
+        );
+        assert!(!config.trusts(Path::new("/repo/theirs")));
+        // A prefix of the path is not a parent of it.
+        assert!(!config.trusts(Path::new("/repo/mine-other")));
+        // Nothing is trusted by default.
+        let (_directory, empty) = layered("", "");
+        assert!(!empty.trusts(Path::new("/repo/mine")));
+    }
+
+    /// Revoking by editing the level rather than deleting the table has to
+    /// work, or an operator who thinks they revoked trust has not.
+    #[test]
+    fn a_later_layer_may_revoke_what_an_earlier_one_vouched_for() {
+        let (_directory, config) = layered(
+            "[project.\"/repo/mine\"]\ntrust_level = \"untrusted\"\n",
+            "",
+        );
+        assert!(!config.trusts(Path::new("/repo/mine")));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("one.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n[project.\"/repo/mine\"]\ntrust_level = \"sort-of\"\n",
+        )
+        .unwrap();
+        let error = Config::load(&[(Layer::User, path)]).unwrap_err();
+        assert!(
+            format!("{error}").contains("trusted"),
+            "an unknown level is refused by name: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_identity_tests {
+    use super::*;
+
+    fn layered(enterprise: &str, workspace: &str) -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("enterprise.toml");
+        let second = directory.path().join("workspace.toml");
+        std::fs::write(&first, enterprise).unwrap();
+        std::fs::write(&second, workspace).unwrap();
+        let config =
+            Config::load(&[(Layer::Enterprise, first), (Layer::Workspace, second)]).unwrap();
+        (directory, config)
+    }
+
+    /// A rule id names a rule, not a licence to rewrite it.
+    #[test]
+    fn a_repository_cannot_narrow_an_enterprise_rule_by_reusing_its_id() {
+        let (_directory, config) = layered(
+            "schema_version = 1\n[[policy.rules]]\nid = \"no-exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+            // Same id, same effect -- so the effect check passes -- but scoped
+            // to one binary, which would leave every other command allowed.
+            "schema_version = 1\n[[policy.rules]]\nid = \"no-exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:/bin/true\"\n",
+        );
+
+        let rules = config.policy_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].pattern.to_string(),
+            "process:**",
+            "the enterprise rule still covers what it covered"
+        );
+        assert_eq!(rules[0].source, PolicySource::Enterprise);
+        assert_eq!(
+            config
+                .diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.key == "policy.rules.no-exec")
+                .count(),
+            1,
+            "the attempt is reported rather than silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_repository_may_still_tighten_the_effect_of_a_rule_it_did_not_write() {
+        let (_directory, config) = layered(
+            "schema_version = 1\n[[policy.rules]]\nid = \"exec\"\neffect = \"ask\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+            "schema_version = 1\n[[policy.rules]]\nid = \"exec\"\neffect = \"deny\"\n             action = \"process.exec\"\nresource = \"process:**\"\n",
+        );
+
+        let rules = config.policy_rules();
+        assert_eq!(rules[0].effect, RuleEffect::Deny, "tightening is allowed");
+        assert_eq!(rules[0].pattern.to_string(), "process:**");
+    }
+
+    #[test]
+    fn a_layer_may_refine_a_rule_of_its_own_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.toml");
+        let second = directory.path().join("b.toml");
+        std::fs::write(
+            &first,
+            "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:**\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &second,
+            "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:src/**\"\n",
+        )
+        .unwrap();
+        // Both from the user layer: nobody is overruling anybody.
+        let config = Config::load(&[(Layer::User, first), (Layer::User, second)]).unwrap();
+
+        assert_eq!(config.policy_rules()[0].pattern.to_string(), "file:src/**");
+    }
 }
 
 #[cfg(test)]

@@ -1313,10 +1313,36 @@ mod tests {
             "/repo/a file/b.rs",
             "/repo/100%/c.rs",
             "/repo/a#b/d.rs",
+            "/repo/café/été.rs",
         ] {
             let uri = crate::lsp::file_uri(Path::new(path));
             assert!(uri.starts_with("file:///"), "{uri}");
             assert_eq!(crate::lsp::uri_path(&uri), PathBuf::from(path), "{uri}");
         }
+    }
+
+    /// Every URI decoded here came from a language server, and servers encode
+    /// non-ASCII even where `file_uri` does not. Decoding an escape per `char`
+    /// read those bytes as Latin-1, so a rename touching an accented path
+    /// planned edits for a file it could then not read.
+    #[test]
+    fn a_server_encoded_path_decodes_to_the_bytes_it_named() {
+        assert_eq!(
+            crate::lsp::uri_path("file:///repo/caf%C3%A9/a.rs"),
+            PathBuf::from("/repo/café/a.rs")
+        );
+        assert_eq!(
+            crate::lsp::uri_path("file:///repo/%E6%97%A5%E6%9C%AC/b.rs"),
+            PathBuf::from("/repo/日本/b.rs")
+        );
+        // A stray percent is not an escape and is kept as written.
+        assert_eq!(
+            crate::lsp::uri_path("file:///repo/100%/c.rs"),
+            PathBuf::from("/repo/100%/c.rs")
+        );
+        assert_eq!(
+            crate::lsp::uri_path("file:///repo/a%zz/d.rs"),
+            PathBuf::from("/repo/a%zz/d.rs")
+        );
     }
 }
