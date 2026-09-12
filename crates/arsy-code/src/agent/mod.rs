@@ -37,12 +37,15 @@ pub mod budget;
 pub mod codeops;
 #[cfg(feature = "dap")]
 pub mod debugops;
+pub mod discoveryops;
 pub mod fsops;
 pub mod instructions;
 pub mod patch;
+pub mod planops;
 #[cfg(feature = "wasm")]
 pub mod pluginops;
 pub mod searchops;
+pub mod validateops;
 
 use crate::resource::Workspace;
 use arsy_kernel::{
@@ -606,6 +609,137 @@ pub const TOOLS: &[Tool] = &[
             }))
         },
         summarize: |arguments| text(arguments, "command"),
+    },
+    Tool {
+        name: "repo_discover",
+        operation: "repo.discover",
+        description: "Identify the repository: its git root, every manifest found (Cargo.toml, package.json, go.mod, ...) with the language it implies, and the members a workspace-level manifest declares. Call this before inferring the project's layout from `bash`.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
+    },
+    Tool {
+        name: "plan_add",
+        operation: "plan.add",
+        description: "Add a step to the task's plan. Returns the whole plan. Steps start `pending`; put a new one after an existing step with `after`, or leave it off to append.",
+        schema: || {
+            object(
+                json!({
+                    "description": {"type": "string", "description": "What the step is."},
+                    "after": {"type": "string", "description": "Step id to insert after. Defaults to the end of the plan."}
+                }),
+                &["description"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"description": text(arguments, "description")});
+            if let Some(after) = arguments.get("after").and_then(Value::as_str) {
+                input["after"] = json!(after);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "description"),
+    },
+    Tool {
+        name: "plan_update",
+        operation: "plan.update",
+        description: "Change a plan step's status or description. Status is one of `pending`, `in_progress`, `completed`. Returns the whole plan.",
+        schema: || {
+            object(
+                json!({
+                    "id": {"type": "string", "description": "Step id, as returned by plan_add or plan_list."},
+                    "status": {"type": "string", "description": "pending | in_progress | completed"},
+                    "description": {"type": "string", "description": "Replacement text. Leave unset to keep it."}
+                }),
+                &["id"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"id": text(arguments, "id")});
+            for key in ["status", "description"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_str) {
+                    input[key] = json!(value);
+                }
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "id"),
+    },
+    Tool {
+        name: "plan_remove",
+        operation: "plan.remove",
+        description: "Remove a step from the plan. Returns the whole plan.",
+        schema: || {
+            object(
+                json!({"id": {"type": "string", "description": "Step id to remove."}}),
+                &["id"],
+            )
+        },
+        translate: |arguments| Ok(json!({"id": text(arguments, "id")})),
+        summarize: |arguments| text(arguments, "id"),
+    },
+    Tool {
+        name: "plan_reorder",
+        operation: "plan.reorder",
+        description: "Put the plan's steps in a new order. `order` must name every current step id exactly once.",
+        schema: || {
+            object(
+                json!({
+                    "order": {"type": "array", "items": {"type": "string"}, "description": "Every step id, in the new order."}
+                }),
+                &["order"],
+            )
+        },
+        translate: |arguments| {
+            let order = arguments
+                .get("order")
+                .and_then(Value::as_array)
+                .ok_or("plan_reorder requires an `order` array")?;
+            Ok(json!({"order": order}))
+        },
+        summarize: |_| "reorder".to_owned(),
+    },
+    Tool {
+        name: "plan_list",
+        operation: "plan.list",
+        description: "Read the current plan back without changing it.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
+    },
+    Tool {
+        name: "validate_record",
+        operation: "validate.record",
+        description: "Record the outcome of a check you just ran with `bash` (a test suite, a build, a linter). `outcome` is `passed` or `failed`. This is what a completion claim cites.",
+        schema: || {
+            object(
+                json!({
+                    "command": {"type": "string", "description": "The command that was run."},
+                    "outcome": {"type": "string", "description": "passed | failed"},
+                    "detail": {"type": "string", "description": "The failing assertion or a short summary. Optional."}
+                }),
+                &["command", "outcome"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({
+                "command": text(arguments, "command"),
+                "outcome": text(arguments, "outcome"),
+            });
+            if let Some(detail) = arguments.get("detail").and_then(Value::as_str) {
+                input["detail"] = json!(detail);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "command"),
+    },
+    Tool {
+        name: "validate_status",
+        operation: "validate.status",
+        description: "Read the validation log back without changing it. The task is only done once the last entry passed.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
     },
 ];
 

@@ -6433,6 +6433,14 @@ mod tests {
                 "fs.delete",
                 "fs.move",
                 "bash",
+                "repo_discover",
+                "plan_add",
+                "plan_update",
+                "plan_remove",
+                "plan_reorder",
+                "plan_list",
+                "validate_record",
+                "validate_status",
             ],
             "reading and searching are offered before the shell"
         );

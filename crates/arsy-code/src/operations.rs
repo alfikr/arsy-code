@@ -188,6 +188,24 @@ pub fn registry(
             process(Arc::clone(&artifacts)),
         )))?;
     }
+    registry.register(crate::agent::discoveryops::DiscoveryExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
+    for executor in crate::agent::planops::PlanExecutor::executors(
+        &crate::agent::planops::state(),
+        &artifacts,
+        retain_until_ms,
+    )
+    .into_iter()
+    .chain(crate::agent::validateops::ValidateExecutor::executors(
+        &crate::agent::validateops::state(),
+        &artifacts,
+        retain_until_ms,
+    )) {
+        registry.register(executor)?;
+    }
     registry.register(Arc::new(process(artifacts)))?;
     Ok(registry)
 }
@@ -237,9 +255,17 @@ mod tests {
                 "git.diff".to_owned(),
                 "git.log".to_owned(),
                 "git.status".to_owned(),
+                "plan.add".to_owned(),
+                "plan.list".to_owned(),
+                "plan.remove".to_owned(),
+                "plan.reorder".to_owned(),
+                "plan.update".to_owned(),
                 "process.exec".to_owned(),
+                "repo.discover".to_owned(),
                 "search.files".to_owned(),
                 "search.text".to_owned(),
+                "validate.record".to_owned(),
+                "validate.status".to_owned(),
             ],
             "a workspace with no remote target cannot dispatch one"
         );
