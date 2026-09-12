@@ -109,6 +109,18 @@ impl PlanOperation {
         }
     }
 
+    /// A read cannot conflict with another read, the same reason `fs.read` is
+    /// `Parallel`; a mutation has to see the plan a previous one left, the same
+    /// reason `fs.write` is not.
+    const fn concurrency(self) -> ConcurrencyRule {
+        match self {
+            Self::List => ConcurrencyRule::Parallel,
+            Self::Add | Self::Update | Self::Remove | Self::Reorder => {
+                ConcurrencyRule::ExclusiveGlobal
+            }
+        }
+    }
+
     fn schema(self) -> InputSchema {
         let string = |name: &str| (name.to_owned(), JsonType::String);
         let array = |name: &str| (name.to_owned(), JsonType::Array);
@@ -156,7 +168,7 @@ impl PlanExecutor {
                         actions: vec![CapabilityAction::SystemModify],
                         idempotency: operation.idempotency(),
                         reversible: true,
-                        concurrency: ConcurrencyRule::ExclusiveGlobal,
+                        concurrency: operation.concurrency(),
                     },
                     state: Arc::clone(state),
                     artifacts: Arc::clone(artifacts),

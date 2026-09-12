@@ -94,6 +94,15 @@ impl ValidateOperation {
         }
     }
 
+    /// A read cannot conflict with another read; recording an outcome
+    /// mutates the log and has to see what a previous record left.
+    const fn concurrency(self) -> ConcurrencyRule {
+        match self {
+            Self::Status => ConcurrencyRule::Parallel,
+            Self::Record => ConcurrencyRule::ExclusiveGlobal,
+        }
+    }
+
     fn schema(self) -> InputSchema {
         let string = |name: &str| (name.to_owned(), JsonType::String);
         let (required, optional) = match self {
@@ -137,7 +146,7 @@ impl ValidateExecutor {
                         actions: vec![CapabilityAction::SystemModify],
                         idempotency: operation.idempotency(),
                         reversible: true,
-                        concurrency: ConcurrencyRule::ExclusiveGlobal,
+                        concurrency: operation.concurrency(),
                     },
                     state: Arc::clone(state),
                     artifacts: Arc::clone(artifacts),
