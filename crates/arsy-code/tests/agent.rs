@@ -126,6 +126,14 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
             "fs.delete",
             "fs.move",
             "bash",
+            "repo_discover",
+            "plan_add",
+            "plan_update",
+            "plan_remove",
+            "plan_reorder",
+            "plan_list",
+            "validate_record",
+            "validate_status",
         ]
     );
     // Every offered tool publishes a schema the model can fill in, and no tool
