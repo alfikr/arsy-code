@@ -194,13 +194,13 @@ pub fn registry(
         retain_until_ms,
     ))?;
     for executor in crate::agent::planops::PlanExecutor::executors(
-        &crate::agent::planops::state(),
+        &crate::agent::planops::state_for(workspace.path()),
         &artifacts,
         retain_until_ms,
     )
     .into_iter()
     .chain(crate::agent::validateops::ValidateExecutor::executors(
-        &crate::agent::validateops::state(),
+        &crate::agent::validateops::state_for(workspace.path()),
         &artifacts,
         retain_until_ms,
     )) {

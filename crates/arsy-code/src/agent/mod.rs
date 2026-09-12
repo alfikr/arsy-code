@@ -577,7 +577,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "bash",
         operation: "process.exec",
-        description: "Run a shell command in the workspace and return its merged stdout and stderr, truncated to the last 16 KiB. Use the file and search tools for reading and editing; use this for builds, tests, and version control.",
+        description: "Run a shell command in the workspace and return its merged stdout and stderr, truncated to the last 16 KiB, followed by an `evidence: <id>` line. Use the file and search tools for reading and editing; use this for builds, tests, and version control. Pass the evidence id to `validate_record` after a test, build, or lint run.",
         schema: || {
             object(
                 json!({
@@ -710,21 +710,21 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "validate_record",
         operation: "validate.record",
-        description: "Record the outcome of a check you just ran with `bash` (a test suite, a build, a linter). `outcome` is `passed` or `failed`. This is what a completion claim cites.",
+        description: "Record a check you just ran with `bash` (a test suite, a build, a linter) against the task. `evidence` is the id from the `evidence: <id>` line `bash`'s own result ended with — the outcome is read from that command's real exit code, not from what you say it was. This is what a completion claim cites.",
         schema: || {
             object(
                 json!({
                     "command": {"type": "string", "description": "The command that was run."},
-                    "outcome": {"type": "string", "description": "passed | failed"},
+                    "evidence": {"type": "string", "description": "The id from the `evidence:` line at the end of that command's `bash` result."},
                     "detail": {"type": "string", "description": "The failing assertion or a short summary. Optional."}
                 }),
-                &["command", "outcome"],
+                &["command", "evidence"],
             )
         },
         translate: |arguments| {
             let mut input = json!({
                 "command": text(arguments, "command"),
-                "outcome": text(arguments, "outcome"),
+                "evidence": text(arguments, "evidence"),
             });
             if let Some(detail) = arguments.get("detail").and_then(Value::as_str) {
                 input["detail"] = json!(detail);
@@ -1036,6 +1036,14 @@ impl ToolRuntime {
             }
         };
         let (success, output) = present(name, &value, &self.evidence(outcome));
+        // `bash` is the one tool `validate_record` needs an id back from: its
+        // artifact is what `validate.record` reads to find the real exit
+        // code, so the model has to be able to name it. Nothing else reads
+        // this line; appending it elsewhere would just be noise.
+        let output = match (name, artifact) {
+            ("bash", Some(id)) => format!("{output}\n\nevidence: {id}"),
+            _ => output,
+        };
         ToolResult {
             tool: name.to_owned(),
             success,

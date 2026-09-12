@@ -537,10 +537,11 @@ fn bash_runs_in_the_workspace_and_reports_output_exit_codes_and_deadlines() {
     std::fs::write(root.path().join("marker"), "x").unwrap();
     let runtime = permissive(root.path());
 
-    assert_eq!(
-        ok(&runtime, "bash", json!({"command": "printf 'hi\\n'"})),
-        "hi\n"
-    );
+    let hi = ok(&runtime, "bash", json!({"command": "printf 'hi\\n'"}));
+    assert!(hi.starts_with("hi\n"), "{hi}");
+    // Every successful call ends with the evidence line `validate_record`
+    // reads its exit code from.
+    assert!(hi.contains("\nevidence: "), "{hi}");
     // The workspace is the working directory, not wherever ARSY was launched.
     assert!(ok(&runtime, "bash", json!({"command": "ls"})).contains("marker"));
 
@@ -550,7 +551,8 @@ fn bash_runs_in_the_workspace_and_reports_output_exit_codes_and_deadlines() {
         json!({"command": "printf 'oops\\n' >&2; exit 3"}),
     );
     assert!(failed.contains("oops"), "{failed}");
-    assert!(failed.ends_with("Command exited with code 3"), "{failed}");
+    assert!(failed.contains("Command exited with code 3"), "{failed}");
+    assert!(failed.contains("\nevidence: "), "{failed}");
 
     let started = std::time::Instant::now();
     let timed_out = err(
@@ -573,7 +575,8 @@ fn bash_runs_in_the_workspace_and_reports_output_exit_codes_and_deadlines() {
         long.len()
     );
     assert!(long.contains("earlier bytes omitted"), "{long}");
-    assert!(long.ends_with("LAST\n"), "{long}");
+    assert!(long.contains("LAST\n"), "{long}");
+    assert!(long.contains("\nevidence: "), "{long}");
 
     let empty = err(&runtime, "bash", json!({"command": "   "}));
     assert!(empty.contains("non-empty"), "{empty}");

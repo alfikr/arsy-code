@@ -23,7 +23,11 @@ use arsy_kernel::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,11 +68,32 @@ impl PlanState {
     }
 }
 
-/// A fresh, empty plan. One is built per workspace registry and handed to
-/// every `plan.*` kind, so they share state rather than each keeping their
-/// own copy that could disagree.
+/// A fresh, empty plan, with no lifetime beyond whoever holds the `Arc`. Used
+/// by tests, which want a plan isolated to one case rather than shared with
+/// every other test in the process.
 pub fn state() -> Arc<Mutex<PlanState>> {
     Arc::new(Mutex::new(PlanState::default()))
+}
+
+/// Every workspace's plan, kept alive for the life of the process.
+///
+/// `operations::registry` is rebuilt once per turn — a fresh [`PlanState`]
+/// there would forget the plan the moment the model asked its next question.
+/// The plan is exactly the thing this tool exists to keep, so it is cached
+/// here by workspace root instead, and every turn's registry is handed the
+/// same one back.
+static WORKSPACES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<PlanState>>>>> = OnceLock::new();
+
+/// The plan for one workspace, shared across every registry built for it in
+/// this process. Lost on restart, the same ceiling `budget`'s in-memory
+/// transcript has; a resumed session's plan is not this ticket's scope.
+pub fn state_for(workspace_root: &Path) -> Arc<Mutex<PlanState>> {
+    let workspaces = WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut workspaces = workspaces.lock().unwrap_or_else(|error| error.into_inner());
+    workspaces
+        .entry(workspace_root.to_path_buf())
+        .or_insert_with(state)
+        .clone()
 }
 
 /// What a plan call may ask for. Kept separate rather than one kind with an

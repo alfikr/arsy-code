@@ -8,9 +8,11 @@
 //! `validate.status` can answer "is the last known validation state a pass"
 //! without re-reading the transcript, and a completion claim can cite it.
 
+use crate::process::ProcessResult;
 use arsy_kernel::{
+    artifact::{ArtifactReadLimits, ArtifactStore},
     capability::{CapabilityAction, CapabilityGrant},
-    domain::{Principal, ResourceRef},
+    domain::{ArtifactId, Principal, ResourceRef},
     operation::{
         ConcurrencyRule, Effect, Idempotency, InputSchema, JsonType, OperationContract,
         OperationError, OperationExecutor, OperationKind, OperationOutcome, OperationRequest,
@@ -18,7 +20,18 @@ use arsy_kernel::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+};
+
+/// How much of an evidence artifact is read to find its exit code. Well past
+/// any real `process.exec` result, which is a handful of fields.
+const EVIDENCE_LIMITS: ArtifactReadLimits = ArtifactReadLimits {
+    max_bytes: 64 * 1024,
+    max_expansion_ratio: 1_000,
+};
 
 /// Longest excerpt of a check's own output kept against the record. Enough to
 /// show the failing assertion, little enough that a noisy test runner cannot
@@ -65,10 +78,24 @@ pub struct ValidationState {
     records: Vec<ValidationRecord>,
 }
 
-/// A fresh, empty log. One is built per workspace registry and handed to
-/// every `validate.*` kind.
+/// A fresh, empty log, with no lifetime beyond whoever holds the `Arc`. Used
+/// by tests, which want a log isolated to one case.
 pub fn state() -> Arc<Mutex<ValidationState>> {
     Arc::new(Mutex::new(ValidationState::default()))
+}
+
+/// Every workspace's validation log, kept alive for the life of the process —
+/// the same reason, and the same restart ceiling, as
+/// [`planops::state_for`](super::planops::state_for).
+static WORKSPACES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<ValidationState>>>>> = OnceLock::new();
+
+pub fn state_for(workspace_root: &Path) -> Arc<Mutex<ValidationState>> {
+    let workspaces = WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut workspaces = workspaces.lock().unwrap_or_else(|error| error.into_inner());
+    workspaces
+        .entry(workspace_root.to_path_buf())
+        .or_insert_with(state)
+        .clone()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,7 +134,7 @@ impl ValidateOperation {
         let string = |name: &str| (name.to_owned(), JsonType::String);
         let (required, optional) = match self {
             Self::Record => (
-                vec![string("command"), string("outcome")],
+                vec![string("command"), string("evidence")],
                 vec![string("detail")],
             ),
             Self::Status => (Vec::new(), Vec::new()),
@@ -124,14 +151,14 @@ pub struct ValidateExecutor {
     operation: ValidateOperation,
     contract: OperationContract,
     state: Arc<Mutex<ValidationState>>,
-    artifacts: Arc<dyn arsy_kernel::artifact::ArtifactStore>,
+    artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
 }
 
 impl ValidateExecutor {
     pub fn executors(
         state: &Arc<Mutex<ValidationState>>,
-        artifacts: &Arc<dyn arsy_kernel::artifact::ArtifactStore>,
+        artifacts: &Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
     ) -> Vec<Arc<dyn OperationExecutor>> {
         ValidateOperation::ALL
@@ -168,15 +195,30 @@ impl ValidateExecutor {
             self.retain_until_ms,
         )
     }
-}
 
-fn outcome_of(value: &str) -> Result<ValidationOutcome, OperationError> {
-    match value {
-        "passed" => Ok(ValidationOutcome::Passed),
-        "failed" => Ok(ValidationOutcome::Failed),
-        other => Err(OperationError::Execution(format!(
-            "`{other}` is not a validation outcome; use passed or failed"
-        ))),
+    /// The outcome a `bash` call actually had, read from the artifact its own
+    /// call returned — not asserted by whoever is calling `validate.record`.
+    /// A model that never ran the command, or ran a different one, has no
+    /// artifact id to give; one that ran it and got a failure cannot report
+    /// `passed` by simply saying so.
+    fn outcome_of(&self, evidence: &str) -> Result<ValidationOutcome, OperationError> {
+        let id: ArtifactId = evidence
+            .parse()
+            .map_err(|_| OperationError::Execution("`evidence` is not an artifact id".into()))?;
+        let bytes = self
+            .artifacts
+            .read(id, EVIDENCE_LIMITS)
+            .map_err(|error| OperationError::Execution(format!("evidence artifact: {error}")))?;
+        let result: ProcessResult = serde_json::from_slice(&bytes).map_err(|_| {
+            OperationError::Execution(
+                "evidence must be the artifact id a `bash` call returned".into(),
+            )
+        })?;
+        Ok(if !result.timed_out && result.status_code == Some(0) {
+            ValidationOutcome::Passed
+        } else {
+            ValidationOutcome::Failed
+        })
     }
 }
 
@@ -206,9 +248,9 @@ impl OperationExecutor for ValidateExecutor {
                     "a validation record needs the command that was run".into(),
                 ));
             }
-            let outcome = outcome_of(
+            let outcome = self.outcome_of(
                 input
-                    .get("outcome")
+                    .get("evidence")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )?;
@@ -258,18 +300,41 @@ mod tests {
     fn setup() -> (
         tempfile::TempDir,
         Vec<Arc<dyn OperationExecutor>>,
-        Arc<dyn arsy_kernel::artifact::ArtifactStore>,
+        Arc<dyn ArtifactStore>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let artifacts: Arc<dyn arsy_kernel::artifact::ArtifactStore> =
+        let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(dir.path().join("artifacts"), 0).unwrap());
         let executors = ValidateExecutor::executors(&state(), &artifacts, 0);
         (dir, executors, artifacts)
     }
 
+    /// The artifact a `bash` call itself would have left, so a test can hand
+    /// `validate.record` a real id rather than a claim.
+    fn evidence(artifacts: &Arc<dyn ArtifactStore>, status_code: Option<i32>) -> String {
+        let result = ProcessResult {
+            status_code,
+            timed_out: false,
+            graceful_termination_sent: false,
+            forced_kill_sent: false,
+            cleanup: crate::process::Cleanup::Reaped,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            sandbox_assurance: arsy_kernel::policy::SandboxAssurance::None,
+        };
+        let reference = super::super::store(
+            artifacts.as_ref(),
+            &result,
+            Principal::User("test".into()),
+            0,
+        )
+        .unwrap();
+        reference.value().to_owned()
+    }
+
     fn call(
         executors: &[Arc<dyn OperationExecutor>],
-        artifacts: &Arc<dyn arsy_kernel::artifact::ArtifactStore>,
+        artifacts: &Arc<dyn ArtifactStore>,
         kind: &str,
         input: Value,
     ) -> ValidationLog {
@@ -286,11 +351,11 @@ mod tests {
         };
         let outcome = executor.execute(&request, &[]).unwrap();
         let reference = outcome.value.expect("validate calls always return a log");
-        let id: arsy_kernel::domain::ArtifactId = reference.value().parse().unwrap();
+        let id: ArtifactId = reference.value().parse().unwrap();
         let bytes = artifacts
             .read(
                 id,
-                arsy_kernel::artifact::ArtifactReadLimits {
+                ArtifactReadLimits {
                     max_bytes: 1024 * 1024,
                     max_expansion_ratio: 1_000,
                 },
@@ -309,7 +374,7 @@ mod tests {
             "validate.record",
             serde_json::json!({
                 "command": "cargo test -p arsy-code",
-                "outcome": "failed",
+                "evidence": evidence(&artifacts, Some(1)),
                 "detail": "assertion failed: left == right"
             }),
         );
@@ -322,7 +387,7 @@ mod tests {
             "validate.record",
             serde_json::json!({
                 "command": "cargo test -p arsy-code",
-                "outcome": "passed"
+                "evidence": evidence(&artifacts, Some(0)),
             }),
         );
         assert_eq!(log.records.len(), 2);
@@ -340,8 +405,11 @@ mod tests {
         assert_eq!(status, log, "status reads the same log without mutating it");
     }
 
+    /// A model cannot claim a passing check that never ran: there is no
+    /// evidence artifact for a command it did not call `bash` for, and an id
+    /// it makes up does not resolve.
     #[test]
-    fn an_unknown_outcome_is_rejected() {
+    fn a_claim_with_no_real_evidence_artifact_is_rejected() {
         let (_dir, executors, _artifacts) = setup();
         let executor = executors
             .iter()
@@ -352,8 +420,72 @@ mod tests {
             kind: executor.contract().kind.clone(),
             actor: Principal::User("test".into()),
             requirements: Vec::new(),
-            input: serde_json::json!({"command": "make test", "outcome": "maybe"}),
+            input: serde_json::json!({"command": "make test", "evidence": "not-an-artifact-id"}),
         };
         assert!(executor.execute(&request, &[]).is_err());
+    }
+
+    /// Evidence that resolves but is not a `bash` result — someone else's
+    /// artifact, or the plan snapshot from `plan.add` — is rejected the same
+    /// way: a real id is necessary but has to name the right kind of thing.
+    #[test]
+    fn evidence_that_is_not_a_command_result_is_rejected() {
+        let (_dir, executors, artifacts) = setup();
+        let executor = executors
+            .iter()
+            .find(|executor| executor.contract().kind.as_str() == "validate.record")
+            .unwrap();
+        let not_a_process_result = super::super::store(
+            artifacts.as_ref(),
+            &serde_json::json!({"steps": []}),
+            Principal::User("test".into()),
+            0,
+        )
+        .unwrap();
+        let request = OperationRequest {
+            id: OperationId::new(),
+            kind: executor.contract().kind.clone(),
+            actor: Principal::User("test".into()),
+            requirements: Vec::new(),
+            input: serde_json::json!({
+                "command": "make test",
+                "evidence": not_a_process_result.value(),
+            }),
+        };
+        assert!(executor.execute(&request, &[]).is_err());
+    }
+
+    /// A command that timed out is not a pass, whatever its exit code reads
+    /// as by the time the process was killed.
+    #[test]
+    fn a_timed_out_run_is_never_a_pass() {
+        let (_dir, executors, artifacts) = setup();
+        let timed_out = ProcessResult {
+            status_code: Some(0),
+            timed_out: true,
+            graceful_termination_sent: true,
+            forced_kill_sent: false,
+            cleanup: crate::process::Cleanup::Terminated,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            sandbox_assurance: arsy_kernel::policy::SandboxAssurance::None,
+        };
+        let reference = super::super::store(
+            artifacts.as_ref(),
+            &timed_out,
+            Principal::User("test".into()),
+            0,
+        )
+        .unwrap();
+        let log = call(
+            &executors,
+            &artifacts,
+            "validate.record",
+            serde_json::json!({"command": "sleep 300", "evidence": reference.value()}),
+        );
+        assert!(
+            log.actionable(),
+            "a timed-out run is not evidence of a pass"
+        );
     }
 }

@@ -169,6 +169,12 @@ fn npm_members(root: &Path, manifest: &Path) -> Vec<String> {
 }
 
 fn discover(workspace_root: &Path) -> Discovery {
+    // `found` is at or above `workspace_root`; it is below only when the
+    // workspace itself is the checkout root, the ordinary case. When the
+    // workspace is a subdirectory of a larger checkout, `found` is an
+    // ancestor and has no path relative to `workspace_root` at all — its own
+    // absolute path is what is reported, not a workspace-relative one that
+    // does not exist and must not be papered over as ".".
     let git_root = git_root(workspace_root).map(|found| {
         found
             .strip_prefix(workspace_root)
@@ -179,7 +185,7 @@ fn discover(workspace_root: &Path) -> Discovery {
                     relative.display().to_string()
                 }
             })
-            .unwrap_or_else(|_| ".".to_owned())
+            .unwrap_or_else(|_| found.display().to_string())
     });
 
     let mut manifests = Vec::new();
@@ -188,6 +194,13 @@ fn discover(workspace_root: &Path) -> Discovery {
     for (count, entry) in crate::resource::walk(workspace_root).flatten().enumerate() {
         if count >= MAX_ENTRIES {
             break;
+        }
+        // A manifest that is a symlink can resolve outside the workspace;
+        // reading it (or a member glob resolved through it) would then read
+        // whatever the link actually points at. Skipping it here, before
+        // anything reads its content, is the one place that has to hold.
+        if entry.file_type().is_some_and(|kind| kind.is_symlink()) {
+            continue;
         }
         let path = entry.path();
         let Ok(relative) = path.strip_prefix(workspace_root) else {
@@ -381,5 +394,45 @@ mod tests {
         let discovery = discovery_at(root);
         assert_eq!(discovery.languages, vec!["javascript"]);
         assert_eq!(discovery.workspace_members, vec!["packages/app".to_owned()]);
+    }
+
+    /// A workspace opened on a subdirectory of a larger checkout has a git
+    /// root that is its own ancestor, not a descendant — `strip_prefix` fails,
+    /// and the absolute path is what has to come back, not a workspace-
+    /// relative "." that claims the workspace is the repository root.
+    #[test]
+    fn a_workspace_below_the_git_root_reports_the_real_root_not_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path();
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        let workspace = checkout.join("services/api");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let discovery = discovery_at(&workspace);
+        let expected = std::fs::canonicalize(checkout).unwrap();
+        assert_eq!(
+            discovery.git_root.as_deref(),
+            Some(expected.to_str().unwrap())
+        );
+    }
+
+    /// A manifest that is a symlink is never read: on some other path, that
+    /// content could be outside the workspace entirely.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_manifest_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let secret = dir.path().parent().unwrap().join("outside-secret.toml");
+        std::fs::write(&secret, "[workspace]\nmembers = [\"leak\"]\n").unwrap();
+        std::os::unix::fs::symlink(&secret, root.join("Cargo.toml")).unwrap();
+
+        let discovery = discovery_at(root);
+        assert!(
+            discovery.manifests.is_empty(),
+            "a symlinked manifest must not be read: {:?}",
+            discovery.manifests
+        );
+        assert!(discovery.workspace_members.is_empty());
     }
 }
