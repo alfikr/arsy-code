@@ -411,6 +411,10 @@ impl Supervisor<'_> {
                 sandbox: crate::installed_sandbox_assurance(),
             },
             arsy_code::operations::Reachable::from_config(self.config),
+            // The child's own plan and validation history, not the parent's:
+            // a delegated subtask should not inherit or pollute the plan the
+            // supervisor is tracking.
+            &agent.to_string(),
         )
         .map_err(|error| error.to_string())?;
 

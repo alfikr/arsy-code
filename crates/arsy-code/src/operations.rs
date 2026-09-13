@@ -110,19 +110,22 @@ impl Reachable {
 ///
 /// `retain_until_ms` is stamped on the artifacts operations produce, so `gc`
 /// knows when their evidence may be collected.
+///
+/// `scope` isolates the plan and validation history a registry's `plan.*`
+/// and `validate.*` kinds hold: two registries built for the same workspace
+/// but different scopes (a session id, a task id, or any other value unique
+/// to the unit of work) get their own state rather than one inheriting
+/// whatever the other left. A registry rebuilt with the same scope — the
+/// ordinary case, once per turn of one session — gets the same state back.
 pub fn registry(
     workspace: &Workspace,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
     reachable: Reachable,
+    scope: &str,
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
-    for operation in [
-        GitOperation::Status,
-        GitOperation::Diff,
-        GitOperation::Log,
-        GitOperation::Blame,
-    ] {
+    for operation in GitOperation::ALL {
         registry.register(GitExecutor::new(
             operation,
             workspace,
@@ -188,6 +191,24 @@ pub fn registry(
             process(Arc::clone(&artifacts)),
         )))?;
     }
+    registry.register(crate::agent::discoveryops::DiscoveryExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
+    for executor in crate::agent::planops::PlanExecutor::executors(
+        &crate::agent::planops::state_for(workspace.path(), scope),
+        &artifacts,
+        retain_until_ms,
+    )
+    .into_iter()
+    .chain(crate::agent::validateops::ValidateExecutor::executors(
+        &crate::agent::validateops::state_for(workspace.path(), scope),
+        &artifacts,
+        retain_until_ms,
+    )) {
+        registry.register(executor)?;
+    }
     registry.register(Arc::new(process(artifacts)))?;
     Ok(registry)
 }
@@ -203,8 +224,14 @@ mod tests {
         let workspace = Workspace::open(temporary.path()).unwrap();
         let artifacts: Arc<dyn ArtifactStore> =
             Arc::new(FileArtifactStore::open(temporary.path().join("artifacts"), 0).unwrap());
-        let registry =
-            registry(&workspace, Arc::clone(&artifacts), 0, Reachable::default()).unwrap();
+        let registry = registry(
+            &workspace,
+            Arc::clone(&artifacts),
+            0,
+            Reachable::default(),
+            "test",
+        )
+        .unwrap();
 
         let kinds: Vec<_> = registry.kinds().map(ToString::to_string).collect();
         // A WASM build can dispatch a plugin; a build without the feature has
@@ -234,12 +261,21 @@ mod tests {
                 "fs.read".to_owned(),
                 "fs.write".to_owned(),
                 "git.blame".to_owned(),
+                "git.branch".to_owned(),
                 "git.diff".to_owned(),
                 "git.log".to_owned(),
                 "git.status".to_owned(),
+                "plan.add".to_owned(),
+                "plan.list".to_owned(),
+                "plan.remove".to_owned(),
+                "plan.reorder".to_owned(),
+                "plan.update".to_owned(),
                 "process.exec".to_owned(),
+                "repo.discover".to_owned(),
                 "search.files".to_owned(),
                 "search.text".to_owned(),
+                "validate.record".to_owned(),
+                "validate.status".to_owned(),
             ],
             "a workspace with no remote target cannot dispatch one"
         );
@@ -258,6 +294,7 @@ mod tests {
                 )],
                 ..Reachable::default()
             },
+            "test",
         )
         .unwrap();
         assert!(with_remote

@@ -53,17 +53,65 @@ pub enum GitOperation {
     Diff,
     Log,
     Blame,
+    Branch,
 }
 
 impl GitOperation {
+    pub const ALL: [Self; 5] = [
+        Self::Status,
+        Self::Diff,
+        Self::Log,
+        Self::Blame,
+        Self::Branch,
+    ];
+
     const fn kind(self) -> &'static str {
         match self {
             Self::Status => "git.status",
             Self::Diff => "git.diff",
             Self::Log => "git.log",
             Self::Blame => "git.blame",
+            Self::Branch => "git.branch",
         }
     }
+}
+
+/// One entry from `git status --porcelain=v1`, decoded rather than left as a
+/// line the model has to parse itself.
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChangedFile {
+    /// The two-letter index/worktree status code, e.g. `" M"`, `"??"`, `"A "`.
+    pub status: String,
+    /// The current path. For a rename this is the path after `-> `; the
+    /// porcelain line itself is kept in `output` for the rare caller that
+    /// needs the old path too.
+    pub path: String,
+}
+
+/// Porcelain v1 is `XY PATH` or, for a rename/copy, `XY OLD -> NEW`. Neither
+/// side is quoted unless it contains a character `core.quotepath` would
+/// otherwise mangle, which callers of this tool do not need decoded.
+fn parse_status(porcelain: &str) -> Vec<ChangedFile> {
+    porcelain
+        .lines()
+        .filter(|line| line.len() > 3)
+        .map(|line| {
+            let status = line[..2].to_owned();
+            let rest = &line[3..];
+            // The arrow only marks a rename or copy; an ordinary path is
+            // reported byte for byte, including one that happens to contain
+            // the substring " -> ".
+            let path = if status.starts_with(['R', 'C']) {
+                rest.rsplit_once(" -> ").map_or(rest, |(_, new)| new)
+            } else {
+                rest
+            };
+            ChangedFile {
+                status,
+                path: path.to_owned(),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +141,8 @@ pub struct GitResult {
     pub operation: String,
     pub output: String,
     pub workspace: Option<WorkspaceCleanliness>,
+    /// Parsed from `output` for `git.status`; empty for every other kind.
+    pub changed_files: Vec<ChangedFile>,
 }
 
 pub struct GitExecutor {
@@ -115,6 +165,7 @@ impl GitExecutor {
             GitOperation::Diff => BTreeMap::from([("revision".into(), JsonType::String)]),
             GitOperation::Log => BTreeMap::from([("max_entries".into(), JsonType::Number)]),
             GitOperation::Blame => BTreeMap::from([("path".into(), JsonType::String)]),
+            GitOperation::Branch => BTreeMap::new(),
         };
         Arc::new(Self {
             operation,
@@ -186,6 +237,10 @@ impl GitExecutor {
                     path,
                 ])
             }
+            GitOperation::Branch => {
+                serde_json::from_value::<EmptyInput>(input.clone()).map_err(schema)?;
+                Ok(vec!["branch".into(), "--show-current".into()])
+            }
         }
     }
 
@@ -223,6 +278,11 @@ impl GitExecutor {
         }
         let output = String::from_utf8(stdout)
             .map_err(|_| OperationError::Execution("Git output is not UTF-8".into()))?;
+        let changed_files = if self.operation == GitOperation::Status {
+            parse_status(&output)
+        } else {
+            Vec::new()
+        };
         let result = GitResult {
             operation: self.operation.kind().into(),
             workspace: (self.operation == GitOperation::Status).then_some(if output.is_empty() {
@@ -231,6 +291,7 @@ impl GitExecutor {
                 WorkspaceCleanliness::Dirty
             }),
             output,
+            changed_files,
         };
         let metadata = self
             .artifacts
@@ -368,6 +429,7 @@ mod tests {
             (GitOperation::Diff, json!({"revision": "HEAD"})),
             (GitOperation::Log, json!({"max_entries": 1})),
             (GitOperation::Blame, json!({"path": "tracked.txt"})),
+            (GitOperation::Branch, json!({})),
         ];
 
         for (operation, input) in cases {
@@ -410,6 +472,98 @@ mod tests {
             GitExecutor::new(GitOperation::Blame, &workspace, artifacts, 0)
                 .arguments(&json!({"path": "../outside"}))
                 .is_err()
+        );
+    }
+
+    /// A dirty tree with a modification, an addition, and an untracked file
+    /// produces a structured entry per file, not a porcelain line the caller
+    /// has to parse itself.
+    #[test]
+    fn status_on_a_dirty_tree_is_parsed_into_changed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        git(temp.path(), &["config", "user.email", "test@example.com"]);
+        git(temp.path(), &["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("tracked.txt"), "first\n").unwrap();
+        git(temp.path(), &["add", "tracked.txt"]);
+        git(temp.path(), &["commit", "-qm", "initial"]);
+
+        std::fs::write(temp.path().join("tracked.txt"), "second\n").unwrap();
+        std::fs::write(temp.path().join("staged.txt"), "new\n").unwrap();
+        git(temp.path(), &["add", "staged.txt"]);
+        std::fs::write(temp.path().join("untracked.txt"), "new\n").unwrap();
+
+        let workspace = Workspace::open(temp.path()).unwrap();
+        let artifacts =
+            Arc::new(FileArtifactStore::open(temp.path().join("artifacts"), 0).unwrap());
+        let executor = GitExecutor::new(GitOperation::Status, &workspace, artifacts.clone(), 0);
+        let outcome = executor
+            .execute(
+                &OperationRequest {
+                    id: OperationId::new(),
+                    kind: executor.contract().kind.clone(),
+                    actor: Principal::System,
+                    requirements: vec![arsy_kernel::capability::CapabilityRequirement::new(
+                        CapabilityAction::GitRead,
+                        ResourceRef::new("git", ".").unwrap(),
+                    )],
+                    input: json!({}),
+                },
+                &[],
+            )
+            .unwrap();
+        let id = ArtifactId::from_str(outcome.evidence[0].value()).unwrap();
+        let bytes = artifacts
+            .read(
+                id,
+                ArtifactReadLimits {
+                    max_bytes: MAX_GIT_OUTPUT_BYTES as u64,
+                    max_expansion_ratio: 100,
+                },
+            )
+            .unwrap();
+        let result: GitResult = serde_json::from_slice(&bytes).unwrap();
+        let mut by_path: std::collections::BTreeMap<&str, &str> = result
+            .changed_files
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.status.as_str()))
+            .collect();
+        assert_eq!(by_path.remove("tracked.txt"), Some(" M"));
+        assert_eq!(by_path.remove("staged.txt"), Some("A "));
+        assert_eq!(by_path.remove("untracked.txt"), Some("??"));
+        assert!(by_path.is_empty(), "{by_path:?}");
+    }
+
+    /// An untracked or modified file whose name happens to contain " -> " is
+    /// not a rename: the arrow is only ever a separator for the `R`/`C`
+    /// status codes porcelain actually uses it for.
+    #[test]
+    fn an_arrow_in_an_ordinary_file_name_is_not_mistaken_for_a_rename() {
+        let entries = parse_status("?? weird -> name.txt\n M another -> odd.txt\n");
+        assert_eq!(
+            entries,
+            vec![
+                ChangedFile {
+                    status: "??".to_owned(),
+                    path: "weird -> name.txt".to_owned(),
+                },
+                ChangedFile {
+                    status: " M".to_owned(),
+                    path: "another -> odd.txt".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_reports_the_new_path() {
+        let entries = parse_status("R  old.txt -> new.txt\n");
+        assert_eq!(
+            entries,
+            vec![ChangedFile {
+                status: "R ".to_owned(),
+                path: "new.txt".to_owned(),
+            }]
         );
     }
 

@@ -120,7 +120,11 @@ fn call(
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let config = crate::load_config(&root, &working)?;
-    let runtime = crate::agent_runtime(&root, &config, false)?;
+    // A one-shot command, not a turn: its plan/validation state has no
+    // session or task to share, so a fresh scope is the correct isolation,
+    // not an approximation of one.
+    let scope = arsy_kernel::domain::SessionId::new().to_string();
+    let runtime = crate::agent_runtime(&root, &config, false, &scope)?;
     let workspace = arsy_code::resource::Workspace::open(&root)
         .map_err(|error| crate::storage_failed(error.to_string()))?;
     let registry = arsy_code::operations::registry(
@@ -128,6 +132,7 @@ fn call(
         std::sync::Arc::new(crate::artifact_store(&root)?),
         arsy_kernel::artifact::unix_time_ms(),
         arsy_code::operations::Reachable::from_config(&config),
+        &scope,
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let kind = arsy_kernel::operation::OperationKind::new(operation)
