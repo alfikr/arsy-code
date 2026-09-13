@@ -619,6 +619,72 @@ pub const TOOLS: &[Tool] = &[
         summarize: |_| String::new(),
     },
     Tool {
+        name: "git_status",
+        operation: "git.status",
+        description: "The working tree's status: cleanliness and every changed, added, deleted, renamed, or untracked file, each with its two-letter status code. Use this instead of `bash git status`.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
+    },
+    Tool {
+        name: "git_branch",
+        operation: "git.branch",
+        description: "The current branch name. Empty when HEAD is detached.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
+    },
+    Tool {
+        name: "git_diff",
+        operation: "git.diff",
+        description: "The diff against a revision (a commit, branch, or `HEAD`). Use this instead of `bash git diff`.",
+        schema: || {
+            object(
+                json!({"revision": {"type": "string", "description": "A commit, branch, or ref, e.g. `HEAD` or `main`."}}),
+                &["revision"],
+            )
+        },
+        translate: |arguments| Ok(json!({"revision": text(arguments, "revision")})),
+        summarize: |arguments| text(arguments, "revision"),
+    },
+    Tool {
+        name: "git_log",
+        operation: "git.log",
+        description: "Recent commits: hash, author, date, and subject, one per line. Use this instead of `bash git log`.",
+        schema: || {
+            object(
+                json!({"max_entries": {"type": "number", "description": "How many commits, most recent first. 1 to 1000."}}),
+                &["max_entries"],
+            )
+        },
+        translate: |arguments| {
+            let max_entries = arguments
+                .get("max_entries")
+                .and_then(Value::as_u64)
+                .ok_or("git_log requires a numeric `max_entries`")?;
+            Ok(json!({"max_entries": max_entries}))
+        },
+        summarize: |arguments| {
+            arguments
+                .get("max_entries")
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        },
+    },
+    Tool {
+        name: "git_blame",
+        operation: "git.blame",
+        description: "Per-line authorship for one workspace file. Use this instead of `bash git blame`.",
+        schema: || {
+            object(
+                json!({"path": {"type": "string", "description": "Workspace-relative path."}}),
+                &["path"],
+            )
+        },
+        translate: |arguments| Ok(json!({"path": text(arguments, "path")})),
+        summarize: |arguments| text(arguments, "path"),
+    },
+    Tool {
         name: "plan_add",
         operation: "plan.add",
         description: "Add a step to the task's plan. Returns the whole plan. Steps start `pending`; put a new one after an existing step with `after`, or leave it off to append.",

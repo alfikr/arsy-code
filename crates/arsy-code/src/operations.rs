@@ -117,12 +117,7 @@ pub fn registry(
     reachable: Reachable,
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
-    for operation in [
-        GitOperation::Status,
-        GitOperation::Diff,
-        GitOperation::Log,
-        GitOperation::Blame,
-    ] {
+    for operation in GitOperation::ALL {
         registry.register(GitExecutor::new(
             operation,
             workspace,
@@ -252,6 +247,7 @@ mod tests {
                 "fs.read".to_owned(),
                 "fs.write".to_owned(),
                 "git.blame".to_owned(),
+                "git.branch".to_owned(),
                 "git.diff".to_owned(),
                 "git.log".to_owned(),
                 "git.status".to_owned(),
