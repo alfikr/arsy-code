@@ -1,0 +1,288 @@
+//! How readily an interactive tool call runs without asking the operator.
+//!
+//! Named after the modes an operator coming from another agent CLI already
+//! knows, mapped onto what this harness actually tracks: a capability grant
+//! per action, and a policy engine that can already deny a call outright.
+//! There is no command classifier here and no background safety check, so
+//! [`ApprovalMode::Plan`] and [`ApprovalMode::BypassPermissions`] are defined
+//! by what they refuse or skip rather than by a heuristic this codebase does
+//! not have — `BypassPermissions` behaves exactly like `Auto` today, and is
+//! kept as its own name so a future check has somewhere to attach without
+//! moving `Auto`'s callers under it by surprise.
+//!
+//! Policy can still deny a call in every mode: none of this skips
+//! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
+//! answered.
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalMode {
+    /// Reads run; anything else asks. The starting mode.
+    Default,
+    /// Reads and file writes/creates/edits/moves run; deletes, shell
+    /// commands, and everything else still asks.
+    AcceptEdits,
+    /// Reads and the plan/validation tools run; anything that would change
+    /// the workspace is refused outright, not asked. For exploring a
+    /// codebase before deciding to change it.
+    Plan,
+    /// Everything runs without asking.
+    Auto,
+    /// Reads run; anything else that would ask is refused instead of
+    /// prompting. For a script or CI run where nobody is at the keyboard.
+    DontAsk,
+    /// Everything runs without asking. See the module docs for why this is
+    /// not distinct from `Auto` yet.
+    BypassPermissions,
+}
+
+impl ApprovalMode {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "default" | "prompt" | "manual" | "ask" | "off" => Some(Self::Default),
+            "accept-edits" | "acceptedits" | "acceptEdits" => Some(Self::AcceptEdits),
+            "plan" => Some(Self::Plan),
+            "auto" | "all" | "always" | "on" => Some(Self::Auto),
+            "dont-ask" | "dontask" | "dontAsk" => Some(Self::DontAsk),
+            "bypass" | "bypass-permissions" | "bypasspermissions" | "bypassPermissions" => {
+                Some(Self::BypassPermissions)
+            }
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::DontAsk => "dontAsk",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    /// One line naming what runs without asking, for `/approval` with no
+    /// argument.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Default => "reads only; everything else asks",
+            Self::AcceptEdits => "reads and file writes/creates/edits/moves; everything else asks",
+            Self::Plan => "reads and the plan/validation tools; everything else is refused",
+            Self::Auto => "everything runs without asking",
+            Self::DontAsk => "reads only; everything else is refused instead of asked",
+            Self::BypassPermissions => "everything runs without asking (same as auto)",
+        }
+    }
+
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::AcceptEdits => 1,
+            Self::Plan => 2,
+            Self::Auto => 3,
+            Self::DontAsk => 4,
+            Self::BypassPermissions => 5,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::AcceptEdits,
+            2 => Self::Plan,
+            3 => Self::Auto,
+            4 => Self::DontAsk,
+            5 => Self::BypassPermissions,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// The current mode, shared the way the single auto-approve flag it replaces
+/// was: passed by reference into everything that asks, updated from
+/// wherever the operator changes it.
+#[derive(Default)]
+pub struct ApprovalCell(AtomicU8);
+
+impl ApprovalCell {
+    pub fn new(mode: ApprovalMode) -> Self {
+        Self(AtomicU8::new(mode.as_u8()))
+    }
+
+    pub fn get(&self) -> ApprovalMode {
+        ApprovalMode::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, mode: ApprovalMode) {
+        self.0.store(mode.as_u8(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Decision {
+    /// Runs without asking.
+    Approve,
+    /// The operator is asked.
+    Ask,
+    /// Refused without asking anyone.
+    Refuse,
+}
+
+/// A read, in the sense every mode above means it: it cannot change the
+/// workspace, so approving it costs nothing a mistake could not already cost
+/// by reading the wrong file.
+fn is_read(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.read"
+            | "fs.list"
+            | "search.files"
+            | "search.text"
+            | "code.symbol"
+            | "code.inspect"
+            | "code.references"
+            | "code.diagnostics"
+            | "repo_discover"
+            | "git_status"
+            | "git_branch"
+            | "git_diff"
+            | "git_log"
+            | "git_blame"
+            | "plan_list"
+            | "validate_status"
+    )
+}
+
+/// A structured file write, as opposed to a shell command that could do
+/// anything a write can and more.
+fn is_edit(name: &str) -> bool {
+    matches!(
+        name,
+        "fs.write" | "fs.create" | "fs.edit" | "fs.move" | "apply_patch"
+    )
+}
+
+/// Recording a plan or a validation result changes no file and runs no
+/// process; it is the harness's own bookkeeping, which `Plan` mode exists to
+/// still allow while nothing else that could change the workspace does.
+fn is_plan_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "plan_add" | "plan_update" | "plan_remove" | "plan_reorder" | "validate_record"
+    )
+}
+
+/// Whether `name` runs, asks, or is refused, under `mode`. Called only once
+/// policy has already said the call needs an answer — a call policy allows
+/// or denies outright never reaches this.
+pub fn decide(mode: ApprovalMode, name: &str) -> Decision {
+    match mode {
+        ApprovalMode::Auto | ApprovalMode::BypassPermissions => Decision::Approve,
+        ApprovalMode::Default => {
+            if is_read(name) {
+                Decision::Approve
+            } else {
+                Decision::Ask
+            }
+        }
+        ApprovalMode::AcceptEdits => {
+            if is_read(name) || is_edit(name) {
+                Decision::Approve
+            } else {
+                Decision::Ask
+            }
+        }
+        ApprovalMode::Plan => {
+            if is_read(name) || is_plan_tool(name) {
+                Decision::Approve
+            } else {
+                Decision::Refuse
+            }
+        }
+        ApprovalMode::DontAsk => {
+            if is_read(name) {
+                Decision::Approve
+            } else {
+                Decision::Refuse
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_mode_name_round_trips_through_its_label() {
+        for mode in [
+            ApprovalMode::Default,
+            ApprovalMode::AcceptEdits,
+            ApprovalMode::Plan,
+            ApprovalMode::Auto,
+            ApprovalMode::DontAsk,
+            ApprovalMode::BypassPermissions,
+        ] {
+            assert_eq!(ApprovalMode::parse(mode.label()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn default_asks_for_anything_that_is_not_a_read() {
+        assert_eq!(decide(ApprovalMode::Default, "fs.read"), Decision::Approve);
+        assert_eq!(decide(ApprovalMode::Default, "fs.write"), Decision::Ask);
+        assert_eq!(decide(ApprovalMode::Default, "bash"), Decision::Ask);
+    }
+
+    #[test]
+    fn accept_edits_runs_writes_but_still_asks_for_bash_and_delete() {
+        assert_eq!(
+            decide(ApprovalMode::AcceptEdits, "fs.write"),
+            Decision::Approve
+        );
+        assert_eq!(
+            decide(ApprovalMode::AcceptEdits, "apply_patch"),
+            Decision::Approve
+        );
+        assert_eq!(decide(ApprovalMode::AcceptEdits, "bash"), Decision::Ask);
+        assert_eq!(
+            decide(ApprovalMode::AcceptEdits, "fs.delete"),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn plan_mode_allows_the_plan_tools_and_refuses_everything_that_changes_the_workspace() {
+        assert_eq!(decide(ApprovalMode::Plan, "fs.read"), Decision::Approve);
+        assert_eq!(decide(ApprovalMode::Plan, "plan_add"), Decision::Approve);
+        assert_eq!(
+            decide(ApprovalMode::Plan, "validate_record"),
+            Decision::Approve
+        );
+        assert_eq!(decide(ApprovalMode::Plan, "fs.write"), Decision::Refuse);
+        assert_eq!(decide(ApprovalMode::Plan, "bash"), Decision::Refuse);
+    }
+
+    #[test]
+    fn dont_ask_refuses_instead_of_prompting() {
+        assert_eq!(decide(ApprovalMode::DontAsk, "fs.read"), Decision::Approve);
+        assert_eq!(decide(ApprovalMode::DontAsk, "bash"), Decision::Refuse);
+    }
+
+    #[test]
+    fn auto_and_bypass_approve_everything() {
+        for mode in [ApprovalMode::Auto, ApprovalMode::BypassPermissions] {
+            assert_eq!(decide(mode, "bash"), Decision::Approve);
+            assert_eq!(decide(mode, "fs.delete"), Decision::Approve);
+        }
+    }
+
+    #[test]
+    fn the_cell_starts_at_the_mode_it_was_built_with_and_can_be_changed() {
+        let cell = ApprovalCell::new(ApprovalMode::Default);
+        assert_eq!(cell.get(), ApprovalMode::Default);
+        cell.set(ApprovalMode::Auto);
+        assert_eq!(cell.get(), ApprovalMode::Auto);
+    }
+}

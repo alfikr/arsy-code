@@ -19,6 +19,8 @@
 //! | `ARSY-UIX-1000` | interactive terminal input or output failed |
 
 mod acp;
+#[cfg(feature = "tui")]
+mod approval;
 mod code;
 mod config_edit;
 mod eval;
@@ -1987,7 +1989,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut conversation: Vec<ModelMessage> = Vec::new();
     let mut auth_draft = String::new();
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
-    let auto_approve = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let approval =
+        std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
@@ -2473,25 +2476,28 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match line.split_whitespace().nth(1) {
-                    Some("auto" | "all" | "always" | "on") => {
-                        auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
-                        writeln!(stdout, "Auto-approval enabled for this session (all tools will run without prompts).").map_err(terminal_failed)?;
-                    }
-                    Some("prompt" | "manual" | "ask" | "off") => {
-                        auto_approve.store(false, std::sync::atomic::Ordering::Relaxed);
-                        writeln!(stdout, "Interactive approval prompts enabled.")
-                            .map_err(terminal_failed)?;
-                    }
-                    _ => {
-                        let cur = if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
-                            "auto (auto-approve all)"
-                        } else {
-                            "prompt (ask confirmation)"
-                        };
+                match line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(approval::ApprovalMode::parse)
+                {
+                    Some(mode) => {
+                        approval.set(mode);
                         writeln!(
                             stdout,
-                            "Current approval mode: {cur}\nUsage: /approval auto | prompt"
+                            "Approval mode: {} — {}",
+                            mode.label(),
+                            mode.description()
+                        )
+                        .map_err(terminal_failed)?;
+                    }
+                    None => {
+                        let current = approval.get();
+                        writeln!(
+                            stdout,
+                            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions",
+                            current.label(),
+                            current.description()
                         )
                         .map_err(terminal_failed)?;
                     }
@@ -2627,7 +2633,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &keys,
                     &mut decoder,
                     &mut composer,
-                    &auto_approve,
+                    &approval,
                     emitter,
                 ) {
                     Ok(turn) if turn.quit => break,
@@ -3480,7 +3486,7 @@ fn run_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
-    auto_approve: &std::sync::atomic::AtomicBool,
+    approval: &approval::ApprovalCell,
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
@@ -3515,7 +3521,7 @@ fn run_turn(
             keys,
             decoder,
             composer,
-            auto_approve,
+            approval,
         ),
         None => external_status(
             &root,
@@ -3674,7 +3680,7 @@ fn native_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
-    auto_approve: &std::sync::atomic::AtomicBool,
+    approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
@@ -3769,7 +3775,7 @@ fn native_turn(
                     &summary,
                     keys,
                     decoder,
-                    auto_approve,
+                    approval,
                 )? {
                     Executed::Answered(mut result) => {
                         if !result.changed_files.is_empty() {
@@ -3852,7 +3858,7 @@ fn execute_call(
     summary: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
-    auto_approve: &std::sync::atomic::AtomicBool,
+    approval: &approval::ApprovalCell,
 ) -> io::Result<Executed> {
     use arsy_code::agent::Authorization;
 
@@ -3867,40 +3873,27 @@ fn execute_call(
     let (grants, approval_note) = match &authorization {
         Authorization::Allowed(grants) => (grants.clone(), None),
         Authorization::Denied(reason) => return Ok(refused(reason.clone())),
-        Authorization::NeedsApproval { .. } => {
-            let is_read = matches!(
-                name,
-                "fs.read"
-                    | "fs.list"
-                    | "search.files"
-                    | "search.text"
-                    | "code.symbol"
-                    | "code.inspect"
-                    | "code.references"
-                    | "code.diagnostics"
-            );
-            if is_read || auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
-                match authorization.approve() {
-                    Ok(grants) => (grants, None),
-                    Err(error) => {
-                        return Ok(refused(format!(
-                            "the approval could not be turned into a grant: {error}"
-                        )))
-                    }
+        Authorization::NeedsApproval { .. } => match approval::decide(approval.get(), name) {
+            approval::Decision::Approve => match authorization.approve() {
+                Ok(grants) => (grants, None),
+                Err(error) => {
+                    return Ok(refused(format!(
+                        "the approval could not be turned into a grant: {error}"
+                    )))
                 }
-            } else {
+            },
+            approval::Decision::Refuse => {
+                return Ok(refused(format!(
+                    "the current approval mode ({}) refuses this call without asking: {}",
+                    approval.get().label(),
+                    authorization.requested()
+                )))
+            }
+            approval::Decision::Ask => {
                 let reason = authorization.requested();
                 let preview = format_tool_preview(name, arguments);
                 match confirm_tool(
-                    terminal,
-                    colour,
-                    name,
-                    summary,
-                    &reason,
-                    preview,
-                    keys,
-                    decoder,
-                    auto_approve,
+                    terminal, colour, name, summary, &reason, preview, keys, decoder, approval,
                 )? {
                     Answer::Yes { note } => match authorization.approve() {
                         Ok(grants) => (grants, note),
@@ -3922,7 +3915,7 @@ fn execute_call(
                     Answer::Stop => return Ok(Executed::Stopped),
                 }
             }
-        }
+        },
     };
     let (mut result, cancelled) = dispatch_tool_live(
         terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
@@ -4100,11 +4093,8 @@ fn confirm_tool(
     diff_preview: Option<String>,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
-    auto_approve: &std::sync::atomic::AtomicBool,
+    approval: &approval::ApprovalCell,
 ) -> io::Result<Answer> {
-    if auto_approve.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(Answer::Yes { note: None });
-    }
     let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
     let width = tui::terminal_width();
     let mut rendered_lines = dialog.render(width, colour).lines().count();
@@ -4122,7 +4112,7 @@ fn confirm_tool(
                                 return Ok(Answer::Yes { note })
                             }
                             tui::AskDialogResult::AlwaysApprove { note } => {
-                                auto_approve.store(true, std::sync::atomic::Ordering::Relaxed);
+                                approval.set(approval::ApprovalMode::Auto);
                                 return Ok(Answer::Yes { note });
                             }
                             tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
@@ -6383,7 +6373,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &std::sync::atomic::AtomicBool::new(false),
+            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
         )
         .unwrap();
         typist.join().unwrap();
@@ -6500,7 +6490,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &std::sync::atomic::AtomicBool::new(false),
+            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
         )
         .unwrap();
         typist.join().unwrap();
@@ -6564,7 +6554,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &std::sync::atomic::AtomicBool::new(false),
+            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
         )
         .unwrap();
         // Measured before the typist is joined, which outlives the turn on
