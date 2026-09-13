@@ -75,23 +75,27 @@ pub fn state() -> Arc<Mutex<PlanState>> {
     Arc::new(Mutex::new(PlanState::default()))
 }
 
-/// Every workspace's plan, kept alive for the life of the process.
+/// Every (workspace, scope)'s plan, kept alive for the life of the process.
 ///
 /// `operations::registry` is rebuilt once per turn — a fresh [`PlanState`]
 /// there would forget the plan the moment the model asked its next question.
 /// The plan is exactly the thing this tool exists to keep, so it is cached
-/// here by workspace root instead, and every turn's registry is handed the
-/// same one back.
-static WORKSPACES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<PlanState>>>>> = OnceLock::new();
+/// here instead, and every turn's registry is handed the same one back. The
+/// scope is part of the key, not just the workspace root, so a second task or
+/// session working the same workspace gets its own plan rather than picking
+/// up whatever the first one left.
+type WorkspaceKey = (PathBuf, String);
+static WORKSPACES: OnceLock<Mutex<HashMap<WorkspaceKey, Arc<Mutex<PlanState>>>>> = OnceLock::new();
 
-/// The plan for one workspace, shared across every registry built for it in
-/// this process. Lost on restart, the same ceiling `budget`'s in-memory
-/// transcript has; a resumed session's plan is not this ticket's scope.
-pub fn state_for(workspace_root: &Path) -> Arc<Mutex<PlanState>> {
+/// The plan for one (workspace, scope) pair, shared across every registry
+/// built for it in this process. Lost on restart, the same ceiling
+/// `budget`'s in-memory transcript has; a resumed session's plan is not this
+/// ticket's scope.
+pub fn state_for(workspace_root: &Path, scope: &str) -> Arc<Mutex<PlanState>> {
     let workspaces = WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut workspaces = workspaces.lock().unwrap_or_else(|error| error.into_inner());
     workspaces
-        .entry(workspace_root.to_path_buf())
+        .entry((workspace_root.to_path_buf(), scope.to_owned()))
         .or_insert_with(state)
         .clone()
 }

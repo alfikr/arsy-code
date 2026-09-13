@@ -62,6 +62,9 @@ pub enum Cleanup {
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessResult {
+    /// The command that was actually run. `validate.record` binds its claim
+    /// of what passed to this, not to a string the caller separately asserts.
+    pub argv: Vec<String>,
     pub status_code: Option<i32>,
     pub timed_out: bool,
     pub graceful_termination_sent: bool,
@@ -212,6 +215,7 @@ impl ProcessExecutor {
         let stdout_artifact = self.put(&stdout.bytes, actor.clone(), "application/octet-stream")?;
         let stderr_artifact = self.put(&stderr.bytes, actor.clone(), "application/octet-stream")?;
         let result = ProcessResult {
+            argv: input.argv.clone(),
             status_code: status.code(),
             timed_out,
             graceful_termination_sent: graceful,

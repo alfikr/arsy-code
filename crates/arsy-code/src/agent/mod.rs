@@ -1402,6 +1402,7 @@ fn explain(error: &OperationError) -> String {
 }
 
 /// Build the runtime for one workspace, with every operation this build offers.
+#[allow(clippy::too_many_arguments)]
 pub fn runtime(
     workspace: &Workspace,
     rules: RuleSet,
@@ -1410,12 +1411,14 @@ pub fn runtime(
     actor: Principal,
     context: RiskContext,
     reachable: crate::operations::Reachable,
+    scope: &str,
 ) -> Result<ToolRuntime, arsy_kernel::operation::RegistrationError> {
     let registry = crate::operations::registry(
         workspace,
         Arc::clone(&artifacts),
         retain_until_ms,
         reachable,
+        scope,
     )?;
     Ok(ToolRuntime::new(
         registry,

@@ -98,7 +98,14 @@ fn parse_status(porcelain: &str) -> Vec<ChangedFile> {
         .map(|line| {
             let status = line[..2].to_owned();
             let rest = &line[3..];
-            let path = rest.rsplit_once(" -> ").map_or(rest, |(_, new)| new);
+            // The arrow only marks a rename or copy; an ordinary path is
+            // reported byte for byte, including one that happens to contain
+            // the substring " -> ".
+            let path = if status.starts_with(['R', 'C']) {
+                rest.rsplit_once(" -> ").map_or(rest, |(_, new)| new)
+            } else {
+                rest
+            };
             ChangedFile {
                 status,
                 path: path.to_owned(),
@@ -525,6 +532,39 @@ mod tests {
         assert_eq!(by_path.remove("staged.txt"), Some("A "));
         assert_eq!(by_path.remove("untracked.txt"), Some("??"));
         assert!(by_path.is_empty(), "{by_path:?}");
+    }
+
+    /// An untracked or modified file whose name happens to contain " -> " is
+    /// not a rename: the arrow is only ever a separator for the `R`/`C`
+    /// status codes porcelain actually uses it for.
+    #[test]
+    fn an_arrow_in_an_ordinary_file_name_is_not_mistaken_for_a_rename() {
+        let entries = parse_status("?? weird -> name.txt\n M another -> odd.txt\n");
+        assert_eq!(
+            entries,
+            vec![
+                ChangedFile {
+                    status: "??".to_owned(),
+                    path: "weird -> name.txt".to_owned(),
+                },
+                ChangedFile {
+                    status: " M".to_owned(),
+                    path: "another -> odd.txt".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_reports_the_new_path() {
+        let entries = parse_status("R  old.txt -> new.txt\n");
+        assert_eq!(
+            entries,
+            vec![ChangedFile {
+                status: "R ".to_owned(),
+                path: "new.txt".to_owned(),
+            }]
+        );
     }
 
     fn git(path: &Path, args: &[&str]) {

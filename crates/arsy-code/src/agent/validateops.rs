@@ -84,16 +84,18 @@ pub fn state() -> Arc<Mutex<ValidationState>> {
     Arc::new(Mutex::new(ValidationState::default()))
 }
 
-/// Every workspace's validation log, kept alive for the life of the process —
-/// the same reason, and the same restart ceiling, as
-/// [`planops::state_for`](super::planops::state_for).
-static WORKSPACES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<ValidationState>>>>> = OnceLock::new();
+/// Every (workspace, scope)'s validation log, kept alive for the life of the
+/// process — the same reason, the same scope-isolation, and the same restart
+/// ceiling, as [`planops::state_for`](super::planops::state_for).
+type WorkspaceKey = (PathBuf, String);
+static WORKSPACES: OnceLock<Mutex<HashMap<WorkspaceKey, Arc<Mutex<ValidationState>>>>> =
+    OnceLock::new();
 
-pub fn state_for(workspace_root: &Path) -> Arc<Mutex<ValidationState>> {
+pub fn state_for(workspace_root: &Path, scope: &str) -> Arc<Mutex<ValidationState>> {
     let workspaces = WORKSPACES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut workspaces = workspaces.lock().unwrap_or_else(|error| error.into_inner());
     workspaces
-        .entry(workspace_root.to_path_buf())
+        .entry((workspace_root.to_path_buf(), scope.to_owned()))
         .or_insert_with(state)
         .clone()
 }
@@ -201,7 +203,17 @@ impl ValidateExecutor {
     /// A model that never ran the command, or ran a different one, has no
     /// artifact id to give; one that ran it and got a failure cannot report
     /// `passed` by simply saying so.
-    fn outcome_of(&self, evidence: &str) -> Result<ValidationOutcome, OperationError> {
+    ///
+    /// The evidence proves only that *some* command exited 0 unless it is
+    /// also checked against `command`: `bash` runs everything as `sh -c
+    /// <command>`, so its argv's last element is the command text, and that
+    /// has to match what is being recorded — otherwise `true` is evidence
+    /// for `cargo test`.
+    fn outcome_of(
+        &self,
+        evidence: &str,
+        command: &str,
+    ) -> Result<ValidationOutcome, OperationError> {
         let id: ArtifactId = evidence
             .parse()
             .map_err(|_| OperationError::Execution("`evidence` is not an artifact id".into()))?;
@@ -214,6 +226,11 @@ impl ValidateExecutor {
                 "evidence must be the artifact id a `bash` call returned".into(),
             )
         })?;
+        if result.argv.last().map(String::as_str) != Some(command) {
+            return Err(OperationError::Execution(
+                "`evidence` is a result for a different command than `command` names".into(),
+            ));
+        }
         Ok(if !result.timed_out && result.status_code == Some(0) {
             ValidationOutcome::Passed
         } else {
@@ -253,6 +270,7 @@ impl OperationExecutor for ValidateExecutor {
                     .get("evidence")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
+                command,
             )?;
             let mut detail = input
                 .get("detail")
@@ -311,8 +329,13 @@ mod tests {
 
     /// The artifact a `bash` call itself would have left, so a test can hand
     /// `validate.record` a real id rather than a claim.
-    fn evidence(artifacts: &Arc<dyn ArtifactStore>, status_code: Option<i32>) -> String {
+    fn evidence(
+        artifacts: &Arc<dyn ArtifactStore>,
+        command: &str,
+        status_code: Option<i32>,
+    ) -> String {
         let result = ProcessResult {
+            argv: vec!["sh".into(), "-c".into(), command.into()],
             status_code,
             timed_out: false,
             graceful_termination_sent: false,
@@ -374,7 +397,7 @@ mod tests {
             "validate.record",
             serde_json::json!({
                 "command": "cargo test -p arsy-code",
-                "evidence": evidence(&artifacts, Some(1)),
+                "evidence": evidence(&artifacts, "cargo test -p arsy-code", Some(1)),
                 "detail": "assertion failed: left == right"
             }),
         );
@@ -387,7 +410,7 @@ mod tests {
             "validate.record",
             serde_json::json!({
                 "command": "cargo test -p arsy-code",
-                "evidence": evidence(&artifacts, Some(0)),
+                "evidence": evidence(&artifacts, "cargo test -p arsy-code", Some(0)),
             }),
         );
         assert_eq!(log.records.len(), 2);
@@ -461,6 +484,7 @@ mod tests {
     fn a_timed_out_run_is_never_a_pass() {
         let (_dir, executors, artifacts) = setup();
         let timed_out = ProcessResult {
+            argv: vec!["sh".into(), "-c".into(), "sleep 300".into()],
             status_code: Some(0),
             timed_out: true,
             graceful_termination_sent: true,
@@ -487,5 +511,27 @@ mod tests {
             log.actionable(),
             "a timed-out run is not evidence of a pass"
         );
+    }
+
+    /// Evidence that `true` exited 0 is not evidence that `cargo test`
+    /// passed: the command named has to be the one the evidence itself ran.
+    #[test]
+    fn evidence_for_a_different_command_is_rejected() {
+        let (_dir, executors, artifacts) = setup();
+        let executor = executors
+            .iter()
+            .find(|executor| executor.contract().kind.as_str() == "validate.record")
+            .unwrap();
+        let request = OperationRequest {
+            id: OperationId::new(),
+            kind: executor.contract().kind.clone(),
+            actor: Principal::User("test".into()),
+            requirements: Vec::new(),
+            input: serde_json::json!({
+                "command": "cargo test -p arsy-code",
+                "evidence": evidence(&artifacts, "true", Some(0)),
+            }),
+        };
+        assert!(executor.execute(&request, &[]).is_err());
     }
 }

@@ -54,11 +54,15 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
         arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
             .map_err(|error| storage_failed(error.to_string()))?,
     );
+    // One registry for the life of this process, and this process is the
+    // whole of one client's session: its own fresh scope is the plan and
+    // validation history's correct lifetime.
     let registry = arsy_code::operations::registry(
         &workspace,
         artifacts,
         arsy_kernel::artifact::unix_time_ms(),
         arsy_code::operations::Reachable::from_config(&config),
+        &arsy_kernel::domain::SessionId::new().to_string(),
     )
     .map_err(|error| storage_failed(error.to_string()))?;
 

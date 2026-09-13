@@ -3511,7 +3511,12 @@ fn run_turn(
     let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
-            &agent_runtime(&root, &load_config(&root, &working)?, true)?,
+            &agent_runtime(
+                &root,
+                &load_config(&root, &working)?,
+                true,
+                &session_id.to_string(),
+            )?,
             conversation,
             route,
             effort,
@@ -5156,7 +5161,7 @@ impl<'a> TaskRun<'a> {
         // No operator is present, so nothing can be confirmed mid-run: the risk
         // context says so, and a call that needs an approval is refused by
         // policy rather than waiting on a keyboard that is not there.
-        let agent = agent_runtime(&self.root, &self.config, false)?;
+        let agent = agent_runtime(&self.root, &self.config, false, &task.to_string())?;
         // A supervisor exists only when policy actually delegates something,
         // so a workspace that grants nothing sees no spawn tool rather than one
         // that always refuses.
@@ -6114,10 +6119,15 @@ fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStor
         .map_err(|error| storage_failed(error.to_string()))
 }
 
+/// `scope` isolates the plan and validation history this runtime's
+/// `plan.*`/`validate.*` kinds hold from another unit of work in the same
+/// workspace — a session id for a turn, a task id for an autonomous task, or
+/// any other value unique to the caller. See `operations::registry`.
 fn agent_runtime(
     root: &Path,
     config: &arsy_kernel::config::Config,
     interactive: bool,
+    scope: &str,
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
         .map_err(|error| storage_failed(error.to_string()))?;
@@ -6135,6 +6145,7 @@ fn agent_runtime(
             sandbox: installed_sandbox_assurance(),
         },
         arsy_code::operations::Reachable::from_config(config),
+        scope,
     )
     .map_err(|error| storage_failed(error.to_string()))
 }
@@ -6293,7 +6304,7 @@ mod tests {
     /// workspace gets — which is what a first run actually sees.
     #[cfg(feature = "tui")]
     fn test_runtime(root: &Path) -> arsy_code::agent::ToolRuntime {
-        agent_runtime(root, &load_config(root, root).unwrap(), true).unwrap()
+        agent_runtime(root, &load_config(root, root).unwrap(), true, "test").unwrap()
     }
 
     /// Answers typed at the confirmation prompt. Keys sent while a round is

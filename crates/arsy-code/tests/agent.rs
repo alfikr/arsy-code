@@ -53,6 +53,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
             sandbox: SandboxAssurance::None,
         },
         arsy_code::operations::Reachable::default(),
+        "test",
     )
     .unwrap()
 }

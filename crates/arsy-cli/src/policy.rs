@@ -53,11 +53,15 @@ pub fn explain(
         arsy_kernel::artifact::FileArtifactStore::open(root.join(".arsy/artifacts"), 0)
             .map_err(|error| crate::storage_failed(error.to_string()))?,
     );
+    // An explanation, not a turn: nothing here shares a session or task, so a
+    // fresh scope is the correct isolation for whatever plan/validation state
+    // this registry's contracts describe.
     let registry = arsy_code::operations::registry(
         &workspace,
         artifacts,
         0,
         arsy_code::operations::Reachable::from_config(&config),
+        &arsy_kernel::domain::SessionId::new().to_string(),
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let contract = registry.contract(&kind).ok_or_else(|| {

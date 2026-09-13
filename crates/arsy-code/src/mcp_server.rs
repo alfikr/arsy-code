@@ -348,6 +348,7 @@ mod tests {
             artifacts,
             0,
             crate::operations::Reachable::default(),
+            "test",
         )
         .unwrap();
         let server = McpServer::new(
