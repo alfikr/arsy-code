@@ -131,7 +131,7 @@ Usage:
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
-  arsy update [--check]      check for and install arsy-code updates
+  arsy update [--check]      report the running version; ARSY does not self-update
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)

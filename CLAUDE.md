@@ -75,13 +75,15 @@ Release channels: GitHub Release binaries for six Tier 1 targets with a
 Sigstore-signed `SHA256SUMS`, the SuiFlex Homebrew tap, the SuiFlex Scoop
 bucket, the npm package `@suiflex/arsy-code` (a launcher that downloads and
 verifies the matching archive in a postinstall step), and `install.sh` /
-`install.ps1` (checksum-only — they do not check the signature). All of them
-are published by `.github/workflows/release.yml`. See
+`install.ps1` (checksum-only — they do not check the signature).
+`.github/workflows/release.yml` publishes the release, the tap, and the bucket;
+npm is published separately by `npm-publish.yml` once that build succeeds. See
 [docs/34-distribution.md](docs/34-distribution.md).
 
 ## CI
 
 All workflows are active — see `.github/workflows/README.md` for the release
 path and the secrets it needs. Cut a release by dispatching
-`release-please.yml`, which calls `release.yml` and `npm-publish.yml`; pushing
-a tag by hand runs the same build but can double-publish to npm.
+`release-please.yml`: merging the pull request it opens tags the release, and
+the tag push is what builds and publishes. Pushing a tag by hand runs the same
+build without the changelog and version bump that precede it.

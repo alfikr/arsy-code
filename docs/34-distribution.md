@@ -2,7 +2,7 @@
 
 ## Channels
 
-GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, a `.sha256` sidecar beside each, an aggregate `SHA256SUMS` with its Sigstore signature and bundle, and a CycloneDX SBOM. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
+GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, a `.sha256` sidecar beside each, an aggregate `SHA256SUMS`, a Sigstore bundle signing it, a CycloneDX SBOM per crate, and `install.sh` / `install.ps1`. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
 
 The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a SuiFlex Scoop bucket for Windows, the public npm package `@suiflex/arsy-code`, and `install.sh` / `install.ps1` published alongside each GitHub Release. All of them reference an exact GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries. Cargo, unattended self-update, OS stores, and third-party package repositories remain out of scope until demand justifies them.
 
@@ -29,20 +29,20 @@ Tier 1 means native CI build and test, signed release artifacts, and security fi
 
 ## Install and verify
 
-For the canonical channel, download the archive, `SHA256SUMS`, matching `.sig`, and matching `.bundle` from the same release. Verify the digest before extraction, then verify `SHA256SUMS` with Sigstore while pinning the `suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A digest or signature mismatch is fatal; the installer must not offer an override.
+For the canonical channel, download the archive, `SHA256SUMS`, and `SHA256SUMS.bundle` from the same release. Verify the digest before extraction, then verify `SHA256SUMS` with Sigstore while pinning the `suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A digest or signature mismatch is fatal; the installer must not offer an override.
 
 ```console
 sha256sum --check --ignore-missing SHA256SUMS
-cosign verify-blob SHA256SUMS --signature SHA256SUMS.sig --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp '^https://github.com/suiflex/arsy-code/.github/workflows/release.yml@refs/' \
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.bundle \
+  --certificate-identity-regexp '^https://github.com/suiflex/arsy-code/.github/workflows/release.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-The certificate identity is the workflow that signed, not the tag. `release.yml`
-runs as a reusable workflow called by `release-please.yml`, so the ref embedded
-in the certificate is the branch that invoked it rather than `refs/tags/<tag>`.
-Pin the regexp to the exact identity a given release actually carries; `cosign
-verify-blob` prints the identity it found when the match fails.
+The bundle carries the signature, the certificate, and the transparency-log
+entry together, so there is no separate `.sig` to fetch. The certificate names
+the workflow and the ref it ran from — a release is built by the tag push, so
+that ref is `refs/tags/<tag>`, which is what the regexp above pins. `cosign
+verify-blob` prints the identity it found when a match fails.
 
 On macOS, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum`. On Windows, Scoop validates the manifest's pinned SHA-256 before installation. Homebrew likewise validates the formula's pinned `sha256`. Both manifests are rendered from this repository's `packaging/` templates and pushed only after the GitHub Release publishes, and both pin digests taken from that same build.
 
@@ -76,7 +76,7 @@ instead of `latest`; `ARSY_INSTALL_DIR` overrides the install directory.
 `verify-installers` job runs it plus a PowerShell parse of `install.ps1`
 before any platform build.
 
-After extraction or package-manager installation, run `arsy doctor`. It reports the version, target, config paths, sandbox assurance, and release provenance without sending telemetry.
+After extraction or package-manager installation, run `arsy doctor`. It reports the version, target, config paths, storage, and the resolved provider and credential without sending telemetry. It does not check the release it came from; verify provenance with the bundle as above.
 
 ## Update and rollback
 
@@ -93,4 +93,4 @@ Before replacement, stop active sessions cleanly. Config and session migrations 
 
 ## Release gate
 
-A release is publishable only when all Tier 1 native jobs pass, the lockfile and license policy pass, and the SBOM and checksums are generated from the final bytes. `SHA256SUMS` is verified with `sha256sum --check` against those bytes before it is signed. Package manifests are downstream of that gate: the tap and bucket jobs run only after the release publishes, and pin digests from the same build.
+A release is publishable only when all Tier 1 native jobs pass and the SBOM and checksums are generated from the final bytes: `publish` waits on `build`, `sbom`, and `checksums`. The lockfile and licence policy are enforced by `ci.yml` on the way to `main` rather than by the release itself, so a tag pushed past a red `main` would not be stopped here. `SHA256SUMS` is verified with `sha256sum --check` against those bytes before it is signed. Package manifests are downstream of that gate: the tap and bucket jobs run only after the release publishes, and pin digests from the same build.
