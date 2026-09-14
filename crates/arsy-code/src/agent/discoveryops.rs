@@ -78,6 +78,21 @@ fn language_of(file_name: &str) -> Option<&'static str> {
 /// The git root at or above `start`, as a path relative to `workspace_root`.
 /// `None` when the walk leaves the workspace before finding one, which is the
 /// ordinary case for a workspace opened outside any git checkout.
+/// A workspace-relative path as it is reported.
+///
+/// `resolve_file` names a resource with forward slashes, so discovery answers
+/// with the same spelling rather than handing a caller `crates\\one` on one
+/// platform and `crates/one` on another. A backslash is a legal character in a
+/// Unix file name, so only Windows rewrites.
+fn reported(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text
+    }
+}
+
 fn git_root(workspace_root: &Path) -> Option<PathBuf> {
     let mut candidate = workspace_root;
     loop {
@@ -116,12 +131,12 @@ fn cargo_members(root: &Path, manifest: &Path) -> Vec<String> {
             for entry in entries.flatten() {
                 if entry.path().join("Cargo.toml").is_file() {
                     if let Ok(relative) = entry.path().strip_prefix(root) {
-                        resolved.push(relative.display().to_string());
+                        resolved.push(reported(relative));
                     }
                 }
             }
         } else if let Ok(relative) = base.join(member).strip_prefix(root) {
-            resolved.push(relative.display().to_string());
+            resolved.push(reported(relative));
         }
     }
     resolved.sort();
@@ -156,12 +171,12 @@ fn npm_members(root: &Path, manifest: &Path) -> Vec<String> {
             for entry in entries.flatten() {
                 if entry.path().join("package.json").is_file() {
                     if let Ok(relative) = entry.path().strip_prefix(root) {
-                        resolved.push(relative.display().to_string());
+                        resolved.push(reported(relative));
                     }
                 }
             }
         } else if let Ok(relative) = base.join(pattern).strip_prefix(root) {
-            resolved.push(relative.display().to_string());
+            resolved.push(reported(relative));
         }
     }
     resolved.sort();
@@ -182,10 +197,10 @@ fn discover(workspace_root: &Path) -> Discovery {
                 if relative.as_os_str().is_empty() {
                     ".".to_owned()
                 } else {
-                    relative.display().to_string()
+                    reported(relative)
                 }
             })
-            .unwrap_or_else(|_| found.display().to_string())
+            .unwrap_or_else(|_| reported(&found))
     });
 
     let mut manifests = Vec::new();
@@ -217,7 +232,7 @@ fn discover(workspace_root: &Path) -> Discovery {
         };
         languages.insert(language);
         manifests.push(Manifest {
-            path: relative.display().to_string(),
+            path: reported(relative),
             language: language.to_owned(),
         });
         match file_name {

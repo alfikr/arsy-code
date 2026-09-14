@@ -89,9 +89,30 @@ pub struct Workspace {
     path: PathBuf,
 }
 
+/// Drop Windows' extended-length prefix from a canonicalized path.
+///
+/// `canonicalize` returns `\\?\C:\...` on Windows, and nothing else produces
+/// that spelling: not a URI from a language server, not an argument from the
+/// operator. Every comparison against the workspace root would then fail
+/// against a path naming the very same file, and a file inside the workspace
+/// would be reported as escaping it.
+///
+/// A UNC share canonicalizes to `\\?\UNC\server\share`, which needs a
+/// different rewrite to be usable, so those are left as they are.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn without_verbatim_prefix(path: &str) -> Option<&str> {
+    path.strip_prefix(r"\\?\")
+        .filter(|rest| !rest.starts_with("UNC\\"))
+}
+
 impl Workspace {
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         let path = std::fs::canonicalize(root)?;
+        #[cfg(windows)]
+        let path = match path.to_str().and_then(without_verbatim_prefix) {
+            Some(plain) => PathBuf::from(plain),
+            None => path,
+        };
         Dir::open_ambient_dir(&path, ambient_authority()).map(|root| Self { root, path })
     }
 
@@ -392,5 +413,22 @@ mod tests {
             Workspace::open(temp.path()).unwrap().resolve_file("escape"),
             Err(ResolveError::OutsideWorkspace)
         ));
+    }
+
+    /// Runs everywhere, because the rewrite is string work and a Unix build
+    /// that silently broke it would only be caught on Windows.
+    #[test]
+    fn a_verbatim_prefix_is_dropped_but_a_unc_share_is_left_alone() {
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\C:\Users\runner\repo"),
+            Some(r"C:\Users\runner\repo")
+        );
+        assert_eq!(without_verbatim_prefix(r"C:\Users\runner\repo"), None);
+        assert_eq!(without_verbatim_prefix("/home/runner/repo"), None);
+        assert_eq!(
+            without_verbatim_prefix(r"\\?\UNC\server\share\repo"),
+            None,
+            "a share needs a different rewrite to stay usable"
+        );
     }
 }
