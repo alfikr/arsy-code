@@ -695,7 +695,9 @@ fn configure_trusting(home: &Path, port: u16, workspace: &Path) {
     configure(home, port);
     let mut config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     config.push_str(&format!(
-        "[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+        // A literal key: a Windows path's backslashes are escapes in a TOML
+        // basic string.
+        "[project.'{}']\ntrust_level = \"trusted\"\n",
         workspace.display()
     ));
     std::fs::write(home.join("config.toml"), config).unwrap();
