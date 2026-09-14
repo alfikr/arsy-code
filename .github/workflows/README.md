@@ -25,6 +25,15 @@ signed artifacts, and `docs/34-distribution.md` verifies them against
 `.github/workflows/release.yml@refs/tags/` as the certificate identity. Tagging
 while it is parked produces no artifacts and no signature.
 
+`release-please.yml` and `npm-publish.yml` follow the same convention and
+must be restored alongside it: `release-please.yml` opens/updates the release
+PR and, once one merges, calls `release.yml` and `npm-publish.yml` as reusable
+workflows to build and publish. `release-please.yml` also needs a
+`RELEASE_PLEASE_TOKEN` repository secret (a PAT, not `github.token` — PRs
+opened with the default token don't trigger workflow events) and npm Trusted
+Publishing configured for `@suiflex/arsy-code` and each
+`@suiflex/arsy-code-<platform>` package.
+
 Re-enable one by dropping the suffix:
 
     git mv .github/workflows/ci.yml.disabled .github/workflows/ci.yml
