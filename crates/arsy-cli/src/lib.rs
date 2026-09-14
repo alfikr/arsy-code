@@ -3538,27 +3538,9 @@ fn provider_step(
     };
 
     match step {
-        Step::Pick => match answer {
-            "+new" => Ok(ProviderNext::Ask(Step::Name)),
-            "-remove" => Ok(ProviderNext::Ask(Step::Remove)),
-            chosen if providers.iter().any(|name| name == chosen) => {
-                write_config(|config| config_edit::set_default(config, chosen))?;
-                Ok(ProviderNext::Done(format!("Provider: {chosen}")))
-            }
-            other => Err(format!(
-                "`{}` is not a configured provider",
-                tui::safe_text(other)
-            )),
-        },
+        Step::Pick => provider_picked(answer, providers),
         Step::Name => {
-            let name = writable("provider name")?;
-            if providers.contains(&name) {
-                return Err(format!("`{name}` is already configured"));
-            }
-            if name.starts_with(['+', '-']) {
-                return Err("a provider name cannot start with `+` or `-`".to_owned());
-            }
-            draft.name = name;
+            draft.name = provider_name(writable("provider name")?, providers)?;
             Ok(ProviderNext::Ask(Step::Kind))
         }
         Step::Kind => {
@@ -3599,6 +3581,36 @@ fn provider_step(
             provider_removed(invocation, &draft.name.clone())
         }
     }
+}
+
+/// The first answer: one of the two wizard rows, or an endpoint to switch to.
+#[cfg(feature = "tui")]
+fn provider_picked(answer: &str, providers: &[String]) -> Result<ProviderNext, String> {
+    match answer {
+        "+new" => Ok(ProviderNext::Ask(tui::ProviderStep::Name)),
+        "-remove" => Ok(ProviderNext::Ask(tui::ProviderStep::Remove)),
+        chosen if providers.iter().any(|name| name == chosen) => {
+            write_config(|config| config_edit::set_default(config, chosen))?;
+            Ok(ProviderNext::Done(format!("Provider: {chosen}")))
+        }
+        other => Err(format!(
+            "`{}` is not a configured provider",
+            tui::safe_text(other)
+        )),
+    }
+}
+
+/// A name for a new endpoint: not one that exists, and not one the picker
+/// would read as its own `+new` or `-remove` row.
+#[cfg(feature = "tui")]
+fn provider_name(name: String, providers: &[String]) -> Result<String, String> {
+    if providers.contains(&name) {
+        return Err(format!("`{name}` is already configured"));
+    }
+    if name.starts_with(['+', '-']) {
+        return Err("a provider name cannot start with `+` or `-`".to_owned());
+    }
+    Ok(name)
 }
 
 /// The last answer of the add wizard: store the credential, write the
