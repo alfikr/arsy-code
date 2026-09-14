@@ -3581,27 +3581,7 @@ fn provider_step(
             draft.store = one_of(tui::PROVIDER_STORES)?;
             Ok(ProviderNext::Ask(Step::Key))
         }
-        Step::Key => {
-            let handle = store_credential(invocation, &draft.name, &draft.store, answer)?;
-            let endpoint = config_edit::Endpoint {
-                name: draft.name.clone(),
-                kind: draft.kind.clone(),
-                base_url: draft.base_url.clone(),
-                models: draft.models.clone(),
-                credential: handle,
-            };
-            write_config(|config| {
-                let config = config_edit::append_endpoint(config, &endpoint)?;
-                config_edit::set_default(&config, &endpoint.name)
-            })?;
-            Ok(ProviderNext::Done(format!(
-                "Added provider {} with {} model{}, and made it the default. The others are \
-                 still configured; `/provider` switches between them.",
-                endpoint.name,
-                endpoint.models.len(),
-                if endpoint.models.len() == 1 { "" } else { "s" },
-            )))
-        }
+        Step::Key => provider_added(invocation, draft, answer),
         Step::Remove => {
             if !providers.iter().any(|name| name == answer) {
                 return Err(format!(
@@ -3616,35 +3596,81 @@ fn provider_step(
             if one_of(tui::CONFIRM_ROWS)? == "no" {
                 return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
             }
-            let name = draft.name.clone();
-            write_config(|config| config_edit::remove_endpoint(config, &name))?;
-            let store = CatalogStore::resolve(invocation);
-            if let Ok(mut records) = catalog(store) {
-                let to_remove: Vec<SecretHandle> = records
-                    .iter()
-                    .filter(|r| {
-                        r.handle.name() == name || r.handle.name() == format!("endpoint.{name}")
-                    })
-                    .map(|r| r.handle.clone())
-                    .collect();
-                records.retain(|r| !to_remove.contains(&r.handle));
-                let _ = save_catalog(store, &records);
-                for handle in to_remove {
-                    match handle.store() {
-                        OS_STORE_ID => {
-                            let _ = OsCredentialStore.remove(handle.name());
-                        }
-                        FILE_STORE_ID => {
-                            let _ = FileCredentialStore.remove(handle.name());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(ProviderNext::Done(format!(
-                "Removed provider {name} and its credentials."
-            )))
+            provider_removed(invocation, &draft.name.clone())
         }
+    }
+}
+
+/// The last answer of the add wizard: store the credential, write the
+/// endpoint, and make it the default.
+#[cfg(feature = "tui")]
+fn provider_added(
+    invocation: &Invocation,
+    draft: &tui::ProviderDraft,
+    key: &str,
+) -> Result<ProviderNext, String> {
+    let handle = store_credential(invocation, &draft.name, &draft.store, key)?;
+    let endpoint = config_edit::Endpoint {
+        name: draft.name.clone(),
+        kind: draft.kind.clone(),
+        base_url: draft.base_url.clone(),
+        models: draft.models.clone(),
+        credential: handle,
+    };
+    write_config(|config| {
+        let config = config_edit::append_endpoint(config, &endpoint)?;
+        config_edit::set_default(&config, &endpoint.name)
+    })?;
+    Ok(ProviderNext::Done(format!(
+        "Added provider {} with {} model{}, and made it the default. The others are \
+         still configured; `/provider` switches between them.",
+        endpoint.name,
+        endpoint.models.len(),
+        if endpoint.models.len() == 1 { "" } else { "s" },
+    )))
+}
+
+/// Remove the endpoint and every credential stored for it.
+///
+/// The catalog is updated first and the stores after it, so a store that
+/// refuses cannot leave the catalog naming a credential the wizard just said
+/// it removed.
+#[cfg(feature = "tui")]
+fn provider_removed(invocation: &Invocation, name: &str) -> Result<ProviderNext, String> {
+    write_config(|config| config_edit::remove_endpoint(config, name))?;
+    let store = CatalogStore::resolve(invocation);
+    if let Ok(mut records) = catalog(store) {
+        let removed: Vec<SecretHandle> = records
+            .iter()
+            .filter(|record| {
+                record.handle.name() == name || record.handle.name() == format!("endpoint.{name}")
+            })
+            .map(|record| record.handle.clone())
+            .collect();
+        records.retain(|record| !removed.contains(&record.handle));
+        let _ = save_catalog(store, &records);
+        for handle in removed {
+            forget_credential(&handle);
+        }
+    }
+    Ok(ProviderNext::Done(format!(
+        "Removed provider {name} and its credentials."
+    )))
+}
+
+/// Delete one stored credential from whichever store holds it. A store that
+/// refuses is not an error here: the catalog no longer names the handle, and
+/// the wizard has nothing left to undo.
+#[cfg(feature = "tui")]
+fn forget_credential(handle: &SecretHandle) {
+    match handle.store() {
+        OS_STORE_ID => {
+            let _ = OsCredentialStore.remove(handle.name());
+        }
+        FILE_STORE_ID => {
+            let _ = FileCredentialStore.remove(handle.name());
+        }
+        _ => {}
     }
 }
 #[cfg(feature = "tui")]

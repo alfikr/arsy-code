@@ -796,94 +796,124 @@ impl Config {
     }
 
     fn apply(&mut self, layer: Layer, path: &Path, raw: &str) -> Result<(), ConfigError> {
-        let reject = |message: String| ConfigError {
-            path: path.to_path_buf(),
-            message,
-        };
         // Parsed as JSON into the same tree the rest of this module walks. The
         // tree type is `toml`'s because that is what the schema was written
         // against; no configuration file is TOML any more.
-        let table: toml::Table = serde_json::from_str(raw)
-            .map_err(|error| reject(format!("is not valid JSON: {error}")))?;
-        // Absent means this schema: a settings file a person just created is
-        // `{}`, and refusing that would make the first edit a ceremony. A
-        // version that *is* written still has to be one this build understands,
-        // so a future file fails loudly rather than being half-applied.
-        match table.get("schema_version") {
-            None => {}
-            Some(value) => match value.as_integer() {
-                Some(SCHEMA_VERSION) => {}
-                Some(other) => return Err(reject(format!("unsupported schema_version {other}"))),
-                None => return Err(reject("`schema_version` must be an integer".to_owned())),
-            },
-        }
+        let table: toml::Table = serde_json::from_str(raw).map_err(|error| ConfigError {
+            path: path.to_path_buf(),
+            message: format!("is not valid JSON: {error}"),
+        })?;
+        check_schema_version(&table, path)?;
         for (key, value) in &table {
-            match key.as_str() {
-                "schema_version" => {}
-                "provider" => self.apply_provider(layer, path, value)?,
-                "model" => {
-                    let table = as_table(value, "model", path)?;
-                    if let Some(default) = string(table, "default", "model.default", path)? {
-                        self.model_default = Some(default.clone());
-                        self.record(layer, path, "model.default", default);
-                    }
-                    if let Some(value) = table.get("allowed") {
-                        let allowed = name_set(value, "model.allowed", path)?;
-                        self.record(layer, path, "model.allowed", joined(&allowed));
-                        self.model_allowed = Some(intersect(self.model_allowed.take(), allowed));
-                    }
-                }
-                "credentials" => {
-                    let table = as_table(value, "credentials", path)?;
-                    if let Some(store) = string(table, "store", "credentials.store", path)?.cloned()
-                    {
-                        if !CREDENTIAL_STORES.contains(&store.as_str()) {
-                            return Err(reject(format!(
-                                "credentials.store must be one of {}, not `{store}`",
-                                CREDENTIAL_STORES.join(", ")
-                            )));
-                        }
-                        self.credential_store = Some(store.clone());
-                        self.record(layer, path, "credentials.store", store);
-                    }
-                }
-                "execution" => {
-                    // The rest of `[execution]` is still inert, so an unknown
-                    // key here is accepted as it always was; only the one this
-                    // build reads is validated.
-                    let table = as_table(value, "execution", path)?;
-                    if let Some(value) = table.get("max_parallel") {
-                        let key = "execution.max_parallel";
-                        let limit = value
-                            .as_integer()
-                            .and_then(|limit| usize::try_from(limit).ok())
-                            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
-                            .ok_or_else(|| {
-                                reject(format!(
-                                    "`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"
-                                ))
-                            })?;
-                        self.record(layer, path, key, limit.to_string());
-                        // Narrowest wins, like every other ceiling: a layer may
-                        // ask for less concurrency than the one above it and
-                        // never for more.
-                        self.max_parallel_tools = Some(
-                            self.max_parallel_tools
-                                .map_or(limit, |held| held.min(limit)),
-                        );
-                    }
-                }
-                "telemetry" => self.apply_telemetry(layer, path, value)?,
-                "lsp" => self.apply_lsp(layer, path, value)?,
-                "mcp" => self.apply_mcp(layer, path, value)?,
-                "remote" => self.apply_remote(layer, path, value)?,
-                "project" => self.apply_project(layer, path, value)?,
-                "policy" => self.apply_policy(layer, path, value)?,
-                "theme" => self.apply_theme(layer, path, value)?,
-                section if INERT_SECTIONS.contains(&section) => {}
-                other => return Err(reject(format!("unknown key `{other}`"))),
-            }
+            self.apply_section(layer, path, key, value)?;
         }
+        Ok(())
+    }
+
+    /// One top-level section. Every arm either delegates to the function that
+    /// owns that section or, for the three short ones, reads its own keys.
+    fn apply_section(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        key: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        match key {
+            "schema_version" => Ok(()),
+            "provider" => self.apply_provider(layer, path, value),
+            "model" => self.apply_model(layer, path, value),
+            "credentials" => self.apply_credentials(layer, path, value),
+            "execution" => self.apply_execution(layer, path, value),
+            "telemetry" => self.apply_telemetry(layer, path, value),
+            "lsp" => self.apply_lsp(layer, path, value),
+            "mcp" => self.apply_mcp(layer, path, value),
+            "remote" => self.apply_remote(layer, path, value),
+            "project" => self.apply_project(layer, path, value),
+            "policy" => self.apply_policy(layer, path, value),
+            "theme" => self.apply_theme(layer, path, value),
+            section if INERT_SECTIONS.contains(&section) => Ok(()),
+            other => Err(ConfigError {
+                path: path.to_path_buf(),
+                message: format!("unknown key `{other}`"),
+            }),
+        }
+    }
+
+    /// `model.default` and the `model.allowed` ceiling.
+    fn apply_model(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "model", path)?;
+        if let Some(default) = string(table, "default", "model.default", path)? {
+            self.model_default = Some(default.clone());
+            self.record(layer, path, "model.default", default);
+        }
+        if let Some(value) = table.get("allowed") {
+            let allowed = name_set(value, "model.allowed", path)?;
+            self.record(layer, path, "model.allowed", joined(&allowed));
+            self.model_allowed = Some(intersect(self.model_allowed.take(), allowed));
+        }
+        Ok(())
+    }
+
+    /// `credentials.store`: which store the credential catalog is kept in.
+    fn apply_credentials(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "credentials", path)?;
+        let Some(store) = string(table, "store", "credentials.store", path)?.cloned() else {
+            return Ok(());
+        };
+        if !CREDENTIAL_STORES.contains(&store.as_str()) {
+            return Err(ConfigError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "credentials.store must be one of {}, not `{store}`",
+                    CREDENTIAL_STORES.join(", ")
+                ),
+            });
+        }
+        self.credential_store = Some(store.clone());
+        self.record(layer, path, "credentials.store", store);
+        Ok(())
+    }
+
+    /// `execution.max_parallel`. The rest of the section is still inert, so an
+    /// unknown key here is accepted as it always was; only the one this build
+    /// reads is validated.
+    fn apply_execution(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "execution", path)?;
+        let Some(value) = table.get("max_parallel") else {
+            return Ok(());
+        };
+        let key = "execution.max_parallel";
+        let limit = value
+            .as_integer()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
+            .ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!("`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"),
+            })?;
+        self.record(layer, path, key, limit.to_string());
+        // Narrowest wins, like every other ceiling: a layer may ask for less
+        // concurrency than the one above it and never for more.
+        self.max_parallel_tools = Some(
+            self.max_parallel_tools
+                .map_or(limit, |held| held.min(limit)),
+        );
         Ok(())
     }
 
@@ -2210,6 +2240,25 @@ fn expect_string<'a>(
             path: path.to_path_buf(),
             message: format!("`{key}` must be a non-empty string"),
         }),
+    }
+}
+
+/// An absent `schema_version` means this schema: a settings file a person just
+/// created is `{}`, and refusing that would make the first edit a ceremony. A
+/// version that *is* written still has to be one this build understands, so a
+/// future file fails loudly rather than being half-applied.
+fn check_schema_version(table: &toml::Table, path: &Path) -> Result<(), ConfigError> {
+    let reject = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        message,
+    };
+    match table.get("schema_version") {
+        None => Ok(()),
+        Some(value) => match value.as_integer() {
+            Some(SCHEMA_VERSION) => Ok(()),
+            Some(other) => Err(reject(format!("unsupported schema_version {other}"))),
+            None => Err(reject("`schema_version` must be an integer".to_owned())),
+        },
     }
 }
 
