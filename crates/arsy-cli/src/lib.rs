@@ -4163,7 +4163,6 @@ enum Answer {
 /// rather than hidden, so it can say what it would do instead.
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn native_turn(
     resolved: &provider::Resolved,
     runtime: &arsy_code::agent::ToolRuntime,
@@ -6033,6 +6032,7 @@ const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
 /// model as a failed result rather than silently skipped. That is what makes a
 /// pipeline's behaviour a property of its configuration instead of a property
 /// of who happened to be watching.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
@@ -6194,15 +6194,15 @@ fn dispatch(
         // are the exception: a hook engine is one interpreter with its own
         // recursion guard, so a workspace that loads hooks keeps the
         // sequential path rather than racing them.
-        let batched = (hooks.is_none() && supervisor.is_none() && parallel > 1)
-            .then(|| {
-                let batch: Vec<(String, Value)> = calls
-                    .iter()
-                    .map(|(_, name, arguments)| (name.clone(), arguments.clone()))
-                    .collect();
-                runtime.invoke_batch(&batch, parallel)
-            })
-            .unwrap_or_default();
+        let batched = if hooks.is_none() && supervisor.is_none() && parallel > 1 {
+            let batch: Vec<(String, Value)> = calls
+                .iter()
+                .map(|(_, name, arguments)| (name.clone(), arguments.clone()))
+                .collect();
+            runtime.invoke_batch(&batch, parallel)
+        } else {
+            Vec::new()
+        };
         let results = calls
             .iter()
             .enumerate()

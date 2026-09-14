@@ -501,7 +501,7 @@ mod tests {
             .add("first, actually", Vec::new(), TodoAuthor::User)
             .unwrap();
 
-        assert!(todos.reorder(&[second.id.clone()]).is_err());
+        assert!(todos.reorder(std::slice::from_ref(&second.id)).is_err());
         todos
             .reorder(&[second.id.clone(), first.id.clone()])
             .unwrap();

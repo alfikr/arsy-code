@@ -2725,7 +2725,7 @@ output_micros_per_million = 75000000
             "a part-micro charge is not lost"
         );
         assert!(
-            endpoint.pricing.get("haiku").is_none(),
+            !endpoint.pricing.contains_key("haiku"),
             "an unpriced model is absent, so a caller reports unknown rather than free"
         );
 

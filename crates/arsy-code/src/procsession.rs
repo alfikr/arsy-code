@@ -615,13 +615,10 @@ fn drain(
     let capacity = usize::try_from(capacity).unwrap_or(usize::MAX);
     thread::spawn(move || {
         let mut chunk = [0; 8192];
-        loop {
-            // A closed pseudoterminal reports EIO rather than end-of-file on
-            // some platforms, so any error ends the stream the same way a
-            // clean close does.
-            let Ok(count) = reader.read(&mut chunk) else {
-                break;
-            };
+        // A closed pseudoterminal reports EIO rather than end-of-file on some
+        // platforms, so any error ends the stream the same way a clean close
+        // does — and a zero-length read is the clean close itself.
+        while let Ok(count) = reader.read(&mut chunk) {
             if count == 0 {
                 break;
             }
