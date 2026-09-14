@@ -85,6 +85,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ inputs.tag || github.ref_name }}
+      # --all-features reaches the Linux credential store, whose -sys crate
+      # needs the system library at build time. CI installs the same packages;
+      # the release build has to as well, or it ships from a narrower
+      # environment than the one the code was tested in.
+      - name: Install Linux credential-store dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 build --workspace --all-features --locked --release
       - name: Package Unix archive
