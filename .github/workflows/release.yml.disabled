@@ -145,12 +145,55 @@ jobs:
           path: dist/*.cdx.json
           if-no-files-found: error
 
-  # No signing yet: this attaches a plain SHA-256 per archive so install.sh /
-  # install.ps1 have something to verify against. docs/34-distribution.md's
-  # cosign-based verification stays the target for the canonical channel;
-  # wire it in here before relying on it for anything beyond a checksum check.
+  # The per-archive .sha256 sidecars stay: install.sh and install.ps1 read them
+  # directly. This adds the aggregate SHA256SUMS that docs/34-distribution.md
+  # documents, signed with keyless Sigstore so the canonical channel can be
+  # verified rather than merely checksummed.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Build the aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The sidecars hold a bare digest; sha256sum --check wants
+          # "<digest>  <file>". Archives only: the sums file describes the
+          # installable artifacts, not itself or the SBOM.
+          for archive in arsy-*.tar.gz arsy-*.zip; do
+            test -f "$archive"
+            printf '%s  %s\n' "$(tr -d '[:space:]' < "${archive}.sha256")" "$archive"
+          done > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --bundle SHA256SUMS.bundle \
+            SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checksums
+          path: |
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sig
+            dist/SHA256SUMS.bundle
+          if-no-files-found: error
+
   publish:
-    needs: [build, sbom]
+    needs: [build, sbom, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
