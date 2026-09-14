@@ -286,11 +286,23 @@ fn summary(entries: &[Value], kind: &str) -> String {
         .iter()
         .filter(|entry| entry["level"] == "unsupported")
         .count();
+    // Counted rather than asserted. The rows below report each entry's real
+    // `runtime_status`, so a summary that always said "none loaded" contradicted
+    // the listing it introduces the moment anything was loaded — and the count
+    // line is the part a reader takes away.
+    let loaded = entries
+        .iter()
+        .filter(|entry| entry["runtime_status"] == "loaded")
+        .count();
     let mut summary = format!("{} {noun}{plural} declared", entries.len());
     if unsupported > 0 {
         summary.push_str(&format!(", {unsupported} unsupported"));
     }
-    summary.push_str("; none loaded\n");
+    summary.push_str(&match loaded {
+        0 => "; none loaded\n".to_owned(),
+        loaded if loaded == entries.len() => "; all loaded\n".to_owned(),
+        loaded => format!("; {loaded} loaded\n"),
+    });
     summary
 }
 
@@ -430,6 +442,35 @@ mod tests {
             .to_owned();
         assert!(listing.contains("not loaded"), "{listing}");
         assert!(listing.contains("declared; none loaded"), "{listing}");
+
+        // The count line and the rows read the same field, so one can never say
+        // nothing is loaded while the other names something that is.
+        let mixed = json!({
+            "entries": [
+                {"name": "a", "transport": "stdio", "runtime_status": "loaded"},
+                {"name": "b", "transport": "stdio", "runtime_status": "not_loaded"},
+            ],
+            "notice": "",
+        });
+        let mixed = human_report(&mixed, "mcp", None, None)["declarations"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            mixed.contains("2 MCP servers declared; 1 loaded"),
+            "{mixed}"
+        );
+
+        let all = json!({
+            "entries": [{"name": "a", "transport": "stdio", "runtime_status": "loaded"}],
+            "notice": "",
+        });
+        let all = human_report(&all, "mcp", None, None)["declarations"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(all.contains("1 MCP server declared; all loaded"), "{all}");
+        assert!(!all.contains("none loaded"), "{all}");
         // The record itself is never printed at a person: only the fields that
         // say what a connection would run.
         assert!(!listing.contains("\"runtime_status\""), "{listing}");

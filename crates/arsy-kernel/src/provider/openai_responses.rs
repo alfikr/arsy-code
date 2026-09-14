@@ -172,7 +172,7 @@ fn arsy_tool_name(name: &str) -> String {
         "search_files" => "search.files",
         "search_text" => "search.text",
         "code_symbol" => "code.symbol",
-        "code_inspect" => "code.inspect",
+        "code_explain" => "code.explain",
         "code_references" => "code.references",
         "code_diagnostics" => "code.diagnostics",
         "plugin_invoke" => "plugin.invoke",
@@ -606,6 +606,14 @@ mod tests {
         assert_eq!(body["input"][0]["type"], json!("message"));
         assert_eq!(body["input"][0]["content"][0]["type"], json!("input_text"));
         assert!(wire.headers.iter().any(|(key, _)| key == "originator"));
+    }
+
+    #[test]
+    fn semantic_read_tool_name_round_trips() {
+        assert_eq!(
+            arsy_tool_name(&codex_tool_name("code.explain")),
+            "code.explain"
+        );
     }
 
     #[test]

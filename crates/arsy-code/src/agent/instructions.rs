@@ -118,6 +118,13 @@ pub const HARNESS_INSTRUCTIONS: &str = concat!(
     "read the error and adjust rather than repeating the call unchanged.\n",
 );
 
+pub const PLAN_MODE_INSTRUCTIONS: &str = concat!(
+    "You are in Plan Mode. Inspect the existing implementation with read-only tools and do not modify project state. ",
+    "Use the plan tools to keep an ordered, repository-specific implementation plan. ",
+    "Before finishing, identify current behavior, affected files, the implementation approach, validation, and important constraints. ",
+    "Do not execute the plan; end with a concrete plan for the operator to approve or revise.\n",
+);
+
 /// Build the system prompt for one turn.
 ///
 /// `recalled` is context the caller retrieved — what this workspace remembers,
@@ -132,6 +139,7 @@ pub fn system_prompt(
     family: ModelFamily,
     instructions: &[Instruction],
     recalled: Option<&str>,
+    mode: super::ExecutionMode,
     redactor: &Redactor,
     token_budget: u32,
 ) -> Result<CompiledPrompt, prompt::PromptError> {
@@ -154,6 +162,13 @@ pub fn system_prompt(
                 },
                 instruction.text.trim_end()
             ),
+        });
+    }
+    if mode == super::ExecutionMode::Plan {
+        fragments.push(PromptFragment {
+            id: FragmentId::new(),
+            kind: PromptFragmentKind::PermissionState,
+            content: PLAN_MODE_INSTRUCTIONS.to_owned(),
         });
     }
     if let Some(context) = recalled.filter(|text| !text.trim().is_empty()) {

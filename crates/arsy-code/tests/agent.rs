@@ -6,7 +6,7 @@
 //! called an executor directly would pass while the model saw nothing.
 
 use arsy_code::{
-    agent::{self, Authorization, ToolRuntime},
+    agent::{self, Authorization, ExecutionMode, ToolRuntime},
     resource::Workspace,
 };
 use arsy_kernel::{
@@ -157,6 +157,131 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
     // The refusal names what is available, so the model can pick again rather
     // than guess a second time.
     assert!(unknown.contains("search.text"), "{unknown}");
+}
+
+#[test]
+fn plan_mode_offers_exploration_and_planning_but_not_mutation_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = permissive(root.path()).with_execution_mode(ExecutionMode::Plan);
+    let offered: Vec<String> = runtime
+        .schemas()
+        .into_iter()
+        .map(|schema| schema.name)
+        .collect();
+
+    for allowed in [
+        "fs.read",
+        "search.text",
+        "code.explain",
+        "git_status",
+        "plan_add",
+        "plan_list",
+    ] {
+        assert!(offered.iter().any(|name| name == allowed), "{allowed}");
+    }
+    for blocked in [
+        "fs.edit",
+        "apply_patch",
+        "fs.write",
+        "fs.delete",
+        "fs.move",
+        "code.rename",
+        "plugin.invoke",
+        "bash",
+    ] {
+        assert!(!offered.iter().any(|name| name == blocked), "{blocked}");
+    }
+}
+
+#[test]
+fn plan_mode_blocks_policy_allowed_writes_at_authorization_and_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("kept.txt");
+    std::fs::write(&path, "before\n").unwrap();
+    let normal = permissive(root.path());
+    let plan = permissive(root.path()).with_execution_mode(ExecutionMode::Plan);
+    let arguments = json!({"path": "kept.txt", "content": "after\n"});
+    assert_eq!(
+        plan.invoke("fs.read", &json!({"path": "kept.txt"})).output,
+        "before"
+    );
+    let request = normal.prepare("fs.write", &arguments).unwrap();
+    let grants = normal.authorize(&request).approve().unwrap();
+
+    assert!(matches!(plan.authorize(&request), Authorization::Denied(_)));
+    let invoked = plan.invoke("fs.write", &arguments);
+    assert!(!invoked.success);
+    assert!(invoked.output.contains("Blocked in Plan Mode"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
+    let result = plan.dispatch("fs.write", &request, &grants, std::time::Instant::now());
+    assert!(!result.success);
+    assert!(
+        result.output.contains("Blocked in Plan Mode"),
+        "{}",
+        result.output
+    );
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "before\n");
+}
+
+/// Not being offered a tool is not the same as being refused one: a model can
+/// name a tool it was never shown, and a front end holds grants minted before
+/// the mode changed. Every mutation this build has is put through the gate
+/// itself, so the ceiling is the operation's contract rather than a list of
+/// names that a new tool could be added without.
+#[test]
+fn plan_mode_refuses_every_mutating_tool_at_the_gate_not_only_in_the_offered_list() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("kept.txt"), "before\n").unwrap();
+    std::fs::write(root.path().join("other.txt"), "other\n").unwrap();
+    let normal = permissive(root.path());
+    let plan = permissive(root.path()).with_execution_mode(ExecutionMode::Plan);
+
+    for (name, arguments) in [
+        (
+            "apply_patch",
+            json!({"patch": "*** Begin Patch\n*** Delete File: other.txt\n*** End Patch\n"}),
+        ),
+        (
+            "fs.edit",
+            json!({"path": "kept.txt", "old_text": "before", "new_text": "after"}),
+        ),
+        ("fs.delete", json!({"path": "kept.txt"})),
+        ("fs.move", json!({"from": "kept.txt", "to": "moved.txt"})),
+        (
+            "code.rename",
+            json!({"symbol": "symbol:kept.txt#thing", "new_name": "other"}),
+        ),
+        ("bash", json!({"command": "rm -f kept.txt"})),
+    ] {
+        let request = plan.prepare(name, &arguments).unwrap();
+        assert!(
+            matches!(plan.authorize(&request), Authorization::Denied(_)),
+            "{name} was authorized in Plan Mode"
+        );
+
+        // The grants a Normal-mode turn would have held, spent against the
+        // Plan-mode runtime: dispatch refuses them on their own.
+        let held = normal.prepare(name, &arguments).unwrap();
+        let grants = normal
+            .authorize(&held)
+            .approve()
+            .unwrap_or_else(|error| panic!("{name} could not be granted normally: {error}"));
+        let dispatched = plan.dispatch(name, &held, &grants, std::time::Instant::now());
+        assert!(!dispatched.success, "{name} ran in Plan Mode");
+        assert!(
+            dispatched.output.contains("Blocked in Plan Mode"),
+            "{name}: {}",
+            dispatched.output
+        );
+    }
+
+    // Nothing on disk moved, in either direction.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("kept.txt")).unwrap(),
+        "before\n"
+    );
+    assert!(root.path().join("other.txt").exists());
+    assert!(!root.path().join("moved.txt").exists());
 }
 
 #[test]
@@ -707,6 +832,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
         None,
+        ExecutionMode::Normal,
         &arsy_kernel::secret::Redactor::new(),
         arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
     )
@@ -719,6 +845,19 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         !rendered.contains("not an instruction"),
         "README is not injected: {rendered}"
     );
+
+    let plan = agent::instructions::system_prompt(
+        arsy_kernel::prompt::ModelFamily::Claude,
+        &found,
+        None,
+        ExecutionMode::Plan,
+        &arsy_kernel::secret::Redactor::new(),
+        arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
+    )
+    .unwrap();
+    let rendered = agent::instructions::render(&plan);
+    assert!(rendered.contains("You are in Plan Mode"), "{rendered}");
+    assert!(rendered.contains("Do not execute the plan"), "{rendered}");
 }
 
 #[test]
