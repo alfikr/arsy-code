@@ -28,7 +28,7 @@
 //! budget it was given. Every intervention is recorded with what it cost.
 
 use crate::{provider, Emitter};
-use arsy_code::agent::{ToolResult, ToolRuntime};
+use arsy_code::agent::{ExecutionMode, ToolResult, ToolRuntime};
 use arsy_kernel::{
     capability::{CapabilityAction, CapabilityGrant, ResourcePattern, ResourceScope},
     config::Config,
@@ -141,6 +141,10 @@ pub struct Supervisor<'a> {
     /// What the parent may hand on. Empty when policy grants nothing that may
     /// be delegated, which is the default and refuses every spawn.
     delegable: Vec<CapabilityGrant>,
+    /// The parent's execution ceiling. A child runs under its own runtime, so
+    /// without this a supervisor in Plan Mode could delegate the write it is
+    /// itself refused — authority is attenuated by delegation, never widened.
+    mode: ExecutionMode,
     observer: ObserverSubscription,
     allowance: Allowance,
     /// What the observer did, for the turn's record.
@@ -169,6 +173,7 @@ impl<'a> Supervisor<'a> {
             model,
             parent,
             delegable,
+            mode: runtime.execution_mode(),
             observer: ObserverSubscription {
                 id: SubscriptionId::new(),
                 observer: AgentId::new(),
@@ -416,7 +421,8 @@ impl Supervisor<'_> {
             // supervisor is tracking.
             &agent.to_string(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .with_execution_mode(self.mode);
 
         let request = CanonicalModelRequest {
             model: ModelKey {

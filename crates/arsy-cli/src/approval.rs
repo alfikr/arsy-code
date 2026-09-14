@@ -76,6 +76,29 @@ impl ApprovalMode {
         }
     }
 
+    /// The next mode Shift+Tab steps to.
+    ///
+    /// Only the modes an operator at a keyboard would choose between are in the
+    /// ring. `dontAsk` exists for a run with nobody watching, and
+    /// `bypassPermissions` is `auto` under another name — putting either one a
+    /// keypress away would mean stepping past the mode you wanted into one that
+    /// behaves identically or refuses everything.
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Default => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Plan,
+            Self::Plan => Self::Auto,
+            _ => Self::Default,
+        }
+    }
+
+    pub const fn execution_mode(self) -> arsy_code::agent::ExecutionMode {
+        match self {
+            Self::Plan => arsy_code::agent::ExecutionMode::Plan,
+            _ => arsy_code::agent::ExecutionMode::Normal,
+        }
+    }
+
     const fn as_u8(self) -> u8 {
         match self {
             Self::Default => 0,
@@ -102,20 +125,58 @@ impl ApprovalMode {
 /// The current mode, shared the way the single auto-approve flag it replaces
 /// was: passed by reference into everything that asks, updated from
 /// wherever the operator changes it.
-#[derive(Default)]
-pub struct ApprovalCell(AtomicU8);
+pub struct ApprovalCell {
+    current: AtomicU8,
+    before_plan: AtomicU8,
+}
+
+impl Default for ApprovalCell {
+    fn default() -> Self {
+        Self::new(ApprovalMode::Default)
+    }
+}
 
 impl ApprovalCell {
     pub fn new(mode: ApprovalMode) -> Self {
-        Self(AtomicU8::new(mode.as_u8()))
+        Self {
+            current: AtomicU8::new(mode.as_u8()),
+            before_plan: AtomicU8::new(ApprovalMode::Default.as_u8()),
+        }
     }
 
     pub fn get(&self) -> ApprovalMode {
-        ApprovalMode::from_u8(self.0.load(Ordering::Relaxed))
+        ApprovalMode::from_u8(self.current.load(Ordering::Relaxed))
     }
 
     pub fn set(&self, mode: ApprovalMode) {
-        self.0.store(mode.as_u8(), Ordering::Relaxed);
+        if mode == ApprovalMode::Plan {
+            self.enter_plan();
+        } else {
+            self.current.store(mode.as_u8(), Ordering::Relaxed);
+            self.before_plan.store(mode.as_u8(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn enter_plan(&self) {
+        let current = self.get();
+        if current != ApprovalMode::Plan {
+            self.before_plan.store(current.as_u8(), Ordering::Relaxed);
+        }
+        self.current
+            .store(ApprovalMode::Plan.as_u8(), Ordering::Relaxed);
+    }
+
+    /// An approved plan enters the existing edit-capable mode. Shell and
+    /// destructive operations still use their normal approval path.
+    pub fn approve_plan(&self) -> ApprovalMode {
+        self.set(ApprovalMode::AcceptEdits);
+        ApprovalMode::AcceptEdits
+    }
+
+    pub fn cancel_plan(&self) -> ApprovalMode {
+        let mode = ApprovalMode::from_u8(self.before_plan.load(Ordering::Relaxed));
+        self.set(mode);
+        mode
     }
 }
 
@@ -140,7 +201,7 @@ fn is_read(name: &str) -> bool {
             | "search.files"
             | "search.text"
             | "code.symbol"
-            | "code.inspect"
+            | "code.explain"
             | "code.references"
             | "code.diagnostics"
             | "repo_discover"
@@ -284,5 +345,52 @@ mod tests {
         assert_eq!(cell.get(), ApprovalMode::Default);
         cell.set(ApprovalMode::Auto);
         assert_eq!(cell.get(), ApprovalMode::Auto);
+    }
+
+    #[test]
+    fn shift_tab_steps_through_the_interactive_modes_and_returns_to_the_start() {
+        let mut mode = ApprovalMode::Default;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            mode = mode.cycle();
+            seen.push(mode);
+        }
+        assert_eq!(
+            seen,
+            [
+                ApprovalMode::AcceptEdits,
+                ApprovalMode::Plan,
+                ApprovalMode::Auto,
+                ApprovalMode::Default,
+            ]
+        );
+        // A mode outside the ring is a way in, never a dead end.
+        assert_eq!(ApprovalMode::DontAsk.cycle(), ApprovalMode::Default);
+        assert_eq!(
+            ApprovalMode::BypassPermissions.cycle(),
+            ApprovalMode::Default
+        );
+    }
+
+    #[test]
+    fn stepping_into_plan_and_back_out_restores_the_mode_it_started_from() {
+        let cell = ApprovalCell::new(ApprovalMode::AcceptEdits);
+        cell.set(cell.get().cycle());
+        assert_eq!(cell.get(), ApprovalMode::Plan);
+        // Stepping out is not approving: the plan was never accepted, so the
+        // mode before planning is what comes back.
+        assert_eq!(cell.cancel_plan(), ApprovalMode::AcceptEdits);
+    }
+
+    #[test]
+    fn plan_lifecycle_approves_into_edits_and_cancel_restores_the_previous_mode() {
+        let approval = ApprovalCell::new(ApprovalMode::Auto);
+        approval.enter_plan();
+        assert_eq!(approval.get(), ApprovalMode::Plan);
+        assert_eq!(approval.cancel_plan(), ApprovalMode::Auto);
+
+        approval.enter_plan();
+        assert_eq!(approval.approve_plan(), ApprovalMode::AcceptEdits);
+        assert_eq!(approval.get(), ApprovalMode::AcceptEdits);
     }
 }

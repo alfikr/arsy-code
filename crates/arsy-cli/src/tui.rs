@@ -480,6 +480,8 @@ pub enum Key {
     Enter,
     /// Shift+Enter or Alt+Enter to insert a newline without submitting.
     Newline,
+    /// Shift+Tab: step to the next approval mode without leaving the line.
+    CycleMode,
     /// Ctrl-C, or Escape once it is known to stand alone.
     Interrupt,
     /// Ctrl-D on an empty line.
@@ -621,6 +623,11 @@ impl Keys {
         if sequence == b"\x1b[3;3~" || sequence == b"\x1b[3;5~" {
             return Some(Key::WordBackspace);
         }
+        // Shift+Tab. `CSI Z` is what every terminal here sends; the modified
+        // form is what a terminal in kitty-style key reporting sends instead.
+        if sequence == b"\x1b[Z" || sequence == b"\x1b[1;2Z" {
+            return Some(Key::CycleMode);
+        }
         match (sequence.last(), sequence.get(2)) {
             (Some(b'A'), _) => Some(Key::Up),
             (Some(b'B'), _) => Some(Key::Down),
@@ -646,6 +653,10 @@ impl Keys {
     }
 }
 
+/// What Shift+Tab submits. A command rather than a new action, so the mode is
+/// changed by the one dispatch arm that already knows how to announce it.
+pub const CYCLE_APPROVAL_MODE: &str = "/approval cycle";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Submit(String),
@@ -665,7 +676,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/session",
         "manage sessions; list | rename <TITLE> | delete [ID]",
     ),
-    ("/approval", "set approval mode; auto | prompt"),
+    (
+        "/approval",
+        "set approval mode; default | acceptEdits | plan | auto | dontAsk | bypassPermissions",
+    ),
+    ("/plan", "plan a task; approve | revise [NOTE] | cancel"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -948,7 +963,10 @@ pub fn help(colour: bool) -> String {
         "Type / to open this menu; Up/Down: input history, or the menu while one is open",
         "Enter: take the highlighted command, or send a line that is already one",
         "Esc/Ctrl-C: cancel turn · Ctrl-D: exit on empty input",
-        "MCP connections and executable hooks are not loaded by ARSY; imported declarations grant no authority.",
+        "Shift+Tab: step the approval mode (default, acceptEdits, plan, auto)",
+        // Hooks the engine loaded do run, and `/hooks` marks which; an MCP
+        // declaration is still only a reading of a file.
+        "MCP connections are not loaded by ARSY; imported declarations grant no authority. `/hooks` marks the hooks that run.",
     ] {
         text.push_str(&paint(colour, sgr_dim(), line));
         text.push('\n');
@@ -1222,6 +1240,14 @@ impl Composer {
             Key::Interrupt if !self.buffer.is_empty() => {
                 self.take();
                 Action::Redraw
+            }
+            // Shift+Tab steps the approval mode. It is submitted as the command
+            // an operator could have typed instead, so the mode is changed in
+            // exactly one place and the shortcut cannot drift away from what
+            // `/approval` does. The drafted line is deliberately left alone:
+            // changing mode mid-sentence must not cost the sentence.
+            Key::CycleMode if !self.picking && !self.masked => {
+                Action::Submit(CYCLE_APPROVAL_MODE.to_owned())
             }
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,
@@ -1721,6 +1747,7 @@ pub struct TuiState {
     sandbox_assurance: SandboxAssurance,
     model_route: Option<ModelRoute>,
     effort: Option<Effort>,
+    approval_mode: String,
 }
 
 impl TuiState {
@@ -1734,6 +1761,7 @@ impl TuiState {
             sandbox_assurance: SandboxAssurance::None,
             model_route: None,
             effort: None,
+            approval_mode: "default".to_owned(),
         }
     }
 
@@ -1755,6 +1783,10 @@ impl TuiState {
 
     pub fn set_effort(&mut self, effort: Option<Effort>) {
         self.effort = effort;
+    }
+
+    pub fn set_approval_mode(&mut self, mode: impl Into<String>) {
+        self.approval_mode = mode.into();
     }
 
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), TuiError> {
@@ -1825,6 +1857,9 @@ impl TuiState {
             &self.session.to_string(),
             sgr_dim(),
         ));
+        if self.approval_mode == "plan" {
+            rows.push(label_row(colour, "mode:", "PLAN", sgr_accent()));
+        }
         if let Some(entry) = self.timeline.last() {
             rows.push(label_row(
                 colour,
@@ -1881,10 +1916,24 @@ impl TuiState {
             Some(Effort::Medium) => "◑ medium".to_owned(),
             Some(Effort::High) => "● high".to_owned(),
         };
+        // `default` is the mode the row means when it says nothing, so naming it
+        // would cost a field to tell the reader what they already assume. Every
+        // other mode is a standing decision about what runs without asking, and
+        // Shift+Tab can change it between two glances at the screen.
+        let mode_label = match self.approval_mode.as_str() {
+            "default" => None,
+            "plan" => Some("⏸ PLAN".to_owned()),
+            mode => Some(format!("⚙ {mode}")),
+        };
+        let mode_label = mode_label.as_deref();
         let branch = branch.unwrap_or_default();
 
         let model_label = format!("✦ {route}");
-        let head = INDENT + visible_len(&model_label) + GAP + visible_len(&effort_label);
+        let head = INDENT
+            + visible_len(&model_label)
+            + GAP
+            + visible_len(&effort_label)
+            + mode_label.map_or(0, |label| GAP + visible_len(label));
         let branch_label = if branch.is_empty() {
             String::new()
         } else {
@@ -1911,6 +1960,10 @@ impl TuiState {
             paint(colour, sgr_dim(), &effort_label),
         );
         let mut used = head;
+        if let Some(label) = mode_label {
+            row.push_str(&" ".repeat(GAP));
+            row.push_str(&paint(colour, sgr_accent(), label));
+        }
         if let Some(workspace) = &workspace {
             row.push_str(&" ".repeat(GAP));
             row.push_str(&paint(colour, sgr_cwd(), workspace));
@@ -2803,6 +2856,7 @@ pub struct AskDialogState {
     pub selected: usize,
     pub custom_note: String,
     pub editing_note: bool,
+    plan_decision: bool,
 }
 
 impl AskDialogState {
@@ -2836,6 +2890,35 @@ impl AskDialogState {
             selected: 0,
             custom_note: String::new(),
             editing_note: false,
+            plan_decision: false,
+        }
+    }
+
+    pub fn for_plan() -> Self {
+        Self {
+            title: "PLAN READY".to_owned(),
+            summary: "Review the repository-aware plan before any implementation begins."
+                .to_owned(),
+            reason: "Plan Mode blocks workspace mutations until approval.".to_owned(),
+            diff_preview: None,
+            options: vec![
+                AskOption {
+                    label: "Approve and implement".to_owned(),
+                    description: Some("Enter acceptEdits mode and execute this plan".to_owned()),
+                },
+                AskOption {
+                    label: "Continue planning / revise".to_owned(),
+                    description: Some("Stay in Plan Mode and send the optional note".to_owned()),
+                },
+                AskOption {
+                    label: "Cancel planning".to_owned(),
+                    description: Some("Leave Plan Mode without implementing".to_owned()),
+                },
+            ],
+            selected: 0,
+            custom_note: String::new(),
+            editing_note: false,
+            plan_decision: true,
         }
     }
 
@@ -2914,6 +2997,10 @@ impl AskDialogState {
         lines.push(Self::box_line("", inner, colour, ""));
         let hint = if self.editing_note {
             "[Enter] Done Note  [Esc] Clear Note"
+        } else if self.plan_decision && self.custom_note.is_empty() {
+            "[↑/↓] Navigate  [1-3] Choose  [e] Add Note  [i] Implement  [r] Revise  [c] Cancel"
+        } else if self.plan_decision {
+            "[↑/↓] Navigate  [1-3] Choose  [e] Edit Note  [i] Implement  [r] Revise  [c] Cancel"
         } else if self.custom_note.is_empty() {
             "[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm"
         } else {
@@ -3021,10 +3108,23 @@ impl AskDialogState {
                 }
                 None
             }
-            Key::Char('n' | 'N') => {
+            Key::Char('e' | 'E') if self.plan_decision => {
                 self.editing_note = true;
                 None
             }
+            Key::Char('n' | 'N') if !self.plan_decision => {
+                self.editing_note = true;
+                None
+            }
+            Key::Char('i' | 'I') if self.plan_decision => Some(AskDialogResult::Approve {
+                note: self.current_note(),
+            }),
+            Key::Char('r' | 'R') if self.plan_decision => Some(AskDialogResult::AlwaysApprove {
+                note: self.current_note(),
+            }),
+            Key::Char('c' | 'C') if self.plan_decision => Some(AskDialogResult::Deny {
+                note: self.current_note(),
+            }),
             Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve {
                 note: self.current_note(),
             }),
@@ -4511,6 +4611,9 @@ mod tests {
             assert!(help.contains(description), "{name} has no description");
         }
         assert!(help.contains("Up/Down: input history"));
+        // The keybinding list is where a shortcut is discovered, so a binding
+        // the composer answers has to be named there.
+        assert!(help.contains("Shift+Tab: step the approval mode"), "{help}");
     }
 
     /// A typed credential must not survive anywhere a later keystroke or a
@@ -4607,6 +4710,48 @@ mod tests {
                 "width {width}: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn shift_tab_is_decoded_and_asks_the_composer_for_the_next_approval_mode() {
+        for sequence in [b"\x1b[Z".as_slice(), b"\x1b[1;2Z".as_slice()] {
+            let mut keys = Keys::default();
+            let decoded: Vec<Key> = sequence
+                .iter()
+                .filter_map(|byte| keys.feed(*byte))
+                .collect();
+            assert_eq!(decoded, vec![Key::CycleMode], "{sequence:?}");
+        }
+
+        // The drafted line survives the mode change.
+        let mut composer = Composer::default();
+        for key in "write the parser".chars().map(Key::Char) {
+            composer.press(key);
+        }
+        assert_eq!(
+            composer.press(Key::CycleMode),
+            Action::Submit(CYCLE_APPROVAL_MODE.to_owned())
+        );
+        assert_eq!(
+            composer.press(Key::Enter),
+            Action::Submit("write the parser".to_owned())
+        );
+
+        // A picker is collecting an answer, not a task: Shift+Tab there would
+        // submit a command the picker cannot take.
+        composer.set_picking(true);
+        assert_eq!(composer.press(Key::CycleMode), Action::None);
+    }
+
+    #[test]
+    fn plan_mode_is_visible_in_the_launch_card_and_status_row() {
+        let mut state = TuiState::new("/workspace".into(), SessionId::new());
+        state.set_approval_mode("plan");
+
+        let launch = state.render(80, false);
+        assert!(launch.contains("mode:"), "{launch}");
+        assert!(launch.contains("PLAN"), "{launch}");
+        assert!(state.status_row(80, false, None).contains("⏸ PLAN"));
     }
 
     #[test]
@@ -4929,6 +5074,24 @@ mod tests {
             Some(AskDialogResult::Approve {
                 note: Some("ab".to_owned())
             })
+        );
+    }
+
+    #[test]
+    fn plan_dialog_offers_implement_revise_and_cancel() {
+        let mut dialog = AskDialogState::for_plan();
+        let rendered = dialog.render(80, false);
+        assert!(rendered.contains("PLAN READY"));
+        assert!(rendered.contains("Approve and implement"));
+        assert!(rendered.contains("Continue planning / revise"));
+        assert!(rendered.contains("Cancel planning"));
+        assert_eq!(
+            dialog.handle_key(Key::Char('r')),
+            Some(AskDialogResult::AlwaysApprove { note: None })
+        );
+        assert_eq!(
+            dialog.handle_key(Key::Char('c')),
+            Some(AskDialogResult::Deny { note: None })
         );
     }
 

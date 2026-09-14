@@ -128,15 +128,38 @@ def main():
             terminal.send(b"/help\r")
             terminal.expect("Up/Down: input history")
 
-            # `/` opens the command menu; Down moves the marker and Enter takes
-            # the highlighted command, which a second Enter then sends.
+            terminal.send(b"/plan\r")
+            terminal.expect("Plan Mode active")
+            terminal.expect("PLAN")
+            terminal.send(b"/plan cancel\r")
+            terminal.expect("Planning cancelled. Approval mode: default.")
+
+            # Shift+Tab steps the same modes `/approval` sets, without Enter.
+            terminal.send(b"\x1b[Z")
+            terminal.expect("Approval mode: acceptEdits")
+            terminal.send(b"\x1b[Z")
+            terminal.expect("Approval mode: plan")
+            terminal.expect("PLAN")
+            terminal.send(b"/approval default\r")
+            terminal.expect("Approval mode: default")
+
+            # `/` opens the command menu, typing filters it, Down moves the
+            # marker, and Enter takes the highlighted command, which a second
+            # Enter then sends. The filter rather than a row count, so adding a
+            # command does not move the row this asserts on.
             terminal.send(b"/")
-            terminal.expect("› /provider")
-            # Five rows down: /model, /effort, /theme, /mcp, then /hooks.
-            terminal.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B")
+            terminal.expect("› /new")
+            terminal.send(b"h")
+            terminal.expect("› /hooks")
+            # One row down and back, to prove the marker moves at all.
+            terminal.send(b"\x1b[B")
+            terminal.expect("› /help")
+            terminal.send(b"\x1b[A")
             terminal.expect("› /hooks")
             terminal.send(b"\r\r")
-            terminal.expect("1 hook declared; none loaded")
+            # The fixture's hook is one the engine loaded, and the count line
+            # reports that rather than contradicting the row below it.
+            terminal.expect("1 hook declared; all loaded")
 
             # Inspection reports what a connection would run, never the record.
             terminal.send(b"/mcp\r")
@@ -144,7 +167,7 @@ def main():
             terminal.expect("docs · stdio · not loaded")
             terminal.expect("command: never-execute-this --serve")
             terminal.send(b"/hooks --event Stop\r")
-            terminal.expect("Stop · * · not loaded")
+            terminal.expect("Stop · * · loaded")
             terminal.expect("lifecycle: after_turn")
             terminal.send(b"/hooks --event NoSuchEvent\r")
             terminal.expect("Filters applied: --event NoSuchEvent")
@@ -295,7 +318,7 @@ def main():
             terminal.close()
             os.close(master)
             os.close(slave)
-    print("PASS: JSON success/failure, PTY inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration")
+    print("PASS: JSON success/failure, PTY Plan Mode, inspection, filtering, help, model, effort and provider flows, safe paste, exit, terminal restoration")
 
 
 if __name__ == "__main__":

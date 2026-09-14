@@ -825,6 +825,19 @@ pub struct ToolRuntime {
     workspace: PathBuf,
     actor: Principal,
     context: RiskContext,
+    mode: ExecutionMode,
+}
+
+/// The execution ceiling applied after decoding and before dispatch.
+///
+/// Policy still decides ordinary authority. Plan Mode is stricter: it keeps
+/// repository reads and harness bookkeeping available while refusing every
+/// operation capable of changing the workspace or starting a process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionMode {
+    #[default]
+    Normal,
+    Plan,
 }
 
 impl ToolRuntime {
@@ -843,7 +856,17 @@ impl ToolRuntime {
             workspace: workspace.as_ref().to_path_buf(),
             actor,
             context,
+            mode: ExecutionMode::Normal,
         }
+    }
+
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub const fn execution_mode(&self) -> ExecutionMode {
+        self.mode
     }
 
     pub fn workspace(&self) -> &Path {
@@ -862,9 +885,33 @@ impl ToolRuntime {
     pub fn schemas(&self) -> Vec<ToolSchema> {
         TOOLS
             .iter()
-            .filter(|tool| self.registered(tool))
+            .filter(|tool| self.registered(tool) && self.mode_allows_operation(tool.operation))
             .map(Tool::schema)
             .collect()
+    }
+
+    fn mode_allows_operation(&self, operation: &str) -> bool {
+        if self.mode == ExecutionMode::Normal
+            || operation.starts_with("plan.")
+            || operation.starts_with("validate.")
+        {
+            return true;
+        }
+        OperationKind::new(operation)
+            .ok()
+            .and_then(|kind| self.registry.contract(&kind))
+            .is_some_and(|contract| {
+                contract.actions.iter().all(|action| {
+                    matches!(action, CapabilityAction::FsRead | CapabilityAction::GitRead)
+                })
+            })
+    }
+
+    fn mode_denial(&self, request: &OperationRequest) -> Option<String> {
+        (!self.mode_allows_operation(request.kind.as_str())).then(|| {
+            "Blocked in Plan Mode: approve the plan before modifying files or running commands."
+                .to_owned()
+        })
     }
 
     fn registered(&self, tool: &Tool) -> bool {
@@ -964,6 +1011,9 @@ impl ToolRuntime {
     }
 
     pub fn authorize(&self, request: &OperationRequest) -> Authorization {
+        if let Some(reason) = self.mode_denial(request) {
+            return Authorization::Denied(reason);
+        }
         let digest = request.digest();
         // Reversibility is the operation's own claim, not a guess from the
         // transport: policy raises an irreversible call to approval, and taking
@@ -1053,6 +1103,9 @@ impl ToolRuntime {
         grants: &[CapabilityGrant],
         started: Instant,
     ) -> ToolResult {
+        if let Some(reason) = self.mode_denial(request) {
+            return ToolResult::failed(name, reason, started.elapsed());
+        }
         match self.registry.dispatch(request, grants, unix_time_ms()) {
             Ok(outcome) => self.render(name, &outcome, started.elapsed()),
             // A tool that ran and failed is a result, not a crash: the model

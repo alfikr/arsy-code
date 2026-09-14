@@ -1904,6 +1904,68 @@ enum Prompt {
 }
 
 #[cfg(feature = "tui")]
+const IMPLEMENT_APPROVED_PLAN: &str =
+    "Implement the approved plan now. Reuse the findings and constraints already established in this conversation, update the existing plan steps as work progresses, and run the planned validation.";
+
+/// What `/plan` was asked to do.
+///
+/// Parsed away from the terminal loop so the lifecycle — enter, revise,
+/// approve, cancel — can be tested without a session, a provider, or a tty.
+#[cfg(feature = "tui")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlanCommand {
+    /// Enter Plan Mode, optionally with the task to plan.
+    Enter(Option<String>),
+    /// Stay in Plan Mode and plan again, optionally with operator feedback.
+    Revise(Option<String>),
+    Approve,
+    Cancel,
+}
+
+/// The subcommand is the whole first word or it is not the subcommand: a
+/// `/plan approve when you can` that fell through to `Enter` would re-enter
+/// planning and queue the operator's sentence as the thing to plan.
+#[cfg(feature = "tui")]
+fn plan_command(line: &str) -> PlanCommand {
+    let argument = line.trim().trim_start_matches("/plan").trim();
+    let (head, rest) = argument
+        .split_once(char::is_whitespace)
+        .unwrap_or((argument, ""));
+    let note = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    };
+    match head {
+        "revise" => PlanCommand::Revise(note(rest)),
+        "approve" => PlanCommand::Approve,
+        "cancel" => PlanCommand::Cancel,
+        _ => PlanCommand::Enter(note(argument)),
+    }
+}
+
+/// The turn a revision asks for. One wording, whether the operator typed
+/// `/plan revise` or chose it in the plan dialog.
+#[cfg(feature = "tui")]
+fn revise_instruction(note: Option<&str>) -> String {
+    match note {
+        Some(note) => {
+            format!("Revise the plan using this operator feedback, without making changes: {note}")
+        }
+        None => "Continue planning. Reinspect any uncertain paths and return a revised implementation plan without making changes.".to_owned(),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn set_approval_mode(
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    mode: approval::ApprovalMode,
+) {
+    approval.set(mode);
+    state.set_approval_mode(mode.label());
+}
+
+#[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
@@ -1995,6 +2057,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
     state.set_model_route(route.clone());
+    state.set_approval_mode(approval.get().label());
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -2248,6 +2311,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     Ok(picked_id) => {
                         conversation = reconstruct_session_conversation(&workspace, picked_id);
                         state.set_session_id(picked_id);
+                        set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
                         queued.clear();
                         writeln!(
                             stdout,
@@ -2277,6 +2341,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                             conversation =
                                                 reconstruct_session_conversation(&workspace, id);
                                             state.set_session_id(id);
+                                            set_approval_mode(
+                                                &approval,
+                                                &mut state,
+                                                approval::ApprovalMode::Default,
+                                            );
                                             queued.clear();
                                             writeln!(
                                                 stdout,
@@ -2308,6 +2377,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                                 let new_session = SessionId::new();
                                                 state.set_session_id(new_session);
                                                 conversation.clear();
+                                                set_approval_mode(
+                                                    &approval,
+                                                    &mut state,
+                                                    approval::ApprovalMode::Default,
+                                                );
                                                 queued.clear();
                                                 writeln!(
                                                     stdout,
@@ -2345,6 +2419,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 let new_session = SessionId::new();
                 state.set_session_id(new_session);
                 conversation.clear();
+                set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
                 queued.clear();
                 writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
             }
@@ -2370,6 +2445,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         Ok(id) => {
                             conversation = reconstruct_session_conversation(&workspace, id);
                             state.set_session_id(id);
+                            set_approval_mode(
+                                &approval,
+                                &mut state,
+                                approval::ApprovalMode::Default,
+                            );
                             queued.clear();
                             writeln!(
                                 stdout,
@@ -2454,6 +2534,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             let new_session = SessionId::new();
                             state.set_session_id(new_session);
                             conversation.clear();
+                            set_approval_mode(
+                                &approval,
+                                &mut state,
+                                approval::ApprovalMode::Default,
+                            );
                             queued.clear();
                             writeln!(
                                 stdout,
@@ -2474,15 +2559,68 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
+            Prompt::Task if line.split_whitespace().next() == Some("/plan") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                match plan_command(&line) {
+                    PlanCommand::Revise(note) => {
+                        approval.enter_plan();
+                        state.set_approval_mode(approval.get().label());
+                        queued.push_front(revise_instruction(note.as_deref()));
+                    }
+                    PlanCommand::Approve => {
+                        if approval.get() == approval::ApprovalMode::Plan {
+                            let mode = approval.approve_plan();
+                            state.set_approval_mode(mode.label());
+                            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
+                            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                                .map_err(terminal_failed)?;
+                        } else {
+                            writeln!(stdout, "No plan is awaiting approval.")
+                                .map_err(terminal_failed)?;
+                        }
+                    }
+                    PlanCommand::Cancel => {
+                        if approval.get() == approval::ApprovalMode::Plan {
+                            let mode = approval.cancel_plan();
+                            state.set_approval_mode(mode.label());
+                            writeln!(
+                                stdout,
+                                "Planning cancelled. Approval mode: {}.",
+                                mode.label()
+                            )
+                            .map_err(terminal_failed)?;
+                        } else {
+                            writeln!(stdout, "Plan Mode is not active.")
+                                .map_err(terminal_failed)?;
+                        }
+                    }
+                    PlanCommand::Enter(task) => {
+                        approval.enter_plan();
+                        state.set_approval_mode(approval.get().label());
+                        writeln!(
+                            stdout,
+                            "Plan Mode active — workspace mutations are blocked."
+                        )
+                        .map_err(terminal_failed)?;
+                        if let Some(task) = task {
+                            queued.push_front(task);
+                        }
+                    }
+                }
+            }
             Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match line
                     .split_whitespace()
                     .nth(1)
-                    .and_then(approval::ApprovalMode::parse)
-                {
+                    .and_then(|argument| match argument {
+                        // What Shift+Tab sends. Resolved here so the shortcut
+                        // and the typed command take the same path.
+                        "cycle" => Some(approval.get().cycle()),
+                        _ => approval::ApprovalMode::parse(argument),
+                    }) {
                     Some(mode) => {
-                        approval.set(mode);
+                        set_approval_mode(&approval, &mut state, mode);
                         writeln!(
                             stdout,
                             "Approval mode: {} — {}",
@@ -2495,7 +2633,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         let current = approval.get();
                         writeln!(
                             stdout,
-                            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions",
+                            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
                             current.label(),
                             current.description()
                         )
@@ -2642,6 +2780,49 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             queued.clear();
                         }
                         queued.extend(turn.queued);
+                        if approval.get() == approval::ApprovalMode::Plan
+                            && !turn.interrupted
+                            && turn.failure.is_none()
+                        {
+                            match confirm_plan(&mut stdout, colour, &keys, &mut decoder)
+                                .map_err(terminal_failed)?
+                            {
+                                tui::AskDialogResult::Approve { note } => {
+                                    let mode = approval.approve_plan();
+                                    state.set_approval_mode(mode.label());
+                                    let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
+                                    if let Some(note) = note {
+                                        instruction
+                                            .push_str(&format!(" Operator constraint: {note}"));
+                                    }
+                                    queued.push_front(instruction);
+                                    writeln!(
+                                        stdout,
+                                        "Plan approved. Entering {} mode.",
+                                        mode.label()
+                                    )
+                                    .map_err(terminal_failed)?;
+                                }
+                                // The dialog's second choice is "continue
+                                // planning", so it stays in Plan Mode and
+                                // queues another planning turn.
+                                tui::AskDialogResult::AlwaysApprove { note } => {
+                                    queued.push_front(revise_instruction(note.as_deref()));
+                                }
+                                tui::AskDialogResult::Deny { .. }
+                                | tui::AskDialogResult::Cancel => {
+                                    let mode = approval.cancel_plan();
+                                    state.set_approval_mode(mode.label());
+                                    queued.clear();
+                                    writeln!(
+                                        stdout,
+                                        "Planning cancelled. Approval mode: {}.",
+                                        mode.label()
+                                    )
+                                    .map_err(terminal_failed)?;
+                                }
+                            }
+                        }
                     }
                     Err(diagnostic) => emitter.diagnostic(&diagnostic),
                 }
@@ -3516,7 +3697,8 @@ fn run_turn(
                 &load_config(&root, &working)?,
                 true,
                 &session_id.to_string(),
-            )?,
+            )?
+            .with_execution_mode(approval.get().execution_mode()),
             conversation,
             route,
             effort,
@@ -3532,6 +3714,7 @@ fn run_turn(
             &root,
             &task,
             route,
+            approval.get(),
             colour,
             footer,
             keys,
@@ -4138,6 +4321,37 @@ fn confirm_tool(
 }
 
 #[cfg(feature = "tui")]
+fn confirm_plan(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> io::Result<tui::AskDialogResult> {
+    let mut dialog = tui::AskDialogState::for_plan();
+    let width = tui::terminal_width();
+    let mut rendered_lines = dialog.render(width, colour).lines().count();
+    writeln!(terminal, "{}", dialog.render(width, colour))?;
+    terminal.flush()?;
+    loop {
+        let Ok(byte) = keys.recv() else {
+            return Ok(tui::AskDialogResult::Cancel);
+        };
+        let Some(key) = decoder.feed(byte) else {
+            continue;
+        };
+        if let Some(result) = dialog.handle_key(key) {
+            write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
+            terminal.flush()?;
+            return Ok(result);
+        }
+        let frame = dialog.render(width, colour);
+        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
+        terminal.flush()?;
+        rendered_lines = frame.lines().count();
+    }
+}
+
+#[cfg(feature = "tui")]
 fn redraw_live_response(
     terminal: &mut io::Stdout,
     composer: &mut tui::Composer,
@@ -4209,7 +4423,12 @@ fn native_status(
         // The harness's instructions and the project's, discovered by walking
         // the workspace. Rebuilt per round rather than captured once: an
         // AGENTS.md the turn just edited is the one the next round should read.
-        system: system_prompt(runtime.workspace(), &route.provider, &route.model),
+        system: system_prompt(
+            runtime.workspace(),
+            &route.provider,
+            &route.model,
+            runtime.execution_mode(),
+        ),
         messages: conversation.to_vec(),
         tools: runtime.schemas(),
         max_output_tokens: resolved.endpoint.max_output_tokens,
@@ -4549,6 +4768,7 @@ fn external_status(
     workspace: &Path,
     task: &str,
     route: &tui::ModelRoute,
+    mode: approval::ApprovalMode,
     colour: bool,
     footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -4562,7 +4782,16 @@ fn external_status(
         "--json",
         "--ephemeral",
         "--sandbox",
-        "read-only",
+        if matches!(
+            mode,
+            approval::ApprovalMode::AcceptEdits
+                | approval::ApprovalMode::Auto
+                | approval::ApprovalMode::BypassPermissions
+        ) {
+            "workspace-write"
+        } else {
+            "read-only"
+        },
         "--cd",
     ]);
     command.arg(workspace);
@@ -4571,8 +4800,17 @@ fn external_status(
     }
     command.arg("-");
     command.current_dir(workspace);
+    let task = if mode == approval::ApprovalMode::Plan {
+        format!(
+            "{}\n\n{}",
+            arsy_code::agent::instructions::PLAN_MODE_INSTRUCTIONS,
+            task
+        )
+    } else {
+        task.to_owned()
+    };
     drive_provider(
-        command, task, route, colour, footer, keys, decoder, composer, redactor,
+        command, &task, route, colour, footer, keys, decoder, composer, redactor,
     )
 }
 
@@ -4831,6 +5069,14 @@ fn drive_provider(
                 ) && finished.is_none()
                 {
                     finished = Some(std::time::Instant::now());
+                }
+                if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" {
+                    if let Some(text) = event["item"]["text"].as_str() {
+                        if !outcome.response.is_empty() {
+                            outcome.response.push('\n');
+                        }
+                        outcome.response.push_str(text);
+                    }
                 }
                 outcome.provider_failed |= event["type"] == "turn.failed";
                 // A killed provider still flushes buffered events; showing them
@@ -5200,7 +5446,12 @@ impl<'a> TaskRun<'a> {
                 provider: self.resolved.endpoint.id.clone(),
                 model: self.model.clone(),
             },
-            system: system_prompt(&self.root, &self.resolved.endpoint.id, &self.model),
+            system: system_prompt(
+                &self.root,
+                &self.resolved.endpoint.id,
+                &self.model,
+                arsy_code::agent::ExecutionMode::Normal,
+            ),
             messages: vec![ModelMessage {
                 role: ModelRole::User,
                 content: vec![ModelContent::Text { text: goal }],
@@ -6164,7 +6415,12 @@ fn agent_runtime(
 /// facts is one whose next turn has less room to read the code.
 const MAX_RECALLED_MEMORY_BYTES: usize = 4 * 1024;
 
-fn system_prompt(root: &Path, provider: &str, model: &str) -> Option<String> {
+fn system_prompt(
+    root: &Path,
+    provider: &str,
+    model: &str,
+    mode: arsy_code::agent::ExecutionMode,
+) -> Option<String> {
     let workspace = arsy_code::resource::Workspace::open(root).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
     let instructions = arsy_code::agent::instructions::discover(&workspace, &working);
@@ -6173,6 +6429,7 @@ fn system_prompt(root: &Path, provider: &str, model: &str) -> Option<String> {
         family,
         &instructions,
         memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
+        mode,
         &arsy_kernel::secret::Redactor::new(),
         arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
     )
@@ -7220,6 +7477,7 @@ mod tests {
                     | "/rename"
                     | "/session"
                     | "/approval"
+                    | "/plan"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
@@ -7229,6 +7487,73 @@ mod tests {
                 "{slash} is dispatched but never offered"
             );
         }
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn plan_subcommands_are_whole_words_and_everything_else_is_the_task_to_plan() {
+        assert_eq!(plan_command("/plan"), PlanCommand::Enter(None));
+        assert_eq!(
+            plan_command("/plan add a cache to the resolver"),
+            PlanCommand::Enter(Some("add a cache to the resolver".to_owned()))
+        );
+        assert_eq!(plan_command("/plan revise"), PlanCommand::Revise(None));
+        assert_eq!(
+            plan_command("/plan revise keep the existing schema"),
+            PlanCommand::Revise(Some("keep the existing schema".to_owned()))
+        );
+        assert_eq!(plan_command("/plan approve"), PlanCommand::Approve);
+        assert_eq!(plan_command("/plan cancel"), PlanCommand::Cancel);
+        // A subcommand with anything after it is still that subcommand, not a
+        // new planning task that silently re-enters Plan Mode.
+        assert_eq!(plan_command("/plan approve please"), PlanCommand::Approve);
+        assert_eq!(plan_command("/plan cancel for now"), PlanCommand::Cancel);
+        // A word that only starts with one is not one.
+        assert_eq!(
+            plan_command("/plan approvals for the release"),
+            PlanCommand::Enter(Some("approvals for the release".to_owned()))
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_plan_lifecycle_moves_between_planning_and_the_edit_mode_it_approves_into() {
+        let approval = approval::ApprovalCell::new(approval::ApprovalMode::Default);
+        let mut state = tui::TuiState::new("/workspace".into(), SessionId::new());
+
+        // Entering plans rather than executes: the runtime built for the next
+        // turn refuses every mutation.
+        approval.enter_plan();
+        state.set_approval_mode(approval.get().label());
+        assert_eq!(
+            approval.get().execution_mode(),
+            arsy_code::agent::ExecutionMode::Plan
+        );
+        assert!(state.status_row(80, false, None).contains("PLAN"));
+
+        // Revising stays in Plan Mode.
+        let revision = revise_instruction(Some("reuse the existing cache"));
+        assert!(revision.contains("reuse the existing cache"));
+        assert!(revision.contains("without making changes"));
+        assert_eq!(approval.get(), approval::ApprovalMode::Plan);
+        assert_eq!(
+            approval.get().execution_mode(),
+            arsy_code::agent::ExecutionMode::Plan
+        );
+
+        // Approving leaves it for an existing edit-capable mode.
+        let mode = approval.approve_plan();
+        state.set_approval_mode(mode.label());
+        assert_eq!(mode, approval::ApprovalMode::AcceptEdits);
+        assert_eq!(
+            approval.get().execution_mode(),
+            arsy_code::agent::ExecutionMode::Normal
+        );
+        assert!(!state.status_row(80, false, None).contains("PLAN"));
+        assert_eq!(
+            approval::decide(approval.get(), "fs.write"),
+            approval::Decision::Approve
+        );
     }
 
     #[cfg(all(feature = "tui", unix))]
