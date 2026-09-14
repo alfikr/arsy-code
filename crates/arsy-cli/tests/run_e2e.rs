@@ -73,17 +73,24 @@ impl FakeProvider {
 /// Read one HTTP request and return its body.
 /// A `PreToolUse` guard on `fs.read` whose hook denies the call with `reason`.
 ///
-/// Hooks run under `/bin/sh -c` on Unix and `cmd /C` on Windows, and the two
-/// disagree about quoting: sh strips the double quotes the JSON needs, while
-/// cmd keeps them and does not strip the single quotes that protect them from
-/// sh. Quoting for the wrong shell makes the hook emit something that is not
-/// JSON, which reads as a broken hook rather than the denial under test.
-fn denying_guard(reason: &str) -> String {
-    let payload = format!(r#"{{"decision": "deny", "reason": "{reason}"}}"#);
+/// The denial is written to a file in `directory` and the hook prints it, so
+/// the command carries no quotes for a shell to disagree about.
+fn denying_guard(directory: &Path, reason: &str) -> String {
+    let answer = directory.join("deny.json");
+    std::fs::write(
+        &answer,
+        format!(r#"{{"decision": "deny", "reason": "{reason}"}}"#),
+    )
+    .unwrap();
+    // Printing the file rather than the JSON keeps every quote out of the
+    // command line. `cmd /C` and `sh -c` disagree about quoting in ways no
+    // single string satisfies: sh strips the double quotes the JSON needs, and
+    // cmd strips them too once they reach it through Rust's own argument
+    // quoting.
     let command = if cfg!(windows) {
-        format!("echo {payload}")
+        format!("type {}", answer.display())
     } else {
-        format!("echo '{payload}'")
+        format!("cat {}", answer.display())
     };
     serde_json::json!({
         "hooks": {
@@ -622,7 +629,7 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
     std::fs::write(
         home.path().join(".arsy/guard.json"),
-        denying_guard("notes are off limits"),
+        denying_guard(&home.path().join(".arsy"), "notes are off limits"),
     )
     .unwrap();
 
@@ -664,7 +671,7 @@ fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
     std::fs::create_dir_all(workspace.path().join(".arsy")).unwrap();
     std::fs::write(
         workspace.path().join(".arsy/guard.json"),
-        denying_guard("the repo said no"),
+        denying_guard(&workspace.path().join(".arsy"), "the repo said no"),
     )
     .unwrap();
 
