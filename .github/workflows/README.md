@@ -1,12 +1,10 @@
-# Disabled while the repository is private
+# Workflows
 
-Every workflow here is parked as `*.yml.disabled`. GitHub only reads `.yml`, so
-none of them run — including manual dispatch, which needs the file to be visible
-to Actions.
-
-They were parked because Actions minutes on a private repository are billed with
-a per-runner multiplier (Linux 1x, Windows 2x, macOS 10x), and the last 90 runs
-cost roughly 2550 billed minutes against a 2000-3000 minute monthly allowance:
+All workflows here are active. They were previously parked as `*.yml.disabled`
+while the repository was private, because Actions minutes on a private
+repository are billed with a per-runner multiplier (Linux 1x, Windows 2x,
+macOS 10x) and a 90-run sample cost roughly 2550 billed minutes against a
+2000-3000 minute monthly allowance:
 
 | Workflow | Runs | Wall min | Billed min |
 |---|---|---|---|
@@ -15,28 +13,43 @@ cost roughly 2550 billed minutes against a 2000-3000 minute monthly allowance:
 | Performance | 16 | 70 | 70 |
 | Fuzz | 5 | 1 | 1 |
 
-Most of it is structural rather than slow: CI and Sandbox both run a
-three-OS matrix on every push and pull request, so each push pays the macOS
-multiplier twice, and CI's `dependencies` job builds `cargo-deny` from source
-every run with no cache.
+The repository is public now, so that multiplier no longer applies, but the
+shape of the cost is worth knowing before adding jobs: CI and Sandbox both run
+a three-OS matrix on every push and pull request, only CI has a concurrency
+group, and CI's `dependencies` job builds `cargo-deny` from source every run
+with no cache.
 
-`release.yml` is the one to restore before cutting a release: it builds the
-signed artifacts, and `docs/34-distribution.md` verifies them against
-`.github/workflows/release.yml@refs/tags/` as the certificate identity. Tagging
-while it is parked produces no artifacts and no signature.
+## Release path
 
-`release-please.yml` and `npm-publish.yml` follow the same convention and
-must be restored alongside it: `release-please.yml` opens/updates the release
-PR and, once one merges, calls `release.yml` and `npm-publish.yml` as reusable
-workflows to build and publish. `release-please.yml` also needs a
-`RELEASE_PLEASE_TOKEN` repository secret (a PAT, not `github.token` — PRs
-opened with the default token don't trigger workflow events) and npm Trusted
-Publishing configured for `@suiflex/arsy-code` and each
-`@suiflex/arsy-code-<platform>` package.
+`release-please.yml` is the entry point. Dispatch it manually, or let it run
+when a `release-please--*` pull request merges: it opens or updates the release
+PR, and once one merges it calls `release.yml` and `npm-publish.yml` as
+reusable workflows. Those two are referenced by path, so all three have to stay
+enabled together.
 
-Re-enable one by dropping the suffix:
+`release.yml` builds six archives (macOS, Linux, and Windows on x86_64 and
+aarch64), writes a `.sha256` beside each, signs an aggregate `SHA256SUMS` with
+keyless Sigstore, attaches the installers and the CycloneDX SBOM, then pushes
+the rendered formula and manifest to `suiflex/homebrew-tap` and
+`suiflex/scoop-bucket`. `docs/34-distribution.md` documents how to verify the
+result.
 
-    git mv .github/workflows/ci.yml.disabled .github/workflows/ci.yml
+Secrets the release path needs, all already configured:
+
+- `RELEASE_PLEASE_TOKEN` — a PAT, not `github.token`; pull requests opened with
+  the default token don't trigger workflow events, so CI would never run on the
+  release PR itself.
+- `TAP_PUBLISH_TOKEN` — push access to the tap and bucket repositories.
+
+npm publishes through Trusted Publishing (OIDC), so there is no `NPM_TOKEN`.
+It requires this repository and `.github/workflows/npm-publish.yml` to be
+registered as a Trusted Publisher for `@suiflex/arsy-code` on npmjs.com.
+
+Prefer the `release-please` dispatch over pushing a tag by hand. A manual tag
+push runs `release.yml`, whose completion fires `npm-publish.yml` through
+`workflow_run`; doing that after a release-please run would publish twice.
+
+## Local checks
 
 The same checks run locally, and are what the contributing guide expects before
 a push:
