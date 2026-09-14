@@ -2,8 +2,42 @@ name: Sandbox conformance
 
 on:
   pull_request:
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
   push:
     branches: [main]
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+
+concurrency:
+  group: sandbox-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
