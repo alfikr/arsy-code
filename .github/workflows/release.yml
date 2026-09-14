@@ -186,16 +186,16 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cosign sign-blob --yes \
-            --output-signature SHA256SUMS.sig \
-            --bundle SHA256SUMS.bundle \
-            SHA256SUMS
+          # The bundle carries the signature, the certificate, and the
+          # transparency-log entry. cosign v3 ignores --output-signature when
+          # it writes one, so asking for a separate .sig produced nothing and
+          # left the documented verification pointing at a missing file.
+          cosign sign-blob --yes --bundle SHA256SUMS.bundle SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: checksums
           path: |
             dist/SHA256SUMS
-            dist/SHA256SUMS.sig
             dist/SHA256SUMS.bundle
           if-no-files-found: error
 
