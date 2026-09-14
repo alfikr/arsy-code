@@ -39,49 +39,15 @@ jobs:
         shell: bash
         run: |
           tag="${{ inputs.tag || github.event.workflow_run.head_branch }}"
-          package_version="$(node -p "require('./package.json').version")"
+          package_version="$(node -p "require('./npm/package.json').version")"
           test "$tag" = "v$package_version"
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: arsy-*
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
       # Trusted Publishing (OIDC): no NPM_TOKEN needed. Requires npm >= 11.5.1
       # and this exact workflow path registered as a Trusted Publisher on
-      # npmjs.com for @suiflex/arsy-code and for each @suiflex/arsy-code-<platform>
-      # package below.
+      # npmjs.com for @suiflex/arsy-code.
+      #
+      # The package carries no binary. Its postinstall downloads the archive for
+      # the host platform from this tag's GitHub Release, so the release must
+      # already exist -- hence the gate on "Release build" above.
       - run: npm install -g npm@latest
-
-      # One npm package per Rust target, each staged from that target's release
-      # binary, published under its own name (docs/34-distribution.md). The
-      # optionalDependencies in package.json can only resolve once every
-      # platform package listed there is live, so all five publish before
-      # the launcher does.
-      - name: Stage and publish platform packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ inputs.tag || github.event.workflow_run.head_branch }}"
-          version="${version#v}"
-          declare -A targets=(
-            [x86_64-unknown-linux-gnu]=arsy
-            [aarch64-unknown-linux-gnu]=arsy
-            [x86_64-apple-darwin]=arsy
-            [aarch64-apple-darwin]=arsy
-            [x86_64-pc-windows-msvc]=arsy.exe
-          )
-          for target in "${!targets[@]}"; do
-            binary="dist/arsy-${target}/target/release/${targets[$target]}"
-            test -f "$binary"
-            output="npm/platforms/${target}"
-            npm run stage:platform -- \
-              --target "$target" \
-              --binary "$binary" \
-              --version "$version" \
-              --output "$output"
-            npm publish --access public "$output"
-          done
-
-      - name: Publish the launcher package
-        run: npm publish --access public
+      - run: npm publish --access public
+        working-directory: npm
