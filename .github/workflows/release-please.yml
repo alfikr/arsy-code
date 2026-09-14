@@ -64,7 +64,9 @@ jobs:
           fi
           git fetch origin "$branch"
           git checkout "$branch"
-          cargo update -w --offline
+          # No --offline: the runner has never fetched the crates.io index,
+          # so resolving even a workspace member fails without it.
+          cargo update --workspace
           if git diff --quiet -- Cargo.lock; then
             echo "Cargo.lock already matches Cargo.toml"
             exit 0
