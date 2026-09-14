@@ -362,6 +362,9 @@ fn encode_message(
         match content {
             ModelContent::Text { text } if !text.is_empty() => parts.push(json!({"text": text})),
             ModelContent::Text { .. } => {}
+            ModelContent::Image { media_type, data } => {
+                parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}}));
+            }
             ModelContent::ToolCall {
                 id,
                 name,

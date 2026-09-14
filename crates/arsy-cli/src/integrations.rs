@@ -49,6 +49,7 @@ pub fn inspect(
     name: Option<&str>,
     source: Option<&str>,
     event: Option<&str>,
+    extra_config: Option<&Path>,
 ) -> Result<Value, Diagnostic> {
     let cwd = std::env::current_dir().map_err(crate::storage_failed)?;
     let working = if cwd.starts_with(root) {
@@ -63,13 +64,13 @@ pub fn inspect(
     let loaded = if kind == "hook" {
         Some(crate::hook_engine(
             root,
-            &crate::load_config(root, working)?,
+            &crate::load_config(root, working, extra_config)?,
         ))
     } else {
         None
     };
     if kind == "mcp" && source.is_none_or(|source| source == "arsy") {
-        entries.extend(configured(root, working, name)?);
+        entries.extend(configured(root, working, name, extra_config)?);
     }
     for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
         if source.is_some_and(|source| source != ecosystem.as_str()) {
@@ -180,8 +181,13 @@ fn runtime_status(
 ///
 /// Reading a definition is not connecting: `runtime_status` is `not_loaded`
 /// for every row here, exactly as it is for an import.
-fn configured(root: &Path, working: &Path, name: Option<&str>) -> Result<Vec<Value>, Diagnostic> {
-    let config = crate::load_config(root, working)?;
+fn configured(
+    root: &Path,
+    working: &Path,
+    name: Option<&str>,
+    extra_config: Option<&Path>,
+) -> Result<Vec<Value>, Diagnostic> {
+    let config = crate::load_config(root, working, extra_config)?;
     let mut entries = Vec::new();
     for server in config.mcp_servers() {
         if name.is_some_and(|name| name != server.name) {
@@ -426,14 +432,22 @@ mod tests {
             .join("../../fixtures/compat/claude/input")
             .canonicalize()
             .unwrap();
-        let hooks = inspect(&root, "hook", None, Some("claude"), Some("PreToolUse")).unwrap();
+        let hooks = inspect(
+            &root,
+            "hook",
+            None,
+            Some("claude"),
+            Some("PreToolUse"),
+            None,
+        )
+        .unwrap();
         assert!(!hooks["entries"].as_array().unwrap().is_empty());
         assert_eq!(hooks["entries"][0]["runtime_status"], "not_loaded");
-        let mcp = inspect(&root, "mcp", None, Some("claude"), None).unwrap();
+        let mcp = inspect(&root, "mcp", None, Some("claude"), None, None).unwrap();
         assert!(!mcp["entries"].as_array().unwrap().is_empty());
-        assert!(inspect(&root, "mcp", Some("missing"), Some("claude"), None).is_err());
+        assert!(inspect(&root, "mcp", Some("missing"), Some("claude"), None, None).is_err());
         assert_eq!(
-            inspect(&root, "mcp", None, None, None).unwrap()["entries"],
+            inspect(&root, "mcp", None, None, None, None).unwrap()["entries"],
             mcp["entries"]
         );
         let listing = human_report(&mcp, "mcp", Some("claude"), None)["declarations"]
@@ -480,7 +494,15 @@ mod tests {
         );
 
         // An empty result names what was read and which filters narrowed it.
-        let empty = inspect(&root, "hook", None, Some("claude"), Some("NoSuchEvent")).unwrap();
+        let empty = inspect(
+            &root,
+            "hook",
+            None,
+            Some("claude"),
+            Some("NoSuchEvent"),
+            None,
+        )
+        .unwrap();
         let empty = human_report(&empty, "hook", Some("claude"), Some("NoSuchEvent"))
             ["declarations"]
             .as_str()
@@ -511,7 +533,7 @@ mod tests {
             .join("../../fixtures/compat/claude/input")
             .canonicalize()
             .unwrap();
-        let hooks = inspect(&root, "hook", None, Some("claude"), None).unwrap();
+        let hooks = inspect(&root, "hook", None, Some("claude"), None, None).unwrap();
         let listing = human_report(&hooks, "hook", None, None)["declarations"]
             .as_str()
             .unwrap()

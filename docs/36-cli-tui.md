@@ -181,6 +181,7 @@ Global flags apply before or after a subcommand:
 | `--model <ID>` | resolved default | select an allowed model |
 | `--output <MODE>` | `human` on a TTY, `ci` otherwise | `human`, `json`, or `ci` |
 | `--no-color` | false | disable ANSI styling; equivalent to `ui.color = "never"` |
+| `--debug` | false | trace the agent loop to stderr as JSON lines: requests, normalized model events, tool results, retries, and turn transitions. Redacted like every other sink, and absent entirely when unset |
 | `--help` | — | print help and exit |
 | `--version` | — | print version and target, then exit |
 
@@ -200,7 +201,7 @@ read-only: they never mutate the workspace, session history, or stored configura
 | Command | Positional arguments | Command flags | Description | Availability |
 |---|---|---|---|---|
 | `arsy` | none | global flags | open the interactive TUI in the workspace | 2 |
-| `arsy run <TASK>` | one required task string; `-` reads it from stdin | global flags | execute one task non-interactively and exit at its terminal state | 1 |
+| `arsy run <TASK>` | one required task string; `-` reads it from stdin | `--image <PATH>` plus global flags | execute one task non-interactively and exit at its terminal state; `--image` attaches one png, jpeg, gif, or webp of at most 5 MiB, and a provider that cannot read one refuses the turn rather than dropping it | 1 |
 | `arsy resume <SESSION_ID>` | one required canonical session ID | `--follow` plus global flags | resume an existing session; follow new events until terminal when requested | 1 |
 | `arsy review [REVISION]` | optional Git revision; omitted means `HEAD`, so the working tree | `--base <REVISION>`, `--strict` plus global flags | report what changed, the verification depth it implies, and findings that name a file; `--strict` makes any finding a non-zero exit | 6 |
 | `arsy session list` | none | `--workspace-only`, `--limit <N>` | list session IDs with workspace, status, start time, and token totals | 1 |

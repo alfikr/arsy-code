@@ -321,6 +321,58 @@ pub fn set_enabled(
     Ok(0)
 }
 
+/// Connect every enabled server and collect the tools they offer.
+///
+/// Called once per turn, at the boundary, so a server added or enabled between
+/// turns becomes callable at the next one and a definition edited mid-turn
+/// cannot change what the model was already told.
+///
+/// A server that will not connect is reported as a warning and skipped. The
+/// alternative — failing the turn — would make one broken definition in a user
+/// config file stop all work in every workspace, which is a worse failure than
+/// a turn that runs with fewer tools and says so.
+pub fn connect_enabled(
+    config: &arsy_kernel::config::Config,
+    emitter: &mut Emitter,
+) -> (
+    Option<arsy_code::agent::mcpops::Connections>,
+    Vec<arsy_code::agent::DynamicTool>,
+) {
+    let channels = RealChannels {
+        http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
+            Box::new(arsy_kernel::provider::http::HttpTransport::default())
+        },
+    };
+    let mut connections = std::collections::BTreeMap::new();
+    let mut tools = Vec::new();
+    for server in config.mcp_servers().filter(|server| server.enabled) {
+        // A first connection is bounded by what it discovers; a ceiling only
+        // exists once one has been recorded, and nothing records one across
+        // processes yet.
+        match Connection::open(server, None, &channels) {
+            Ok(connection) => {
+                tools.extend(arsy_code::agent::mcpops::tools_of(&connection));
+                connections.insert(server.name.clone(), connection);
+            }
+            Err(error) => emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-MCP-1000",
+                format!("MCP server `{}` is unavailable: {error}", server.name),
+                format!(
+                    "check it with `arsy mcp test {}`, or disable it",
+                    server.name
+                ),
+            )),
+        }
+    }
+    if connections.is_empty() {
+        return (None, Vec::new());
+    }
+    (
+        Some(std::sync::Arc::new(std::sync::Mutex::new(connections))),
+        tools,
+    )
+}
+
 /// `arsy mcp test`: connect, negotiate, discover, disconnect.
 ///
 /// No tool is invoked, and nothing is recorded against a session: this is a
@@ -333,7 +385,7 @@ pub fn test(
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working)?;
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
     let mut server = config.mcp_server(name).cloned().ok_or_else(|| {
         usage(format!(
             "no connection named `{name}` is configured; list them with `arsy mcp list`"

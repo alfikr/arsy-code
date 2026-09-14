@@ -332,6 +332,40 @@ fn drain(
     })
 }
 
+/// Ask a child's process group to stop, then insist once the grace runs out.
+///
+/// Shared rather than written at each call site: a timeout, a cancellation,
+/// and a background session's `process.stop` are the same three steps, and a
+/// copy that forgot the forced kill would leave a process behind.
+pub(crate) fn end(child: &mut Child, grace: Duration) -> Ended {
+    let graceful = terminate(child);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Ended {
+                status: Some(status),
+                graceful,
+                forced: false,
+            };
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = force_kill(child);
+    Ended {
+        status: child.wait().ok(),
+        graceful,
+        forced: true,
+    }
+}
+
+/// How a child that had to be stopped actually stopped.
+pub(crate) struct Ended {
+    pub status: Option<ExitStatus>,
+    /// Whether the polite signal was delivered at all.
+    pub graceful: bool,
+    pub forced: bool,
+}
+
 fn wait_bounded(
     child: &mut Child,
     timeout: Duration,
@@ -339,37 +373,30 @@ fn wait_bounded(
     operation: OperationId,
 ) -> Result<(ExitStatus, bool, bool, bool, Cleanup), OperationError> {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if take_cancelled(operation) {
-            let graceful = terminate(child);
-            let grace_deadline = Instant::now() + grace;
-            while Instant::now() < grace_deadline {
-                if let Some(status) = child.try_wait().map_err(execution)? {
-                    return Ok((status, false, graceful, false, Cleanup::Terminated));
-                }
-                thread::sleep(Duration::from_millis(5));
+    let mut timed_out = false;
+    loop {
+        let cancelled = take_cancelled(operation);
+        if !cancelled && !timed_out {
+            if let Some(status) = child.try_wait().map_err(execution)? {
+                return Ok((status, false, false, false, Cleanup::Reaped));
             }
-            force_kill(child)?;
-            let status = child.wait().map_err(execution)?;
-            return Ok((status, false, graceful, true, Cleanup::Killed));
+            timed_out = Instant::now() >= deadline;
+            if !timed_out {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
         }
-        if let Some(status) = child.try_wait().map_err(execution)? {
-            return Ok((status, false, false, false, Cleanup::Reaped));
-        }
-        thread::sleep(Duration::from_millis(5));
+        let ended = end(child, grace);
+        let status = ended
+            .status
+            .ok_or_else(|| OperationError::Execution("the child could not be reaped".into()))?;
+        let cleanup = if ended.forced {
+            Cleanup::Killed
+        } else {
+            Cleanup::Terminated
+        };
+        return Ok((status, timed_out, ended.graceful, ended.forced, cleanup));
     }
-
-    let graceful = terminate(child);
-    let grace_deadline = Instant::now() + grace;
-    while Instant::now() < grace_deadline {
-        if let Some(status) = child.try_wait().map_err(execution)? {
-            return Ok((status, true, graceful, false, Cleanup::Terminated));
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    force_kill(child)?;
-    let status = child.wait().map_err(execution)?;
-    Ok((status, true, graceful, true, Cleanup::Killed))
 }
 
 #[cfg(unix)]

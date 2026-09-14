@@ -217,6 +217,19 @@ fn row(store: &dyn EventStore, summary: &SessionSummary) -> Result<Value, Diagno
     }))
 }
 
+/// A cost total as an operator reads it.
+///
+/// `null` is "unknown", which is what an unpriced model produces. Printed as
+/// the word rather than as `$0.00`, because a running total that silently
+/// reported unpriced spend as free would be the one thing this whole path
+/// exists to avoid.
+fn money(micros: &Value) -> String {
+    match micros.as_u64() {
+        Some(micros) => format!("${:.4}", micros as f64 / 1_000_000.0),
+        None => "unknown (no pricing configured)".to_owned(),
+    }
+}
+
 /// A session is as unfinished as its least finished turn: one running turn
 /// makes the whole session running, however many completed before it.
 fn status(projection: &ProjectionSet) -> &'static str {
@@ -253,13 +266,14 @@ fn human_list(report: &Value) -> Value {
     );
     for session in sessions {
         listing.push_str(&format!(
-            "\n  {} · {} · {} turn(s) · {} event(s)\n    tokens: {} in / {} out · started {}\n",
+            "\n  {} · {} · {} turn(s) · {} event(s)\n    tokens: {} in / {} out · cost: {} · started {}\n",
             session["session"].as_str().unwrap_or("?"),
             session["status"].as_str().unwrap_or("?"),
             session["turns"],
             session["events"],
             session["input_tokens"],
             session["output_tokens"],
+            money(&session["cost_micros"]),
             timestamp(&session["started_at_ms"]),
         ));
         if let Some(parent) = session["branched_from"].as_object() {
@@ -357,13 +371,14 @@ pub fn show(
 
 fn human_show(report: &Value) -> Value {
     let mut text = format!(
-        "session {}\n  status: {} · {} turn(s) · {} event(s)\n  tokens: {} in / {} out\n",
+        "session {}\n  status: {} · {} turn(s) · {} event(s)\n  tokens: {} in / {} out · cost: {}\n",
         report["session"].as_str().unwrap_or("?"),
         report["status"].as_str().unwrap_or("?"),
         report["turns"],
         report["events"],
         report["usage"]["input_tokens"],
         report["usage"]["output_tokens"],
+        money(&report["usage"]["cost_micros"]),
     );
     if let Some(branch) = report["branched_from"].as_object() {
         text.push_str(&format!(

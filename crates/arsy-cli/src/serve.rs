@@ -47,7 +47,7 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
 pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working)?;
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
     let workspace = arsy_code::resource::Workspace::open(&root)
         .map_err(|error| storage_failed(error.to_string()))?;
     let artifacts = std::sync::Arc::new(
@@ -63,6 +63,9 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
         arsy_kernel::artifact::unix_time_ms(),
         arsy_code::operations::Reachable::from_config(&config),
         &arsy_kernel::domain::SessionId::new().to_string(),
+        // The embedding client owns the conversation, so there is no ARSY
+        // session stream here to hang a durable checklist from.
+        arsy_code::operations::TurnState::default(),
     )
     .map_err(|error| storage_failed(error.to_string()))?;
 

@@ -105,6 +105,7 @@ fn run(input: Value) -> Result<Value, String> {
         },
         arsy_code::operations::Reachable::default(),
         "test",
+        arsy_code::operations::TurnState::default(),
     )
     .unwrap();
 
@@ -117,6 +118,7 @@ fn run(input: Value) -> Result<Value, String> {
         0,
         arsy_code::operations::Reachable::default(),
         "test",
+        arsy_code::operations::TurnState::default(),
     )
     .unwrap();
     let kind = OperationKind::new("debug.run").unwrap();
@@ -220,6 +222,7 @@ fn the_launch_is_checked_against_the_adapter_it_would_run() {
         0,
         operations::Reachable::default(),
         "test",
+        arsy_code::operations::TurnState::default(),
     )
     .unwrap();
     let kind = OperationKind::new("debug.run").unwrap();

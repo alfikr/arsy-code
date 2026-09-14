@@ -134,9 +134,17 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
     };
     let mut text = String::new();
     let mut tool_calls = Vec::new();
+    // Empty unless the message carries an image. A text-only message keeps the
+    // plain-string `content` every existing recording and test expects; the
+    // array form is used only where it is actually needed.
+    let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
             ModelContent::Text { text: chunk } => text.push_str(chunk),
+            ModelContent::Image { media_type, data } => images.push(json!({
+                "type": "image_url",
+                "image_url": {"url": super::data_url(media_type, data)},
+            })),
             ModelContent::ToolCall {
                 id,
                 name,
@@ -150,10 +158,17 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
             ModelContent::ToolResult { .. } => {}
         }
     }
-    if !text.is_empty() || !tool_calls.is_empty() {
+    if !text.is_empty() || !tool_calls.is_empty() || !images.is_empty() {
         let mut wire = Map::new();
         wire.insert("role".to_owned(), json!(role));
-        wire.insert("content".to_owned(), json!(text));
+        if images.is_empty() {
+            wire.insert("content".to_owned(), json!(text));
+        } else {
+            wire.insert(
+                "content".to_owned(),
+                Value::Array(super::content_parts("text", &text, &mut images)),
+            );
+        }
         if !tool_calls.is_empty() {
             wire.insert("tool_calls".to_owned(), Value::Array(tool_calls));
         }

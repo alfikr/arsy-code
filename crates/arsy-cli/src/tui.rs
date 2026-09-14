@@ -680,7 +680,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/approval",
         "set approval mode; default | acceptEdits | plan | auto | dontAsk | bypassPermissions",
     ),
-    ("/plan", "plan a task; approve | revise [NOTE] | cancel"),
+    (
+        "/plan",
+        "plan a task; show | approve | revise [NOTE] | cancel",
+    ),
+    ("/todo", "show this session's durable checklist"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -941,7 +945,13 @@ pub const EFFORT_ROWS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 20;
+/// Rows the slash menu may occupy on a terminal tall enough for them.
+///
+/// Above the number of commands, so the whole table is offered rather than
+/// silently truncated at the bottom — which is where `/quit` and `/help` live,
+/// and hiding the way out is the one thing a menu must not do. A short
+/// terminal still narrows it; that bound is the screen's, not this one.
+const MENU_ROWS: usize = 24;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -1857,9 +1867,15 @@ impl TuiState {
             &self.session.to_string(),
             sgr_dim(),
         ));
-        if self.approval_mode == "plan" {
-            rows.push(label_row(colour, "mode:", "PLAN", sgr_accent()));
-        }
+        // Named on every launch, not only when it is Plan Mode: an operator
+        // opening a session should be told what runs without asking before
+        // they type, rather than after a call they expected to be prompted for.
+        let (mode, style) = match self.approval_mode.as_str() {
+            "default" => ("manual", sgr_dim()),
+            "plan" => ("PLAN", sgr_accent()),
+            other => (other, sgr_accent()),
+        };
+        rows.push(label_row(colour, "mode:", mode, style));
         if let Some(entry) = self.timeline.last() {
             rows.push(label_row(
                 colour,
@@ -1916,16 +1932,18 @@ impl TuiState {
             Some(Effort::Medium) => "◑ medium".to_owned(),
             Some(Effort::High) => "● high".to_owned(),
         };
-        // `default` is the mode the row means when it says nothing, so naming it
-        // would cost a field to tell the reader what they already assume. Every
-        // other mode is a standing decision about what runs without asking, and
-        // Shift+Tab can change it between two glances at the screen.
+        // Always named, never blank. A row that says nothing about the mode
+        // leaves the reader to remember which one they are in, and Shift+Tab
+        // can change it between two glances at the screen — so the one moment
+        // an operator most needs to see the mode is the moment the row would
+        // have been silent. `default` is spelled `manual` here because that is
+        // what it does; `/approval manual` is an accepted spelling of it.
         let mode_label = match self.approval_mode.as_str() {
-            "default" => None,
-            "plan" => Some("⏸ PLAN".to_owned()),
-            mode => Some(format!("⚙ {mode}")),
+            "default" => "⚙ manual".to_owned(),
+            "plan" => "⏸ PLAN".to_owned(),
+            mode => format!("⚙ {mode}"),
         };
-        let mode_label = mode_label.as_deref();
+        let mode_label = Some(mode_label.as_str());
         let branch = branch.unwrap_or_default();
 
         let model_label = format!("✦ {route}");
@@ -4118,16 +4136,21 @@ mod tests {
         assert!(!first.contains("\x1b["));
         assert!(first.lines().all(|line| line.chars().count() == 80));
         // No model, no effort, and no checkout: the row still says what is
-        // missing rather than dropping the field.
+        // missing rather than dropping the field — and it always names the
+        // approval mode, `default` included, so the mode is never something
+        // the operator has to remember.
         assert_eq!(
             state.status_row(80, false, None),
-            "  ✦ no model  ○ off  📁 /repo"
+            "  ✦ no model  ○ off  ⚙ manual  📁 /repo"
         );
         state.set_effort(Some(Effort::High));
         // The branch sits at the right edge, so it holds its column while the
         // fields on the left change length.
         let row = state.status_row(80, false, Some("feat/x"));
-        assert!(row.starts_with("  ✦ no model  ● high  📁 /repo"), "{row:?}");
+        assert!(
+            row.starts_with("  ✦ no model  ● high  ⚙ manual  📁 /repo"),
+            "{row:?}"
+        );
         assert!(row.ends_with("⎇ feat/x"), "{row:?}");
         assert_eq!(visible_len(&row), 80, "{row:?}");
         state.set_effort(None);
@@ -4691,13 +4714,14 @@ mod tests {
         assert!(middle.ends_with("feat/slash-menu"), "{middle:?}");
         assert!(visible_len(&middle) <= 72, "{middle:?}");
 
-        // Narrower still: the path goes entirely before the branch is touched.
+        // Narrower still: the path goes entirely, and then the branch — never
+        // cut, always whole or absent. The approval mode outlives both, because
+        // it is the field that says what will run without asking.
         let narrow = state.status_row(48, false, Some("feat/slash-menu"));
         assert!(!narrow.contains("arsy-code"), "{narrow:?}");
-        assert!(narrow.ends_with("feat/slash-menu"), "{narrow:?}");
+        assert!(narrow.contains("⚙ manual"), "{narrow:?}");
         assert!(visible_len(&narrow) <= 48, "{narrow:?}");
 
-        // Only when even that cannot fit is the branch dropped, never cut.
         let tiny = state.status_row(30, false, Some("feat/slash-menu"));
         assert!(!tiny.contains("feat/"), "{tiny:?}");
         assert!(visible_len(&tiny) <= 30, "{tiny:?}");
@@ -4762,8 +4786,10 @@ mod tests {
         let rows: Vec<&str> = frame.split('\n').collect();
         assert_eq!(
             rows.len(),
-            4 + COMMANDS.len(),
-            "pad, input, pad, one row per command, status"
+            // The menu is windowed: a table longer than the window shows the
+            // window, not the table.
+            4 + COMMANDS.len().min(MENU_ROWS),
+            "pad, input, pad, one row per visible command, status"
         );
         assert!(
             rows[3].contains(&format!("› {}", COMMANDS[0].0)),
@@ -4780,7 +4806,10 @@ mod tests {
         }
         // Up over the bottom pad, the menu, and the status row, then across `› /`.
         assert!(
-            frame.ends_with(&format!("\x1b[{}A\r\x1b[3C", COMMANDS.len() + 2)),
+            frame.ends_with(&format!(
+                "\x1b[{}A\r\x1b[3C",
+                COMMANDS.len().min(MENU_ROWS) + 2
+            )),
             "{frame:?}"
         );
 

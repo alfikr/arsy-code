@@ -62,6 +62,99 @@ pub enum ModelContent {
         content: String,
         is_error: bool,
     },
+    /// An image the operator attached to the prompt.
+    ///
+    /// Carried inline as base64 rather than as a path or a URL: every dialect
+    /// that accepts one accepts bytes, only some accept a URL, and none can
+    /// read a file on this machine. The canonical form is the one they all
+    /// share, so the adapter re-frames it and never has to go and fetch it.
+    Image {
+        /// An IANA media type, such as `image/png`.
+        media_type: String,
+        /// Standard base64, with padding. Not base64url: this is what every
+        /// image API in this family expects, and a data URL is built from it
+        /// directly.
+        data: String,
+    },
+}
+
+/// Standard base64 with padding.
+///
+/// Written here rather than taken as a dependency because it is fifteen lines
+/// and the workspace already carries a URL-alphabet encoder for OAuth; a crate
+/// for this would be a supply-chain surface bought for nothing.
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut block = 0_u32;
+        for (index, byte) in chunk.iter().enumerate() {
+            block |= u32::from(*byte) << (16 - 8 * index);
+        }
+        for index in 0..=chunk.len() {
+            let sextet = (block >> (18 - 6 * index)) & 0b11_1111;
+            encoded.push(char::from(ALPHABET[sextet as usize]));
+        }
+        // Padding to a multiple of four, which the decoders on the other side
+        // require and the URL-safe variant omits.
+        for _ in chunk.len()..3 {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+/// A data URL, for the dialects that take one instead of a byte field.
+pub fn data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
+}
+
+/// One message's content as a parts array: the text first, then the images.
+///
+/// Both OpenAI dialects splice a message the same way and differ only in how a
+/// part is spelled — `text` against `input_text`, an object `image_url`
+/// against a string one. Written once here so a fix to the shape (an empty
+/// text, a new field, an ordering rule) lands in both adapters rather than in
+/// whichever one the next reader happens to open.
+///
+/// `images` is emptied, because a caller that has already decided to use the
+/// array form has no second use for them.
+pub fn content_parts(text_type: &str, text: &str, images: &mut Vec<Value>) -> Vec<Value> {
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    // An empty text part is not "no text", it is a part saying nothing, and
+    // some endpoints reject one.
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"type": text_type, "text": text}));
+    }
+    parts.append(images);
+    parts
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::{base64, data_url};
+
+    /// The RFC 4648 vectors, because every image API on the other side of this
+    /// decodes with a strict decoder: a missing pad byte is a rejected request,
+    /// not a slightly different string.
+    #[test]
+    fn encoding_matches_the_standard_alphabet_and_pads_to_four() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // The bytes that differ from the URL-safe alphabet, which is the other
+        // encoder in this crate and the wrong one here.
+        assert_eq!(base64(&[0xfb, 0xff, 0xbf]), "+/+/");
+
+        assert_eq!(
+            data_url("image/png", &base64(b"foo")),
+            "data:image/png;base64,Zm9v"
+        );
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -40,11 +40,13 @@ pub mod debugops;
 pub mod discoveryops;
 pub mod fsops;
 pub mod instructions;
+pub mod mcpops;
 pub mod patch;
 pub mod planops;
 #[cfg(feature = "wasm")]
 pub mod pluginops;
 pub mod searchops;
+pub mod todoops;
 pub mod validateops;
 
 use crate::resource::Workspace;
@@ -611,6 +613,132 @@ pub const TOOLS: &[Tool] = &[
         summarize: |arguments| text(arguments, "command"),
     },
     Tool {
+        name: "web_fetch",
+        operation: "net.fetch",
+        description: "Fetch one http or https URL and return its content as text. HTML is reduced to the readable part of the page. Use this instead of `bash curl`: it is bounded in size, redirects, and time, it needs no execute authority, and an operator can allow or deny it per host.",
+        schema: || {
+            object(
+                json!({
+                    "url": {"type": "string", "description": "Absolute http or https URL."},
+                    "max_bytes": {"type": "number", "description": "Most response bytes to read. Defaults to 2097152."},
+                    "timeout_ms": {"type": "number", "description": "Deadline in milliseconds. Defaults to 30000; capped at 120000."}
+                }),
+                &["url"],
+            )
+        },
+        translate: |arguments| {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.trim().is_empty())
+                .ok_or("web_fetch requires a non-empty `url` string")?;
+            let mut input = json!({"url": url});
+            for key in ["max_bytes", "timeout_ms"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_u64) {
+                    input[key] = json!(value);
+                }
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "url"),
+    },
+    Tool {
+        name: "bash_start",
+        operation: "process.start",
+        description: "Start a shell command in the background and return a handle instead of waiting for it. Use this for anything that does not end on its own — a dev server, a file watcher — or a long run whose progress is worth reading. Read its output with `bash_poll`, send it input with `bash_write`, and end it with `bash_stop`. Set `pty` when the program needs to believe it is talking to a terminal, such as a REPL that prints no prompt otherwise. Prefer plain `bash` for anything that finishes by itself.",
+        schema: || {
+            object(
+                json!({
+                    "command": {"type": "string", "description": "Shell command to run."},
+                    "pty": {"type": "boolean", "description": "Give the process a pseudoterminal. Defaults to false."},
+                    "timeout_ms": {"type": "number", "description": "Deadline in milliseconds, after which the process is stopped. Defaults to 24 hours."}
+                }),
+                &["command"],
+            )
+        },
+        translate: |arguments| {
+            let command = arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|command| !command.trim().is_empty())
+                .ok_or("bash_start requires a non-empty `command` string")?;
+            let mut input = json!({"argv": ["sh", "-c", command]});
+            if let Some(pty) = arguments.get("pty").and_then(Value::as_bool) {
+                input["pty"] = json!(pty);
+            }
+            if let Some(timeout) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+                input["timeout_ms"] = json!(timeout);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "command"),
+    },
+    Tool {
+        name: "bash_poll",
+        operation: "process.poll",
+        description: "Read whatever a background process has printed since the last poll, and whether it is still running. Output is returned once: a second poll returns only what arrived after the first. When the process has ended, its exit code is reported here.",
+        schema: || {
+            object(
+                json!({"handle": {"type": "string", "description": "A handle from `bash_start`."}}),
+                &["handle"],
+            )
+        },
+        translate: |arguments| Ok(json!({"handle": text(arguments, "handle")})),
+        summarize: |arguments| text(arguments, "handle"),
+    },
+    Tool {
+        name: "bash_write",
+        operation: "process.write",
+        description: "Send text to a background process's standard input. Include the newline the program is waiting for — text without one usually leaves it still reading.",
+        schema: || {
+            object(
+                json!({
+                    "handle": {"type": "string", "description": "A handle from `bash_start`."},
+                    "data": {"type": "string", "description": "Exactly what to write, newline included."}
+                }),
+                &["handle", "data"],
+            )
+        },
+        translate: |arguments| {
+            Ok(json!({
+                "handle": text(arguments, "handle"),
+                "data": text(arguments, "data"),
+            }))
+        },
+        summarize: |arguments| text(arguments, "handle"),
+    },
+    Tool {
+        name: "bash_stop",
+        operation: "process.stop",
+        description: "End a background process and report how it ended. Asks it to stop first and kills it only if it will not. Returns the same shape `bash_poll` does, including any output that had not been read.",
+        schema: || {
+            object(
+                json!({"handle": {"type": "string", "description": "A handle from `bash_start`."}}),
+                &["handle"],
+            )
+        },
+        translate: |arguments| Ok(json!({"handle": text(arguments, "handle")})),
+        summarize: |arguments| text(arguments, "handle"),
+    },
+    Tool {
+        name: "repo_map",
+        operation: "repo.map",
+        description: "A compact map of the repository: which files exist, what each declares, and how many modules each imports. Kept between turns and refreshed incrementally, so calling it is cheap. Call it before exploring an unfamiliar repository — it answers in one call what several rounds of listing and reading would. Files it could not parse are still listed; read them with `fs.read` or find them with `search.text`.",
+        schema: || {
+            object(
+                json!({"max_bytes": {"type": "number", "description": "Most bytes of map to return. Defaults to 4096."}}),
+                &[],
+            )
+        },
+        translate: |arguments| {
+            Ok(match arguments.get("max_bytes").and_then(Value::as_u64) {
+                Some(max_bytes) => json!({"max_bytes": max_bytes}),
+                None => json!({}),
+            })
+        },
+        summarize: |_| String::new(),
+    },
+    Tool {
         name: "repo_discover",
         operation: "repo.discover",
         description: "Identify the repository: its git root, every manifest found (Cargo.toml, package.json, go.mod, ...) with the language it implies, and the members a workspace-level manifest declares. Call this before inferring the project's layout from `bash`.",
@@ -774,6 +902,95 @@ pub const TOOLS: &[Tool] = &[
         summarize: |_| String::new(),
     },
     Tool {
+        name: "todo_add",
+        operation: "todo.add",
+        description: "Add an item to the session's durable checklist and return the whole list. Unlike the plan, a TODO survives this turn and the process: use it for work that is agreed but not yet done, and use `plan_add` for the steps of what you are doing right now. `depends_on` names TODOs that must finish first.",
+        schema: || {
+            object(
+                json!({
+                    "text": {"type": "string", "description": "What has to happen."},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "TODO ids this one waits for."}
+                }),
+                &["text"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"text": text(arguments, "text")});
+            if let Some(depends_on) = arguments.get("depends_on").and_then(Value::as_array) {
+                input["depends_on"] = json!(depends_on);
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "text"),
+    },
+    Tool {
+        name: "todo_update",
+        operation: "todo.update",
+        description: "Change a TODO's status or text. Status is one of `pending`, `in_progress`, `completed`, `cancelled`. Starting or finishing one whose dependencies are unfinished is refused. Returns the whole list.",
+        schema: || {
+            object(
+                json!({
+                    "id": {"type": "string", "description": "TODO id, as returned by todo_add or todo_list."},
+                    "status": {"type": "string", "description": "pending | in_progress | completed | cancelled"},
+                    "text": {"type": "string", "description": "Replacement text. Leave unset to keep it."}
+                }),
+                &["id"],
+            )
+        },
+        translate: |arguments| {
+            let mut input = json!({"id": text(arguments, "id")});
+            for key in ["status", "text"] {
+                if let Some(value) = arguments.get(key).and_then(Value::as_str) {
+                    input[key] = json!(value);
+                }
+            }
+            Ok(input)
+        },
+        summarize: |arguments| text(arguments, "id"),
+    },
+    Tool {
+        name: "todo_remove",
+        operation: "todo.remove",
+        description: "Drop a TODO. It is marked cancelled rather than deleted, so the checklist can still say what was abandoned. Returns the whole list.",
+        schema: || {
+            object(
+                json!({"id": {"type": "string", "description": "TODO id to drop."}}),
+                &["id"],
+            )
+        },
+        translate: |arguments| Ok(json!({"id": text(arguments, "id")})),
+        summarize: |arguments| text(arguments, "id"),
+    },
+    Tool {
+        name: "todo_reorder",
+        operation: "todo.reorder",
+        description: "Put the checklist in a new order. `order` must name every current TODO id exactly once.",
+        schema: || {
+            object(
+                json!({
+                    "order": {"type": "array", "items": {"type": "string"}, "description": "Every TODO id, in the new order."}
+                }),
+                &["order"],
+            )
+        },
+        translate: |arguments| {
+            let order = arguments
+                .get("order")
+                .and_then(Value::as_array)
+                .ok_or("todo_reorder requires an `order` array")?;
+            Ok(json!({"order": order}))
+        },
+        summarize: |_| "reorder".to_owned(),
+    },
+    Tool {
+        name: "todo_list",
+        operation: "todo.list",
+        description: "Read the durable checklist back without changing it, including how many items are done and which one is current. Call this at the start of a resumed session to find out what was left unfinished.",
+        schema: || object(json!({}), &[]),
+        translate: |_| Ok(json!({})),
+        summarize: |_| String::new(),
+    },
+    Tool {
         name: "validate_record",
         operation: "validate.record",
         description: "Record a check you just ran with `bash` (a test suite, a build, a linter) against the task. `evidence` is the id from the `evidence: <id>` line `bash`'s own result ended with — the outcome is read from that command's real exit code, not from what you say it was. This is what a completion claim cites.",
@@ -813,6 +1030,45 @@ pub fn tool(name: &str) -> Option<&'static Tool> {
     TOOLS.iter().find(|tool| tool.name == name)
 }
 
+/// A tool discovered at runtime rather than compiled in.
+///
+/// [`Tool`] is a static table because the operations it names are static.
+/// An MCP server's tools are neither: which ones exist, and what arguments
+/// they take, is only known once a connection has been made, and it can
+/// change at the next turn boundary. This is that case and only that case —
+/// a name and a schema the model is shown, plus the binding that turns a call
+/// into the one `mcp.call` operation everything routes through.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub operation: &'static str,
+    /// The server the call goes to, under the name it was configured with.
+    pub server: String,
+    /// The tool's name on that server, which is not the model-visible one.
+    pub tool: String,
+}
+
+impl DynamicTool {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+
+    /// The operation input one model call becomes.
+    fn translate(&self, arguments: &Value) -> Value {
+        json!({
+            "server": self.server,
+            "tool": self.tool,
+            "arguments": arguments.clone(),
+        })
+    }
+}
+
 /// Executes tool calls for one workspace under one policy.
 ///
 /// Cloneable and cheap to share: everything it owns is either a handle or a
@@ -826,6 +1082,10 @@ pub struct ToolRuntime {
     actor: Principal,
     context: RiskContext,
     mode: ExecutionMode,
+    /// Tools this turn discovered. Shared rather than owned so a clone of the
+    /// runtime offers the same set — the TUI and a background turn must not
+    /// disagree about which tools exist.
+    dynamic: Arc<Vec<DynamicTool>>,
 }
 
 /// The execution ceiling applied after decoding and before dispatch.
@@ -857,12 +1117,37 @@ impl ToolRuntime {
             actor,
             context,
             mode: ExecutionMode::Normal,
+            dynamic: Arc::new(Vec::new()),
         }
     }
 
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.mode = mode;
         self
+    }
+
+    /// Offer the tools a turn's connections discovered.
+    ///
+    /// Set once per turn, at the boundary where connections are opened, so the
+    /// set the model is shown and the set a call can reach are the same set.
+    /// A tool whose operation this build cannot dispatch is dropped here
+    /// rather than offered and then refused.
+    pub fn with_dynamic_tools(mut self, tools: Vec<DynamicTool>) -> Self {
+        self.dynamic = Arc::new(
+            tools
+                .into_iter()
+                .filter(|tool| {
+                    OperationKind::new(tool.operation)
+                        .ok()
+                        .is_some_and(|kind| self.registry.contract(&kind).is_some())
+                })
+                .collect(),
+        );
+        self
+    }
+
+    fn dynamic_tool(&self, name: &str) -> Option<&DynamicTool> {
+        self.dynamic.iter().find(|tool| tool.name == name)
     }
 
     pub const fn execution_mode(&self) -> ExecutionMode {
@@ -887,6 +1172,15 @@ impl ToolRuntime {
             .iter()
             .filter(|tool| self.registered(tool) && self.mode_allows_operation(tool.operation))
             .map(Tool::schema)
+            // Discovered tools come last: the built-ins are what a model should
+            // reach for first, and a list headed by thirty MCP tools invites it
+            // to shell out to one of them for something `fs.read` does.
+            .chain(
+                self.dynamic
+                    .iter()
+                    .filter(|tool| self.mode_allows_operation(tool.operation))
+                    .map(DynamicTool::schema),
+            )
             .collect()
     }
 
@@ -900,11 +1194,98 @@ impl ToolRuntime {
         OperationKind::new(operation)
             .ok()
             .and_then(|kind| self.registry.contract(&kind))
-            .is_some_and(|contract| {
-                contract.actions.iter().all(|action| {
-                    matches!(action, CapabilityAction::FsRead | CapabilityAction::GitRead)
-                })
-            })
+            .is_some_and(read_only)
+    }
+
+    /// Run several model calls, concurrently where that is safe.
+    ///
+    /// # What "safe" means here
+    ///
+    /// Only an observational call joins a batch: reversible, declared
+    /// `Parallel`, and asking for nothing but reads. Everything else — a
+    /// write, a patch, a shell command, an MCP tool, a rename — runs on its
+    /// own, in the order the model asked for it.
+    ///
+    /// That rule is deliberately stricter than the contracts alone.
+    /// `process.exec` declares itself parallel, and two shell commands really
+    /// can run at once — but nothing here knows whether they are `git log` and
+    /// `ls` or two builds writing the same target directory, and a harness
+    /// that guessed wrong would corrupt a workspace to save a second.
+    ///
+    /// # Order
+    ///
+    /// Results come back in call order whatever order they finished in, so the
+    /// result the model reads as answering its third call is its third call's.
+    /// The pairing is by position because that is how the caller pairs them
+    /// back to their ids.
+    ///
+    /// # Cleanup
+    ///
+    /// A scoped thread per call: the scope cannot be left until every thread
+    /// has been joined, so a failure or a panic in one call cannot leave a
+    /// worker running against a workspace the turn has moved on from.
+    pub fn invoke_batch(&self, calls: &[(String, Value)], limit: usize) -> Vec<ToolResult> {
+        let limit = limit.max(1);
+        let mut results: Vec<Option<ToolResult>> = (0..calls.len()).map(|_| None).collect();
+        let mut index = 0;
+        while index < calls.len() {
+            let group = self.joinable_run(calls, index, limit);
+            if group <= 1 {
+                results[index] = Some(self.invoke(&calls[index].0, &calls[index].1));
+                index += 1;
+                continue;
+            }
+            let slice = &calls[index..index + group];
+            let computed: Vec<ToolResult> = std::thread::scope(|scope| {
+                let handles: Vec<_> = slice
+                    .iter()
+                    .map(|(name, arguments)| scope.spawn(|| self.invoke(name, arguments)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .zip(slice)
+                    .map(|(handle, (name, _))| {
+                        handle.join().unwrap_or_else(|_| {
+                            ToolResult::refused(
+                                name,
+                                "the tool panicked and its call was abandoned",
+                            )
+                        })
+                    })
+                    .collect()
+            });
+            for (offset, result) in computed.into_iter().enumerate() {
+                results[index + offset] = Some(result);
+            }
+            index += group;
+        }
+        results
+            .into_iter()
+            .map(|result| result.expect("every call is answered exactly once"))
+            .collect()
+    }
+
+    /// How many calls starting at `from` may run together.
+    fn joinable_run(&self, calls: &[(String, Value)], from: usize, limit: usize) -> usize {
+        calls[from..]
+            .iter()
+            .take(limit)
+            .take_while(|(name, arguments)| self.is_observational(name, arguments))
+            .count()
+    }
+
+    /// Whether one model call only reads.
+    pub fn is_observational(&self, name: &str, arguments: &Value) -> bool {
+        let Ok(request) = self.decode(name, arguments) else {
+            // A call that cannot even be decoded fails on its own, where its
+            // error is the only thing that happens.
+            return false;
+        };
+        self.mode_denial(&request).is_none()
+            && self
+                .registry
+                .contract(&request.kind)
+                .is_some_and(observational)
     }
 
     fn mode_denial(&self, request: &OperationRequest) -> Option<String> {
@@ -924,33 +1305,43 @@ impl ToolRuntime {
     pub fn summarize(&self, name: &str, arguments: &Value) -> String {
         match tool(name) {
             Some(tool) => (tool.summarize)(arguments),
-            None => name.to_owned(),
+            None => match self.dynamic_tool(name) {
+                Some(dynamic) => format!("{}/{}", dynamic.server, dynamic.tool),
+                None => name.to_owned(),
+            },
         }
     }
 
     /// Turn a model call into a request, or say why it cannot be one.
     fn decode(&self, name: &str, arguments: &Value) -> Result<OperationRequest, String> {
-        let tool = tool(name).ok_or_else(|| {
-            let offered = self
-                .schemas()
-                .iter()
-                .map(|schema| schema.name.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("`{name}` is not a tool this session offers; the tools are: {offered}")
+        let (operation, input) = match tool(name) {
+            Some(tool) => {
+                if !self.registered(tool) {
+                    return Err(format!(
+                        "`{name}` is not available in this workspace: no executor is registered \
+                         for {}",
+                        tool.operation
+                    ));
+                }
+                (tool.operation, (tool.translate)(arguments)?)
+            }
+            None => {
+                let dynamic = self.dynamic_tool(name).ok_or_else(|| {
+                    let offered = self
+                        .schemas()
+                        .iter()
+                        .map(|schema| schema.name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("`{name}` is not a tool this session offers; the tools are: {offered}")
+                })?;
+                (dynamic.operation, dynamic.translate(arguments))
+            }
+        };
+        let kind = OperationKind::new(operation).expect("a static operation kind is valid");
+        let contract = self.registry.contract(&kind).ok_or_else(|| {
+            format!("`{name}` is not available in this workspace: no executor is registered for {operation}")
         })?;
-        if !self.registered(tool) {
-            return Err(format!(
-                "`{name}` is not available in this workspace: no executor is registered for {}",
-                tool.operation
-            ));
-        }
-        let input = (tool.translate)(arguments)?;
-        let kind = OperationKind::new(tool.operation).expect("a static operation kind is valid");
-        let contract = self
-            .registry
-            .contract(&kind)
-            .expect("registration was just checked");
         Ok(OperationRequest {
             id: OperationId::new(),
             kind,
@@ -1194,6 +1585,37 @@ impl ToolRuntime {
     }
 }
 
+/// Whether an operation changes nothing the operator would mind: reversible,
+/// and asking for nothing but reads.
+///
+/// This is Plan Mode's question — may this run while a plan is being made.
+/// Reading a page is part of making a plan, so the network is not
+/// blanket-denied; the contract's own reversibility is what admits it, so an
+/// operation that posted somewhere could not slip in later by sharing an
+/// action.
+fn read_only(contract: &arsy_kernel::operation::OperationContract) -> bool {
+    contract.reversible
+        && contract.actions.iter().all(|action| {
+            matches!(
+                action,
+                CapabilityAction::FsRead
+                    | CapabilityAction::GitRead
+                    | CapabilityAction::NetworkConnect
+            )
+        })
+}
+
+/// Whether an operation may run *beside another one*.
+///
+/// Read-only is necessary and not sufficient: an operation that only reads the
+/// workspace may still hold something exclusive — a cache it rewrites, an
+/// index it rebuilds — and says so in its concurrency rule. Both conditions,
+/// because the two questions are different and collapsing them would let a
+/// cache be written twice at once to save a few milliseconds.
+fn observational(contract: &arsy_kernel::operation::OperationContract) -> bool {
+    read_only(contract) && contract.concurrency == arsy_kernel::operation::ConcurrencyRule::Parallel
+}
+
 /// Render one operation's result as the text the model reads.
 fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
     match name {
@@ -1220,6 +1642,103 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
                     format!("{merged}\n\nCommand was terminated by a signal"),
                 ),
             }
+        }
+        // A background call succeeded when the call succeeded. Whether the
+        // process it names failed is information, not a tool error: reporting
+        // an exit code as a failed tool call would make a model retry the poll
+        // rather than read what the command said.
+        "bash_start" => (
+            true,
+            format!(
+                "started {} as {} (pid {}){}",
+                argv_of(value),
+                value.get("handle").and_then(Value::as_str).unwrap_or("?"),
+                value.get("pid").and_then(Value::as_u64).unwrap_or(0),
+                if value.get("pty").and_then(Value::as_bool) == Some(true) {
+                    ", on a pseudoterminal"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        "repo_map" => {
+            let projection = value
+                .get("projection")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                true,
+                format!(
+                    "{projection}\n({} file(s) reparsed, {} unchanged, {} not parsed)",
+                    value.get("reindexed").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("unchanged").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("unparsed").and_then(Value::as_u64).unwrap_or(0),
+                ),
+            )
+        }
+        "web_fetch" => {
+            let status = value.get("status").and_then(Value::as_u64).unwrap_or(0);
+            let mut text = format!(
+                "{} — HTTP {status}, {} bytes{}\n\n{}",
+                value.get("url").and_then(Value::as_str).unwrap_or("?"),
+                value.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                if value.get("extracted").and_then(Value::as_bool) == Some(true) {
+                    ", HTML reduced to its text"
+                } else {
+                    ""
+                },
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                text.push_str("\n\n(the response was cut at its byte limit)");
+            }
+            // A 404 that came back is a fetch that worked; only the request
+            // failing is a tool failure, and that is an error, not a result.
+            (true, text)
+        }
+        "bash_write" => (
+            true,
+            format!(
+                "wrote {} byte(s) to {}",
+                value
+                    .get("bytes_written")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                value.get("handle").and_then(Value::as_str).unwrap_or("?")
+            ),
+        ),
+        "bash_poll" | "bash_stop" => {
+            let body = value
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut text = if body.is_empty() {
+                "(no new output)".to_owned()
+            } else {
+                body.to_owned()
+            };
+            if value.get("dropped_output").and_then(Value::as_bool) == Some(true) {
+                text.push_str("\n\n(output was dropped: poll more often, or raise the buffer)");
+            }
+            let status = if value.get("running").and_then(Value::as_bool) == Some(true) {
+                "still running".to_owned()
+            } else if value.get("wait_failed").and_then(Value::as_bool) == Some(true) {
+                // The exit code below came from the kill, not from the command,
+                // so a model must not read it as the command's own answer.
+                "lost track of and stopped; its exit code is the kill's, not the command's"
+                    .to_owned()
+            } else if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                "stopped at its deadline".to_owned()
+            } else {
+                match value.get("status_code").and_then(Value::as_i64) {
+                    Some(code) => format!("exited with code {code}"),
+                    None => "ended without an exit code".to_owned(),
+                }
+            };
+            (true, format!("{text}\n\n{} — {status}", argv_of(value)))
         }
         "fs.read" => {
             if value.get("binary").and_then(Value::as_bool) == Some(true) {
@@ -1380,11 +1899,40 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
                 value.get("to").and_then(Value::as_str).unwrap_or("?")
             ),
         ),
+        // A discovered tool: named for its server, rendered as its text. A
+        // server that reports the call as failed produces a failed result, so
+        // the model treats it the way it treats any other refusal rather than
+        // reading "isError: true" out of a JSON dump and continuing.
+        name if name.starts_with("mcp__") => {
+            let body = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
+            (!failed, body)
+        }
         _ => (
             true,
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
         ),
     }
+}
+
+/// The command a background result names, for a line that says which process
+/// is being reported when several are running.
+fn argv_of(value: &Value) -> String {
+    value
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|argv| {
+            argv.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|argv| !argv.is_empty())
+        .unwrap_or_else(|| "the process".to_owned())
 }
 
 fn listing(lines: Vec<String>, value: &Value, empty: &str) -> String {
@@ -1465,6 +2013,7 @@ pub fn runtime(
     context: RiskContext,
     reachable: crate::operations::Reachable,
     scope: &str,
+    turn: crate::operations::TurnState,
 ) -> Result<ToolRuntime, arsy_kernel::operation::RegistrationError> {
     let registry = crate::operations::registry(
         workspace,
@@ -1472,6 +2021,7 @@ pub fn runtime(
         retain_until_ms,
         reachable,
         scope,
+        turn,
     )?;
     Ok(ToolRuntime::new(
         registry,

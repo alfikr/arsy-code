@@ -134,7 +134,23 @@ impl ModelProvider for ReplayProvider {
         &self.descriptor
     }
 
-    fn stream(&self, _request: &CanonicalModelRequest) -> Result<ModelEventStream, ProviderError> {
+    fn stream(&self, request: &CanonicalModelRequest) -> Result<ModelEventStream, ProviderError> {
+        // A script is a recording of replies, not a model: it cannot look at
+        // an image, and answering as if it had would make a measurement that
+        // silently ignored half its input. Refusing names the capability, so
+        // the operator knows which endpoint to use instead.
+        if request.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, super::ModelContent::Image { .. }))
+        }) {
+            return Err(ProviderError::InvalidRequest(
+                "a replay endpoint cannot accept image input: it answers from a recorded script. \
+                 Use a provider whose model reads images."
+                    .to_owned(),
+            ));
+        }
         let mut served = self
             .served
             .lock()

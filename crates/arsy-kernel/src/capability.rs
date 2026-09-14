@@ -42,6 +42,14 @@ pub enum CapabilityAction {
     SystemModify,
     #[serde(rename = "plugin.invoke")]
     PluginInvoke,
+    /// Calling a tool on an external MCP server.
+    ///
+    /// Distinct from `network.connect` and from `process.exec`, which are how
+    /// a connection is *made*: this is about what may be invoked once one
+    /// exists, so a rule can admit one server's tools and refuse another's
+    /// without also deciding whether the harness may open sockets at all.
+    #[serde(rename = "mcp.invoke")]
+    McpInvoke,
 }
 
 impl CapabilityAction {
@@ -64,6 +72,7 @@ impl CapabilityAction {
         Self::RemoteExec,
         Self::SystemModify,
         Self::PluginInvoke,
+        Self::McpInvoke,
     ];
 
     /// The resource scheme this action is written against.
@@ -85,6 +94,8 @@ impl CapabilityAction {
             Self::RemoteExec => "remote",
             Self::SystemModify => "system",
             Self::PluginInvoke => "plugin",
+            // `<server>/<tool>`, so a glob can admit a whole server or one tool.
+            Self::McpInvoke => "mcp",
         }
     }
 
@@ -105,6 +116,7 @@ impl CapabilityAction {
             Self::RemoteExec => "remote.exec",
             Self::SystemModify => "system.modify",
             Self::PluginInvoke => "plugin.invoke",
+            Self::McpInvoke => "mcp.invoke",
         }
     }
 }

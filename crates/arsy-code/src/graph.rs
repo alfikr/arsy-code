@@ -15,7 +15,7 @@
 use crate::{resource::Workspace, syntax::RustSyntax};
 use arsy_kernel::domain::StateVersion;
 use ignore::WalkBuilder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -27,7 +27,7 @@ use std::{
 /// a generated blob is not worth parsing and must not be able to stall an index.
 pub const MAX_INDEXED_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     File,
@@ -38,7 +38,7 @@ pub enum NodeKind {
 
 /// A node's stable name. `file:src/main.rs`, `symbol:src/main.rs#run`,
 /// `module:serde::Serialize`.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct NodeId(String);
 
 impl NodeId {
@@ -65,7 +65,7 @@ impl fmt::Display for NodeId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
@@ -78,7 +78,7 @@ pub struct Node {
     pub revision: Option<StateVersion>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
     /// A file declares a symbol.
@@ -87,7 +87,7 @@ pub enum EdgeKind {
     Imports,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Edge {
     pub from: NodeId,
     pub kind: EdgeKind,
@@ -122,7 +122,7 @@ impl IndexDelta {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct FileEntry {
     digest: StateVersion,
     nodes: BTreeSet<NodeId>,
@@ -144,7 +144,10 @@ impl fmt::Display for GraphError {
 
 impl std::error::Error for GraphError {}
 
-#[derive(Debug, Default)]
+/// Serializable so a map can be kept between processes: re-walking a large
+/// repository on every turn is the cost this whole structure exists to avoid,
+/// and it is wasted if the answer dies with the process that computed it.
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct KnowledgeGraph {
     files: BTreeMap<PathBuf, FileEntry>,
     nodes: BTreeMap<NodeId, Node>,

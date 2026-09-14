@@ -188,9 +188,14 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
         ModelRole::Assistant => ("assistant", "output_text"),
     };
     let mut text = String::new();
+    let mut images: Vec<Value> = Vec::new();
     for content in &message.content {
         match content {
             ModelContent::Text { text: chunk } => text.push_str(chunk),
+            ModelContent::Image { media_type, data } => images.push(json!({
+                "type": "input_image",
+                "image_url": super::data_url(media_type, data),
+            })),
             ModelContent::ToolCall {
                 id,
                 name,
@@ -204,12 +209,9 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
             ModelContent::ToolResult { .. } => {}
         }
     }
-    if !text.is_empty() {
-        out.push(json!({
-            "type": "message",
-            "role": role,
-            "content": [{"type": text_type, "text": text}],
-        }));
+    if !text.is_empty() || !images.is_empty() {
+        let parts = super::content_parts(text_type, &text, &mut images);
+        out.push(json!({"type": "message", "role": role, "content": parts}));
     }
     for content in &message.content {
         if let ModelContent::ToolResult {

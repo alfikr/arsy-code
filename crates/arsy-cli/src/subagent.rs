@@ -420,6 +420,9 @@ impl Supervisor<'_> {
             // a delegated subtask should not inherit or pollute the plan the
             // supervisor is tracking.
             &agent.to_string(),
+            // A delegate reports back to its parent; the parent owns the
+            // session's checklist, so a child does not get one of its own.
+            arsy_code::operations::TurnState::default(),
         )
         .map_err(|error| error.to_string())?
         .with_execution_mode(self.mode);

@@ -14,7 +14,11 @@ The resolver reads these six layers in authority order, then returns the effecti
 3. `.arsy/config.toml` at the workspace root;
 4. nested `.arsy/config.toml` files from the workspace root toward the working directory, parent before child;
 5. enabled Claude, Codex, and OMP compatibility imports in their documented precedence order;
-6. the current session request, including CLI flags.
+6. the current session request, including CLI flags. `--config <PATH>` supplies
+   one file at this layer. It is the operator speaking for this invocation, so
+   it carries their own authority — it may name an endpoint or a credential
+   handle the way a user file can — and no more: every ceiling merges by
+   intersection, so it can narrow the run and never widen it.
 
 Symlinks are resolved before scope checks. A nested file applies only below its parent directory. Repository and compatibility files are untrusted content: they may express intent or narrow authority, but cannot grant capabilities, expose credentials, weaken a ceiling, or redirect user storage.
 
@@ -47,6 +51,8 @@ Authority classes are:
 | `provider.endpoint.<id>.api_key_env` | environment variable name | none | replace | user |
 | `provider.endpoint.<id>.model` | string | none | replace | user |
 | `provider.endpoint.<id>.max_output_tokens` | positive integer | `8192` | replace | user |
+| `provider.endpoint.<id>.pricing.<model>.input_micros_per_million` | non-negative integer | none | replace | user |
+| `provider.endpoint.<id>.pricing.<model>.output_micros_per_million` | non-negative integer | none | replace | user |
 | `provider.endpoint.<id>.oauth.authorize_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.token_url` | HTTPS URL | none | replace | user |
 | `provider.endpoint.<id>.oauth.device_authorization_url` | HTTPS URL | none | replace | user |

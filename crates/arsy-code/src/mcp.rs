@@ -118,6 +118,14 @@ pub struct Descriptor {
     pub name: String,
     pub title: Option<String>,
     pub description: Option<String>,
+    /// The tool's JSON Schema, as the server published it.
+    ///
+    /// Carried through discovery rather than fetched later, because it is what
+    /// makes a discovered tool callable: a model handed a name with no
+    /// parameter shape can only guess at the arguments. `None` for resources
+    /// and prompts, which are not called with arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
 }
 
 /// Something the server offered that this connection refused, and why.
@@ -733,6 +741,10 @@ fn discover(
                 name,
                 title: text(&entry["title"]),
                 description: text(&entry["description"]),
+                input_schema: (kind == "tool")
+                    .then(|| entry.get("inputSchema").cloned())
+                    .flatten()
+                    .filter(Value::is_object),
             };
             match kind {
                 "tool" => discovery.tools.push(descriptor),

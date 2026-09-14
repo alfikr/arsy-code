@@ -59,12 +59,38 @@ fn resource_for(action: CapabilityAction, input: &Value, workspace: &Path) -> Re
             .and_then(Value::as_array)
             .and_then(|argv| argv.first())
             .and_then(Value::as_str)
-            .unwrap_or("*")
-            .to_owned(),
+            .map(str::to_owned)
+            // A call against a background session names only its handle, so
+            // the program is looked up rather than left as `*`: an operator
+            // who narrowed `process.exec` to the commands they trust must get
+            // the same answer for polling one as for starting it.
+            .or_else(|| {
+                input
+                    .get("handle")
+                    .and_then(Value::as_str)
+                    .and_then(crate::procsession::program_for)
+            })
+            .unwrap_or_else(|| "*".to_owned()),
         CapabilityAction::RemoteExec => string("target").unwrap_or_else(|| "*".into()),
-        CapabilityAction::NetworkConnect => string("host").unwrap_or_else(|| "*".into()),
+        // A rule is written about a host; `net.fetch` carries a URL, so the
+        // host is derived from it rather than left as `*` — otherwise an
+        // operator who allowed one domain would have allowed every domain.
+        CapabilityAction::NetworkConnect => string("host")
+            .or_else(|| {
+                input
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .and_then(crate::web::host_of)
+            })
+            .unwrap_or_else(|| "*".into()),
         CapabilityAction::CredentialUse => string("handle").unwrap_or_else(|| "*".into()),
         CapabilityAction::PluginInvoke => string("plugin").unwrap_or_else(|| "*".into()),
+        // `<server>/<tool>`: a rule can admit one server wholesale with
+        // `mcp:github/**`, or exactly one of its tools.
+        CapabilityAction::McpInvoke => crate::agent::mcpops::resource_path(
+            &string("server").unwrap_or_else(|| "*".into()),
+            &string("tool").unwrap_or_else(|| "*".into()),
+        ),
         CapabilityAction::BrowserControl
         | CapabilityAction::DebugLaunch
         | CapabilityAction::DebugAttach
@@ -106,6 +132,21 @@ impl Reachable {
     }
 }
 
+/// What one turn brought with it, beyond the workspace.
+///
+/// Both fields are the same kind of thing — state that exists for a turn and
+/// not for the workspace — so they travel together rather than as two more
+/// positional parameters. A registry built with the default offers neither
+/// kind rather than inventing somewhere to write or someone to call.
+#[derive(Clone, Default)]
+pub struct TurnState {
+    /// The session stream durable state is written to. `None` — a dry run, a
+    /// bare tool call, a test — offers no `todo.*` kind at all.
+    pub journal: Option<crate::agent::todoops::Journal>,
+    /// MCP servers this turn connected to. `None` offers no `mcp.call`.
+    pub mcp: Option<crate::agent::mcpops::Connections>,
+}
+
 /// Build the registry for one workspace.
 ///
 /// `retain_until_ms` is stamped on the artifacts operations produce, so `gc`
@@ -123,8 +164,26 @@ pub fn registry(
     retain_until_ms: u64,
     reachable: Reachable,
     scope: &str,
+    turn: TurnState,
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
+    if let Some(connections) = turn.mcp {
+        registry.register(crate::agent::mcpops::McpExecutor::new(
+            connections,
+            Arc::clone(&artifacts),
+            retain_until_ms,
+        ))?;
+    }
+    if let Some(journal) = &turn.journal {
+        // A stream that cannot be read is a broken session, not a missing
+        // feature, so it is reported rather than silently dropping the kinds.
+        for executor in
+            crate::agent::todoops::TodoExecutor::executors(journal, &artifacts, retain_until_ms)
+                .map_err(|error| RegistrationError::Unusable(error.to_string()))?
+        {
+            registry.register(executor)?;
+        }
+    }
     for operation in GitOperation::ALL {
         registry.register(GitExecutor::new(
             operation,
@@ -191,6 +250,15 @@ pub fn registry(
             process(Arc::clone(&artifacts)),
         )))?;
     }
+    registry.register(crate::web::FetchExecutor::new(
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
+    registry.register(crate::repomap::MapExecutor::new(
+        workspace,
+        Arc::clone(&artifacts),
+        retain_until_ms,
+    ))?;
     registry.register(crate::agent::discoveryops::DiscoveryExecutor::new(
         workspace,
         Arc::clone(&artifacts),
@@ -207,6 +275,26 @@ pub fn registry(
         &artifacts,
         retain_until_ms,
     )) {
+        registry.register(executor)?;
+    }
+    // A background command runs under the same environment allowlist and the
+    // same termination grace as a foreground one: the difference between them
+    // is who waits for the exit, not what the child is allowed to see.
+    for executor in crate::procsession::SessionExecutor::executors(
+        workspace,
+        &artifacts,
+        retain_until_ms,
+        scope,
+        DEFAULT_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| ((*name).to_owned(), value))
+            })
+            .collect(),
+        DEFAULT_TERMINATION_GRACE,
+    ) {
         registry.register(executor)?;
     }
     registry.register(Arc::new(process(artifacts)))?;
@@ -230,6 +318,7 @@ mod tests {
             0,
             Reachable::default(),
             "test",
+            TurnState::default(),
         )
         .unwrap();
 
@@ -265,13 +354,19 @@ mod tests {
                 "git.diff".to_owned(),
                 "git.log".to_owned(),
                 "git.status".to_owned(),
+                "net.fetch".to_owned(),
                 "plan.add".to_owned(),
                 "plan.list".to_owned(),
                 "plan.remove".to_owned(),
                 "plan.reorder".to_owned(),
                 "plan.update".to_owned(),
                 "process.exec".to_owned(),
+                "process.poll".to_owned(),
+                "process.start".to_owned(),
+                "process.stop".to_owned(),
+                "process.write".to_owned(),
                 "repo.discover".to_owned(),
+                "repo.map".to_owned(),
                 "search.files".to_owned(),
                 "search.text".to_owned(),
                 "validate.record".to_owned(),
@@ -295,6 +390,7 @@ mod tests {
                 ..Reachable::default()
             },
             "test",
+            TurnState::default(),
         )
         .unwrap();
         assert!(with_remote

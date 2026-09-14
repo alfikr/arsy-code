@@ -19,13 +19,16 @@ pub mod mcp_server;
 pub mod operations;
 pub mod plugin;
 pub mod process;
+pub mod procsession;
 pub mod remote;
+pub mod repomap;
 pub mod resource;
 pub mod review;
 pub mod sandbox;
 pub mod search;
 pub mod shell;
 pub mod syntax;
+pub mod web;
 pub mod workspace;
 
 /// Version shared with the domain kernel.

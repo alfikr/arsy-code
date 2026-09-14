@@ -349,6 +349,7 @@ mod tests {
             0,
             crate::operations::Reachable::default(),
             "test",
+            crate::operations::TurnState::default(),
         )
         .unwrap();
         let server = McpServer::new(
