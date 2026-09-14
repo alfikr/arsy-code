@@ -43,6 +43,38 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # release-type "simple" rewrites Cargo.toml through extra-files but knows
+      # nothing about Cargo.lock, and every build in this repo runs --locked. Left
+      # alone, CI on the release pull request fails with "the lock file needs to be
+      # updated" before a human ever looks at it.
+      - name: Sync Cargo.lock to the proposed version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          branch=$(jq -r '.headBranchName // empty' <<<"$RELEASE_PR")
+          if [ -z "$branch" ]; then
+            branch=$(gh pr list --state open --label "autorelease: pending" \
+              --json headRefName --jq '.[0].headRefName')
+          fi
+          if [ -z "$branch" ]; then
+            echo "no open release PR; nothing to sync"
+            exit 0
+          fi
+          git fetch origin "$branch"
+          git checkout "$branch"
+          cargo update -w --offline
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches Cargo.toml"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "build: sync Cargo.lock to the release version"
+          git push origin "$branch"
+
       - name: Attribute contributors in changelog
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}

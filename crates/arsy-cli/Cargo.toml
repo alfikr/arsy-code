@@ -21,8 +21,8 @@ wasm = ["arsy-code/wasm"]
 remote-transports = ["arsy-code/remote-transports"]
 
 [dependencies]
-arsy-code = { version = "0.1.0", path = "../arsy-code" }
-arsy-kernel = { version = "0.1.0", path = "../arsy-kernel", features = ["http"] }
+arsy-code = { path = "../arsy-code" }
+arsy-kernel = { path = "../arsy-kernel", features = ["http"] }
 resvg = { version = "=0.48.1", default-features = false, optional = true }
 rpassword.workspace = true
 serde.workspace = true
@@ -32,7 +32,7 @@ unicode-width = "=0.2.2"
 [dev-dependencies]
 # The reference thin client, so the pair can be tested as a pair. The
 # dependency runs this way round because the client depends on nothing.
-arsy-ide = { version = "0.1.0", path = "../arsy-ide" }
+arsy-ide = { path = "../arsy-ide" }
 tempfile.workspace = true
 
 [lints]
