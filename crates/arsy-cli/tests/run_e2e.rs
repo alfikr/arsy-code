@@ -71,6 +71,31 @@ impl FakeProvider {
 }
 
 /// Read one HTTP request and return its body.
+/// A `PreToolUse` guard on `fs.read` whose hook denies the call with `reason`.
+///
+/// Hooks run under `/bin/sh -c` on Unix and `cmd /C` on Windows, and the two
+/// disagree about quoting: sh strips the double quotes the JSON needs, while
+/// cmd keeps them and does not strip the single quotes that protect them from
+/// sh. Quoting for the wrong shell makes the hook emit something that is not
+/// JSON, which reads as a broken hook rather than the denial under test.
+fn denying_guard(reason: &str) -> String {
+    let payload = format!(r#"{{"decision": "deny", "reason": "{reason}"}}"#);
+    let command = if cfg!(windows) {
+        format!("echo {payload}")
+    } else {
+        format!("echo '{payload}'")
+    };
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "fs.read",
+                "hooks": [{"type": "command", "command": command}]
+            }]
+        }
+    })
+    .to_string()
+}
+
 fn read_request(stream: &mut std::net::TcpStream) -> String {
     let mut reader = BufReader::new(stream);
     let mut length = 0;
@@ -597,10 +622,7 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
     std::fs::write(
         home.path().join(".arsy/guard.json"),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
-            {"type": "command",
-             "command": "echo '{\"decision\": \"deny\", \"reason\": \"notes are off limits\"}'"}
-        ]}]}}"#,
+        denying_guard("notes are off limits"),
     )
     .unwrap();
 
@@ -642,10 +664,7 @@ fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
     std::fs::create_dir_all(workspace.path().join(".arsy")).unwrap();
     std::fs::write(
         workspace.path().join(".arsy/guard.json"),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
-            {"type": "command",
-             "command": "echo '{\"decision\": \"deny\", \"reason\": \"the repo said no\"}'"}
-        ]}]}}"#,
+        denying_guard("the repo said no"),
     )
     .unwrap();
 
