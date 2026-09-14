@@ -14,7 +14,7 @@
 //! `RuleSet::evaluate`, only how a call that reaches `NeedsApproval` is
 //! answered.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalMode {
@@ -128,6 +128,7 @@ impl ApprovalMode {
 pub struct ApprovalCell {
     current: AtomicU8,
     before_plan: AtomicU8,
+    opened: AtomicUsize,
 }
 
 impl Default for ApprovalCell {
@@ -141,7 +142,24 @@ impl ApprovalCell {
         Self {
             current: AtomicU8::new(mode.as_u8()),
             before_plan: AtomicU8::new(ApprovalMode::Default.as_u8()),
+            opened: AtomicUsize::new(0),
         }
+    }
+
+    /// Record that a confirmation prompt is on screen and about to block on the
+    /// keyboard.
+    ///
+    /// Waiting for input is the one moment in a turn with no other observable
+    /// effect, which leaves a caller that wants to answer it no way to know it
+    /// has arrived. Counting it makes that moment visible.
+    pub fn open(&self) {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many confirmation prompts have been shown.
+    #[cfg(test)]
+    pub fn opened(&self) -> usize {
+        self.opened.load(Ordering::SeqCst)
     }
 
     pub fn get(&self) -> ApprovalMode {
