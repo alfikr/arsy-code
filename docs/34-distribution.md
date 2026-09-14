@@ -2,48 +2,17 @@
 
 ## Channels
 
-GitHub Releases is the target canonical channel. The operational gate is not
-met at the audited revision: every workflow is parked as `*.yml.disabled`, and
-repository source alone does not prove that any channel has published
-successfully.
+GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, a `.sha256` sidecar beside each, an aggregate `SHA256SUMS`, a Sigstore bundle signing it, a CycloneDX SBOM per crate, and `install.sh` / `install.ps1`. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
 
-The disabled release workflow currently describes five native archives, a
-CycloneDX JSON SBOM, and one `.sha256` file per archive. It does not create a
-canonical `SHA256SUMS`, an SPDX SBOM, Sigstore signatures/bundles, or release
-copies of `install.sh` and `install.ps1`. It also builds with Rust 1.85 while
-the workspace declares 1.98. Those discrepancies must be fixed and verified
-before the target channel below is described as operational.
+The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a SuiFlex Scoop bucket for Windows, the public npm package `@suiflex/arsy-code`, and `install.sh` / `install.ps1` published alongside each GitHub Release. All of them reference an exact GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries. Cargo, unattended self-update, OS stores, and third-party package repositories remain out of scope until demand justifies them.
 
-At the release gate, each stable SemVer tag publishes one archive per supported
-target, a canonical checksum manifest, an explicitly selected SBOM format, and
-Sigstore signatures and bundles. This keeps rollback possible without a
-privileged installer and gives every wrapper one immutable source of bytes.
+`install.sh` and `install.ps1` are a checksum-only channel: they verify the archive's SHA-256 digest against its `.sha256` sidecar, but not the Sigstore signature described below. Release automation signs `SHA256SUMS`, so a caller that wants provenance verifies that file itself rather than relying on the scripts.
 
-Target convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a
-SuiFlex Scoop bucket for Windows, the npm package `@suiflex/arsy-code`, and
-`install.sh` / `install.ps1` published with each GitHub Release. Their source or
-documentation exists, but enabled publication and production availability are
-not established by this repository. Once operational, all reference an exact
-GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries.
-Cargo, unattended self-update, OS stores, and third-party repositories remain
-out of scope until demand justifies them.
-
-`install.sh` and `install.ps1` implement the interim checksum-only client path:
-they verify an archive SHA-256 but not the future Sigstore signature. The
-current release workflow does not attach those scripts, so their presence in
-source is not an operational download channel. They are suitable for local/dev
-testing against explicitly supplied assets; unattended provisioning waits for
-the release gate.
-
-The npm package is a thin launcher with platform-filtered optional dependencies:
-
-| npm package | Target |
-|---|---|
-| `@suiflex/arsy-code-darwin-arm64` | `aarch64-apple-darwin` |
-| `@suiflex/arsy-code-darwin-x64` | `x86_64-apple-darwin` |
-| `@suiflex/arsy-code-linux-arm64-gnu` | `aarch64-unknown-linux-gnu` |
-| `@suiflex/arsy-code-linux-x64-gnu` | `x86_64-unknown-linux-gnu` |
-| `@suiflex/arsy-code-win32-x64-msvc` | `x86_64-pc-windows-msvc` |
+The npm package carries no binary. Its postinstall script resolves the host
+platform, downloads that archive from the release matching the package version,
+verifies the digest against the published `.sha256`, and unpacks it into the
+package. An unsupported platform fails the install with an explicit diagnostic
+rather than installing a launcher that cannot run.
 
 ## Supported targets
 
@@ -54,31 +23,28 @@ The npm package is a thin launcher with platform-filtered optional dependencies:
 | macOS 13+ | Intel x86-64 | `x86_64-apple-darwin` | Tier 1 |
 | macOS 13+ | Apple silicon | `aarch64-apple-darwin` | Tier 1 |
 | Windows 10 22H2+ | x86-64 | `x86_64-pc-windows-msvc` | Tier 1 |
+| Windows 11 22H2+ | ARM64 | `aarch64-pc-windows-msvc` | Tier 1 |
 
-Tier 1 is the target support contract: native CI build/test, signed release
-artifacts, and security fixes. No target reaches that operational status while
-workflows are disabled and signing is absent. Other combinations remain
-unsupported until native CI and sandbox conformance exist; WSL does not
-establish Windows support.
+Tier 1 means native CI build and test, signed release artifacts, and security fixes. Other OS/architecture combinations are unsupported until native CI and sandbox conformance exist; WSL does not establish Windows support.
 
-## Target install and verification flow
+## Install and verify
 
-After the release gate is met, download the archive, `SHA256SUMS`, matching
-`.sig`, and matching `.bundle` from the same release. Verify the digest before
-extraction, then verify `SHA256SUMS` with Sigstore while pinning the
-`suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A
-digest or signature mismatch is fatal; the installer must not offer an override.
-The commands below describe this target and do not validate current published
-assets.
+For the canonical channel, download the archive, `SHA256SUMS`, and `SHA256SUMS.bundle` from the same release. Verify the digest before extraction, then verify `SHA256SUMS` with Sigstore while pinning the `suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A digest or signature mismatch is fatal; the installer must not offer an override.
 
 ```console
 sha256sum --check --ignore-missing SHA256SUMS
-cosign verify-blob SHA256SUMS --signature SHA256SUMS.sig --bundle SHA256SUMS.bundle \
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.bundle \
   --certificate-identity-regexp '^https://github.com/suiflex/arsy-code/.github/workflows/release.yml@refs/tags/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-On macOS, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum`. On Windows, Scoop validates the manifest's pinned SHA-256 before installation. Homebrew likewise validates the formula's pinned `sha256`; both manifests are updated only after the canonical signature check passes in release automation.
+The bundle carries the signature, the certificate, and the transparency-log
+entry together, so there is no separate `.sig` to fetch. The certificate names
+the workflow and the ref it ran from — a release is built by the tag push, so
+that ref is `refs/tags/<tag>`, which is what the regexp above pins. `cosign
+verify-blob` prints the identity it found when a match fails.
+
+On macOS, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum`. On Windows, Scoop validates the manifest's pinned SHA-256 before installation. Homebrew likewise validates the formula's pinned `sha256`. Both manifests are rendered from this repository's `packaging/` templates and pushed only after the GitHub Release publishes, and both pin digests taken from that same build.
 
 For npm, install the public launcher package globally:
 
@@ -87,22 +53,10 @@ npm install --global @suiflex/arsy-code
 arsy doctor
 ```
 
-npm installs one platform-filtered native package as an optional dependency. The
-launcher supports only the Tier 1 targets listed above; on an unsupported OS or
-architecture, it exits with an explicit diagnostic.
-
-Release automation stages each native package from the matching Cargo binary:
-
-```console
-npm run stage:platform -- \
-  --target <rust-target> \
-  --binary <release-binary> \
-  --version <semver> \
-  --output npm/platforms/<package-name>
-```
-
-Publish all platform packages before publishing `@suiflex/arsy-code`, so npm
-can resolve the launcher's optional dependencies.
+The install needs network access at install time and honours the Tier 1 targets
+listed above. Because the archive comes from the release tagged `v<package
+version>`, the npm package can only be published after that release exists;
+`npm-publish.yml` is gated on `release.yml` completing for exactly that reason.
 
 For curl / PowerShell, install directly from the latest release:
 
@@ -122,7 +76,7 @@ instead of `latest`; `ARSY_INSTALL_DIR` overrides the install directory.
 `verify-installers` job runs it plus a PowerShell parse of `install.ps1`
 before any platform build.
 
-After extraction or package-manager installation, run `arsy doctor`. It reports the version, target, config paths, sandbox assurance, and release provenance without sending telemetry.
+After extraction or package-manager installation, run `arsy doctor`. It reports the version, target, config paths, storage, and the resolved provider and credential without sending telemetry. It does not check the release it came from; verify provenance with the bundle as above.
 
 ## Update and rollback
 
@@ -139,4 +93,4 @@ Before replacement, stop active sessions cleanly. Config and session migrations 
 
 ## Release gate
 
-A release is publishable only when all Tier 1 native jobs pass, the lockfile and license policy pass, SBOM and checksums are generated from the final bytes, and signature verification succeeds in a clean job. Package manifests are downstream of that gate and must resolve to the same digests.
+A release is publishable only when all Tier 1 native jobs pass and the SBOM and checksums are generated from the final bytes: `publish` waits on `build`, `sbom`, and `checksums`. The lockfile and licence policy are enforced by `ci.yml` on the way to `main` rather than by the release itself, so a tag pushed past a red `main` would not be stopped here. `SHA256SUMS` is verified with `sha256sum --check` against those bytes before it is signed. Package manifests are downstream of that gate: the tap and bucket jobs run only after the release publishes, and pin digests from the same build.

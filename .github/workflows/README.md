@@ -1,45 +1,58 @@
-# Disabled while the repository is private
+# Workflows
 
-Every workflow here is parked as `*.yml.disabled`. GitHub only reads `.yml`, so
-none of them run — including manual dispatch, which needs the file to be visible
-to Actions.
+All workflows here are active. CI and Sandbox each run a three-OS matrix on
+every push and every pull request, only CI has a concurrency group, and CI's
+`dependencies` job builds `cargo-deny` from source with no cache — worth
+knowing before adding jobs, because that shape is where the minutes go.
 
-They were parked because Actions minutes on a private repository are billed with
-a per-runner multiplier (Linux 1x, Windows 2x, macOS 10x), and the last 90 runs
-cost roughly 2550 billed minutes against a 2000-3000 minute monthly allowance:
+CI compiles x86_64 Linux, macOS, and Windows x64. It does **not** compile
+`aarch64-unknown-linux-gnu` or `aarch64-pc-windows-msvc`, which the release
+builds: those two targets first meet a compiler during a release, and a
+compile error there has already reached a tagged version once.
 
-| Workflow | Runs | Wall min | Billed min |
-|---|---|---|---|
-| CI | 48 | 1375 | 2340 |
-| Sandbox conformance | 21 | 41 | 142 |
-| Performance | 16 | 70 | 70 |
-| Fuzz | 5 | 1 | 1 |
+## Release path
 
-Most of it is structural rather than slow: CI and Sandbox both run a
-three-OS matrix on every push and pull request, so each push pays the macOS
-multiplier twice, and CI's `dependencies` job builds `cargo-deny` from source
-every run with no cache.
+`release-please.yml` is the entry point, and it only prepares: dispatch it
+manually, or let it run when a `release-please--*` pull request merges. Merging
+that pull request tags the release, and **the tag push is what builds and
+publishes** — `release.yml` runs on the tag, and `npm-publish.yml` runs on
+`release.yml` completing.
 
-`release.yml` is one workflow to repair and restore before cutting a release.
-Its current source builds archives, a CycloneDX SBOM, and per-archive SHA-256
-files, but explicitly does not sign them. It also pins Rust 1.85 while the
-workspace currently requires 1.98, and does not attach the installer scripts.
-The signed canonical channel in `docs/34-distribution.md` remains the release
-gate. Tagging while the workflow is parked produces no artifacts or signature.
+release-please deliberately does not call those two itself. Doing so built
+every target twice, and npm refuses a publish arriving through `workflow_call`
+because the trusted publisher is registered against `npm-publish.yml` rather
+than against whatever called it.
 
-`release-please.yml` and `npm-publish.yml` follow the same convention and
-must be restored alongside it: `release-please.yml` opens/updates the release
-PR and, once one merges, calls `release.yml` and `npm-publish.yml` as reusable
-workflows to build and publish. `release-please.yml` also needs a
-`RELEASE_PLEASE_TOKEN` repository secret (a PAT, not `github.token` — PRs
-opened with the default token don't trigger workflow events) and npm Trusted
-Publishing configured for `@suiflex/arsy-code` and each
-`@suiflex/arsy-code-<platform>` package.
+`release.yml` builds six archives (macOS, Linux, and Windows on x86_64 and
+aarch64), writes a `.sha256` beside each, signs an aggregate `SHA256SUMS` with
+keyless Sigstore, attaches the installers and one CycloneDX SBOM per crate,
+then pushes the rendered formula and manifest to `suiflex/homebrew-tap` and
+`suiflex/scoop-bucket`. The signature ships as `SHA256SUMS.bundle`; cosign
+writes no separate `.sig` alongside a bundle. `docs/34-distribution.md`
+documents how to verify the result.
 
-After repairing its stale assumptions and checking the projected minute cost,
-restore a workflow by dropping the suffix:
+A `release.yml` that fails still leaves a published, asset-less GitHub Release
+behind, because release-please creates the release when its pull request
+merges. Fix forward and re-run rather than assuming the tag is unused.
 
-    git mv .github/workflows/ci.yml.disabled .github/workflows/ci.yml
+Secrets the release path needs, all already configured:
+
+- `RELEASE_PLEASE_TOKEN` — a PAT, not `github.token`; pull requests opened with
+  the default token don't trigger workflow events, so CI would never run on the
+  release PR itself.
+- `TAP_PUBLISH_TOKEN` — push access to the tap and bucket repositories.
+
+npm publishes through Trusted Publishing (OIDC), so there is no `NPM_TOKEN`.
+It requires this repository and `.github/workflows/npm-publish.yml` to be
+registered as a Trusted Publisher for `@suiflex/arsy-code` on npmjs.com, with
+the `Release` environment — the publish job declares it, and npm rejects a
+token whose environment claim does not match the registration.
+
+Prefer the `release-please` dispatch over pushing a tag by hand: a hand-pushed
+tag builds and publishes the same way, but without the version bump, changelog,
+and contributor attribution that precede it.
+
+## Local checks
 
 The same checks run locally, and are what the contributing guide expects before
 a push:

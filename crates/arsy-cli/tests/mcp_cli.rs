@@ -31,7 +31,15 @@ fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|record| record["type"] == "result")
-        .unwrap_or_else(|| panic!("no result record in {stdout}"));
+        .unwrap_or_else(|| {
+            // Without the exit code and stderr, a run that produced nothing at
+            // all reports an empty string and says nothing about why.
+            panic!(
+                "no result record for {args:?}\n  status: {:?}\n  stdout: {stdout}\n  stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
     (
         output.status.code().unwrap_or(-1),
         record["payload"].clone(),

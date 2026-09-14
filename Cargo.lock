@@ -75,7 +75,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arsy-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arsy-code",
  "arsy-ide",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "arsy-code"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arsy-kernel",
  "arsy-pty",
@@ -112,14 +112,14 @@ dependencies = [
 
 [[package]]
 name = "arsy-ide"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "arsy-kernel"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "globset",
  "keyring",
@@ -138,14 +138,14 @@ dependencies = [
 
 [[package]]
 name = "arsy-pty"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "arsy-sandbox"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "landlock",
  "libc",
@@ -2017,9 +2017,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -2421,7 +2421,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

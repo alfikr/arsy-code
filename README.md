@@ -8,7 +8,8 @@
 **ARSY** is the core platform; this repository contains **ARSY CODE**, its terminal interface.
 
 > [!NOTE]
-> ARSY CODE is under active development. The Rust CLI and core execution paths are available,
+> ARSY CODE is under active development. The CLI ships as a signed release for six
+> Tier 1 targets and installs from npm, Homebrew, Scoop, or the release archives,
 > while some commands and integrations remain roadmap-gated.
 
 ## Why ARSY CODE?
@@ -37,7 +38,7 @@ ARSY CODE · workspace: ~/code/payments · model: auto
 ```
 
 ```console
-arsy                                      # interactive TUI (when enabled)
+arsy                                      # interactive TUI
 arsy run "fix bug #42"                    # non-interactive execution
 arsy resume <session-id>                   # resume a session
 arsy session list                          # find a session to resume
@@ -60,16 +61,28 @@ and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-t
 
 ## Install with npm
 
-The native CLI is available for supported Tier 1 platforms through npm:
-
 ```console
 npm install --global @suiflex/arsy-code
 arsy --version
 ```
 
-The package selects the matching native executable for macOS, glibc Linux, or
-Windows x64. Run `arsy doctor` after installation to inspect the active build
-and environment.
+Installing downloads the binary for the host platform from the matching GitHub
+Release and verifies its SHA-256, so the install needs network access. macOS,
+glibc Linux, and Windows are supported on x86-64 and ARM64. Run `arsy doctor`
+afterwards to inspect the active build and environment.
+
+## Install with Homebrew
+
+```console
+brew install suiflex/tap/arsy-code
+```
+
+## Install with Scoop
+
+```console
+scoop bucket add suiflex https://github.com/suiflex/scoop-bucket
+scoop install arsy-code
+```
 
 ## Install with curl / PowerShell
 
@@ -82,9 +95,10 @@ irm https://github.com/suiflex/arsy-code/releases/latest/download/install.ps1 | 
 ```
 
 Both scripts verify the downloaded archive's SHA-256 checksum before
-installing; they do not yet verify the Sigstore signature described in
-[Install and verify](docs/34-distribution.md#install-and-verify). Prefer the
-canonical GitHub Release archive when that stronger guarantee matters.
+installing, but not the Sigstore signature. Every release publishes a
+`SHA256SUMS` signed through keyless Sigstore, verifiable with the bundle beside
+it — see [Install and verify](docs/34-distribution.md#install-and-verify) when
+that stronger guarantee matters.
 
 ### Complete command reference
 
@@ -94,7 +108,7 @@ arsy run <TASK> [--workspace <PATH>] [--output human|json|ci]
 arsy resume <SESSION_ID> [--follow]
 arsy review [REVISION] [--base <REVISION>] [--strict]
 arsy doctor [--strict]
-arsy update [--check]
+arsy update [--check]                      # reports the running version; ARSY does not self-update
 
 arsy session list [--workspace-only] [--limit <N>]
 arsy session show <SESSION_ID> [--turns] [--evidence]
@@ -146,12 +160,12 @@ arsy gc [--apply] [--retention <DURATION>]
 arsy migrate [--apply] [--backup <PATH>]
 arsy eval <SUITE> [--trials <N>] [--strict] [--out <PATH>]
 arsy serve [--protocol mcp|acp] [--transport stdio]
-arsy completions <bash|zsh|fish|powershell>
+arsy completions <bash|zsh|fish|powershell>  # roadmap-gated: reports a diagnostic and exits 1
 ```
 
 Global options can be used with commands that support them:
 `--workspace <PATH>`, `--config <PATH>`, `--provider <ID>`, `--model <ID>`,
-`--output human|json|ci`, `--no-color`, `--help`, and `--version`.
+`--output human|json|ci`, `--no-color`, `--debug`, `--help`, and `--version`.
 Run `arsy --help` for the exact syntax and availability of the current build. Commands that are
 roadmap-gated report a diagnostic instead of silently behaving differently.
 
@@ -196,6 +210,7 @@ See the [threat model](docs/29-threat-model.md).
 |---|---|
 | Product and architecture specification | Complete |
 | CLI implementation | Active development |
+| Distribution | Released — npm, Homebrew, Scoop, and signed release archives |
 | Stable API | Not available |
 
 ## License

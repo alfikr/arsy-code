@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     fmt,
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
@@ -235,12 +235,20 @@ impl StdioChannel {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The server's own logs belong on the operator's terminal, not
-            // mixed into the protocol stream.
-            .stderr(Stdio::inherit())
+            // mixed into the protocol stream -- but forwarded rather than
+            // inherited. An inherited handle outlives the child: a server that
+            // leaves a helper running hands that helper the caller's stderr,
+            // and whoever is reading it then waits on the helper rather than on
+            // the probe's deadline.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| McpError::Transport(format!("cannot start `{command}`: {error}")))?;
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        thread::spawn(move || {
+            let _ = io::copy(&mut BufReader::new(stderr), &mut io::stderr());
+        });
         let (sender, lines) = mpsc::channel();
         // A reader thread is what makes a deadline possible: a blocking read on
         // a child that never answers cannot be interrupted otherwise.

@@ -137,9 +137,9 @@ claims must pin new revisions independently.
 | Capability | Status | Source-backed current behavior |
 |---|---|---|
 | TUI | **SHIPPED/PARTIAL** | Interactive turns, plan flow, approvals, provider/model controls, progress, and inspections exist. There is no durable multi-agent supervision view. |
-| CI | **PLANNED operationally** | Every workflow is parked as `*.yml.disabled`; GitHub Actions cannot run them, including manual dispatch. Local checks exist. The previous three-OS per-push layout exceeded the private-repository minute budget. |
-| Release pipeline | **PARTIAL source, PLANNED operationally** | Disabled workflow source builds five targets, CycloneDX JSON, per-archive SHA-256, and GitHub Release assets. It pins Rust 1.85 while the workspace requires 1.98, does not attach installers, and explicitly has no signing. |
-| Installers and npm launcher | **PARTIAL** | Installer and platform-package source exists, including checksum verification and staging. Enabled publication and successful production releases are not established. Homebrew and Scoop remain target channels. |
+| CI | **SHIPPED** | `.github/workflows/` is active: `ci.yml`, `fuzz.yml`, `performance.yml`, `cla.yml`, and the guardener pair run on GitHub Actions. Local checks are the same commands. |
+| Release pipeline | **SHIPPED** | `release-please.yml` prepares the release; the tag push runs `release.yml`, which builds six Tier 1 archives, per-archive SHA-256, a Sigstore-signed `SHA256SUMS`, one CycloneDX SBOM per crate, and the installers, then pushes the Homebrew formula and Scoop manifest. `npm-publish.yml` follows it. |
+| Installers and npm launcher | **SHIPPED/PARTIAL** | The installers are attached to each release and verify the archive digest, but not the Sigstore signature. The npm launcher downloads and verifies the matching archive at postinstall. |
 | Update | **PRIMITIVE** | The CLI surface exists, but the current implementation reports the installed version as current without contacting a release source or installing anything. ARSY has no working self-update mechanism. |
 
 ## Competitive position

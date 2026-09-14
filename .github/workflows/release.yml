@@ -1,0 +1,315 @@
+name: Release build
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Git tag to build (e.g. v0.1.1)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to build (e.g. v0.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: sh -n install.sh
+      - run: sh tests/install_test.sh
+      - name: Parse PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+  build:
+    needs: verify-installers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: arsy-linux-x86_64.tar.gz
+            exe: ""
+            archive: tar
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: arsy-linux-aarch64.tar.gz
+            exe: ""
+            archive: tar
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: arsy-macos-x86_64.tar.gz
+            exe: ""
+            archive: tar
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: arsy-macos-aarch64.tar.gz
+            exe: ""
+            archive: tar
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: arsy-windows-x86_64.zip
+            exe: .exe
+            archive: zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: arsy-windows-aarch64.zip
+            exe: .exe
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      # --all-features reaches the Linux credential store, whose -sys crate
+      # needs the system library at build time. CI installs the same packages;
+      # the release build has to as well, or it ships from a narrower
+      # environment than the one the code was tested in.
+      - name: Install Linux credential-store dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --workspace --all-features --locked --release
+      - name: Package Unix archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/release/arsy${{ matrix.exe }}" dist/package/arsy
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
+          fi
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          Copy-Item "target/release/arsy${{ matrix.exe }}" dist/package/arsy.exe
+          Compress-Archive -Path dist/package/arsy.exe -DestinationPath "dist/${{ matrix.asset }}"
+          (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLowerInvariant() |
+            Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  # The SBOM describes the workspace, not a target, so it is generated once here
+  # rather than six times in the build matrix, where `merge-multiple: true` would
+  # collapse six identical trees onto each other. cargo-cyclonedx writes one file
+  # per crate under crates/<crate>/; they are flattened into dist/ because
+  # action-gh-release's `files: dist/*` glob is single-level.
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Generate CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 install cargo-cyclonedx --version 0.5.9 --locked
+          cargo +1.98.0 cyclonedx --all --format json
+          mkdir -p dist
+          find . -name '*.cdx.json' -not -path './dist/*' -print0 |
+            xargs -0 -I{} sh -c 'cp "{}" "dist/$(basename "{}")"'
+          ls dist/*.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sbom
+          path: dist/*.cdx.json
+          if-no-files-found: error
+
+  # The per-archive .sha256 sidecars stay: install.sh and install.ps1 read them
+  # directly. This adds the aggregate SHA256SUMS that docs/34-distribution.md
+  # documents, signed with keyless Sigstore so the canonical channel can be
+  # verified rather than merely checksummed.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Build the aggregate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The sidecars hold a bare digest; sha256sum --check wants
+          # "<digest>  <file>". Archives only: the sums file describes the
+          # installable artifacts, not itself or the SBOM.
+          for archive in arsy-*.tar.gz arsy-*.zip; do
+            test -f "$archive"
+            printf '%s  %s\n' "$(tr -d '[:space:]' < "${archive}.sha256")" "$archive"
+          done > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The bundle carries the signature, the certificate, and the
+          # transparency-log entry. cosign v3 ignores --output-signature when
+          # it writes one, so asking for a separate .sig produced nothing and
+          # left the documented verification pointing at a missing file.
+          cosign sign-blob --yes --bundle SHA256SUMS.bundle SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: checksums
+          path: |
+            dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
+          if-no-files-found: error
+
+  publish:
+    needs: [build, sbom, checksums]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      # install.sh / install.ps1 ship as release assets because README and
+      # docs/34 point curl and irm at releases/latest/download/.
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*
+            install.sh
+            install.ps1
+
+  # Distribution channels: siblings of each other, both gated on `publish`. Neither needs
+  # the other, so a tap failure does not cancel the bucket push or vice versa.
+  #
+  # Checksums come from this run's artifacts rather than from `gh release download`: they
+  # are already built and hashed here, so there is nothing to re-fetch and no race against
+  # release-asset propagation. The build jobs write the bare hex digest with no file name,
+  # so the value is read directly.
+
+  publish-homebrew:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Render the formula and push it to the tap
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PUBLISH_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          sha() { tr -d '[:space:]' < "dist/arsy-$1.tar.gz.sha256"; }
+
+          sed -e "s|@VERSION@|${version}|g" \
+              -e "s|@BASE@|${base}|g" \
+              -e "s|@MAC_ARM_SHA@|$(sha macos-aarch64)|g" \
+              -e "s|@MAC_X64_SHA@|$(sha macos-x86_64)|g" \
+              -e "s|@LINUX_ARM_SHA@|$(sha linux-aarch64)|g" \
+              -e "s|@LINUX_X64_SHA@|$(sha linux-x86_64)|g" \
+              packaging/arsy-code.rb.tmpl > arsy-code.rb
+          # A surviving placeholder means an artifact was missing. Fail here rather than
+          # publishing a formula that cannot install.
+          ! grep -q '@[A-Z_]*@' arsy-code.rb
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/suiflex/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          mv arsy-code.rb tap/Formula/arsy-code.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/arsy-code.rb
+          git commit -m "arsy-code ${version}" || { echo "tap already up to date"; exit 0; }
+          git push
+
+  publish-scoop:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Render the manifest and push it to the bucket
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PUBLISH_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          sha() { tr -d '[:space:]' < "dist/arsy-$1.zip.sha256"; }
+
+          sed -e "s|@VERSION@|${version}|g" \
+              -e "s|@BASE@|${base}|g" \
+              -e "s|@WIN_X64_SHA@|$(sha windows-x86_64)|g" \
+              -e "s|@WIN_ARM64_SHA@|$(sha windows-aarch64)|g" \
+              packaging/arsy-code.json.tmpl > arsy-code.json
+          ! grep -q '@[A-Z_]*@' arsy-code.json
+          jq empty arsy-code.json
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/suiflex/scoop-bucket.git" bucket
+          mkdir -p bucket/bucket
+          mv arsy-code.json bucket/bucket/arsy-code.json
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bucket/arsy-code.json
+          git commit -m "arsy-code ${version}" || { echo "bucket already up to date"; exit 0; }
+          git push

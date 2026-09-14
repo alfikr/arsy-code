@@ -131,7 +131,7 @@ Usage:
   arsy auth login <PROVIDER> sign in to a provider through its OAuth client
   arsy auth list             list credential handles (never values)
   arsy auth remove <HANDLE>  remove a credential from the OS credential store
-  arsy update [--check]      check for and install arsy-code updates
+  arsy update [--check]      report the running version; ARSY does not self-update
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
@@ -4646,6 +4646,7 @@ fn confirm_tool(
     let mut rendered_lines = dialog.render(width, colour).lines().count();
     writeln!(terminal, "{}", dialog.render(width, colour))?;
     terminal.flush()?;
+    approval.open();
     loop {
         match keys.recv() {
             Ok(byte) => match decoder.feed(byte) {
@@ -5185,6 +5186,9 @@ fn drive_provider(
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
+    // A process group of its own, so a signal aimed at the harness does not also
+    // reach the provider child. There is no Windows equivalent to gate on.
+    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
@@ -7298,25 +7302,52 @@ mod tests {
 
     /// Answers typed at the confirmation prompt. Keys sent while a round is
     /// still streaming belong to the composer, exactly as they do in a
-    /// session, so the answers are sent once the prompt is up.
+    /// session, so an answer only counts once the prompt is up.
+    ///
+    /// There is no way to observe the prompt appearing from here, and sleeping
+    /// long enough to assume it has is a race that a loaded runner loses: the
+    /// composer eats the answer mid-stream, the prompt then blocks until the
+    /// sender hangs up, and the turn stops with an empty response. So the
+    /// answer is offered until the caller reports the turn finished, the way a
+    /// person waiting on a prompt presses again.
+    ///
+    /// The returned flag must be set once the turn returns, or the join hangs.
     #[cfg(feature = "tui")]
     fn typed(
         answers: &'static [u8],
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<u8>) {
+        approval: std::sync::Arc<approval::ApprovalCell>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<u8>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (sender, keys) = std::sync::mpsc::channel();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::clone(&done);
         let typist = std::thread::spawn(move || {
-            for answer in answers {
-                std::thread::sleep(std::time::Duration::from_millis(250));
+            for (answered, answer) in answers.iter().enumerate() {
+                // Wait for the prompt this answer belongs to. Sending before it
+                // is up hands the byte to the composer instead, which is what a
+                // session does with a keystroke typed mid-stream.
+                while approval.opened() <= answered {
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 if sender.send(*answer).is_err() {
                     return;
                 }
             }
-            // The sender stays alive: a confirmation that never comes must
-            // block, not read as a hung-up keyboard.
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            // The sender stays alive until the turn ends: a confirmation that
+            // never comes must block, not read as a hung-up keyboard.
+            while !finished.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             drop(sender);
         });
-        (typist, keys)
+        (typist, keys, done)
     }
 
     #[cfg(feature = "tui")]
@@ -7354,7 +7385,9 @@ mod tests {
                 },
             ],
         ]);
-        let (typist, keys) = typed(b"y");
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"y", std::sync::Arc::clone(&approval));
         let mut conversation = vec![ModelMessage {
             role: ModelRole::User,
             content: vec![ModelContent::Text {
@@ -7374,9 +7407,10 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
+            &approval,
         )
         .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
         typist.join().unwrap();
 
         assert_eq!(turn.response.trim(), "done");
@@ -7483,7 +7517,9 @@ mod tests {
             ],
         ]);
         // `d` denies; `n` now opens the note editor.
-        let (typist, keys) = typed(b"d");
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"d", std::sync::Arc::clone(&approval));
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,
@@ -7498,9 +7534,10 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
+            &approval,
         )
         .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
         typist.join().unwrap();
 
         assert_eq!(turn.response.trim(), "understood");
@@ -7545,11 +7582,12 @@ mod tests {
             ]
         };
         let (resolved, scripted) = resolved(vec![asking(), asking()]);
-        let (typist, keys) = typed(b"\x03");
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"\x03", std::sync::Arc::clone(&approval));
         let mut conversation = Vec::new();
         // A stop is answered by the stop, not by waiting for the keyboard to
         // hang up: the calls after it are refused without asking.
-        let started = std::time::Instant::now();
         let turn = native_turn(
             &resolved,
             &test_runtime(workspace.path()),
@@ -7563,20 +7601,20 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
-            &approval::ApprovalCell::new(approval::ApprovalMode::Default),
+            &approval,
         )
         .unwrap();
-        // Measured before the typist is joined, which outlives the turn on
-        // purpose so an unanswered prompt blocks rather than reading as a
-        // hung-up keyboard.
-        let took = started.elapsed();
+        // The typist outlives the turn on purpose, so an unanswered prompt
+        // blocks rather than reading as a hung-up keyboard.
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
         typist.join().unwrap();
 
         assert!(turn.interrupted, "Ctrl-C at the prompt ends the turn");
-        assert!(
-            took < std::time::Duration::from_millis(1500),
-            "the stop did not carry to the calls after it: {took:?}"
-        );
+        // No wall-clock budget here. That the stop carried to the calls after
+        // it is what the assertions below prove; a clock on a shared runner
+        // measures the runner. A stop that failed to carry would leave the
+        // second prompt waiting on a keyboard that never answers, so it would
+        // hang rather than run slow.
         assert!(!workspace.path().join("first").exists());
         assert!(
             !workspace.path().join("second").exists(),

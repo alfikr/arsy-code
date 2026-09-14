@@ -2,12 +2,17 @@ $ErrorActionPreference = "Stop"
 
 $Repository = "suiflex/arsy-code"
 $Version = if ($env:ARSY_VERSION) { $env:ARSY_VERSION } else { "latest" }
-if ($Version -notmatch '^(latest|v[0-9A-Za-z._-]+)$') {
+if ($Version -notmatch '^(latest|v?[0-9A-Za-z._-]+)$') {
     throw "Invalid ARSY_VERSION: $Version"
+}
+# Releases are tagged v<semver>, so accept a bare version and tag it.
+if ($Version -match '^[0-9]') {
+    $Version = "v$Version"
 }
 
 $Architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
     "AMD64" { "x86_64" }
+    "ARM64" { "aarch64" }
     default { throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE" }
 }
 

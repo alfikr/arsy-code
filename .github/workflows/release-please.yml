@@ -2,6 +2,13 @@ name: release-please
 
 # Version, changelog, contributor attribution, and GitHub Release preparation.
 # A maintainer starts preparation manually. Ordinary PR merges are ignored.
+#
+# Preparation only: merging the release pull request tags the release, and the
+# tag push is what runs `release.yml`, whose completion runs `npm-publish.yml`.
+# This workflow deliberately does not call either. Calling them built every
+# target a second time, and npm refuses a publish that arrives through
+# `workflow_call` because the trusted publisher is registered against
+# `npm-publish.yml` rather than against whatever called it.
 on:
   workflow_dispatch:
   pull_request:
@@ -42,6 +49,40 @@ jobs:
           target-branch: main
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-type "simple" rewrites Cargo.toml through extra-files but knows
+      # nothing about Cargo.lock, and every build in this repo runs --locked. Left
+      # alone, CI on the release pull request fails with "the lock file needs to be
+      # updated" before a human ever looks at it.
+      - name: Sync Cargo.lock to the proposed version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          branch=$(jq -r '.headBranchName // empty' <<<"$RELEASE_PR")
+          if [ -z "$branch" ]; then
+            branch=$(gh pr list --state open --label "autorelease: pending" \
+              --json headRefName --jq '.[0].headRefName')
+          fi
+          if [ -z "$branch" ]; then
+            echo "no open release PR; nothing to sync"
+            exit 0
+          fi
+          git fetch origin "$branch"
+          git checkout "$branch"
+          # No --offline: the runner has never fetched the crates.io index,
+          # so resolving even a workspace member fails without it.
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches Cargo.toml"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "build: sync Cargo.lock to the release version"
+          git push origin "$branch"
 
       - name: Attribute contributors in changelog
         env:
@@ -91,22 +132,3 @@ jobs:
             echo "no attributed changelog block; leaving release notes unchanged"
           fi
           rm -f release-notes.md
-
-  release:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    permissions:
-      contents: write
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
-
-  npm-publish:
-    needs: [release-please, release]
-    if: needs.release-please.outputs.release_created == 'true'
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/npm-publish.yml
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}

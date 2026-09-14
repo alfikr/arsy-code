@@ -1,0 +1,59 @@
+name: Sandbox conformance
+
+on:
+  pull_request:
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+  push:
+    branches: [main]
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+
+concurrency:
+  group: sandbox-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.os }} native escape suite
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Linux namespace helper
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes bubblewrap
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 test -p arsy-sandbox --test sandbox_escape --locked

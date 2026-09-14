@@ -556,12 +556,16 @@ mod linux {
             }
         }
         if controls.max_pids == 1 {
-            for syscall in [
-                libc::SYS_clone,
-                libc::SYS_clone3,
-                libc::SYS_fork,
-                libc::SYS_vfork,
-            ] {
+            for syscall in [libc::SYS_clone, libc::SYS_clone3] {
+                denied.insert(syscall, Vec::new());
+            }
+            // fork and vfork are denied only where the kernel offers them.
+            // aarch64 creates every process through clone, defines no such
+            // syscall numbers, and libc therefore declares no constants to
+            // name here -- so the pair is unreachable there rather than
+            // unguarded.
+            #[cfg(target_arch = "x86_64")]
+            for syscall in [libc::SYS_fork, libc::SYS_vfork] {
                 denied.insert(syscall, Vec::new());
             }
         }

@@ -1,0 +1,94 @@
+# Path -> label map for the PR area labeler (the `label` job in
+# .github/workflows/suiflex.yml).
+#
+# One entry per component/area of arsy-code. A reviewer can tell from the label
+# row which parts of the repository a pull request touches without opening the
+# diff. Keep entries aligned with the repo's actual layout.
+#
+# A file may match several entries, and that is the point: a change to
+# crates/arsy-sandbox is both `area: sandbox` and `area: security`, and a
+# reviewer should see both.
+
+"area: cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-cli/**"
+
+"area: kernel":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-kernel/**"
+
+"area: code":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-code/**"
+
+"area: sandbox":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-sandbox/**"
+
+"area: ide":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-ide/**"
+
+# The pseudoterminal boundary. It owns the workspace's only `unsafe`
+# exception, so it is worth seeing named on its own row.
+"area: pty":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-pty/**"
+
+"area: ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+          - "Makefile"
+
+# How a build reaches a user: the npm launcher, the Homebrew and Scoop
+# templates, the installers, and what release-please reads to cut a version.
+"area: distribution":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "npm/**"
+          - "packaging/**"
+          - "install.sh"
+          - "install.ps1"
+          - "release-please-config.json"
+          - ".release-please-manifest.json"
+
+# Supply chain. deny.toml is here rather than under ci because it is the
+# licence and advisory policy, not a runner detail.
+"area: dependencies":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Cargo.toml"
+          - "Cargo.lock"
+          - "crates/*/Cargo.toml"
+          - "deny.toml"
+
+"area: tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/*/tests/**"
+          - "crates/*/benches/**"
+          - "fixtures/**"
+          - "tests/**"
+
+# Anything that changes what the harness is trusted to do, or what the project
+# promises about it.
+"area: security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-sandbox/**"
+          - "docs/29-threat-model.md"
+          - "SECURITY.md"
+
+"area: docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "*.md"
+          - "docs/**"
+          - "assets/**"

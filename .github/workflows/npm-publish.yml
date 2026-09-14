@@ -1,0 +1,61 @@
+name: npm-publish
+
+on:
+  workflow_run:
+    workflows: ["Release build"]
+    types: [completed]
+  workflow_call:
+    inputs:
+      tag:
+        description: Git tag that was released (e.g. v0.1.1)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish to npm (e.g. v0.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    # The npm Trusted Publisher for @suiflex/arsy-code is registered against this
+    # environment. The OIDC token only carries an `environment` claim when the job
+    # runs in one, and npm rejects the publish if the claim does not match.
+    environment: Release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.event.workflow_run.head_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify release tag matches package version
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.event.workflow_run.head_branch }}"
+          package_version="$(node -p "require('./npm/package.json').version")"
+          test "$tag" = "v$package_version"
+      # Trusted Publishing (OIDC): no NPM_TOKEN needed. Requires npm >= 11.5.1
+      # and this exact workflow path registered as a Trusted Publisher on
+      # npmjs.com for @suiflex/arsy-code.
+      #
+      # The package carries no binary. Its postinstall downloads the archive for
+      # the host platform from this tag's GitHub Release, so the release must
+      # already exist -- hence the gate on "Release build" above.
+      - run: npm install -g npm@latest
+      # `files` is an allowlist rooted at the package directory, so the licence
+      # has to sit inside npm/ to ship. Copying it here rather than committing
+      # a second copy keeps one source of truth.
+      - run: cp LICENSE npm/LICENSE
+      - run: npm publish --access public
+        working-directory: npm

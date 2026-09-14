@@ -86,7 +86,12 @@ mod unix {
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::ioctl(device.as_raw_fd(), libc::TIOCSCTTY.into(), 0) == -1 {
+                    // TIOCSCTTY is already c_ulong on Linux but narrower on the BSDs,
+                    // so this conversion is redundant on one target and required on
+                    // another.
+                    #[allow(clippy::useless_conversion)]
+                    let request = libc::TIOCSCTTY.into();
+                    if libc::ioctl(device.as_raw_fd(), request, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+  push:
+    branches: [main]
+    # Prose and repository furniture cannot change how the code behaves, so
+    # they do not need a three-OS build to prove it. Documentation under
+    # fixtures/ is deliberately absent: fixtures/compat/check.py asserts each
+    # fixture ships a README.md, so those are inputs rather than prose.
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Rust 1.98
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Linux credential-store dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - name: Install MSRV with lint components
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy
+      - name: Formatting
+        run: cargo +1.98.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        # --no-fail-fast: without it cargo stops at the first target that
+        # fails, so a platform with several unrelated failures reveals one
+        # per run.
+        run: cargo +1.98.0 test --workspace --all-features --locked --no-fail-fast
+      - name: Compatibility fixtures
+        run: python3 fixtures/compat/check.py
+
+  dependencies:
+    name: Advisories and licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny check

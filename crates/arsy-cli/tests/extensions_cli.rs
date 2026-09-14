@@ -230,7 +230,9 @@ fn a_vouched_for_workspace_reports_its_hooks_as_loaded() {
     write_settings(
         home.path(),
         &format!(
-            "schema_version = 1\n[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+            // A literal key: a Windows path's backslashes are escapes in a
+            // TOML basic string, and this body is written as TOML.
+            "schema_version = 1\n[project.'{}']\ntrust_level = \"trusted\"\n",
             workspace.path().display()
         ),
     );

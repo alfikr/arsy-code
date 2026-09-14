@@ -11,6 +11,11 @@ case "$version" in
         ;;
 esac
 
+# Releases are tagged v<semver>, so accept a bare version and tag it.
+case "$version" in
+    [0-9]*) version="v$version" ;;
+esac
+
 case "$(uname -s)" in
     Linux) platform="linux" ;;
     Darwin) platform="macos" ;;
