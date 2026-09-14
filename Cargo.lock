@@ -74,6 +74,7 @@ name = "arsy-code"
 version = "0.1.0"
 dependencies = [
  "arsy-kernel",
+ "arsy-pty",
  "cap-std",
  "globset",
  "ignore",
@@ -85,6 +86,7 @@ dependencies = [
  "toml",
  "tree-sitter",
  "tree-sitter-rust",
+ "ureq",
  "wasmtime",
  "yaml_serde",
 ]
@@ -113,6 +115,13 @@ dependencies = [
  "ureq",
  "uuid",
  "zstd",
+]
+
+[[package]]
+name = "arsy-pty"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

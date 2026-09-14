@@ -341,6 +341,32 @@ impl AgentService {
         Ok(state.version)
     }
 
+    /// Record what a turn said, as history rather than as evidence.
+    ///
+    /// `turn.completed` carries only the *digest* of a turn's outcome, which is
+    /// what makes it tamper-evident and useless for resuming: a digest cannot
+    /// be read back into a conversation. So the exchange is its own event, with
+    /// its own inline payload, appended before the turn is closed.
+    ///
+    /// Written for a turn that is about to complete. A turn that failed or was
+    /// interrupted records nothing, so replaying the stream cannot restore half
+    /// an exchange the model never finished having.
+    pub fn record_transcript(
+        &self,
+        actor: Principal,
+        turn: TurnId,
+        transcript: &Value,
+    ) -> Result<StreamVersion, ServiceError> {
+        let mut state = self.lock()?;
+        self.append(
+            &mut state,
+            actor,
+            TURN_TRANSCRIPT,
+            &json!({"turn_id": turn, "transcript": transcript}),
+        )?;
+        Ok(state.version)
+    }
+
     fn finish_turn(
         &self,
         actor: Principal,
@@ -610,6 +636,10 @@ const TURN_STARTED: &str = "turn.started";
 const TURN_COMPLETED: &str = "turn.completed";
 const TURN_FAILED: &str = "turn.failed";
 const USAGE_RECORDED: &str = "usage.recorded";
+/// What a turn said, as replayable history. Not evidence: `turn.completed`
+/// carries the digest that makes the outcome tamper-evident, and a digest
+/// cannot be read back into a conversation.
+pub const TURN_TRANSCRIPT: &str = "turn.transcript";
 
 fn digest_of(value: &Value) -> Result<StateVersion, ServiceError> {
     use sha2::{Digest, Sha256};

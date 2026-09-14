@@ -7,13 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["wasm"]
 dap = []
 wasm = ["dep:wasmtime"]
 remote-transports = []
 
 [dependencies]
 arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
+arsy-pty = { version = "0.1.0", path = "../arsy-pty" }
 cap-std.workspace = true
 globset.workspace = true
 ignore = "=0.4.23"
@@ -24,6 +25,7 @@ tempfile.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-rust.workspace = true
+ureq.workspace = true
 wasmtime = { workspace = true, optional = true }
 yaml_serde.workspace = true
 

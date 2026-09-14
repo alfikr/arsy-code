@@ -680,7 +680,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/approval",
         "set approval mode; default | acceptEdits | plan | auto | dontAsk | bypassPermissions",
     ),
-    ("/plan", "plan a task; approve | revise [NOTE] | cancel"),
+    (
+        "/plan",
+        "plan a task; show | approve | revise [NOTE] | cancel",
+    ),
+    ("/todo", "show this session's durable checklist"),
     ("/provider", "choose, add, or remove a provider endpoint"),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
@@ -941,7 +945,13 @@ pub const EFFORT_ROWS: &[(&str, &str)] = &[
 
 /// ponytail: the menu is capped rather than scrolled. It holds every command
 /// there is; give it a window over `menu()` if the table outgrows the cap.
-const MENU_ROWS: usize = 20;
+/// Rows the slash menu may occupy on a terminal tall enough for them.
+///
+/// Above the number of commands, so the whole table is offered rather than
+/// silently truncated at the bottom — which is where `/quit` and `/help` live,
+/// and hiding the way out is the one thing a menu must not do. A short
+/// terminal still narrows it; that bound is the screen's, not this one.
+const MENU_ROWS: usize = 24;
 
 /// What `/help` prints, built from the same table the menu offers.
 pub fn help(colour: bool) -> String {
@@ -4762,8 +4772,10 @@ mod tests {
         let rows: Vec<&str> = frame.split('\n').collect();
         assert_eq!(
             rows.len(),
-            4 + COMMANDS.len(),
-            "pad, input, pad, one row per command, status"
+            // The menu is windowed: a table longer than the window shows the
+            // window, not the table.
+            4 + COMMANDS.len().min(MENU_ROWS),
+            "pad, input, pad, one row per visible command, status"
         );
         assert!(
             rows[3].contains(&format!("› {}", COMMANDS[0].0)),
@@ -4780,7 +4792,10 @@ mod tests {
         }
         // Up over the bottom pad, the menu, and the status row, then across `› /`.
         assert!(
-            frame.ends_with(&format!("\x1b[{}A\r\x1b[3C", COMMANDS.len() + 2)),
+            frame.ends_with(&format!(
+                "\x1b[{}A\r\x1b[3C",
+                COMMANDS.len().min(MENU_ROWS) + 2
+            )),
             "{frame:?}"
         );
 

@@ -141,6 +141,10 @@ fn encode_content(content: &ModelContent) -> Value {
             "content": content,
             "is_error": is_error,
         }),
+        ModelContent::Image { media_type, data } => json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }),
     }
 }
 

@@ -23,6 +23,7 @@ pub mod secret;
 pub mod service;
 pub mod sqlite;
 pub mod telemetry;
+pub mod todo;
 pub mod transport;
 
 /// Workspace package version.

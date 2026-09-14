@@ -45,15 +45,19 @@ pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
 /// What an operator gets without saying: no unlock prompt to read metadata.
 pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
 
-const INERT_SECTIONS: &[&str] = &[
-    "compat",
-    "context",
-    "execution",
-    "git",
-    "sandbox",
-    "storage",
-    "ui",
-];
+/// How many independent tool calls one round may run at once by default.
+///
+/// Four rather than one because a model that reads five files reads them in
+/// one round, and four rather than the core count because the calls are
+/// waiting on disk and on other people's servers, not on this machine's CPU.
+pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
+
+/// The most any layer may ask for. A ceiling rather than a preference: a
+/// configuration file that asked for two hundred concurrent shell-adjacent
+/// calls would be describing a fork bomb.
+pub const MAX_PARALLEL_TOOLS: usize = 16;
+
+const INERT_SECTIONS: &[&str] = &["compat", "context", "git", "sandbox", "storage", "ui"];
 
 /// Where a value came from, in ascending authority order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -63,6 +67,13 @@ pub enum Layer {
     User,
     Workspace,
     Nested,
+    /// One file named on the command line with `--config`, applied last.
+    ///
+    /// The operator typed the path, so it is as trusted as their own user
+    /// file — but it cannot weaken policy, because `provider.allowed`,
+    /// `model.allowed`, and the policy rules all merge by intersection
+    /// whatever layer supplied them.
+    Session,
 }
 
 impl Layer {
@@ -72,7 +83,7 @@ impl Layer {
     /// untrusted content: they may express intent but cannot name an endpoint
     /// or a credential.
     pub const fn is_trusted(self) -> bool {
-        matches!(self, Self::Enterprise | Self::User)
+        matches!(self, Self::Enterprise | Self::User | Self::Session)
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -81,6 +92,7 @@ impl Layer {
             Self::User => "user",
             Self::Workspace => "workspace",
             Self::Nested => "nested",
+            Self::Session => "session",
         }
     }
 }
@@ -220,6 +232,42 @@ pub struct Endpoint {
     /// fixed.
     pub max_output_tokens: u32,
     pub oauth: Option<OAuth>,
+    /// What this endpoint charges, per model.
+    ///
+    /// Configured rather than built in: prices change, they differ per
+    /// account, and a table compiled into the binary would be quietly wrong
+    /// for anyone on a negotiated rate. An unpriced model reports its cost as
+    /// unknown, which is the honest answer — see [`Pricing`].
+    pub pricing: BTreeMap<String, Pricing>,
+}
+
+const fn charge(tokens: u64, micros_per_million: u64) -> u64 {
+    tokens
+        .saturating_mul(micros_per_million)
+        .div_ceil(1_000_000)
+}
+
+/// What one model costs, in micros per million tokens.
+///
+/// Micros because a token is far cheaper than a cent and floating point has no
+/// place in a running total; per million because that is the unit every
+/// provider publishes, so an operator copies the number rather than converting
+/// it and getting the exponent wrong.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Pricing {
+    pub input_micros_per_million: u64,
+    pub output_micros_per_million: u64,
+}
+
+impl Pricing {
+    /// What a turn cost, rounded up.
+    ///
+    /// Up rather than to nearest: a budget that under-reports is a budget that
+    /// is exceeded without saying so, and the error is at most one micro.
+    pub const fn cost_micros(self, input_tokens: u64, output_tokens: u64) -> u64 {
+        charge(input_tokens, self.input_micros_per_million)
+            .saturating_add(charge(output_tokens, self.output_micros_per_million))
+    }
 }
 
 impl Endpoint {
@@ -457,6 +505,8 @@ pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
     credential_store: Option<String>,
+    /// `execution.max_parallel_tools`. `None` is the built-in default.
+    max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
     /// `provider.allowed` and `model.allowed` after intersection. `None` means
     /// no layer capped the set, which is not the same as an empty allowlist:
@@ -526,6 +576,11 @@ impl Config {
 
     pub fn model_default(&self) -> Option<&str> {
         self.model_default.as_deref()
+    }
+
+    /// How many independent tool calls one round may run at once.
+    pub fn max_parallel_tools(&self) -> usize {
+        self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
     }
 
     /// The `[theme]` table, empty when the file did not set one.
@@ -773,6 +828,32 @@ impl Config {
                         }
                         self.credential_store = Some(store.clone());
                         self.record(layer, path, "credentials.store", store);
+                    }
+                }
+                "execution" => {
+                    // The rest of `[execution]` is still inert, so an unknown
+                    // key here is accepted as it always was; only the one this
+                    // build reads is validated.
+                    let table = as_table(value, "execution", path)?;
+                    if let Some(value) = table.get("max_parallel_tools") {
+                        let key = "execution.max_parallel_tools";
+                        let limit = value
+                            .as_integer()
+                            .and_then(|limit| usize::try_from(limit).ok())
+                            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
+                            .ok_or_else(|| {
+                                reject(format!(
+                                    "`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"
+                                ))
+                            })?;
+                        self.record(layer, path, key, limit.to_string());
+                        // Narrowest wins, like every other ceiling: a layer may
+                        // ask for less concurrency than the one above it and
+                        // never for more.
+                        self.max_parallel_tools = Some(
+                            self.max_parallel_tools
+                                .map_or(limit, |held| held.min(limit)),
+                        );
                     }
                 }
                 "telemetry" => self.apply_telemetry(layer, path, value)?,
@@ -1542,6 +1623,7 @@ impl Config {
                     | "models"
                     | "max_output_tokens"
                     | "oauth"
+                    | "pricing"
             ) {
                 return Err(reject(format!("unknown key `{prefix}.{key}`")));
             }
@@ -1577,6 +1659,7 @@ impl Config {
             models: Vec::new(),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             oauth: None,
+            pricing: BTreeMap::new(),
         });
         // Changing the dialect changes which API the default base URL names,
         // so one inherited from the previous dialect cannot be kept.
@@ -1666,6 +1749,44 @@ impl Config {
         }
         if let Some(oauth) = table.get("oauth") {
             endpoint.oauth = Some(self.apply_oauth(layer, path, &prefix, oauth)?);
+        }
+        if let Some(pricing) = table.get("pricing") {
+            let prefix = format!("{prefix}.pricing");
+            for (model, value) in as_table(pricing, &prefix, path)? {
+                let key = format!("{prefix}.{model}");
+                let rates = as_table(value, &key, path)?;
+                let rate = |name: &str| -> Result<u64, ConfigError> {
+                    rates
+                        .get(name)
+                        .and_then(toml::Value::as_integer)
+                        .and_then(|micros| u64::try_from(micros).ok())
+                        .ok_or_else(|| {
+                            reject(format!("`{key}.{name}` must be a non-negative integer"))
+                        })
+                };
+                for name in rates.keys() {
+                    if !matches!(
+                        name.as_str(),
+                        "input_micros_per_million" | "output_micros_per_million"
+                    ) {
+                        return Err(reject(format!("unknown key `{key}.{name}`")));
+                    }
+                }
+                let priced = Pricing {
+                    input_micros_per_million: rate("input_micros_per_million")?,
+                    output_micros_per_million: rate("output_micros_per_million")?,
+                };
+                self.record(
+                    layer,
+                    path,
+                    &key,
+                    format!(
+                        "in {} / out {} micros per million",
+                        priced.input_micros_per_million, priced.output_micros_per_million
+                    ),
+                );
+                endpoint.pricing.insert(model.clone(), priced);
+            }
         }
 
         self.endpoints.insert(id.to_owned(), endpoint);
@@ -1958,7 +2079,10 @@ pub const fn effect_name(effect: RuleEffect) -> &'static str {
 pub const fn policy_source(layer: Layer) -> PolicySource {
     match layer {
         Layer::Enterprise => PolicySource::Enterprise,
-        Layer::User => PolicySource::User,
+        // `--config` is the operator speaking for this invocation, so it has
+        // their own authority and no more: it can tighten a rule, and the
+        // intersection merge stops it loosening one.
+        Layer::User | Layer::Session => PolicySource::User,
         Layer::Workspace | Layer::Nested => PolicySource::Workspace,
     }
 }

@@ -35,7 +35,15 @@ pub struct AuditEntry {
 pub struct UsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cost_micros: u64,
+    /// What it cost in micros, or `None` when nothing said what the model
+    /// charges.
+    ///
+    /// An `Option` rather than a zero because the two are different facts and
+    /// only one of them is free. Summed across a session, one unpriced turn
+    /// makes the total unknown: a figure that quietly omits some of the spend
+    /// is worse than an honest refusal to name one, because only the second
+    /// tells an operator to go and configure the price.
+    pub cost_micros: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,7 +62,13 @@ impl ProjectionSet {
             applied: StreamVersion(0),
             turns: BTreeMap::new(),
             audit: Vec::new(),
-            usage: UsageTotals::default(),
+            // A session that has spent nothing has cost nothing, and knows it.
+            // Only a turn that was actually run without a price makes the
+            // running total unknown.
+            usage: UsageTotals {
+                cost_micros: Some(0),
+                ..UsageTotals::default()
+            },
         }
     }
 
@@ -110,11 +124,12 @@ impl ProjectionSet {
                     .output_tokens
                     .checked_add(usage.output_tokens)
                     .ok_or(ProjectionError::Overflow)?;
-                let cost_micros = self
-                    .usage
-                    .cost_micros
-                    .checked_add(usage.cost_micros)
-                    .ok_or(ProjectionError::Overflow)?;
+                let cost_micros = match (self.usage.cost_micros, usage.cost_micros) {
+                    (Some(total), Some(next)) => {
+                        Some(total.checked_add(next).ok_or(ProjectionError::Overflow)?)
+                    }
+                    _ => None,
+                };
                 self.usage = UsageTotals {
                     input_tokens,
                     output_tokens,
@@ -223,7 +238,10 @@ impl From<UsagePayload> for UsageTotals {
 struct UsagePayload {
     input_tokens: u64,
     output_tokens: u64,
-    cost_micros: u64,
+    /// Absent in a stream written before costs were recorded, which reads as
+    /// unknown — which is exactly what it was.
+    #[serde(default)]
+    cost_micros: Option<u64>,
 }
 
 fn inline<T>(event: &EventEnvelope) -> Result<T, ProjectionError>
@@ -336,7 +354,7 @@ mod tests {
             UsageTotals {
                 input_tokens: 10,
                 output_tokens: 4,
-                cost_micros: 25,
+                cost_micros: Some(25),
             }
         );
         assert_eq!(rebuilt.lag(StreamVersion(5)), 2);

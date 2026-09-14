@@ -54,6 +54,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
         },
         arsy_code::operations::Reachable::default(),
         "test",
+        arsy_code::operations::TurnState::default(),
     )
     .unwrap()
 }
@@ -127,6 +128,12 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
             "fs.delete",
             "fs.move",
             "bash",
+            "web_fetch",
+            "bash_start",
+            "bash_poll",
+            "bash_write",
+            "bash_stop",
+            "repo_map",
             "repo_discover",
             "git_status",
             "git_branch",
@@ -138,6 +145,8 @@ fn the_offered_tools_are_the_ones_the_registry_can_dispatch() {
             "plan_remove",
             "plan_reorder",
             "plan_list",
+            // No `todo_*`: this runtime was built without a session journal,
+            // and a durable checklist with nowhere to persist is not offered.
             "validate_record",
             "validate_status",
         ]
@@ -176,6 +185,10 @@ fn plan_mode_offers_exploration_and_planning_but_not_mutation_tools() {
         "git_status",
         "plan_add",
         "plan_list",
+        // Reading the repository is what planning is made of.
+        "repo_map",
+        // Reading a page is part of making a plan, and changes nothing.
+        "web_fetch",
     ] {
         assert!(offered.iter().any(|name| name == allowed), "{allowed}");
     }
@@ -188,6 +201,9 @@ fn plan_mode_offers_exploration_and_planning_but_not_mutation_tools() {
         "code.rename",
         "plugin.invoke",
         "bash",
+        "bash_start",
+        "bash_write",
+        "bash_stop",
     ] {
         assert!(!offered.iter().any(|name| name == blocked), "{blocked}");
     }
@@ -831,6 +847,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     let prompt = agent::instructions::system_prompt(
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
+        &[],
         None,
         ExecutionMode::Normal,
         &arsy_kernel::secret::Redactor::new(),
@@ -849,6 +866,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     let plan = agent::instructions::system_prompt(
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
+        &[],
         None,
         ExecutionMode::Plan,
         &arsy_kernel::secret::Redactor::new(),
@@ -858,6 +876,200 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     let rendered = agent::instructions::render(&plan);
     assert!(rendered.contains("You are in Plan Mode"), "{rendered}");
     assert!(rendered.contains("Do not execute the plan"), "{rendered}");
+
+    // `plugin.invoke` takes an id, and its schema cannot say which ids exist:
+    // without this listing the model has a tool it could only call by guessing.
+    let with_plugin = agent::instructions::system_prompt(
+        arsy_kernel::prompt::ModelFamily::Claude,
+        &found,
+        &[agent::instructions::ExtensionTool {
+            id: "formatter".to_owned(),
+            version: "1.2.0".to_owned(),
+            capabilities: vec!["fs.read".to_owned()],
+        }],
+        None,
+        ExecutionMode::Normal,
+        &arsy_kernel::secret::Redactor::new(),
+        arsy_kernel::prompt::MAX_PROMPT_BYTES as u32,
+    )
+    .unwrap();
+    let rendered = agent::instructions::render(&with_plugin);
+    assert!(
+        rendered.contains("`formatter` (version 1.2.0)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("granted fs.read"), "{rendered}");
+    assert!(
+        rendered.contains("plugin.invoke"),
+        "the listing names the tool that calls them: {rendered}"
+    );
+}
+
+/// A plugin an operator installed is callable in the build they installed it
+/// with — no feature flag, no rebuild, no second tool surface.
+#[cfg(feature = "wasm")]
+#[test]
+fn an_installed_plugin_is_callable_through_the_ordinary_tool_path() {
+    let root = tempfile::tempdir().unwrap();
+
+    // A source directory as `arsy plugin install` would be pointed at. The
+    // module reads the input a byte at a time and emits each byte back.
+    let source = root.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("plugin.toml"),
+        "manifest_version = 1\n\
+         id = \"echo\"\n\
+         version = \"1.0.0\"\n\
+         entrypoint = \"plugin.wasm\"\n\
+         api = \"1\"\n\
+         capabilities = []\n\
+         imports = [\"arsy::read_input_byte\", \"arsy::emit_byte\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("plugin.wasm"),
+        r#"
+        (module
+          (import "arsy" "read_input_byte" (func $read (param i32) (result i32)))
+          (import "arsy" "emit_byte" (func $emit (param i32) (result i32)))
+          (memory 1)
+          (func (export "run")
+            (local $index i32)
+            (local $byte i32)
+            (block $done
+              (loop $next
+                (local.set $byte (call $read (local.get $index)))
+                (br_if $done (i32.lt_s (local.get $byte) (i32.const 0)))
+                (drop (call $emit (local.get $byte)))
+                (local.set $index (i32.add (local.get $index) (i32.const 1)))
+                (br $next)))))
+        "#,
+    )
+    .unwrap();
+
+    let registry = arsy_code::plugin::Registry::open(root.path());
+    let (manifest, _) = arsy_code::plugin::Registry::inspect_source(&source).unwrap();
+    // What the operator approved, which is exactly what the manifest asked for.
+    let approved = arsy_code::plugin::Grant::for_manifest(&manifest, 0);
+    let installed = registry.install(&source, &approved, 0).unwrap();
+    assert!(installed.loadable());
+
+    // The same runtime a turn gets, offering the same generic operation.
+    let runtime = permissive(root.path());
+    assert!(
+        runtime
+            .schemas()
+            .iter()
+            .any(|schema| schema.name == "plugin.invoke"),
+        "the supported build offers the plugin tool without a feature flag"
+    );
+
+    let result = attended(
+        &runtime,
+        "plugin.invoke",
+        &json!({"plugin": "echo", "input": "round trip"}),
+    );
+    assert!(result.success, "{}", result.output);
+    assert!(
+        result.output.contains("round trip"),
+        "the plugin's own output reaches the model: {}",
+        result.output
+    );
+    assert!(
+        result.artifact.is_some(),
+        "a plugin call leaves the same evidence every other call does"
+    );
+
+    // An id nobody installed is a refusal that says so, not a crash.
+    let missing = err(&runtime, "plugin.invoke", json!({"plugin": "absent"}));
+    assert!(missing.contains("absent"), "{missing}");
+}
+
+/// Independent reads run together; anything that writes runs alone, in order.
+#[test]
+fn a_batch_runs_independent_reads_together_and_serializes_everything_else() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..6 {
+        std::fs::write(
+            root.path().join(format!("f{index}.txt")),
+            format!("body {index}"),
+        )
+        .unwrap();
+    }
+    let runtime = permissive(root.path());
+
+    // Six reads: independent, so all six may run at once.
+    let reads: Vec<(String, Value)> = (0..6)
+        .map(|index| {
+            (
+                "fs.read".to_owned(),
+                json!({"path": format!("f{index}.txt")}),
+            )
+        })
+        .collect();
+    let results = runtime.invoke_batch(&reads, 6);
+    assert_eq!(results.len(), reads.len());
+    for (index, result) in results.iter().enumerate() {
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            result.output,
+            format!("body {index}"),
+            "a result is paired to its own call by position, whatever order it finished in"
+        );
+    }
+
+    // A write in the middle: it is not batchable, so it runs on its own and
+    // everything keeps its place.
+    let mixed = vec![
+        ("fs.read".to_owned(), json!({"path": "f0.txt"})),
+        (
+            "fs.write".to_owned(),
+            json!({"path": "f0.txt", "content": "rewritten"}),
+        ),
+        ("fs.read".to_owned(), json!({"path": "f0.txt"})),
+    ];
+    let results = runtime.invoke_batch(&mixed, 4);
+    assert_eq!(results[0].output, "body 0", "the read before the write");
+    assert!(results[1].success);
+    assert_eq!(
+        results[2].output, "rewritten",
+        "a write is serialized against the reads around it, so ordering holds"
+    );
+
+    assert!(runtime.is_observational("fs.read", &json!({"path": "f0.txt"})));
+    assert!(!runtime.is_observational("fs.write", &json!({"path": "f0.txt", "content": "x"})));
+    assert!(
+        !runtime.is_observational("bash", &json!({"command": "ls"})),
+        "a shell command may write anywhere, so it never joins a batch"
+    );
+    assert!(
+        !runtime.is_observational("nonsense", &json!({})),
+        "a call that cannot be decoded fails on its own, where its error is the only outcome"
+    );
+
+    // A limit of one is still correct, only sequential: the same answers, in
+    // the same places.
+    let reads: Vec<(String, Value)> = (1..6)
+        .map(|index| {
+            (
+                "fs.read".to_owned(),
+                json!({"path": format!("f{index}.txt")}),
+            )
+        })
+        .collect();
+    let sequential: Vec<String> = runtime
+        .invoke_batch(&reads, 1)
+        .into_iter()
+        .map(|result| result.output)
+        .collect();
+    let concurrent: Vec<String> = runtime
+        .invoke_batch(&reads, 5)
+        .into_iter()
+        .map(|result| result.output)
+        .collect();
+    assert_eq!(sequential, concurrent);
+    assert_eq!(sequential[0], "body 1");
 }
 
 #[test]

@@ -44,9 +44,34 @@ pub struct PlanStep {
     pub status: PlanStepStatus,
 }
 
-#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanSnapshot {
     pub steps: Vec<PlanStep>,
+}
+
+impl PlanSnapshot {
+    /// The step being worked, or the first one that has not been.
+    ///
+    /// A model is supposed to mark one step `in_progress`, and does not always
+    /// remember to. Falling back to the first pending step means a plan view
+    /// still says where the work is rather than showing nothing at all.
+    pub fn current(&self) -> Option<&PlanStep> {
+        self.steps
+            .iter()
+            .find(|step| step.status == PlanStepStatus::InProgress)
+            .or_else(|| {
+                self.steps
+                    .iter()
+                    .find(|step| step.status == PlanStepStatus::Pending)
+            })
+    }
+
+    pub fn completed(&self) -> usize {
+        self.steps
+            .iter()
+            .filter(|step| step.status == PlanStepStatus::Completed)
+            .count()
+    }
 }
 
 /// The plan one workspace holds, shared by every `plan.*` kind.
@@ -57,7 +82,7 @@ pub struct PlanState {
 }
 
 impl PlanState {
-    fn snapshot(&self) -> PlanSnapshot {
+    pub fn snapshot(&self) -> PlanSnapshot {
         PlanSnapshot {
             steps: self.steps.clone(),
         }
@@ -98,6 +123,19 @@ pub fn state_for(workspace_root: &Path, scope: &str) -> Arc<Mutex<PlanState>> {
         .entry((workspace_root.to_path_buf(), scope.to_owned()))
         .or_insert_with(state)
         .clone()
+}
+
+/// Read one scope's plan without dispatching an operation.
+///
+/// A plan view is a question about the harness's own state, not a tool call: a
+/// front end that had to go through `plan.list` would need a capability, a
+/// policy decision, and an artifact write to draw a sidebar. This is the same
+/// data the tool returns, read directly.
+pub fn snapshot_for(workspace_root: &Path, scope: &str) -> PlanSnapshot {
+    state_for(workspace_root, scope)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .snapshot()
 }
 
 /// What a plan call may ask for. Kept separate rather than one kind with an

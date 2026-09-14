@@ -41,7 +41,7 @@ pub fn explain(
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working)?;
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
 
     let kind = OperationKind::new(operation)
         .map_err(|_| usage(format!("`{operation}` is not a canonical operation kind")))?;
@@ -62,6 +62,8 @@ pub fn explain(
         0,
         arsy_code::operations::Reachable::from_config(&config),
         &arsy_kernel::domain::SessionId::new().to_string(),
+        // A dry run explains what would happen; it writes nothing anywhere.
+        arsy_code::operations::TurnState::default(),
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let contract = registry.contract(&kind).ok_or_else(|| {

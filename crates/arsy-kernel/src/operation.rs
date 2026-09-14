@@ -323,12 +323,17 @@ fn validate_input(schema: &InputSchema, input: &serde_json::Value) -> Result<(),
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RegistrationError {
     Duplicate(OperationKind),
+    /// An executor could not be built at all: the state it needs is missing or
+    /// unreadable. Distinct from a duplicate, because the fix is to repair
+    /// what it reads rather than to stop registering it twice.
+    Unusable(String),
 }
 
 impl fmt::Display for RegistrationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Duplicate(kind) => write!(formatter, "operation {kind} is already registered"),
+            Self::Unusable(reason) => write!(formatter, "operation is unusable: {reason}"),
         }
     }
 }

@@ -30,12 +30,14 @@ mod integrations;
 mod mcp;
 mod memory;
 mod policy;
+mod progress;
 pub mod provider;
 mod review;
 mod serve;
 mod session;
 mod subagent;
 mod telemetry;
+mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -84,7 +86,8 @@ const USAGE: &str = "\
 arsy — agentic coding harness
 
 Usage:
-  arsy run <TASK>            execute one task non-interactively ('-' reads stdin)
+  arsy run <TASK> [--image <PATH>]   execute one task non-interactively
+                             ('-' reads the task from stdin)
   arsy resume <SESSION_ID>   resume a recorded session
   arsy doctor                report platform, sandbox, credential, and config state
   arsy eval <SUITE> [--strict]  run an evaluation fixture; --strict needs its revision
@@ -132,8 +135,13 @@ Usage:
 
 Global flags:
   --workspace <PATH>   workspace root (default: current directory)
+  --config <PATH>      one extra config file, applied last; it cannot widen policy
+  --provider <ID>      the endpoint this run dispatches to
+  --model <ID>         the model this run asks for, within model.allowed
   --output <MODE>      human, json, or ci
   --no-color           disable ANSI styling
+  --debug              trace the agent loop to stderr as JSON lines:
+                       requests, normalized model events, tool results, retries
   --help, --version
 ";
 
@@ -209,6 +217,8 @@ impl Diagnostic {
 pub enum Command {
     Run {
         task: String,
+        /// `--image <PATH>`: a picture attached to the prompt.
+        image: Option<PathBuf>,
     },
     Resume {
         session: SessionId,
@@ -408,19 +418,38 @@ pub struct Invocation {
     pub output: Option<Output>,
     /// `--no-color`; `NO_COLOR` in the environment disables styling as well.
     pub no_color: bool,
+    /// `--debug`: trace the agent loop — normalized model events, tool-loop
+    /// transitions, request metadata, retry decisions — to stderr as JSON.
+    pub debug: bool,
+    /// `--config <PATH>`: one extra configuration file, applied after every
+    /// discovered layer. It cannot weaken policy — ceilings intersect.
+    pub config: Option<PathBuf>,
+    /// `--provider <ID>`: the endpoint a turn dispatches to, overriding
+    /// `provider.default` and the routing that "auto" would otherwise do.
+    pub provider: Option<String>,
+    /// `--model <ID>`: the model a turn asks for, overriding the endpoint's
+    /// own `model` and `model.default`.
+    pub model: Option<String>,
     pub command: Command,
 }
 
 /// Parse arguments without touching the filesystem or starting a session.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diagnostic> {
-    let parsed = collect_arguments(args)?;
-    if let Some(command) = parsed.early {
-        return Ok(invocation(
-            parsed.workspace,
-            parsed.output,
-            parsed.no_color,
-            command,
-        ));
+    let mut parsed = collect_arguments(args)?;
+    // Taken before the per-command parse, which moves the rest of `parsed`.
+    let global = Global {
+        workspace: parsed.workspace.take(),
+        output: parsed.output,
+        no_color: parsed.no_color,
+        debug: parsed.debug,
+        config: parsed.config.take(),
+        // `--provider` doubles as the filter for `arsy model list`, so it is
+        // cloned rather than taken: one flag, read in both places.
+        provider: parsed.provider.clone(),
+        model: parsed.model.clone(),
+    };
+    if let Some(command) = parsed.early.take() {
+        return Ok(invocation(global, command));
     }
     if (parsed.source.is_some() || parsed.event.is_some())
         && !matches!(parsed.name.as_deref(), Some("mcp" | "hook" | "skill"))
@@ -433,6 +462,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         None => Command::Tui,
         Some("run") => Command::Run {
             task: only_argument(parsed.positional, "run", "<TASK>")?,
+            image: parsed.image.take(),
         },
         Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
         Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
@@ -469,12 +499,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         }
         Some(other) => return Err(unknown_command(other)),
     };
-    Ok(invocation(
-        parsed.workspace,
-        parsed.output,
-        parsed.no_color,
-        command,
-    ))
+    Ok(invocation(global, command))
 }
 
 #[derive(Default)]
@@ -493,6 +518,8 @@ struct ParsedArguments {
     all: bool,
     capabilities: bool,
     dry_run: bool,
+    /// `--debug`: trace the agent loop to stderr as JSON lines.
+    debug: bool,
     handle: Option<String>,
     trials: Option<u32>,
     limit: Option<usize>,
@@ -511,7 +538,14 @@ struct ParsedArguments {
     base: Option<String>,
     resource: Option<String>,
     actor: Option<String>,
+    /// `--config <PATH>`: one extra configuration file for this invocation.
+    config: Option<PathBuf>,
+    /// `--image <PATH>`: a picture attached to the prompt.
+    image: Option<PathBuf>,
+    /// `--provider <ID>`: a global override, and the filter `model list` reads.
     provider: Option<String>,
+    /// `--model <ID>`: a global override of the model a turn asks for.
+    model: Option<String>,
     capability: Option<String>,
     transport: Option<String>,
     protocol: Option<String>,
@@ -574,6 +608,7 @@ fn apply_switch(argument: &str, parsed: &mut ParsedArguments) -> bool {
         "--all" => parsed.all = true,
         "--capabilities" => parsed.capabilities = true,
         "--dry-run" => parsed.dry_run = true,
+        "--debug" => parsed.debug = true,
         _ => return false,
     }
     true
@@ -620,7 +655,10 @@ fn apply_value_flag(
         "--base" => parsed.base = Some(value(arguments, argument)?),
         "--resource" => parsed.resource = Some(value(arguments, argument)?),
         "--actor" => parsed.actor = Some(value(arguments, argument)?),
+        "--config" => parsed.config = Some(PathBuf::from(value(arguments, argument)?)),
+        "--image" => parsed.image = Some(PathBuf::from(value(arguments, argument)?)),
         "--provider" => parsed.provider = Some(value(arguments, argument)?),
+        "--model" => parsed.model = Some(value(arguments, argument)?),
         "--capability" => parsed.capability = Some(value(arguments, argument)?),
         "--transport" => parsed.transport = Some(value(arguments, argument)?),
         "--protocol" => parsed.protocol = Some(value(arguments, argument)?),
@@ -654,16 +692,27 @@ fn unknown_command(command: &str) -> Diagnostic {
     }
 }
 
-fn invocation(
+/// The flags every command accepts, lifted out of the per-command parse.
+#[derive(Default)]
+struct Global {
     workspace: Option<PathBuf>,
     output: Option<Output>,
     no_color: bool,
-    command: Command,
-) -> Invocation {
+    debug: bool,
+    config: Option<PathBuf>,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+fn invocation(global: Global, command: Command) -> Invocation {
     Invocation {
-        workspace: workspace.unwrap_or_else(|| PathBuf::from(".")),
-        output,
-        no_color,
+        workspace: global.workspace.unwrap_or_else(|| PathBuf::from(".")),
+        output: global.output,
+        no_color: global.no_color,
+        debug: global.debug,
+        config: global.config,
+        provider: global.provider,
+        model: global.model,
         command,
     }
 }
@@ -821,6 +870,8 @@ struct Emitter {
     output: Output,
     session: Option<SessionId>,
     sequence: u64,
+    /// `--debug`: trace the agent loop to stderr.
+    debug: bool,
     redactor: Redactor,
     /// Whether streamed text is mid-line, so the next output can start clean.
     streaming: bool,
@@ -832,9 +883,15 @@ impl Emitter {
             output,
             session: None,
             sequence: 0,
+            debug: false,
             redactor: Redactor::new(),
             streaming: false,
         }
+    }
+
+    const fn with_debug(mut self, debug: bool) -> Self {
+        self.debug = debug;
+        self
     }
 
     fn diagnostic(&mut self, diagnostic: &Diagnostic) {
@@ -896,6 +953,42 @@ impl Emitter {
                     }
                 }
             }
+        }
+    }
+
+    /// One step of the agent loop, for an operator who is debugging it.
+    ///
+    /// # Why stderr, and why JSON either way
+    ///
+    /// A trace is diagnostics, not output: a pipeline reading `--output json`
+    /// on stdout must not have its records interleaved with loop internals, and
+    /// a human watching a turn must not have their reply buried in them. So it
+    /// goes to stderr, where it can be redirected away or captured on its own.
+    ///
+    /// It is JSON in both output modes rather than prose in one: the reason to
+    /// turn this on is to grep it, and a format that changed with `--output`
+    /// would mean writing the grep twice.
+    ///
+    /// Off by default and a no-op when off, so the normal loop stays exactly as
+    /// concise as it was.
+    fn trace(&mut self, event: &str, fields: Value) {
+        if !self.debug {
+            return;
+        }
+        self.sequence += 1;
+        let record = json!({
+            "schema_version": RECORD_SCHEMA,
+            "type": "debug",
+            "event": event,
+            "sequence": self.sequence,
+            "session_id": self.session.map(|session| session.to_string()),
+            "payload": fields,
+        });
+        // Redacted like every other sink: a debug mode that printed the
+        // credential an ordinary record would have masked would be the most
+        // dangerous flag in the binary.
+        if let Ok(record) = self.redactor.sanitize(&record.to_string()) {
+            let _ = writeln!(io::stderr(), "{record}");
         }
     }
 
@@ -981,7 +1074,7 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I, tty: bool) -> i32 {
     let output = invocation
         .output
         .unwrap_or(if tty { Output::Human } else { Output::Ci });
-    let mut emitter = Emitter::new(output);
+    let mut emitter = Emitter::new(output).with_debug(invocation.debug);
     match execute(&invocation, tty, &mut emitter) {
         Ok(code) => code,
         Err(diagnostic) => {
@@ -1020,7 +1113,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             "the interactive TUI is disabled in this build",
             "install a build with the `tui` feature",
         )),
-        Command::Run { task } => run(invocation, task, emitter),
+        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
         Command::Update { check_only } => execute_update(*check_only, emitter),
@@ -1054,6 +1147,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
                 name.as_deref(),
                 source.as_deref(),
                 event.as_deref(),
+                invocation.config.as_deref(),
             )?;
             emitter.result(if emitter.output == Output::Json {
                 report
@@ -1230,7 +1324,7 @@ fn config_explain(
 ) -> Result<i32, Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let report = load_config(&root, &working)?.explain(key);
+    let report = load_config(&root, &working, invocation.config.as_deref())?.explain(key);
     emitter.result(if emitter.output == Output::Json {
         report
     } else {
@@ -1337,19 +1431,72 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
 ///
 /// An invalid file is fatal rather than skipped: continuing with a partly
 /// applied policy would silently run under something the operator never wrote.
+/// Every discovered configuration layer, plus the one `--config` named.
+///
+/// The extra file is applied last, so it wins a conflicting value — and only
+/// that: `provider.allowed`, `model.allowed`, and the policy rules all merge
+/// by intersection, so a session file can narrow the run but never widen it.
 fn load_config(
     workspace: &Path,
     working: &Path,
+    extra: Option<&Path>,
 ) -> Result<arsy_kernel::config::Config, Diagnostic> {
-    arsy_kernel::config::Config::load(&arsy_kernel::config::layers(workspace, working)).map_err(
-        |error| {
-            Diagnostic::error(
+    let mut layers = arsy_kernel::config::layers(workspace, working);
+    if let Some(path) = extra {
+        // Unlike a discovered layer, a path the operator typed is theirs to
+        // get right: a missing one is a mistake, not an absent optional file.
+        if !path.exists() {
+            return Err(Diagnostic::error(
                 ARSY_CFG_1000,
-                format!("configuration is unusable: {error}"),
-                "fix the reported file, then run `arsy config explain`",
+                format!("--config names `{}`, which does not exist", path.display()),
+                "pass the path to an existing config.toml, or drop --config",
+            ));
+        }
+        layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
+    }
+    arsy_kernel::config::Config::load(&layers).map_err(|error| {
+        Diagnostic::error(
+            ARSY_CFG_1000,
+            format!("configuration is unusable: {error}"),
+            "fix the reported file, then run `arsy config explain`",
+        )
+    })
+}
+
+/// The model a turn asks for: `--model` when it was given, otherwise whatever
+/// configuration resolved.
+///
+/// A named model is checked against `model.allowed` before it is used. The
+/// ceiling is the point of the flag being an override and not an escape: an
+/// operator may choose between the models policy permits, and naming one it
+/// does not is refused rather than silently ignored or silently obeyed.
+fn selected_model(
+    config: &Config,
+    endpoint: &arsy_kernel::config::Endpoint,
+    requested: Option<&str>,
+) -> Result<String, Diagnostic> {
+    if let Some(model) = requested {
+        if !config.model_is_allowed(model) {
+            return Err(Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("--model `{model}` is excluded by the model.allowed ceiling"),
+                "run `arsy model list` for the models this configuration permits",
+            ));
+        }
+        return Ok(model.to_owned());
+    }
+    endpoint
+        .model
+        .clone()
+        .or_else(|| config.model_default().map(str::to_owned))
+        .ok_or_else(|| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!("provider `{}` does not say which model to use", endpoint.id),
+                "set `model` on the provider endpoint, or `model.default`, in config.toml, or \
+                 pass --model",
             )
-        },
-    )
+        })
 }
 
 const CATALOG_NAME: &str = "__catalog__";
@@ -1402,7 +1549,7 @@ impl CatalogStore {
             .ok()
             .and_then(|root| {
                 let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-                load_config(&root, &working).ok()
+                load_config(&root, &working, invocation.config.as_deref()).ok()
             })
             .map_or(Self::File, |config| Self::named(config.credential_store()))
     }
@@ -1571,7 +1718,7 @@ fn auth_login(
 ) -> Result<i32, Diagnostic> {
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working)?;
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
     let configured = config.endpoint(Some(provider)).cloned();
     let preset = arsy_kernel::oauth::presets::get(provider);
 
@@ -1920,6 +2067,8 @@ enum PlanCommand {
     Revise(Option<String>),
     Approve,
     Cancel,
+    /// Print the plan the model is working to, without changing anything.
+    Show,
 }
 
 /// The subcommand is the whole first word or it is not the subcommand: a
@@ -1939,6 +2088,7 @@ fn plan_command(line: &str) -> PlanCommand {
         "revise" => PlanCommand::Revise(note(rest)),
         "approve" => PlanCommand::Approve,
         "cancel" => PlanCommand::Cancel,
+        "show" | "list" => PlanCommand::Show,
         _ => PlanCommand::Enter(note(argument)),
     }
 }
@@ -1979,15 +2129,19 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // need re-resolving per turn, which costs a credential-store read each
     // time. An API key does not expire, and `arsy run` resolves per
     // invocation, so only a long interactive OAuth session is affected.
-    let native = load_config(&workspace, &workspace)
+    let native = load_config(&workspace, &workspace, invocation.config.as_deref())
         .and_then(|config| {
-            let resolved = provider::resolve(&config, None)?;
-            let model = resolved
-                .endpoint
-                .model
-                .clone()
-                .or_else(|| config.model_default().map(str::to_owned))
-                .unwrap_or_default();
+            let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
+            // `--model` is checked here rather than defaulted: a model the
+            // ceiling excludes must not open a session that would dispatch to
+            // it, and falling back to the configured one would obey a flag the
+            // operator did not give.
+            let model = match invocation.model.as_deref() {
+                Some(_) => {
+                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
+                }
+                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
+            };
             Ok((resolved, model))
         })
         .ok();
@@ -2011,7 +2165,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
 
     // The palette is fixed before the first frame. A rejected `[theme]`
     // override is reported and dropped, never left to blank the screen.
-    let theme_config = load_config(&workspace, &workspace)
+    let theme_config = load_config(&workspace, &workspace, invocation.config.as_deref())
         .map(|config| config.theme().clone())
         .unwrap_or_default();
     let (mut theme, palette) = resolve_palette(&theme_config);
@@ -2049,6 +2203,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // once `/provider` has switched and the restart has not happened yet.
     let mut chosen_provider = configured_default(invocation);
     let mut conversation: Vec<ModelMessage> = Vec::new();
+    // The events the restored prefix came from, so a compaction of it can cite
+    // something a reader can still open.
+    let mut history = arsy_code::agent::budget::History::default();
     let mut auth_draft = String::new();
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
     let approval =
@@ -2309,7 +2466,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
                     Ok(picked_id) => {
-                        conversation = reconstruct_session_conversation(&workspace, picked_id);
+                        (conversation, history) =
+                            reconstruct_session_conversation(&workspace, picked_id);
                         state.set_session_id(picked_id);
                         set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
                         queued.clear();
@@ -2338,7 +2496,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                 if let Some(action) = dialog.handle_key(key) {
                                     match action {
                                         tui::SessionAction::Resume(id) => {
-                                            conversation =
+                                            (conversation, history) =
                                                 reconstruct_session_conversation(&workspace, id);
                                             state.set_session_id(id);
                                             set_approval_mode(
@@ -2377,6 +2535,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                                 let new_session = SessionId::new();
                                                 state.set_session_id(new_session);
                                                 conversation.clear();
+                                                history =
+                                                    arsy_code::agent::budget::History::default();
                                                 set_approval_mode(
                                                     &approval,
                                                     &mut state,
@@ -2419,6 +2579,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 let new_session = SessionId::new();
                 state.set_session_id(new_session);
                 conversation.clear();
+                history = arsy_code::agent::budget::History::default();
                 set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
                 queued.clear();
                 writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
@@ -2426,6 +2587,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task if line.trim() == "/clear" => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 conversation.clear();
+                history = arsy_code::agent::budget::History::default();
                 queued.clear();
                 writeln!(
                     stdout,
@@ -2443,7 +2605,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                     Some(id_str) => match id_str.parse::<SessionId>() {
                         Ok(id) => {
-                            conversation = reconstruct_session_conversation(&workspace, id);
+                            (conversation, history) =
+                                reconstruct_session_conversation(&workspace, id);
                             state.set_session_id(id);
                             set_approval_mode(
                                 &approval,
@@ -2534,6 +2697,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             let new_session = SessionId::new();
                             state.set_session_id(new_session);
                             conversation.clear();
+                            history = arsy_code::agent::budget::History::default();
                             set_approval_mode(
                                 &approval,
                                 &mut state,
@@ -2594,6 +2758,14 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                 .map_err(terminal_failed)?;
                         }
                     }
+                    PlanCommand::Show => {
+                        // The live plan for this session's scope, which is the
+                        // one the turn's `plan_*` tools have been writing to.
+                        let projection =
+                            progress::plan(&workspace, &state.session_id().to_string());
+                        write!(stdout, "{}", progress::human_plan(&projection))
+                            .map_err(terminal_failed)?;
+                    }
                     PlanCommand::Enter(task) => {
                         approval.enter_plan();
                         state.set_approval_mode(approval.get().label());
@@ -2606,6 +2778,23 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             queued.push_front(task);
                         }
                     }
+                }
+            }
+            Prompt::Task if line.split_whitespace().next() == Some("/todo") => {
+                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+                // Read from the store rather than from the turn's runtime: the
+                // checklist is durable, so what is on disk is the answer even
+                // if this session has not touched it yet.
+                let projection = open_store(&workspace).ok().and_then(|store| {
+                    progress::todos(store as Arc<dyn EventStore>, state.session_id())
+                });
+                match projection {
+                    Some(projection) => {
+                        write!(stdout, "{}", progress::human_todos(&projection))
+                            .map_err(terminal_failed)?;
+                    }
+                    None => writeln!(stdout, "This session's TODOs could not be read.")
+                        .map_err(terminal_failed)?,
                 }
             }
             Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
@@ -2750,7 +2939,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     resolved_providers.get(&route.provider)
                 } else {
                     let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
-                    let resolved = load_config(&workspace, &working)
+                    let resolved = load_config(&workspace, &working, invocation.config.as_deref())
                         .ok()
                         .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
                     if let Some(resolved) = resolved {
@@ -2763,6 +2952,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     state.session_id(),
                     selected_provider,
                     &line,
+                    &history,
                     &route,
                     effort,
                     colour,
@@ -3045,7 +3235,7 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     };
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let mut choices = Vec::new();
-    if let Ok(config) = load_config(&root, &working) {
+    if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
         for endpoint in config.endpoints() {
             choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
                 provider: endpoint.id.clone(),
@@ -3106,7 +3296,7 @@ enum ProviderNext {
 fn configured_default(invocation: &Invocation) -> Option<String> {
     let root = workspace_root(&invocation.workspace).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    load_config(&root, &working)
+    load_config(&root, &working, invocation.config.as_deref())
         .ok()?
         .provider_default()
         .map(str::to_owned)
@@ -3150,42 +3340,96 @@ fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
 }
 
 #[cfg(feature = "tui")]
-fn reconstruct_session_conversation(workspace: &Path, session: SessionId) -> Vec<ModelMessage> {
+/// The conversation a resumed session continues from.
+///
+/// Built from completed turns only. A turn that failed or was interrupted
+/// wrote no completion, so its prompt is not replayed: a question the model
+/// never answered, restored as history, reads as something that happened and
+/// is worse than a gap.
+///
+/// Each completed turn contributes the exchange it recorded — prompt,
+/// replies, tool calls, tool results — or, for a stream written before
+/// transcripts existed, whatever the two ends of it can be reconstructed from.
+fn reconstruct_session_conversation(
+    workspace: &Path,
+    session: SessionId,
+) -> (Vec<ModelMessage>, arsy_code::agent::budget::History) {
+    let mut history = arsy_code::agent::budget::History::default();
     let Ok(store) = open_store(workspace) else {
-        return Vec::new();
+        return (Vec::new(), history);
     };
     let Ok(events) = store.read(session, 1, 1000) else {
-        return Vec::new();
+        return (Vec::new(), history);
     };
-    let mut messages = Vec::new();
-    for event in events {
-        if event.kind == "turn.started" {
-            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
+    let inline = |event: &arsy_kernel::event::EventEnvelope| {
+        let arsy_kernel::event::EventPayload::Inline { data } = &event.payload else {
+            return None;
+        };
+        Some(data.clone())
+    };
+    let turn_of = |data: &Value| {
+        data.get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Two passes, because a transcript is written just before its turn is
+    // closed and a turn that never closed must contribute nothing. One pass
+    // could not know, at the transcript, whether the completion would come.
+    let mut completed = std::collections::HashSet::new();
+    let mut prompts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for event in &events {
+        let Some(data) = inline(event) else { continue };
+        match event.kind.as_str() {
+            "turn.completed" => {
+                completed.insert(turn_of(&data));
+            }
+            "turn.started" => {
                 if let Some(prompt) = data.get("prompt").and_then(Value::as_str) {
-                    messages.push(ModelMessage {
-                        role: ModelRole::User,
-                        content: vec![ModelContent::Text {
-                            text: prompt.to_owned(),
-                        }],
+                    prompts.insert(turn_of(&data), prompt.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut messages = Vec::new();
+    let mut transcribed = std::collections::HashSet::new();
+    for event in &events {
+        let Some(data) = inline(event) else { continue };
+        let turn = turn_of(&data);
+        if !completed.contains(&turn) {
+            continue;
+        }
+        match event.kind.as_str() {
+            "turn.transcript" => {
+                let recorded = transcript::restore(data.get("transcript").unwrap_or(&Value::Null));
+                if !recorded.is_empty() {
+                    transcribed.insert(turn);
+                    messages.extend(recorded);
+                    // What a later compaction of this prefix would cite: the
+                    // event that holds the exchange verbatim.
+                    history.citations.push(arsy_kernel::context::EventCitation {
+                        id: event.id,
+                        sequence: event.sequence,
                     });
                 }
             }
-        } else if event.kind == "turn.completed" {
-            if let arsy_kernel::event::EventPayload::Inline { data } = &event.payload {
-                if let Some(resp) = data.get("response").and_then(Value::as_str) {
-                    if !resp.trim().is_empty() {
-                        messages.push(ModelMessage {
-                            role: ModelRole::Assistant,
-                            content: vec![ModelContent::Text {
-                                text: resp.to_owned(),
-                            }],
-                        });
-                    }
+            // A stream written before transcripts existed, or one whose
+            // transcript did not survive. The question it was asked is what it
+            // has, and it is better than nothing.
+            "turn.completed" if !transcribed.contains(&turn) => {
+                if let Some(prompt) = prompts.remove(&turn) {
+                    messages.push(ModelMessage {
+                        role: ModelRole::User,
+                        content: vec![ModelContent::Text { text: prompt }],
+                    });
                 }
             }
+            _ => {}
         }
     }
-    messages
+    (messages, history)
 }
 
 /// The providers configured right now, in the order the configuration lists
@@ -3197,7 +3441,7 @@ fn configured_providers(invocation: &Invocation) -> Vec<String> {
         return Vec::new();
     };
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let Ok(config) = load_config(&root, &working) else {
+    let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) else {
         return Vec::new();
     };
     config.endpoint_ids()
@@ -3659,6 +3903,7 @@ fn run_turn(
     session_id: SessionId,
     native: Option<&provider::Resolved>,
     task: &str,
+    history: &arsy_code::agent::budget::History,
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     colour: bool,
@@ -3689,17 +3934,31 @@ fn run_turn(
     });
     let root = workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    emitter.trace(
+        "turn.started",
+        json!({
+            "turn": admission.turn.to_string(),
+            "provider": route.provider,
+            "model": route.model,
+            "restored_messages": base,
+            "cited_events": history.citations.len(),
+            "mode": approval.get().label(),
+        }),
+    );
     let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
             &agent_runtime(
                 &root,
-                &load_config(&root, &working)?,
+                &load_config(&root, &working, invocation.config.as_deref())?,
                 true,
                 &session_id.to_string(),
+                Some(session_id),
+                emitter,
             )?
             .with_execution_mode(approval.get().execution_mode()),
             conversation,
+            history,
             route,
             effort,
             admission.turn,
@@ -3749,6 +4008,17 @@ fn run_turn(
             return Ok(Turn::default());
         }
     };
+    emitter.trace(
+        "turn.finished",
+        json!({
+            "turn": admission.turn.to_string(),
+            "interrupted": turn.interrupted,
+            "failed": turn.failure.is_some(),
+            "response_bytes": turn.response.len(),
+            "usage": turn.usage,
+            "messages_added": conversation.len().saturating_sub(base),
+        }),
+    );
     if turn.interrupted {
         conversation.truncate(base);
         // Stopping a turn is a decision, not a fault: the turn is recorded as
@@ -3789,6 +4059,43 @@ fn run_turn(
             }
             let mut outcome = json!({"provider": route.provider, "model": route.model});
             merge(&mut outcome, turn.usage.clone());
+            // The interactive path records what it spent for the same reason
+            // the scripted one does: `arsy session show` reports one session's
+            // totals, and totals that skipped every TUI turn would be fiction.
+            let priced = charge_turn(native, &route.model, &turn.usage);
+            merge(
+                &mut outcome,
+                json!({
+                    "cost_micros": priced,
+                    "cost_source": if priced.is_some() { "configured" } else { "unknown" },
+                    "response": turn.response.clone(),
+                    // From where this turn began, so a resumed session replays
+                    // the tool calls and results the model actually saw rather
+                    // than only the two ends of the exchange.
+                    "transcript": transcript::persistable(&conversation[base..]),
+                }),
+            );
+            service
+                .record_usage(
+                    actor.clone(),
+                    arsy_kernel::projection::UsageTotals {
+                        input_tokens: summary_number(&turn.usage, "input_tokens"),
+                        output_tokens: summary_number(&turn.usage, "output_tokens"),
+                        cost_micros: priced,
+                    },
+                )
+                .map_err(storage_failed)?;
+            // Before the turn is closed, so a process that dies between the
+            // two leaves a transcript belonging to a turn that never
+            // completed — which the reconstruction ignores — rather than a
+            // completed turn whose exchange was never written.
+            service
+                .record_transcript(
+                    actor.clone(),
+                    admission.turn,
+                    &transcript::persistable(&conversation[base..]),
+                )
+                .map_err(storage_failed)?;
             service
                 .complete_turn(actor, admission.turn, &outcome)
                 .map_err(storage_failed)?;
@@ -3856,10 +4163,12 @@ enum Answer {
 /// rather than hidden, so it can say what it would do instead.
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn native_turn(
     resolved: &provider::Resolved,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
+    history: &arsy_code::agent::budget::History,
     route: &tui::ModelRoute,
     effort: Option<Effort>,
     turn: arsy_kernel::domain::TurnId,
@@ -3884,7 +4193,8 @@ fn native_turn(
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
-        let trimmed = arsy_code::agent::budget::trim(conversation, context_budget(resolved));
+        let trimmed =
+            arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history));
         if trimmed.changed() {
             let mut terminal = io::stdout();
             writeln!(
@@ -3895,8 +4205,9 @@ fn native_turn(
                     "context",
                     true,
                     &format!(
-                        "elided {} earlier tool result(s) to stay within {} tokens",
-                        trimmed.elided, trimmed.after
+                        "elided {} tool result(s) and compacted {} earlier message(s) to stay \
+                         within {} tokens",
+                        trimmed.elided, trimmed.summarized, trimmed.after
                     )
                 )
             )?;
@@ -5244,20 +5555,73 @@ fn turn_record(emitter: &mut Emitter, payload: Value) {
     }
 }
 
-fn run(invocation: &Invocation, task: &str, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+fn run(
+    invocation: &Invocation,
+    task: &str,
+    image: Option<&Path>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
     let task = if task == "-" {
         read_stdin()?
     } else {
         task.to_owned()
     };
     let goal = prepare_task(invocation, &task, emitter)?;
+    // Read before the session is opened: a path that is not an image, or is
+    // too large, is the operator's mistake and should not cost a recorded turn.
+    let attached = image.map(read_image).transpose()?;
     let mut execution = match TaskRun::open(invocation, None) {
         Ok(execution) => execution,
         Err(diagnostic) => return Ok(unusable(diagnostic, emitter)),
     };
     emitter.session = Some(execution.session);
     let task = execution.enqueue(&goal)?;
+    execution.attached = attached;
     execution.execute(task, Value::Null, emitter)
+}
+
+/// The most one attached image may be.
+///
+/// Large enough for a full-resolution screenshot, small enough that a
+/// mis-typed path to a video does not become a request nobody can send. The
+/// encoding grows it by a third, and every endpoint in this family refuses
+/// well below that.
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Read an image the operator attached, as canonical model content.
+fn read_image(path: &Path) -> Result<ModelContent, Diagnostic> {
+    let media_type = match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        other => {
+            return Err(usage(format!(
+                "--image accepts png, jpeg, gif, or webp, not `{}`",
+                other.unwrap_or("a file with no extension")
+            )))
+        }
+    };
+    let size = std::fs::metadata(path)
+        .map_err(|error| usage(format!("--image {}: {error}", path.display())))?
+        .len();
+    if size > MAX_IMAGE_BYTES {
+        return Err(usage(format!(
+            "--image {} is {size} bytes; the limit is {MAX_IMAGE_BYTES}",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| usage(format!("--image {}: {error}", path.display())))?;
+    Ok(ModelContent::Image {
+        media_type: media_type.to_owned(),
+        data: arsy_kernel::provider::base64(&bytes),
+    })
 }
 
 /// A misconfiguration is the operator's to fix, not a failed turn in their
@@ -5310,6 +5674,8 @@ struct TaskRun<'a> {
     /// This process's identity as a task holder, so an expired lease can be
     /// told from one this process still holds.
     agent: AgentId,
+    /// An image `--image` attached to the prompt, sent with the first message.
+    attached: Option<ModelContent>,
 }
 
 impl<'a> TaskRun<'a> {
@@ -5320,23 +5686,9 @@ impl<'a> TaskRun<'a> {
     fn open(invocation: &'a Invocation, session: Option<SessionId>) -> Result<Self, Diagnostic> {
         let root = workspace_root(&invocation.workspace)?;
         let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-        let config = load_config(&root, &working)?;
-        let resolved = provider::resolve(&config, None)?;
-        let model = resolved
-            .endpoint
-            .model
-            .clone()
-            .or_else(|| config.model_default().map(str::to_owned))
-            .ok_or_else(|| {
-                Diagnostic::error(
-                    ARSY_PRV_1000,
-                    format!(
-                        "provider `{}` does not say which model to use",
-                        resolved.endpoint.id
-                    ),
-                    "set `model` on the provider endpoint, or `model.default`, in config.toml",
-                )
-            })?;
+        let config = load_config(&root, &working, invocation.config.as_deref())?;
+        let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
+        let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
 
         let store = open_store(&root)?;
         let session = session.unwrap_or_default();
@@ -5355,6 +5707,7 @@ impl<'a> TaskRun<'a> {
             session,
             graph,
             agent: AgentId::new(),
+            attached: None,
         })
     }
 
@@ -5407,7 +5760,14 @@ impl<'a> TaskRun<'a> {
         // No operator is present, so nothing can be confirmed mid-run: the risk
         // context says so, and a call that needs an approval is refused by
         // policy rather than waiting on a keyboard that is not there.
-        let agent = agent_runtime(&self.root, &self.config, false, &task.to_string())?;
+        let agent = agent_runtime(
+            &self.root,
+            &self.config,
+            false,
+            &task.to_string(),
+            Some(self.session),
+            emitter,
+        )?;
         // A supervisor exists only when policy actually delegates something,
         // so a workspace that grants nothing sees no spawn tool rather than one
         // that always refuses.
@@ -5454,7 +5814,9 @@ impl<'a> TaskRun<'a> {
             ),
             messages: vec![ModelMessage {
                 role: ModelRole::User,
-                content: vec![ModelContent::Text { text: goal }],
+                content: std::iter::once(ModelContent::Text { text: goal })
+                    .chain(self.attached.clone())
+                    .collect(),
             }],
             tools: {
                 let mut tools = agent.schemas();
@@ -5483,6 +5845,7 @@ impl<'a> TaskRun<'a> {
             &mut recorder,
             &mut supervising,
             hooks,
+            self.config.max_parallel_tools(),
             emitter,
         );
         let interventions: Vec<Value> = supervising
@@ -5511,8 +5874,33 @@ impl<'a> TaskRun<'a> {
             "model": request.model.model,
             "telemetry": summary,
             "interventions": interventions,
+            // The same projection `/plan` and `/todo` draw, so a pipeline can
+            // read where the work stands without replaying raw events — and
+            // sees exactly what an operator watching the TUI would have seen.
+            "plan": progress::plan(&self.root, &task.to_string()),
+            "todos": open_store(&self.root)
+                .ok()
+                .and_then(|store| progress::todos(store as Arc<dyn EventStore>, self.session)),
         });
         merge(&mut record, context);
+        let input_tokens = summary_number(&record, "input_tokens");
+        let output_tokens = summary_number(&record, "output_tokens");
+        // What the turn cost, when configuration says what the model charges.
+        // `None` is reported as unknown rather than as zero: a session that
+        // claims it spent nothing is worse than one that admits it cannot say.
+        let priced = charge(
+            Some(&self.resolved.endpoint),
+            &self.model,
+            input_tokens,
+            output_tokens,
+        );
+        merge(
+            &mut record,
+            json!({
+                "cost_micros": priced,
+                "cost_source": if priced.is_some() { "configured" } else { "unknown" },
+            }),
+        );
         // Recorded whether the turn completed or failed: a turn that died
         // halfway still spent the tokens it spent, and a session's totals are
         // wrong if the failures are missing from them.
@@ -5520,9 +5908,9 @@ impl<'a> TaskRun<'a> {
             .record_usage(
                 self.actor.clone(),
                 arsy_kernel::projection::UsageTotals {
-                    input_tokens: summary_number(&record, "input_tokens"),
-                    output_tokens: summary_number(&record, "output_tokens"),
-                    cost_micros: 0,
+                    input_tokens,
+                    output_tokens,
+                    cost_micros: priced,
                 },
             )
             .map_err(storage_failed)?;
@@ -5531,9 +5919,8 @@ impl<'a> TaskRun<'a> {
         if let Err(error) = self.graph.consume(
             task,
             Budget {
-                tokens: summary_number(&record, "input_tokens")
-                    + summary_number(&record, "output_tokens"),
-                cost_micros: 0,
+                tokens: input_tokens + output_tokens,
+                cost_micros: priced.unwrap_or(0),
                 wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             },
         ) {
@@ -5548,6 +5935,13 @@ impl<'a> TaskRun<'a> {
             Ok(usage) => {
                 let mut outcome = record.clone();
                 merge(&mut outcome, usage);
+                self.service
+                    .record_transcript(
+                        self.actor.clone(),
+                        admission.turn,
+                        outcome.get("transcript").unwrap_or(&Value::Null),
+                    )
+                    .map_err(storage_failed)?;
                 self.service
                     .complete_turn(self.actor.clone(), admission.turn, &outcome)
                     .map_err(storage_failed)?;
@@ -5646,6 +6040,7 @@ fn dispatch(
     recorder: &mut telemetry::Recorder,
     supervisor: &mut Option<(subagent::Supervisor<'_>, &mut TaskGraph)>,
     hooks: Option<&arsy_code::hook::HookEngine>,
+    parallel: usize,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
     let mut request = request.clone();
@@ -5657,6 +6052,19 @@ fn dispatch(
         // than collapsing into the one before it.
         request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
             .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+        emitter.trace(
+            "request",
+            json!({
+                "round": round,
+                "provider": request.model.provider,
+                "model": request.model.model,
+                "idempotency_key": request.idempotency_key.as_str(),
+                "messages": request.messages.len(),
+                "tools": request.tools.len(),
+                "max_output_tokens": request.max_output_tokens,
+                "context_budget_tokens": budget,
+            }),
+        );
         let mut answer = String::new();
         let mut calls: Vec<(String, String, Value)> = Vec::new();
         // Each sleep the retry loop asks for is one attempt that failed, which
@@ -5665,6 +6073,12 @@ fn dispatch(
         let started = Instant::now();
         let stream = arsy_kernel::provider::stream_with_retry(provider, &request, &mut |delay| {
             retries += 1;
+            // The only place a retry is observable from outside the provider,
+            // and the question an operator debugging a slow turn is asking.
+            emitter.trace(
+                "retry",
+                json!({"round": round, "attempt": retries, "delay_ms": delay.as_millis() as u64}),
+            );
             std::thread::sleep(delay);
         })
         .inspect_err(|error| {
@@ -5698,7 +6112,13 @@ fn dispatch(
                     name,
                     arguments,
                     ..
-                } => calls.push((id, name, arguments)),
+                } => {
+                    emitter.trace(
+                        "model.tool_call",
+                        json!({"round": round, "id": id, "name": name, "arguments": arguments}),
+                    );
+                    calls.push((id, name, arguments));
+                }
                 ModelEvent::Completed { .. }
                 | ModelEvent::ToolCallStarted { .. }
                 | ModelEvent::ToolCallDelta { .. }
@@ -5715,11 +6135,40 @@ fn dispatch(
             retries,
             "ok",
         );
+        emitter.trace(
+            "round.finished",
+            json!({
+                "round": round,
+                "input_tokens": round_input,
+                "output_tokens": round_output,
+                "retries": retries,
+                "tool_calls": calls.len(),
+                "answer_bytes": answer.len(),
+            }),
+        );
         if calls.is_empty() {
             emitter.end_deltas();
-            return Ok(token_usage(input_tokens, output_tokens));
+            if !answer.trim().is_empty() {
+                request.messages.push(ModelMessage {
+                    role: ModelRole::Assistant,
+                    content: vec![ModelContent::Text {
+                        text: answer.clone(),
+                    }],
+                });
+            }
+            let mut usage = token_usage(input_tokens, output_tokens);
+            merge(
+                &mut usage,
+                json!({
+                    "response": answer,
+                    // Everything after the system prompt's own message: the
+                    // turn's exchange, which is what a resume replays.
+                    "transcript": transcript::persistable(&request.messages),
+                }),
+            );
+            return Ok(usage);
         }
-        arsy_code::agent::budget::trim(&mut request.messages, budget);
+        arsy_code::agent::budget::fit(&mut request.messages, budget, None);
 
         // The calls are history now, whatever running them produced: a provider
         // that sent a call and never sees its result rejects the next request.
@@ -5740,20 +6189,51 @@ fn dispatch(
             role: ModelRole::Assistant,
             content,
         });
+        // Independent reads run together; anything that writes, runs a
+        // command, or spawns a child still runs alone and in order. `hooks`
+        // are the exception: a hook engine is one interpreter with its own
+        // recursion guard, so a workspace that loads hooks keeps the
+        // sequential path rather than racing them.
+        let batched = (hooks.is_none() && supervisor.is_none() && parallel > 1)
+            .then(|| {
+                let batch: Vec<(String, Value)> = calls
+                    .iter()
+                    .map(|(_, name, arguments)| (name.clone(), arguments.clone()))
+                    .collect();
+                runtime.invoke_batch(&batch, parallel)
+            })
+            .unwrap_or_default();
         let results = calls
             .iter()
-            .map(|(id, name, arguments)| {
+            .enumerate()
+            .map(|(position, (id, name, arguments))| {
                 // Spawning is the one call the tool runtime does not own: it
                 // adds a node to this session's graph rather than touching the
                 // workspace, and the child's own calls go through the runtime
                 // under the authority the graph attenuated for it.
-                let result = match (name.as_str(), supervisor.as_mut()) {
-                    ("task.spawn", Some((supervisor, graph))) => {
+                let result = match (batched.get(position), name.as_str(), supervisor.as_mut()) {
+                    // Already run, in whatever order the batch chose; the
+                    // position is what pairs it back to this call's id.
+                    (Some(result), _, _) => result.clone(),
+                    (None, "task.spawn", Some((supervisor, graph))) => {
                         supervisor.spawn(arguments, graph, emitter)
                     }
                     _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
                 };
                 recorder.tool_call(&result);
+                emitter.trace(
+                    "tool.result",
+                    json!({
+                        "round": round,
+                        "id": id,
+                        "name": name,
+                        "success": result.success,
+                        "duration_ms": result.duration.as_millis() as u64,
+                        "output_bytes": result.output.len(),
+                        "changed_files": result.changed_files,
+                        "artifact": result.artifact.map(|id| id.to_string()),
+                    }),
+                );
                 ModelContent::ToolResult {
                     id: id.clone(),
                     content: result.output,
@@ -5985,7 +6465,13 @@ pub(crate) fn child_turn(
                     name,
                     arguments,
                     ..
-                } => calls.push((id, name, arguments)),
+                } => {
+                    emitter.trace(
+                        "model.tool_call",
+                        json!({"round": round, "id": id, "name": name, "arguments": arguments}),
+                    );
+                    calls.push((id, name, arguments));
+                }
                 _ => {}
             }
         }
@@ -5996,7 +6482,7 @@ pub(crate) fn child_turn(
                 answer
             });
         }
-        arsy_code::agent::budget::trim(&mut request.messages, budget);
+        arsy_code::agent::budget::fit(&mut request.messages, budget, None);
 
         let mut content: Vec<ModelContent> = Vec::new();
         if !answer.trim().is_empty() {
@@ -6073,6 +6559,41 @@ pub(crate) fn child_turn(
 /// Fewer than the parent's: a child has one question, and a child that cannot
 /// answer it in this many rounds is one the parent should take back.
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+
+/// What a turn cost, when configuration says what its model charges.
+///
+/// `None` means nobody wrote a price down. Reported as unknown rather than as
+/// zero, because a running total that silently treats every unpriced turn as
+/// free is worse than one that admits the gap: the first is wrong and looks
+/// right, the second is right about what it does not know.
+fn charge_turn(resolved: Option<&provider::Resolved>, model: &str, usage: &Value) -> Option<u64> {
+    charge(
+        resolved.map(|resolved| &resolved.endpoint),
+        model,
+        summary_number(usage, "input_tokens"),
+        summary_number(usage, "output_tokens"),
+    )
+}
+
+/// As above, from the parts. A turn that spent no tokens cost nothing at any
+/// price, so it is known to be free rather than unknown — otherwise a failed
+/// turn would make a whole session's total unknowable.
+fn charge(
+    endpoint: Option<&arsy_kernel::config::Endpoint>,
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<u64> {
+    if input_tokens == 0 && output_tokens == 0 {
+        return Some(0);
+    }
+    Some(
+        endpoint?
+            .pricing
+            .get(model)?
+            .cost_micros(input_tokens, output_tokens),
+    )
+}
 
 fn token_usage(input_tokens: u64, output_tokens: u64) -> Value {
     if input_tokens == 0 && output_tokens == 0 {
@@ -6226,7 +6747,7 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
     // A configured endpoint with a reachable credential is what decides
     // whether a turn can dispatch, so report it as one fact rather than
     // leaving an operator to infer it from the credential count.
-    let provider = match load_config(root, root) {
+    let provider = match load_config(root, root, invocation.config.as_deref()) {
         Err(diagnostic) => {
             let value = json!({"status": "unusable", "detail": diagnostic.message});
             warnings.push(diagnostic);
@@ -6374,15 +6895,31 @@ fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStor
 /// `plan.*`/`validate.*` kinds hold from another unit of work in the same
 /// workspace — a session id for a turn, a task id for an autonomous task, or
 /// any other value unique to the caller. See `operations::registry`.
+/// `session` is the stream durable state belongs to. Without one — a dry run,
+/// or a build with no store open — the runtime offers no `todo.*` tool rather
+/// than a checklist that would vanish when the process ends.
 fn agent_runtime(
     root: &Path,
     config: &arsy_kernel::config::Config,
     interactive: bool,
     scope: &str,
+    session: Option<SessionId>,
+    emitter: &mut Emitter,
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
         .map_err(|error| storage_failed(error.to_string()))?;
     let artifacts = Arc::new(artifact_store(root)?);
+    // Connections are opened here, once, because this is the turn boundary:
+    // the set of tools the model is told about and the set a call can reach
+    // are then the same set by construction.
+    //
+    // Only for a turn that has a session. A dry run or a one-shot inspection
+    // has no conversation to offer tools to, and starting somebody's MCP
+    // server as a side effect of `arsy code symbol` would be a surprise.
+    let (connections, discovered) = match session {
+        Some(_) => mcp::connect_enabled(config, emitter),
+        None => (None, Vec::new()),
+    };
     arsy_code::agent::runtime(
         &workspace,
         config.policy_rule_set(),
@@ -6397,7 +6934,20 @@ fn agent_runtime(
         },
         arsy_code::operations::Reachable::from_config(config),
         scope,
+        arsy_code::operations::TurnState {
+            journal: session
+                .map(|session| -> Result<_, Diagnostic> {
+                    Ok(arsy_code::agent::todoops::Journal {
+                        store: open_store(root)? as Arc<dyn EventStore>,
+                        session,
+                        actor: actor(),
+                    })
+                })
+                .transpose()?,
+            mcp: connections,
+        },
     )
+    .map(|runtime| runtime.with_dynamic_tools(discovered))
     .map_err(|error| storage_failed(error.to_string()))
 }
 
@@ -6415,6 +6965,42 @@ fn agent_runtime(
 /// facts is one whose next turn has less room to read the code.
 const MAX_RECALLED_MEMORY_BYTES: usize = 4 * 1024;
 
+/// The plugins this workspace has installed and approved, for the prompt.
+///
+/// Read fresh each turn rather than cached: `arsy plugin install` and
+/// `arsy plugin refresh` take effect at a turn boundary, and a listing held
+/// from session start would tell the model about a set that no longer exists.
+///
+/// Only loadable plugins are listed. One whose manifest now asks for more than
+/// was approved cannot run, and offering it would produce a refusal the model
+/// could do nothing about.
+#[cfg(feature = "wasm")]
+fn installed_extensions(root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
+    let (installed, _unreadable) = arsy_code::plugin::Registry::open(root)
+        .list()
+        .unwrap_or_default();
+    installed
+        .into_iter()
+        .filter(arsy_code::plugin::Installed::loadable)
+        .map(|plugin| arsy_code::agent::instructions::ExtensionTool {
+            id: plugin.manifest.id,
+            version: plugin.manifest.version,
+            capabilities: plugin
+                .manifest
+                .capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        })
+        .collect()
+}
+
+/// A build without the WASM host can install nothing, so it lists nothing.
+#[cfg(not(feature = "wasm"))]
+fn installed_extensions(_root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
+    Vec::new()
+}
+
 fn system_prompt(
     root: &Path,
     provider: &str,
@@ -6428,6 +7014,7 @@ fn system_prompt(
     let compiled = arsy_code::agent::instructions::system_prompt(
         family,
         &instructions,
+        &installed_extensions(root),
         memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
         mode,
         &arsy_kernel::secret::Redactor::new(),
@@ -6472,6 +7059,10 @@ mod tests {
             .unwrap();
 
         let invocation = Invocation {
+            debug: false,
+            config: None,
+            provider: None,
+            model: None,
             workspace: PathBuf::from("."),
             output: None,
             no_color: true,
@@ -6533,6 +7124,7 @@ mod tests {
         let resolved = provider::Resolved {
             provider: scripted.clone(),
             endpoint: arsy_kernel::config::Endpoint {
+                pricing: std::collections::BTreeMap::new(),
                 id: "stub".to_owned(),
                 kind: arsy_kernel::config::Dialect::Openai,
                 base_url: "https://stub.invalid/v1".to_owned(),
@@ -6561,7 +7153,15 @@ mod tests {
     /// workspace gets — which is what a first run actually sees.
     #[cfg(feature = "tui")]
     fn test_runtime(root: &Path) -> arsy_code::agent::ToolRuntime {
-        agent_runtime(root, &load_config(root, root).unwrap(), true, "test").unwrap()
+        agent_runtime(
+            root,
+            &load_config(root, root, None).unwrap(),
+            true,
+            "test",
+            None,
+            &mut Emitter::new(Output::Json),
+        )
+        .unwrap()
     }
 
     /// Answers typed at the confirmation prompt. Keys sent while a round is
@@ -6633,6 +7233,7 @@ mod tests {
             &resolved,
             &test_runtime(workspace.path()),
             &mut conversation,
+            &arsy_code::agent::budget::History::default(),
             &route(),
             None,
             arsy_kernel::domain::TurnId::new(),
@@ -6691,6 +7292,12 @@ mod tests {
                 "fs.delete",
                 "fs.move",
                 "bash",
+                "web_fetch",
+                "bash_start",
+                "bash_poll",
+                "bash_write",
+                "bash_stop",
+                "repo_map",
                 "repo_discover",
                 "git_status",
                 "git_branch",
@@ -6750,6 +7357,7 @@ mod tests {
             &resolved,
             &test_runtime(workspace.path()),
             &mut conversation,
+            &arsy_code::agent::budget::History::default(),
             &route(),
             None,
             arsy_kernel::domain::TurnId::new(),
@@ -6814,6 +7422,7 @@ mod tests {
             &resolved,
             &test_runtime(workspace.path()),
             &mut conversation,
+            &arsy_code::agent::budget::History::default(),
             &route(),
             None,
             arsy_kernel::domain::TurnId::new(),
@@ -6991,6 +7600,10 @@ mod tests {
         use tui::ProviderStep as Step;
 
         let invocation = Invocation {
+            debug: false,
+            config: None,
+            provider: None,
+            model: None,
             workspace: PathBuf::from("."),
             output: None,
             no_color: true,
@@ -7129,6 +7742,10 @@ mod tests {
         use tui::AuthStep as Step;
 
         let invocation = Invocation {
+            debug: false,
+            config: None,
+            provider: None,
+            model: None,
             workspace: PathBuf::from("."),
             command: Command::Tui,
             no_color: true,
@@ -7478,6 +8095,7 @@ mod tests {
                     | "/session"
                     | "/approval"
                     | "/plan"
+                    | "/todo"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
@@ -7504,6 +8122,10 @@ mod tests {
         );
         assert_eq!(plan_command("/plan approve"), PlanCommand::Approve);
         assert_eq!(plan_command("/plan cancel"), PlanCommand::Cancel);
+        // Viewing the plan is not entering Plan Mode: `show` must not queue
+        // "show" as a task to plan, and `list` is the same question.
+        assert_eq!(plan_command("/plan show"), PlanCommand::Show);
+        assert_eq!(plan_command("/plan list"), PlanCommand::Show);
         // A subcommand with anything after it is still that subcommand, not a
         // new planning task that silently re-enters Plan Mode.
         assert_eq!(plan_command("/plan approve please"), PlanCommand::Approve);
@@ -7706,6 +8328,394 @@ mod tests {
         assert!(parse(["auth", "set", "anthropic", "raw-secret"].map(str::to_owned)).is_err());
     }
 
+    /// The documented global flags apply before or after a subcommand, and
+    /// compose with that subcommand's own flags.
+    #[test]
+    fn global_flags_apply_on_either_side_of_the_subcommand() {
+        let before = parse(
+            [
+                "--config",
+                "/tmp/session.toml",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-opus-5",
+                "run",
+                "a task",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(
+            before.config.as_deref(),
+            Some(Path::new("/tmp/session.toml"))
+        );
+        assert_eq!(before.provider.as_deref(), Some("anthropic"));
+        assert_eq!(before.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            before.command,
+            Command::Run {
+                task: "a task".to_owned(),
+                image: None,
+            }
+        );
+
+        let after = parse(
+            [
+                "run",
+                "a task",
+                "--provider",
+                "anthropic",
+                "--model",
+                "claude-opus-5",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(after.provider, before.provider);
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.command, before.command);
+
+        // `--provider` is one flag with two readers: the global override, and
+        // the filter `model list` applies. Both see the same value.
+        let listing =
+            parse(["model", "list", "--provider", "anthropic"].map(str::to_owned)).unwrap();
+        assert_eq!(listing.provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            listing.command,
+            Command::ModelList {
+                provider: Some("anthropic".to_owned()),
+                capability: None,
+            }
+        );
+
+        // A value flag with nothing after it is a usage error, not a silent
+        // consumption of the next word.
+        assert!(parse(["run", "a task", "--model"].map(str::to_owned)).is_err());
+        assert!(parse(["--config"].map(str::to_owned)).is_err());
+
+        // Tracing is opt-in, so an ordinary run stays as quiet as it was.
+        assert!(!parse(["run", "a task"].map(str::to_owned)).unwrap().debug);
+        assert!(
+            parse(["run", "a task", "--debug"].map(str::to_owned))
+                .unwrap()
+                .debug
+        );
+    }
+
+    /// A trace is diagnostics: it belongs on stderr, in one format whichever
+    /// output mode is selected, and it must not exist at all when off.
+    #[test]
+    fn the_debug_trace_is_json_on_stderr_and_absent_unless_asked_for() {
+        let mut quiet = Emitter::new(Output::Json);
+        quiet.trace("request", json!({"round": 0}));
+        assert_eq!(
+            quiet.sequence, 0,
+            "an untraced emitter does not even advance its sequence"
+        );
+
+        let mut traced = Emitter::new(Output::Json).with_debug(true);
+        traced.trace("request", json!({"round": 0}));
+        assert_eq!(traced.sequence, 1);
+    }
+
+    /// `--model` chooses between what policy permits; it cannot reach past it.
+    #[test]
+    fn a_model_the_ceiling_excludes_is_refused_rather_than_dispatched() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.local]\nkind = \"openai\"\nmodel = \"m1\"\n\
+             models = [\"m1\", \"m2\"]\n\n[model]\nallowed = [\"m1\"]\n",
+        )
+        .unwrap();
+        let config = Config::load(&[(arsy_kernel::config::Layer::User, path)]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+
+        assert_eq!(selected_model(&config, &endpoint, None).unwrap(), "m1");
+        assert_eq!(
+            selected_model(&config, &endpoint, Some("m1")).unwrap(),
+            "m1"
+        );
+        let refused = selected_model(&config, &endpoint, Some("m2")).unwrap_err();
+        assert_eq!(refused.code, ARSY_PRV_1000);
+        assert!(
+            refused.message.contains("m2"),
+            "the refusal names the model that was asked for: {}",
+            refused.message
+        );
+    }
+
+    /// `--config` is applied last, so it wins an ordinary value — and loses
+    /// every ceiling, which intersects rather than replaces.
+    #[test]
+    fn an_extra_config_file_overrides_a_value_but_cannot_widen_a_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("repo");
+        std::fs::create_dir_all(workspace.join(".arsy")).unwrap();
+        std::fs::write(
+            workspace.join(".arsy/config.toml"),
+            "schema_version = 1\n\n[model]\ndefault = \"m1\"\nallowed = [\"m1\"]\n",
+        )
+        .unwrap();
+        let extra = directory.path().join("session.toml");
+        std::fs::write(
+            &extra,
+            "schema_version = 1\n\n[model]\ndefault = \"m9\"\nallowed = [\"m1\", \"m9\"]\n",
+        )
+        .unwrap();
+
+        let config = load_config(&workspace, &workspace, Some(&extra)).unwrap();
+        assert_eq!(config.model_default(), Some("m9"), "a later layer wins");
+        assert!(
+            !config.model_is_allowed("m9"),
+            "a ceiling only ever narrows, whichever layer wrote it"
+        );
+
+        // A path the operator typed and got wrong is a diagnostic, not an
+        // absent optional file.
+        let missing = directory.path().join("absent.toml");
+        assert_eq!(
+            load_config(&workspace, &workspace, Some(&missing))
+                .unwrap_err()
+                .code,
+            ARSY_CFG_1000
+        );
+    }
+
+    /// A resumed session continues the conversation the model actually had —
+    /// tool calls and results included — and does not replay a turn that was
+    /// interrupted before it answered.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn resuming_restores_the_exchange_and_skips_a_turn_that_never_finished() {
+        let workspace = std::env::temp_dir().join(format!("arsy-resume-{}", SessionId::new()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = SessionId::new();
+        let store = open_store(&workspace).unwrap();
+        let service =
+            AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session).unwrap();
+
+        let start = |prompt: &str| {
+            service
+                .start_turn(
+                    Principal::System,
+                    &ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
+                        session,
+                        prompt: prompt.to_owned(),
+                        extensions: Extensions::new(),
+                    })),
+                )
+                .unwrap()
+        };
+
+        // A turn that ran a tool and answered.
+        let answered = start("fix the failing test");
+        let exchange = vec![
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text {
+                    text: "fix the failing test".to_owned(),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "cargo test"}),
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::ToolResult {
+                    id: "call-1".to_owned(),
+                    content: "1 failed\n\nevidence: art-1".to_owned(),
+                    is_error: true,
+                }],
+            },
+            ModelMessage {
+                role: ModelRole::Assistant,
+                content: vec![ModelContent::Text {
+                    text: "the assertion is inverted".to_owned(),
+                }],
+            },
+        ];
+        service
+            .record_transcript(
+                Principal::System,
+                answered.turn,
+                &transcript::persistable(&exchange),
+            )
+            .unwrap();
+        service
+            .complete_turn(Principal::System, answered.turn, &json!({}))
+            .unwrap();
+
+        // A turn the operator stopped. It wrote no transcript, so it
+        // contributes nothing — not even the question it was asked.
+        let stopped = start("and now rewrite the parser");
+        service
+            .fail_turn(
+                Principal::System,
+                stopped.turn,
+                "user_interrupt",
+                "stopped by the operator",
+            )
+            .unwrap();
+
+        let (restored, cited) = reconstruct_session_conversation(&workspace, session);
+        assert_eq!(
+            cited.citations.len(),
+            1,
+            "the restored prefix knows which event it came from, so a later \
+             compaction of it can cite one"
+        );
+        assert_eq!(
+            restored, exchange,
+            "the model resumes with the exchange it had, tool traffic included"
+        );
+        assert!(
+            !restored.iter().any(|message| message.content.iter().any(
+                |content| matches!(content, ModelContent::Text { text } if text.contains("parser"))
+            )),
+            "an interrupted turn's prompt is not replayed as history"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// An attachment is bounded and typed before it can cost a recorded turn.
+    #[test]
+    fn an_attached_image_is_read_as_canonical_content_or_refused_with_the_reason() {
+        let directory = tempfile::tempdir().unwrap();
+
+        // One pixel of PNG. What matters is the bytes round-trip, not the
+        // picture: the adapter re-frames whatever this produces.
+        let png = directory.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let ModelContent::Image { media_type, data } = read_image(&png).unwrap() else {
+            panic!("an image path reads as image content");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            data,
+            arsy_kernel::provider::base64(b"\x89PNG\r\n\x1a\n"),
+            "the canonical form is standard base64, which every adapter re-frames"
+        );
+
+        // A type nothing in this family reads is refused by name.
+        let other = directory.path().join("notes.txt");
+        std::fs::write(&other, b"text").unwrap();
+        let refused = read_image(&other).unwrap_err();
+        assert!(refused.message.contains("txt"), "{}", refused.message);
+
+        // Past the limit is refused before a session is opened.
+        let huge = directory.path().join("huge.png");
+        std::fs::write(
+            &huge,
+            vec![0u8; usize::try_from(MAX_IMAGE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(read_image(&huge).unwrap_err().message.contains("limit"));
+
+        assert!(read_image(&directory.path().join("absent.png")).is_err());
+    }
+
+    /// A price that nobody configured is unknown, and unknown is not zero.
+    #[test]
+    fn a_turn_is_charged_from_configured_pricing_or_reported_as_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "schema_version = 1\n\n\
+             [provider.endpoint.anthropic]\nkind = \"anthropic\"\nmodel = \"opus\"\n\
+             models = [\"opus\", \"haiku\"]\n\n\
+             [provider.endpoint.anthropic.pricing.opus]\n\
+             input_micros_per_million = 15000000\n\
+             output_micros_per_million = 75000000\n",
+        )
+        .unwrap();
+        let config = Config::load(&[(arsy_kernel::config::Layer::User, path)]).unwrap();
+        let endpoint = config.endpoint(None).unwrap();
+
+        // 1000 in, 500 out: 15000000/1e6 * 1000 + 75000000/1e6 * 500.
+        assert_eq!(charge(Some(endpoint), "opus", 1_000, 500), Some(52_500));
+        assert_eq!(
+            charge(Some(endpoint), "haiku", 1_000, 500),
+            None,
+            "a model with no configured price is unknown, not free"
+        );
+        assert_eq!(
+            charge(Some(endpoint), "haiku", 0, 0),
+            Some(0),
+            "a turn that spent nothing cost nothing at any price"
+        );
+        assert_eq!(charge(None, "opus", 1_000, 0), None);
+
+        // Rounding is up, so a sub-micro charge is never lost to the floor.
+        assert_eq!(charge(Some(endpoint), "opus", 1, 0), Some(15));
+    }
+
+    /// One unpriced turn makes the session total unknown rather than wrong.
+    #[test]
+    fn session_cost_totals_go_unknown_rather_than_understating_the_spend() {
+        use arsy_kernel::projection::{ProjectionSet, UsageTotals};
+
+        let session = SessionId::new();
+        let empty = ProjectionSet::new(session);
+        assert_eq!(
+            empty.usage(),
+            UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_micros: Some(0),
+            },
+            "a session that has run nothing knows it has spent nothing"
+        );
+
+        let store: Arc<dyn EventStore> = Arc::new(arsy_kernel::event::MemoryEventStore::default());
+        let service = AgentService::attach(Arc::clone(&store), session).unwrap();
+        service
+            .record_usage(
+                Principal::System,
+                UsageTotals {
+                    input_tokens: 10,
+                    output_tokens: 4,
+                    cost_micros: Some(25),
+                },
+            )
+            .unwrap();
+        let history = AgentService::history(store.as_ref(), session).unwrap();
+        assert_eq!(
+            ProjectionSet::rebuild(session, &history)
+                .unwrap()
+                .usage()
+                .cost_micros,
+            Some(25)
+        );
+
+        service
+            .record_usage(
+                Principal::System,
+                UsageTotals {
+                    input_tokens: 7,
+                    output_tokens: 1,
+                    cost_micros: None,
+                },
+            )
+            .unwrap();
+        let history = AgentService::history(store.as_ref(), session).unwrap();
+        let usage = ProjectionSet::rebuild(session, &history).unwrap().usage();
+        assert_eq!(usage.input_tokens, 17, "tokens are still counted");
+        assert_eq!(
+            usage.cost_micros, None,
+            "one unpriced turn makes the total unknown, not $0.000025"
+        );
+    }
+
     #[test]
     fn compatibility_explain_is_a_real_command() {
         assert_eq!(
@@ -7735,6 +8745,10 @@ mod tests {
         drop(service);
 
         let invocation = Invocation {
+            debug: false,
+            config: None,
+            provider: None,
+            model: None,
             workspace: workspace.clone(),
             output: Some(Output::Ci),
             no_color: false,

@@ -125,6 +125,43 @@ pub const PLAN_MODE_INSTRUCTIONS: &str = concat!(
     "Do not execute the plan; end with a concrete plan for the operator to approve or revise.\n",
 );
 
+/// One installed extension the model may call.
+///
+/// `plugin.invoke` is a generic operation — it takes a plugin id and a string —
+/// so its schema cannot say which plugins exist. Without a listing the model
+/// has a tool it can never successfully call, because it would have to guess
+/// an id. This is that listing, refreshed with the rest of the prompt at each
+/// turn boundary, so a plugin installed mid-session becomes callable at the
+/// next turn rather than at the next restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionTool {
+    pub id: String,
+    pub version: String,
+    /// What the operator approved it to do, in the manifest's own words.
+    pub capabilities: Vec<String>,
+}
+
+fn extension_listing(extensions: &[ExtensionTool]) -> Option<String> {
+    if extensions.is_empty() {
+        return None;
+    }
+    let mut listing =
+        String::from("Installed plugins, callable with `plugin.invoke` by the id shown:\n");
+    for extension in extensions {
+        listing.push_str(&format!(
+            "- `{}` (version {}){}\n",
+            extension.id,
+            extension.version,
+            if extension.capabilities.is_empty() {
+                String::new()
+            } else {
+                format!(", granted {}", extension.capabilities.join(", "))
+            }
+        ));
+    }
+    Some(listing)
+}
+
 /// Build the system prompt for one turn.
 ///
 /// `recalled` is context the caller retrieved — what this workspace remembers,
@@ -138,6 +175,7 @@ pub const PLAN_MODE_INSTRUCTIONS: &str = concat!(
 pub fn system_prompt(
     family: ModelFamily,
     instructions: &[Instruction],
+    extensions: &[ExtensionTool],
     recalled: Option<&str>,
     mode: super::ExecutionMode,
     redactor: &Redactor,
@@ -148,6 +186,16 @@ pub fn system_prompt(
         kind: PromptFragmentKind::StableInstruction,
         content: HARNESS_INSTRUCTIONS.to_owned(),
     }];
+    if let Some(listing) = extension_listing(extensions) {
+        // A permission-state fragment rather than a stable one: what is
+        // installed changes at a turn boundary, and a prefix the provider is
+        // caching must not be the thing that changes under it.
+        fragments.push(PromptFragment {
+            id: FragmentId::new(),
+            kind: PromptFragmentKind::PermissionState,
+            content: listing,
+        });
+    }
     for instruction in instructions {
         fragments.push(PromptFragment {
             id: FragmentId::new(),

@@ -106,6 +106,9 @@ pub fn resolve_with_route(
         if let Some(preset) = arsy_kernel::oauth::presets::get(id) {
             let canonical_id = preset.id;
             let endpoint = Endpoint {
+                // A preset names a public endpoint, not what an account pays
+                // for it: a price has to be configured, never assumed.
+                pricing: std::collections::BTreeMap::new(),
                 id: canonical_id.to_owned(),
                 kind: preset.dialect,
                 base_url: preset.base_url.to_owned(),
@@ -609,7 +612,7 @@ fn model_report(
 fn configuration(invocation: &crate::Invocation) -> Result<Config, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    crate::load_config(&root, &working)
+    crate::load_config(&root, &working, invocation.config.as_deref())
 }
 
 fn human_providers(report: &serde_json::Value) -> String {
