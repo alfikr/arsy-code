@@ -169,6 +169,10 @@ fn definition(
             "give exactly one of --command <CMD> (stdio) or --url <URL> (http)",
         ))?,
     };
+    // Only emptiness is refused. These values are escaped on the way into the
+    // table, so a backslash or a quote no longer threatens the file -- and
+    // refusing them would rule out every Windows path. The server's name is a
+    // different matter: it becomes a bare table header, so it stays restricted.
     for value in [
         Some(transport.target()),
         arguments.command.clone(),
@@ -177,10 +181,8 @@ fn definition(
     .into_iter()
     .flatten()
     {
-        if !crate::config_edit::is_writable(&value) {
-            return Err(usage(format!(
-                "`{value}` cannot be written to a TOML file; quote-free ASCII only"
-            )));
+        if value.trim().is_empty() {
+            return Err(usage("a connection needs a non-empty command or URL"));
         }
     }
     Ok(McpServer {
@@ -643,6 +645,38 @@ mod tests {
         ] {
             assert!(command(&refused).is_err(), "{refused:?}");
         }
+    }
+
+    /// A Windows path is a normal command. It was refused while these values
+    /// went into the file unescaped, which left `arsy mcp add` unusable on
+    /// Windows; the escaping is what makes accepting it safe.
+    #[test]
+    fn a_command_carrying_backslashes_and_quotes_is_accepted() {
+        let added = command(&[
+            "mcp",
+            "add",
+            "fixture",
+            "--command",
+            r"D:\a\arsy-code\target\debug\arsy.exe",
+            "--",
+            r#"--note="a" b"#,
+        ])
+        .expect("a Windows path is a command like any other");
+        let Command::McpAdd { server, .. } = added else {
+            panic!("expected an add");
+        };
+        assert_eq!(
+            server.transport,
+            McpTransport::Stdio {
+                command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
+                args: vec![r#"--note="a" b"#.to_owned()],
+            }
+        );
+
+        assert!(
+            command(&["mcp", "add", "fixture", "--command", "  "]).is_err(),
+            "an empty command is still refused"
+        );
     }
 
     #[test]
