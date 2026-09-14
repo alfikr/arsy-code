@@ -3,46 +3,136 @@ name: Release build
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Git tag to build (e.g. v0.1.1)
+        required: true
+        type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag to build (e.g. v0.1.1)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  verify-installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: sh -n install.sh
+      - run: sh tests/install_test.sh
+      - name: Parse PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
   build:
+    needs: verify-installers
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            asset: arsy-linux-x86_64.tar.gz
             exe: ""
+            archive: tar
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            asset: arsy-linux-aarch64.tar.gz
             exe: ""
+            archive: tar
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            asset: arsy-macos-x86_64.tar.gz
             exe: ""
+            archive: tar
           - runner: macos-latest
             target: aarch64-apple-darwin
+            asset: arsy-macos-aarch64.tar.gz
             exe: ""
+            archive: tar
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            asset: arsy-windows-x86_64.zip
             exe: .exe
+            archive: zip
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - run: rustup toolchain install 1.85.0 --profile minimal
       - run: cargo +1.85.0 build --workspace --all-features --locked --release
       - name: Generate CycloneDX SBOM
         run: |
           cargo +1.85.0 install cargo-cyclonedx --version 0.5.9 --locked
           cargo +1.85.0 cyclonedx --all --format json
+      - name: Package Unix archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/release/arsy${{ matrix.exe }}" dist/package/arsy
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
+          fi
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          Copy-Item "target/release/arsy${{ matrix.exe }}" dist/package/arsy.exe
+          Compress-Archive -Path dist/package/arsy.exe -DestinationPath "dist/${{ matrix.asset }}"
+          (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLowerInvariant() |
+            Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: arsy-${{ matrix.target }}
+          name: ${{ matrix.asset }}
           path: |
-            target/release/arsy${{ matrix.exe }}
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
             **/*.cdx.json
           if-no-files-found: error
+
+  # No signing yet: this attaches a plain SHA-256 per archive so install.sh /
+  # install.ps1 have something to verify against. docs/34-distribution.md's
+  # cosign-based verification stays the target for the canonical channel;
+  # wire it in here before relying on it for anything beyond a checksum check.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
