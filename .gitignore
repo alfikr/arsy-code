@@ -11,3 +11,6 @@ docs/.obsidian
 .vscode/
 .suitest/
 .arsy/
+
+# Copied from the repository root at publish time.
+npm/LICENSE
