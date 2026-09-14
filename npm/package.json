@@ -8,7 +8,7 @@
     "url": "git+https://github.com/suiflex/arsy-code.git",
     "directory": "npm"
   },
-  "homepage": "https://github.com/suiflex/arsy-code",
+  "homepage": "https://arsy.suiflex.dev",
   "engines": {
     "node": ">=18"
   },
@@ -17,7 +17,9 @@
   },
   "files": [
     "bin/arsy.js",
-    "scripts/install.js"
+    "scripts/install.js",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "postinstall": "node scripts/install.js"

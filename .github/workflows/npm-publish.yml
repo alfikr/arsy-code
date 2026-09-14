@@ -53,5 +53,9 @@ jobs:
       # the host platform from this tag's GitHub Release, so the release must
       # already exist -- hence the gate on "Release build" above.
       - run: npm install -g npm@latest
+      # `files` is an allowlist rooted at the package directory, so the licence
+      # has to sit inside npm/ to ship. Copying it here rather than committing
+      # a second copy keeps one source of truth.
+      - run: cp LICENSE npm/LICENSE
       - run: npm publish --access public
         working-directory: npm

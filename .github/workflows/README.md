@@ -1,38 +1,39 @@
 # Workflows
 
-All workflows here are active. They were previously parked as `*.yml.disabled`
-while the repository was private, because Actions minutes on a private
-repository are billed with a per-runner multiplier (Linux 1x, Windows 2x,
-macOS 10x) and a 90-run sample cost roughly 2550 billed minutes against a
-2000-3000 minute monthly allowance:
+All workflows here are active. CI and Sandbox each run a three-OS matrix on
+every push and every pull request, only CI has a concurrency group, and CI's
+`dependencies` job builds `cargo-deny` from source with no cache — worth
+knowing before adding jobs, because that shape is where the minutes go.
 
-| Workflow | Runs | Wall min | Billed min |
-|---|---|---|---|
-| CI | 48 | 1375 | 2340 |
-| Sandbox conformance | 21 | 41 | 142 |
-| Performance | 16 | 70 | 70 |
-| Fuzz | 5 | 1 | 1 |
-
-The repository is public now, so that multiplier no longer applies, but the
-shape of the cost is worth knowing before adding jobs: CI and Sandbox both run
-a three-OS matrix on every push and pull request, only CI has a concurrency
-group, and CI's `dependencies` job builds `cargo-deny` from source every run
-with no cache.
+CI compiles x86_64 Linux, macOS, and Windows x64. It does **not** compile
+`aarch64-unknown-linux-gnu` or `aarch64-pc-windows-msvc`, which the release
+builds: those two targets first meet a compiler during a release, and a
+compile error there has already reached a tagged version once.
 
 ## Release path
 
-`release-please.yml` is the entry point. Dispatch it manually, or let it run
-when a `release-please--*` pull request merges: it opens or updates the release
-PR, and once one merges it calls `release.yml` and `npm-publish.yml` as
-reusable workflows. Those two are referenced by path, so all three have to stay
-enabled together.
+`release-please.yml` is the entry point, and it only prepares: dispatch it
+manually, or let it run when a `release-please--*` pull request merges. Merging
+that pull request tags the release, and **the tag push is what builds and
+publishes** — `release.yml` runs on the tag, and `npm-publish.yml` runs on
+`release.yml` completing.
+
+release-please deliberately does not call those two itself. Doing so built
+every target twice, and npm refuses a publish arriving through `workflow_call`
+because the trusted publisher is registered against `npm-publish.yml` rather
+than against whatever called it.
 
 `release.yml` builds six archives (macOS, Linux, and Windows on x86_64 and
 aarch64), writes a `.sha256` beside each, signs an aggregate `SHA256SUMS` with
-keyless Sigstore, attaches the installers and the CycloneDX SBOM, then pushes
-the rendered formula and manifest to `suiflex/homebrew-tap` and
-`suiflex/scoop-bucket`. `docs/34-distribution.md` documents how to verify the
-result.
+keyless Sigstore, attaches the installers and one CycloneDX SBOM per crate,
+then pushes the rendered formula and manifest to `suiflex/homebrew-tap` and
+`suiflex/scoop-bucket`. The signature ships as `SHA256SUMS.bundle`; cosign
+writes no separate `.sig` alongside a bundle. `docs/34-distribution.md`
+documents how to verify the result.
+
+A `release.yml` that fails still leaves a published, asset-less GitHub Release
+behind, because release-please creates the release when its pull request
+merges. Fix forward and re-run rather than assuming the tag is unused.
 
 Secrets the release path needs, all already configured:
 
@@ -43,11 +44,13 @@ Secrets the release path needs, all already configured:
 
 npm publishes through Trusted Publishing (OIDC), so there is no `NPM_TOKEN`.
 It requires this repository and `.github/workflows/npm-publish.yml` to be
-registered as a Trusted Publisher for `@suiflex/arsy-code` on npmjs.com.
+registered as a Trusted Publisher for `@suiflex/arsy-code` on npmjs.com, with
+the `Release` environment — the publish job declares it, and npm rejects a
+token whose environment claim does not match the registration.
 
-Prefer the `release-please` dispatch over pushing a tag by hand. A manual tag
-push runs `release.yml`, whose completion fires `npm-publish.yml` through
-`workflow_run`; doing that after a release-please run would publish twice.
+Prefer the `release-please` dispatch over pushing a tag by hand: a hand-pushed
+tag builds and publishes the same way, but without the version bump, changelog,
+and contributor attribution that precede it.
 
 ## Local checks
 
