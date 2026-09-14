@@ -2,6 +2,13 @@ name: release-please
 
 # Version, changelog, contributor attribution, and GitHub Release preparation.
 # A maintainer starts preparation manually. Ordinary PR merges are ignored.
+#
+# Preparation only: merging the release pull request tags the release, and the
+# tag push is what runs `release.yml`, whose completion runs `npm-publish.yml`.
+# This workflow deliberately does not call either. Calling them built every
+# target a second time, and npm refuses a publish that arrives through
+# `workflow_call` because the trusted publisher is registered against
+# `npm-publish.yml` rather than against whatever called it.
 on:
   workflow_dispatch:
   pull_request:
@@ -125,30 +132,3 @@ jobs:
             echo "no attributed changelog block; leaving release notes unchanged"
           fi
           rm -f release-notes.md
-
-  release:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    # A called workflow may use no more than the calling job grants, and the
-    # run is refused before any job starts if it asks for more: `checksums`
-    # signs with keyless Sigstore and needs id-token, `publish` writes the
-    # release.
-    permissions:
-      contents: write
-      id-token: write
-    uses: ./.github/workflows/release.yml
-    # The tap and bucket jobs need TAP_PUBLISH_TOKEN; a called workflow gets no
-    # secrets unless the caller passes them.
-    secrets: inherit
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
-
-  npm-publish:
-    needs: [release-please, release]
-    if: needs.release-please.outputs.release_created == 'true'
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/npm-publish.yml
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
