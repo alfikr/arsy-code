@@ -62,16 +62,20 @@ fn the_thin_client_drives_a_turn_through_the_protocol_and_nothing_else() {
         json!({"choices": [{"delta": {"content": "the agent."}}]}),
         json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
     ]));
+    let settings = home.path().join(arsy_kernel::config::CONFIG_FILE);
+    let body = format!(
+        "schema_version = 1\n\
+         [provider.endpoint.local]\n\
+         kind = \"openai\"\n\
+         base_url = \"http://127.0.0.1:{port}\"\n\
+         model = \"test-model\"\n\
+         api_key_env = \"ARSY_TEST_KEY\"\n"
+    );
+    // Written as TOML here and converted: the schema reads more clearly that
+    // way, and what lands on disk is the `arsy.json` the binary loads.
     std::fs::write(
-        home.path().join("config.toml"),
-        format!(
-            "schema_version = 1\n\
-             [provider.endpoint.local]\n\
-             kind = \"openai\"\n\
-             base_url = \"http://127.0.0.1:{port}\"\n\
-             model = \"test-model\"\n\
-             api_key_env = \"ARSY_TEST_KEY\"\n"
-        ),
+        &settings,
+        arsy_kernel::config::json_from_toml(&body, &settings).unwrap(),
     )
     .unwrap();
 

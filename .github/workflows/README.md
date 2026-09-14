@@ -20,10 +20,12 @@ three-OS matrix on every push and pull request, so each push pays the macOS
 multiplier twice, and CI's `dependencies` job builds `cargo-deny` from source
 every run with no cache.
 
-`release.yml` is the one to restore before cutting a release: it builds the
-signed artifacts, and `docs/34-distribution.md` verifies them against
-`.github/workflows/release.yml@refs/tags/` as the certificate identity. Tagging
-while it is parked produces no artifacts and no signature.
+`release.yml` is one workflow to repair and restore before cutting a release.
+Its current source builds archives, a CycloneDX SBOM, and per-archive SHA-256
+files, but explicitly does not sign them. It also pins Rust 1.85 while the
+workspace currently requires 1.98, and does not attach the installer scripts.
+The signed canonical channel in `docs/34-distribution.md` remains the release
+gate. Tagging while the workflow is parked produces no artifacts or signature.
 
 `release-please.yml` and `npm-publish.yml` follow the same convention and
 must be restored alongside it: `release-please.yml` opens/updates the release
@@ -34,7 +36,8 @@ opened with the default token don't trigger workflow events) and npm Trusted
 Publishing configured for `@suiflex/arsy-code` and each
 `@suiflex/arsy-code-<platform>` package.
 
-Re-enable one by dropping the suffix:
+After repairing its stale assumptions and checking the projected minute cost,
+restore a workflow by dropping the suffix:
 
     git mv .github/workflows/ci.yml.disabled .github/workflows/ci.yml
 

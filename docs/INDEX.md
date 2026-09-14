@@ -1,8 +1,17 @@
 # ARSY architecture specification
 
-Status: implementation-ready design baseline, 2026-08-26. Runtime implementation is intentionally out of scope.
+Status: architecture and target-design baseline, updated 2026-09-15. Runtime
+implementation is active; [`31-roadmap.md`](31-roadmap.md) provides the
+source-audited delivery status and [`37-harness-core.md`](37-harness-core.md)
+describes the harness core as built.
 
-Start with [vision](00-vision.md), [research](01-competitive-research.md), [architecture](04-system-architecture.md), and [roadmap](31-roadmap.md). Evidence and pinned revisions live in [report-source.md](report-source.md). Where documents conflict, this numbered set and accepted records in `ADR/` govern. [37](37-harness-core.md) describes the harness core *as built*, where the numbered design documents describe the target.
+Start with [vision](00-vision.md), [research](01-competitive-research.md),
+[architecture](04-system-architecture.md), and [roadmap](31-roadmap.md).
+Competitive evidence and pinned revisions live in
+[report-source.md](report-source.md). Where documents conflict, accepted ADRs
+and the numbered target design govern intended behavior; the source-backed
+current-state sections in [31](31-roadmap.md) and [37](37-harness-core.md)
+govern claims about what the audited revision actually ships.
 
 | Area | Documents |
 |---|---|

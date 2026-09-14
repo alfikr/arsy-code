@@ -35,4 +35,8 @@ Use repeated trials, confidence intervals, paired tasks, held-out sets, and cost
 
 ## Decision
 
-Ship the eval runner in Phase 1 with a small trustworthy suite, invoked as [`arsy eval`](36-cli-tui.md); expand before advanced routing, memory, or multi-agent claims.
+Keep the existing [`arsy eval`](36-cli-tui.md) runner and extend it in roadmap
+Phase 4. The current runner has arms, trials, revision checks, Wilson intervals,
+and token/safety fields, but does not isolate/reset each trial or establish
+competitor-equivalent execution. Those are required before advanced routing,
+memory, or multi-agent superiority claims.

@@ -2,11 +2,38 @@
 
 ## Channels
 
-GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, `SHA256SUMS`, an SPDX SBOM, and Sigstore signatures and bundles. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
+GitHub Releases is the target canonical channel. The operational gate is not
+met at the audited revision: every workflow is parked as `*.yml.disabled`, and
+repository source alone does not prove that any channel has published
+successfully.
 
-The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a SuiFlex Scoop bucket for Windows, the public npm package `@suiflex/arsy-code`, and `install.sh` / `install.ps1` published alongside each GitHub Release. All of them reference an exact GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries. Cargo, unattended self-update, OS stores, and third-party package repositories remain out of scope until demand justifies them.
+The disabled release workflow currently describes five native archives, a
+CycloneDX JSON SBOM, and one `.sha256` file per archive. It does not create a
+canonical `SHA256SUMS`, an SPDX SBOM, Sigstore signatures/bundles, or release
+copies of `install.sh` and `install.ps1`. It also builds with Rust 1.85 while
+the workspace declares 1.98. Those discrepancies must be fixed and verified
+before the target channel below is described as operational.
 
-`install.sh` and `install.ps1` are an interim, checksum-only channel: they verify the archive's SHA-256 digest but not yet the Sigstore signature described below, because release automation does not sign artifacts yet (see [Release gate](#release-gate)). Treat them as convenience for a local/dev install, not the channel to script unattended provisioning against until signing lands.
+At the release gate, each stable SemVer tag publishes one archive per supported
+target, a canonical checksum manifest, an explicitly selected SBOM format, and
+Sigstore signatures and bundles. This keeps rollback possible without a
+privileged installer and gives every wrapper one immutable source of bytes.
+
+Target convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a
+SuiFlex Scoop bucket for Windows, the npm package `@suiflex/arsy-code`, and
+`install.sh` / `install.ps1` published with each GitHub Release. Their source or
+documentation exists, but enabled publication and production availability are
+not established by this repository. Once operational, all reference an exact
+GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries.
+Cargo, unattended self-update, OS stores, and third-party repositories remain
+out of scope until demand justifies them.
+
+`install.sh` and `install.ps1` implement the interim checksum-only client path:
+they verify an archive SHA-256 but not the future Sigstore signature. The
+current release workflow does not attach those scripts, so their presence in
+source is not an operational download channel. They are suitable for local/dev
+testing against explicitly supplied assets; unattended provisioning waits for
+the release gate.
 
 The npm package is a thin launcher with platform-filtered optional dependencies:
 
@@ -28,11 +55,21 @@ The npm package is a thin launcher with platform-filtered optional dependencies:
 | macOS 13+ | Apple silicon | `aarch64-apple-darwin` | Tier 1 |
 | Windows 10 22H2+ | x86-64 | `x86_64-pc-windows-msvc` | Tier 1 |
 
-Tier 1 means native CI build and test, signed release artifacts, and security fixes. Other OS/architecture combinations are unsupported until native CI and sandbox conformance exist; WSL does not establish Windows support.
+Tier 1 is the target support contract: native CI build/test, signed release
+artifacts, and security fixes. No target reaches that operational status while
+workflows are disabled and signing is absent. Other combinations remain
+unsupported until native CI and sandbox conformance exist; WSL does not
+establish Windows support.
 
-## Install and verify
+## Target install and verification flow
 
-For the canonical channel, download the archive, `SHA256SUMS`, matching `.sig`, and matching `.bundle` from the same release. Verify the digest before extraction, then verify `SHA256SUMS` with Sigstore while pinning the `suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A digest or signature mismatch is fatal; the installer must not offer an override.
+After the release gate is met, download the archive, `SHA256SUMS`, matching
+`.sig`, and matching `.bundle` from the same release. Verify the digest before
+extraction, then verify `SHA256SUMS` with Sigstore while pinning the
+`suiflex/arsy-code` release-workflow identity and GitHub Actions OIDC issuer. A
+digest or signature mismatch is fatal; the installer must not offer an override.
+The commands below describe this target and do not validate current published
+assets.
 
 ```console
 sha256sum --check --ignore-missing SHA256SUMS

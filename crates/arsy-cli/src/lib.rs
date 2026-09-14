@@ -1427,6 +1427,54 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
     json!({"configuration": listing})
 }
 
+/// Create `~/.arsy/arsy.json` when it is not there yet, carrying over the
+/// `config.toml` an older ARSY kept in the platform configuration directory.
+///
+/// Run before every load rather than only at install time, because ARSY also
+/// arrives through Homebrew, Scoop, and npm, and a person who deleted the file
+/// should get a working one back rather than a diagnostic.
+///
+/// Every failure here is silent: a home directory that cannot be written is a
+/// run without a user layer, which is exactly what it was before this existed.
+/// Nothing is ever overwritten.
+fn bootstrap_user_config() {
+    let Some(path) = arsy_kernel::config::user_config() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    // What an older ARSY had, converted once. A file that no longer parses is
+    // left where it is: reporting nothing beats replacing settings with an
+    // empty file the operator did not ask for.
+    //
+    // A run pointed at a throwaway configuration home — a test, a container, a
+    // second account — asked for that home and not for the operator's own
+    // settings copied into it, exactly as the credential catalog treats it.
+    let carried = (!config_home_overridden())
+        .then(arsy_kernel::config::legacy_user_config)
+        .flatten()
+        .and_then(|legacy| std::fs::read_to_string(legacy).ok())
+        .and_then(|raw| arsy_kernel::config::json_from_toml(&raw, &path).ok());
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let body = carried.unwrap_or_else(|| "{}".to_owned());
+    // `create_new`: two ARSY processes starting at once must not have one of
+    // them truncate what the other just carried over.
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        let _ = file.write_all(body.trim_end().as_bytes());
+        let _ = file.write_all(b"\n");
+    }
+}
+
 /// Read every configuration layer for this workspace.
 ///
 /// An invalid file is fatal rather than skipped: continuing with a partly
@@ -1441,6 +1489,7 @@ fn load_config(
     working: &Path,
     extra: Option<&Path>,
 ) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    bootstrap_user_config();
     let mut layers = arsy_kernel::config::layers(workspace, working);
     if let Some(path) = extra {
         // Unlike a discovered layer, a path the operator typed is theirs to
@@ -1449,7 +1498,7 @@ fn load_config(
             return Err(Diagnostic::error(
                 ARSY_CFG_1000,
                 format!("--config names `{}`, which does not exist", path.display()),
-                "pass the path to an existing config.toml, or drop --config",
+                "pass the path to an existing arsy.json, or drop --config",
             ));
         }
         layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
@@ -1493,7 +1542,7 @@ fn selected_model(
             Diagnostic::error(
                 ARSY_PRV_1000,
                 format!("provider `{}` does not say which model to use", endpoint.id),
-                "set `model` on the provider endpoint, or `model.default`, in config.toml, or \
+                "set `model` on the provider endpoint, or `model.default`, in arsy.json, or \
                  pass --model",
             )
         })
@@ -1843,17 +1892,17 @@ fn auth_login(
                 .collect(),
             credential: handle.to_string(),
         };
-        write_config(|config| {
-            let config = config_edit::ensure_schema(config);
-            config_edit::append_endpoint(&config, &endpoint)
-        })
-        .map_err(|error| {
-            Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("signed in, but the `[provider.endpoint.{provider}]` table could not be written: {error}"),
-                "add the endpoint table by hand; the credential is already stored",
-            )
-        })?;
+        write_config(|config| config_edit::append_endpoint(config, &endpoint)).map_err(
+            |error| {
+                Diagnostic::error(
+                    ARSY_PRV_1000,
+                    format!(
+                    "signed in, but `provider.endpoint.{provider}` could not be written: {error}"
+                ),
+                    "add the endpoint by hand; the credential is already stored",
+                )
+            },
+        )?;
         wrote_endpoint = true;
     }
 
@@ -3542,8 +3591,7 @@ fn provider_step(
                 credential: handle,
             };
             write_config(|config| {
-                let config = config_edit::ensure_schema(config);
-                let config = config_edit::append_endpoint(&config, &endpoint);
+                let config = config_edit::append_endpoint(config, &endpoint)?;
                 config_edit::set_default(&config, &endpoint.name)
             })?;
             Ok(ProviderNext::Done(format!(
@@ -3801,7 +3849,7 @@ fn store_credential(
 ///
 /// The file is read and written whole, so `edit` sees exactly what is on disk
 /// and nothing it did not change can move.
-fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
+fn write_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
     let path = arsy_kernel::config::user_config()
         .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
     let original = match std::fs::read_to_string(&path) {
@@ -3809,7 +3857,7 @@ fn write_config(edit: impl FnOnce(&str) -> String) -> Result<(), String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("the configuration could not be read: {error}")),
     };
-    let updated = edit(&original);
+    let updated = edit(&original)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -6732,6 +6780,10 @@ fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
 
     // ponytail: layer discovery only. Merged values and their source trace
     // arrive with `arsy config explain`.
+    //
+    // Bootstrapped first, so the user layer is reported as it will be for
+    // every later command rather than as absent on the run that creates it.
+    bootstrap_user_config();
     let root = workspace.as_deref().unwrap_or(Path::new("."));
     let config: Vec<Value> = arsy_kernel::config::layers(root, root)
         .into_iter()
@@ -7036,11 +7088,91 @@ mod tests {
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
     };
 
+    /// The environment is the process's, so tests that set a variable take
+    /// this lock rather than reading each other's.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A first run creates the settings file and never replaces one that is
+    /// already there.
+    #[test]
+    fn a_first_run_creates_the_settings_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join(".arsy");
+        let previous = std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR);
+        std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
+
+        bootstrap_user_config();
+        let path = home.join(arsy_kernel::config::CONFIG_FILE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        // An empty settings file is a usable one.
+        assert!(arsy_kernel::config::Config::load(&[(
+            arsy_kernel::config::Layer::User,
+            path.clone()
+        )])
+        .is_ok());
+
+        // What is there already is never replaced.
+        std::fs::write(&path, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        bootstrap_user_config();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("m1"));
+
+        match previous {
+            Some(value) => std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, value),
+            None => std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR),
+        }
+    }
+
+    /// An operator who already had the older TOML keeps every setting it held,
+    /// converted once into the file the new layer reads.
+    #[test]
+    fn the_settings_an_older_arsy_kept_are_carried_over() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory
+            .path()
+            .join(arsy_kernel::config::LEGACY_CONFIG_FILE);
+        std::fs::write(
+            &legacy,
+            "schema_version = 1\n[model]\ndefault = \"m1\"\nallowed = [\"m1\"]\n",
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&legacy).unwrap();
+        let carried = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        std::fs::write(
+            &carried,
+            arsy_kernel::config::json_from_toml(&raw, &carried).unwrap(),
+        )
+        .unwrap();
+
+        let config =
+            arsy_kernel::config::Config::load(&[(arsy_kernel::config::Layer::User, carried)])
+                .unwrap();
+        assert_eq!(config.model_default(), Some("m1"));
+        assert!(
+            !config.model_is_allowed("m9"),
+            "the ceiling came across too"
+        );
+    }
+
+    /// Write a configuration file, given as TOML and converted.
+    ///
+    /// The schema reads more clearly as TOML than as quoted JSON; what reaches
+    /// disk is the `arsy.json` a real run loads.
+    fn write_config_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let json = arsy_kernel::config::json_from_toml(body, path).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
     /// Two things a stored credential must not do to a turn that never asks
     /// for it: abort the turn because it will not open, and follow a run that
     /// was pointed at a throwaway configuration home into that home.
     #[test]
     fn a_credential_that_will_not_open_neither_fails_the_turn_nor_follows_a_throwaway_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
         let home = std::env::temp_dir().join(format!("arsy-catalog-{}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
@@ -7821,8 +7953,9 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let write = |body: &str| {
-            let path = directory.path().join("config.toml");
-            std::fs::write(&path, body).unwrap();
+            let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+            let json = arsy_kernel::config::json_from_toml(body, &path).unwrap();
+            std::fs::write(&path, json).unwrap();
             Config::load(&[(Layer::User, path)])
         };
 
@@ -7866,9 +7999,9 @@ mod tests {
             "schema_version": 1,
             "diagnostics": [],
             "values": {
-                "provider.default": {"layer": "user", "path": "/cfg/config.toml", "value": "myai"},
+                "provider.default": {"layer": "user", "path": "/cfg/arsy.json", "value": "myai"},
                 "provider.endpoint.myai.kind": {
-                    "layer": "workspace", "path": "/ws/.arsy/config.toml", "value": "openai"
+                    "layer": "workspace", "path": "/ws/.arsy/arsy.json", "value": "openai"
                 },
             },
         });
@@ -7883,8 +8016,8 @@ mod tests {
         assert!(listing.contains("kind:  openai  [workspace]"), "{listing}");
         // Each source file is named once, under the rows, rather than repeated
         // on every one of them.
-        assert_eq!(listing.matches("/cfg/config.toml").count(), 1, "{listing}");
-        assert!(listing.contains("from /ws/.arsy/config.toml"), "{listing}");
+        assert_eq!(listing.matches("/cfg/arsy.json").count(), 1, "{listing}");
+        assert!(listing.contains("from /ws/.arsy/arsy.json"), "{listing}");
 
         // Nothing set is a sentence, not an empty object.
         let empty = human_config(&json!({"values": {}}), Some("provider.default"));
@@ -8423,13 +8556,12 @@ mod tests {
     #[test]
     fn a_model_the_ceiling_excludes_is_refused_rather_than_dispatched() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
             &path,
             "schema_version = 1\n\n[provider.endpoint.local]\nkind = \"openai\"\nmodel = \"m1\"\n\
              models = [\"m1\", \"m2\"]\n\n[model]\nallowed = [\"m1\"]\n",
-        )
-        .unwrap();
+        );
         let config = Config::load(&[(arsy_kernel::config::Layer::User, path)]).unwrap();
         let endpoint = config.endpoint(None).unwrap().clone();
 
@@ -8454,17 +8586,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("repo");
         std::fs::create_dir_all(workspace.join(".arsy")).unwrap();
-        std::fs::write(
-            workspace.join(".arsy/config.toml"),
+        write_config_file(
+            &workspace
+                .join(".arsy")
+                .join(arsy_kernel::config::CONFIG_FILE),
             "schema_version = 1\n\n[model]\ndefault = \"m1\"\nallowed = [\"m1\"]\n",
-        )
-        .unwrap();
-        let extra = directory.path().join("session.toml");
-        std::fs::write(
+        );
+        let extra = directory.path().join("session.json");
+        write_config_file(
             &extra,
             "schema_version = 1\n\n[model]\ndefault = \"m9\"\nallowed = [\"m1\", \"m9\"]\n",
-        )
-        .unwrap();
+        );
 
         let config = load_config(&workspace, &workspace, Some(&extra)).unwrap();
         assert_eq!(config.model_default(), Some("m9"), "a later layer wins");
@@ -8627,8 +8759,8 @@ mod tests {
     #[test]
     fn a_turn_is_charged_from_configured_pricing_or_reported_as_unknown() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
             &path,
             "schema_version = 1\n\n\
              [provider.endpoint.anthropic]\nkind = \"anthropic\"\nmodel = \"opus\"\n\
@@ -8636,8 +8768,7 @@ mod tests {
              [provider.endpoint.anthropic.pricing.opus]\n\
              input_micros_per_million = 15000000\n\
              output_micros_per_million = 75000000\n",
-        )
-        .unwrap();
+        );
         let config = Config::load(&[(arsy_kernel::config::Layer::User, path)]).unwrap();
         let endpoint = config.endpoint(None).unwrap();
 

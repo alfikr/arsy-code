@@ -164,7 +164,7 @@ roadmap-gated report a diagnostic instead of silently behaving differently.
 - [Competitive research](docs/01-competitive-research.md) and [claim ledger](docs/report-source.md)
 - [Accepted ADRs](docs/ADR/)
 
-## Target MVP
+## Current implementation baseline
 
 1. Interactive TUI and non-interactive execution.
 2. Official Anthropic and OpenAI API adapters.
@@ -174,7 +174,10 @@ roadmap-gated report a diagnostic instead of silently behaving differently.
 6. Persistent sessions, resume, context compaction, and token/cost summaries.
 7. MCP client support for stdio and Streamable HTTP.
 
-Multi-agent orchestration, remote runners, plugin marketplaces, and a default daemon remain gated on a measured, stable single-agent foundation.
+These paths exist at different maturity levels; the source-audited status is in
+the [engineering roadmap](docs/31-roadmap.md). Durable asynchronous agents and
+isolated writer integration are the next P0 runtime work. Remote runners,
+plugin marketplaces, and a default daemon remain deferred.
 
 ## Security principles
 

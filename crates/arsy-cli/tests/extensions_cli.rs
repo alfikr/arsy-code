@@ -15,6 +15,15 @@ api = ">=1,<2"
 capabilities = ["fs.read:workspace/**"]
 "#;
 
+/// Write the settings file in `home`, given as TOML here and converted: the
+/// schema reads more clearly that way than as quoted JSON, and what lands on
+/// disk is the `arsy.json` the binary under test loads.
+fn write_settings(home: &Path, body: &str) {
+    let path = home.join(arsy_kernel::config::CONFIG_FILE);
+    let json = arsy_kernel::config::json_from_toml(body, &path).unwrap();
+    std::fs::write(&path, json).unwrap();
+}
+
 fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
     // A home of its own, so the operator's real hooks are not what the test
     // measures — and are not run by it either.
@@ -218,14 +227,13 @@ fn a_vouched_for_workspace_reports_its_hooks_as_loaded() {
              "hooks": [{"type": "command", "command": "check.sh"}]}]}}"#,
     )
     .unwrap();
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!(
+    write_settings(
+        home.path(),
+        &format!(
             "schema_version = 1\n[project.\"{}\"]\ntrust_level = \"trusted\"\n",
             workspace.path().display()
         ),
-    )
-    .unwrap();
+    );
 
     let (code, hooks) = arsy_in(workspace.path(), home.path(), &["hook", "list"]);
 
@@ -241,7 +249,7 @@ fn a_vouched_for_workspace_reports_its_hooks_as_loaded() {
 
     // Without the vouching, the same file is read and not run.
     let bare = tempfile::tempdir().unwrap();
-    std::fs::write(bare.path().join("config.toml"), "schema_version = 1\n").unwrap();
+    write_settings(bare.path(), "schema_version = 1\n");
     let (_, unvouched) = arsy_in(workspace.path(), bare.path(), &["hook", "list"]);
     assert_eq!(
         unvouched["entries"].as_array().unwrap()[0]["runtime_status"],
@@ -289,11 +297,10 @@ fn an_approved_plugin_runs_through_the_same_policy_a_tool_call_does() {
     // Allowing it takes a layer that may grant: a config file inside the
     // repository is untrusted content and its `allow` is downgraded.
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(
-        home.path().join("config.toml"),
+    write_settings(
+        home.path(),
         "schema_version = 1\n[policy]\ndefault_effect = \"allow\"\n",
-    )
-    .unwrap();
+    );
     let approved = |args: &[&str]| -> (i32, Value) {
         let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
             .args(["--workspace", workspace.path().to_str().unwrap()])

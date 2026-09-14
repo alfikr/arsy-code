@@ -1,13 +1,15 @@
-//! Narrow edits to the user configuration file.
+//! Narrow edits to the user configuration file, `arsy.json`.
 //!
-//! ARSY reads configuration everywhere and writes it in exactly one place: the
-//! `[provider.endpoint.*]` tables `/provider` maintains. That is why these are
-//! text edits rather than a parse-and-reserialize round trip — a round trip
-//! would return a file with every comment, blank line, and alignment the
-//! operator wrote replaced by the serializer's own formatting.
+//! ARSY reads configuration everywhere and writes it in two places: the
+//! `provider.endpoint.*` objects `/provider` maintains, and the `mcp.server.*`
+//! objects `arsy mcp` maintains. The file is JSON, so an edit is a parse, a
+//! change to one key, and a re-serialize — JSON carries no comments or hand
+//! alignment for a round trip to destroy.
 //!
 //! Each function takes the file as a string and returns a new one, so the
 //! surgery is testable without touching a filesystem.
+
+use serde_json::{Map, Value};
 
 /// A provider endpoint as `/provider` collects it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,33 +24,36 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    fn table(&self) -> String {
-        let mut table = format!(
-            "[provider.endpoint.{}]\nkind = \"{}\"\nbase_url = \"{}\"\n",
-            self.name, self.kind, self.base_url,
-        );
+    fn object(&self) -> Value {
+        let mut object = Map::new();
+        object.insert("kind".to_owned(), Value::String(self.kind.clone()));
+        object.insert("base_url".to_owned(), Value::String(self.base_url.clone()));
         // The first model is the default; the rest are listed beside it, and
         // only when there are any, so a single-model endpoint stays as short as
         // one written by hand.
         if let Some((default, rest)) = self.models.split_first() {
-            table.push_str(&format!("model = \"{default}\"\n"));
+            object.insert("model".to_owned(), Value::String(default.clone()));
             if !rest.is_empty() {
-                let listed = rest
-                    .iter()
-                    .map(|model| format!("\"{model}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                table.push_str(&format!("models = [{listed}]\n"));
+                object.insert(
+                    "models".to_owned(),
+                    Value::Array(rest.iter().cloned().map(Value::String).collect()),
+                );
             }
         }
-        table.push_str(&format!("credential = \"{}\"\n", self.credential));
-        table
+        object.insert(
+            "credential".to_owned(),
+            Value::String(self.credential.clone()),
+        );
+        Value::Object(object)
     }
 }
 
-/// TOML strings here are written, not parsed, so a value that would need
-/// escaping is refused up front rather than producing a file that no longer
-/// loads. Every field `/provider` collects is a name, a URL, or a handle.
+/// A name that may be used as an object key or a value without surprising the
+/// person who later reads the file.
+///
+/// JSON escaping would make any of these safe to write, so this is not about
+/// producing a valid file: a provider called `my "prod"` or one whose name ends
+/// in a space is a name nobody can type back at the CLI.
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn is_writable(value: &str) -> bool {
     !value.is_empty()
@@ -57,169 +62,125 @@ pub fn is_writable(value: &str) -> bool {
         && value.is_ascii()
 }
 
-/// Add an endpoint table at the end of the file.
-///
-/// Appending rather than inserting keeps the diff to the lines that did not
-/// exist before: nothing above the new table can move.
-pub fn append_endpoint(config: &str, endpoint: &Endpoint) -> String {
-    let mut out = config.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+/// The configuration as a JSON object. An empty file is an empty object, so a
+/// first edit does not need the file to exist.
+fn document(config: &str) -> Result<Map<String, Value>, String> {
+    if config.trim().is_empty() {
+        return Ok(Map::new());
     }
-    if !out.is_empty() {
-        out.push('\n');
+    match serde_json::from_str(config) {
+        Ok(Value::Object(object)) => Ok(object),
+        Ok(_) => Err("the configuration is not a JSON object".to_owned()),
+        Err(error) => Err(format!("the configuration is not valid JSON: {error}")),
     }
-    out.push_str(&endpoint.table());
+}
+
+/// Two spaces and a trailing newline: what an operator's editor would have
+/// written, so a later hand edit does not show up as a reformat.
+fn render(document: &Map<String, Value>) -> String {
+    let mut out = serde_json::to_string_pretty(document).unwrap_or_else(|_| "{}".to_owned());
+    out.push('\n');
     out
 }
 
-/// Remove `[provider.endpoint.<name>]` and the keys under it.
+/// The object at `path`, creating the objects along the way.
 ///
-/// The table ends where the next one begins, so everything from its header to
-/// the following header goes, and one blank line left behind by the removal is
-/// taken with it. A name that is not there leaves the file untouched.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub fn remove_endpoint(config: &str, name: &str) -> String {
-    remove_table(config, &format!("[provider.endpoint.{name}]"))
+/// `None` when something on the path is there but is not an object: replacing
+/// an operator's value with a table is not an edit, it is a deletion.
+fn object_at<'a>(
+    document: &'a mut Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a mut Map<String, Value>> {
+    let mut current = document;
+    for key in path {
+        let entry = current
+            .entry((*key).to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        current = entry.as_object_mut()?;
+    }
+    Some(current)
 }
 
-/// Append a table with the given header and `key = value` lines already
-/// formatted, separated from what came before by one blank line.
-pub fn append_table(config: &str, table: &str) -> String {
-    let mut out = config.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(table);
-    out
+/// Set one key, creating the objects that hold it.
+pub fn set(config: &str, path: &[&str], key: &str, value: Value) -> Result<String, String> {
+    let mut document = document(config)?;
+    let parent = object_at(&mut document, path)
+        .ok_or_else(|| format!("`{}` is not an object in the configuration", path.join(".")))?;
+    parent.insert(key.to_owned(), value);
+    Ok(render(&document))
 }
 
-/// Set `key` inside the table whose header is `header`, adding the key when the
-/// table does not have it. A file without that table is returned unchanged, so
-/// the caller decides whether to append one.
-pub fn set_in_table(config: &str, header: &str, key: &str, value: &str) -> Option<String> {
-    let mut lines: Vec<String> = config.lines().map(str::to_owned).collect();
-    let table = lines.iter().position(|line| line.trim() == header)?;
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(table + 1)
-        .find(|(_, line)| line.trim_start().starts_with('['))
-        .map_or(lines.len(), |(index, _)| index);
-    let line = format!("{key} = {value}");
-    // The key is what stands to the left of the first `=`, whatever spacing a
-    // person wrote around it. Matching `"{key} "` missed `enabled=false` and
-    // `enabled\t= false`, and the second key this then appended made the file
-    // fail to load — TOML refuses a duplicate.
-    match lines[table + 1..end].iter().position(|existing| {
-        existing
-            .split_once('=')
-            .is_some_and(|(name, _)| name.trim() == key)
-    }) {
-        Some(offset) => lines[table + 1 + offset] = line,
-        None => lines.insert(end, line),
-    }
-    Some(terminated(lines.join("\n")))
-}
-
-/// Remove the table headed by `header` and the keys under it.
+/// Set one key only where its parent object already exists.
 ///
-/// The table ends where the next one begins, so everything from its header to
-/// the following header goes, and one blank line left behind by the removal is
-/// taken with it. A header that is not there leaves the file untouched.
-pub fn remove_table(config: &str, header: &str) -> String {
-    let header = header.to_owned();
-    let lines: Vec<&str> = config.lines().collect();
-    let Some(start) = lines.iter().position(|line| line.trim() == header) else {
-        return config.to_owned();
+/// `None` when it does not, so the caller can say "no connection named that"
+/// rather than silently creating one from a single key.
+pub fn set_existing(
+    config: &str,
+    path: &[&str],
+    key: &str,
+    value: Value,
+) -> Result<Option<String>, String> {
+    if !contains(config, path)? {
+        return Ok(None);
+    }
+    set(config, path, key, value).map(Some)
+}
+
+/// Remove the key at the end of `path`. A path that is not there leaves the
+/// file unchanged.
+pub fn remove(config: &str, path: &[&str]) -> Result<String, String> {
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(config.to_owned());
     };
-    let end = lines
-        .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, line)| line.trim_start().starts_with('['))
-        .map_or(lines.len(), |(index, _)| index);
-
-    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
-    kept.extend_from_slice(&lines[..start]);
-    kept.extend_from_slice(&lines[end..]);
-    // The blank line that separated this table from the one above is now a
-    // trailing blank, or a doubled one in the middle.
-    while kept.len() > start && start > 0 && kept.get(start - 1).is_some_and(|line| line.is_empty())
-    {
-        if kept.get(start).is_none_or(|line| !line.is_empty()) {
-            break;
+    let mut document = document(config)?;
+    let mut current = &mut document;
+    for key in parents {
+        match current.get_mut(*key).and_then(Value::as_object_mut) {
+            Some(next) => current = next,
+            None => return Ok(render(&document)),
         }
-        kept.remove(start);
     }
-    terminated(kept.join("\n"))
+    current.remove(*last);
+    Ok(render(&document))
 }
 
-/// One trailing newline, never a run of blank lines at the end.
-fn terminated(mut out: String) -> String {
-    while out.ends_with("\n\n") {
-        out.pop();
+/// Whether `path` names something in the file.
+pub fn contains(config: &str, path: &[&str]) -> Result<bool, String> {
+    let document = document(config)?;
+    let mut current = &Value::Object(document);
+    for key in path {
+        match current.get(*key) {
+            Some(next) => current = next,
+            None => return Ok(false),
+        }
     }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    Ok(true)
 }
 
-/// Point `[provider] default` at `name`, adding the key or the table when the
-/// file does not have them yet.
+/// Add `provider.endpoint.<name>`.
+pub fn append_endpoint(config: &str, endpoint: &Endpoint) -> Result<String, String> {
+    set(
+        config,
+        &["provider", "endpoint"],
+        &endpoint.name,
+        endpoint.object(),
+    )
+}
+
+/// Remove `provider.endpoint.<name>` and everything under it.
 #[cfg_attr(not(feature = "tui"), allow(dead_code))]
-pub fn set_default(config: &str, name: &str) -> String {
-    let line = format!("default = \"{name}\"");
-    let mut lines: Vec<String> = config.lines().map(str::to_owned).collect();
-
-    // The key belongs to whichever table it sits under, so `[provider]` has to
-    // be found before a bare `default =` can be claimed as the right one.
-    let table = lines.iter().position(|line| line.trim() == "[provider]");
-    if let Some(table) = table {
-        let end = lines
-            .iter()
-            .enumerate()
-            .skip(table + 1)
-            .find(|(_, line)| line.trim_start().starts_with('['))
-            .map_or(lines.len(), |(index, _)| index);
-        match lines[table + 1..end]
-            .iter()
-            .position(|existing| existing.trim_start().starts_with("default"))
-        {
-            Some(offset) => lines[table + 1 + offset] = line,
-            None => lines.insert(table + 1, line),
-        }
-    } else {
-        // A file with no `[provider]` table gets one before the first table, so
-        // the key cannot land under someone else's header.
-        let first = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with('['))
-            .unwrap_or(lines.len());
-        lines.insert(first, String::new());
-        lines.insert(first + 1, "[provider]".to_owned());
-        lines.insert(first + 2, line);
-        lines.insert(first + 3, String::new());
-    }
-    terminated(lines.join("\n"))
+pub fn remove_endpoint(config: &str, name: &str) -> Result<String, String> {
+    remove(config, &["provider", "endpoint", name])
 }
 
-/// A file ARSY has never written needs the header every layer is rejected
-/// without.
-pub fn ensure_schema(config: &str) -> String {
-    if config
-        .lines()
-        .any(|line| line.trim_start().starts_with("schema_version"))
-    {
-        return config.to_owned();
-    }
-    format!(
-        "schema_version = 1\n{}{config}",
-        if config.is_empty() { "" } else { "\n" }
+/// Point `provider.default` at `name`.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
+pub fn set_default(config: &str, name: &str) -> Result<String, String> {
+    set(
+        config,
+        &["provider"],
+        "default",
+        Value::String(name.to_owned()),
     )
 }
 
@@ -237,102 +198,73 @@ mod tests {
         }
     }
 
-    /// The operator's file is theirs: an edit touches the table it owns and
-    /// leaves every comment and unrelated line exactly where it was.
+    /// The operator's file is theirs: an edit touches the object it owns and
+    /// leaves every other key exactly as it was, and removing is the inverse of
+    /// adding.
     #[test]
-    fn an_edit_leaves_every_other_line_alone() {
+    fn an_edit_leaves_every_other_key_alone() {
         let original = "\
-schema_version = 1
-
-[provider]
-default = \"myai\"
-
-# the endpoint I actually use
-[provider.endpoint.myai]
-kind       = \"openai\"   # aligned by hand
-base_url   = \"https://myai.test/v1\"
-credential = \"secret://os/myai\"
-
-[ui]
-color = \"always\"
+{
+  \"provider\": {
+    \"default\": \"myai\",
+    \"endpoint\": {
+      \"myai\": {
+        \"kind\": \"openai\",
+        \"base_url\": \"https://myai.test/v1\",
+        \"credential\": \"secret://os/myai\"
+      }
+    }
+  },
+  \"ui\": {
+    \"color\": \"always\"
+  }
+}
 ";
-
-        let added = append_endpoint(original, &endpoint());
-        assert!(added.starts_with(original), "the original file moved");
-        assert!(added.contains("[provider.endpoint.acme]"));
-        assert!(added.contains("credential = \"secret://file/acme.key\""));
-        // The first model is the default and the rest are listed beside it.
-        assert!(added.contains("model = \"acme-1\""), "{added}");
-        assert!(added.contains("models = [\"acme-2\"]"), "{added}");
-
-        // Removing gives back a file that still has the comment, the hand
-        // alignment, and the unrelated table.
-        let removed = remove_endpoint(&added, "acme");
-        assert_eq!(removed, original, "removal was not the inverse of adding");
-
-        let removed = remove_endpoint(original, "myai");
-        assert!(!removed.contains("[provider.endpoint.myai]"));
-        assert!(!removed.contains("https://myai.test"));
-        assert!(
-            removed.contains("# the endpoint I actually use"),
-            "a comment above the table is not part of it: {removed}"
+        let added = append_endpoint(original, &endpoint()).unwrap();
+        let loaded: Value = serde_json::from_str(&added).unwrap();
+        assert_eq!(loaded["provider"]["default"], Value::String("myai".into()));
+        assert_eq!(loaded["ui"]["color"], Value::String("always".into()));
+        let acme = &loaded["provider"]["endpoint"]["acme"];
+        assert_eq!(
+            acme["credential"],
+            Value::String("secret://file/acme.key".into())
         );
-        assert!(removed.contains("[ui]"), "an unrelated table went with it");
-        assert!(removed.contains("color = \"always\""));
-        assert!(!removed.contains("\n\n\n"), "a hole was left behind");
+        // The first model is the default and the rest are listed beside it.
+        assert_eq!(acme["model"], Value::String("acme-1".into()));
+        assert_eq!(acme["models"], serde_json::json!(["acme-2"]));
+
+        let removed = remove_endpoint(&added, "acme").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&removed).unwrap(),
+            serde_json::from_str::<Value>(original).unwrap(),
+            "removal was not the inverse of adding"
+        );
 
         // A name that is not there changes nothing at all.
-        assert_eq!(remove_endpoint(original, "nothere"), original);
-    }
-
-    #[test]
-    fn the_default_is_retargeted_added_or_given_a_table() {
-        let with_key =
-            "schema_version = 1\n\n[provider]\ndefault = \"myai\"\n\n[ui]\ncolor = \"never\"\n";
-        let out = set_default(with_key, "acme");
-        assert!(out.contains("default = \"acme\""));
-        assert!(!out.contains("\"myai\""), "the old default survived: {out}");
-        assert!(out.contains("[ui]"));
-        assert_eq!(out.matches("default").count(), 1);
-
-        // A `[provider]` table without the key gets it, under that header.
-        let no_key =
-            "schema_version = 1\n\n[provider]\n\n[provider.endpoint.acme]\nkind = \"openai\"\n";
-        let out = set_default(no_key, "acme");
-        let lines: Vec<&str> = out.lines().collect();
-        let table = lines.iter().position(|line| *line == "[provider]").unwrap();
-        assert_eq!(lines[table + 1], "default = \"acme\"");
-
-        // No table at all: one is created before the first table, so the key
-        // cannot end up under someone else's header.
-        let none = "schema_version = 1\n\n[provider.endpoint.acme]\nkind = \"openai\"\n";
-        let out = set_default(none, "acme");
-        let lines: Vec<&str> = out.lines().collect();
-        let table = lines.iter().position(|line| *line == "[provider]").unwrap();
-        let endpoint = lines
-            .iter()
-            .position(|line| *line == "[provider.endpoint.acme]")
-            .unwrap();
-        assert_eq!(lines[table + 1], "default = \"acme\"");
-        assert!(
-            table < endpoint,
-            "the default landed under the endpoint: {out}"
+        assert_eq!(
+            serde_json::from_str::<Value>(&remove_endpoint(original, "nothere").unwrap()).unwrap(),
+            serde_json::from_str::<Value>(original).unwrap()
         );
     }
 
     #[test]
-    fn a_new_file_gets_the_schema_header_once() {
-        assert_eq!(ensure_schema(""), "schema_version = 1\n");
-        let once = ensure_schema("[provider]\n");
-        assert_eq!(once, "schema_version = 1\n\n[provider]\n");
-        assert_eq!(ensure_schema(&once), once, "the header was added twice");
+    fn the_default_is_retargeted_or_added() {
+        let with_key = "{\"provider\":{\"default\":\"myai\"},\"ui\":{\"color\":\"never\"}}";
+        let out = set_default(with_key, "acme").unwrap();
+        let loaded: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(loaded["provider"]["default"], Value::String("acme".into()));
+        assert_eq!(loaded["ui"]["color"], Value::String("never".into()));
+
+        // An empty file gets the object the key belongs in.
+        let out = set_default("", "acme").unwrap();
+        let loaded: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(loaded["provider"]["default"], Value::String("acme".into()));
     }
 
-    /// These values are written into TOML rather than escaped into it, so a
-    /// value that would need escaping is refused before it can produce a file
-    /// that no longer loads.
+    /// These names are typed back at the CLI, so a value nobody could type is
+    /// refused before it reaches the file.
     #[test]
-    fn a_value_that_would_break_the_file_is_refused() {
+    fn a_value_nobody_could_type_back_is_refused() {
         for good in [
             "acme",
             "https://acme.test/v1",
@@ -353,14 +285,11 @@ color = \"always\"
         }
     }
 
-    /// Toggling a key in one table must not leak into the next one.
-    ///
-    /// The insertion point is "before the following header", which is where a
-    /// blank separator line sits — TOML still reads the key as belonging to the
-    /// table above it. Asserted through the real loader, because "the file
-    /// still loads and means what it says" is the only property that matters.
+    /// Setting a key in one object must not leak into the next one, and the
+    /// file has to still load — asserted through the real loader, because "the
+    /// file still means what it says" is the only property that matters.
     #[test]
-    fn setting_a_key_lands_inside_its_own_table() {
+    fn setting_a_key_lands_inside_its_own_object() {
         use arsy_kernel::config::{Config, Layer, CONFIG_FILE};
 
         let directory = tempfile::tempdir().unwrap();
@@ -371,64 +300,63 @@ color = \"always\"
         };
 
         let config = "\
-schema_version = 1
-
-[mcp.server.first]
-transport = \"stdio\"
-command = \"one\"
-
-[mcp.server.second]
-transport = \"stdio\"
-command = \"two\"
+{
+  \"schema_version\": 1,
+  \"mcp\": {
+    \"server\": {
+      \"first\": { \"transport\": \"stdio\", \"command\": \"one\" },
+      \"second\": { \"transport\": \"stdio\", \"command\": \"two\" }
+    }
+  }
+}
 ";
-        let updated = set_in_table(config, "[mcp.server.first]", "enabled", "false").unwrap();
+        let updated = set_existing(
+            config,
+            &["mcp", "server", "first"],
+            "enabled",
+            Value::Bool(false),
+        )
+        .unwrap()
+        .unwrap();
         let loaded = load(&updated);
         assert!(!loaded.mcp_server("first").unwrap().enabled);
         assert!(
             loaded.mcp_server("second").unwrap().enabled,
-            "the neighbouring table is untouched: {updated}"
+            "the neighbouring object is untouched: {updated}"
         );
 
         // Setting it again replaces the key rather than adding a second one.
-        let again = set_in_table(&updated, "[mcp.server.first]", "enabled", "true").unwrap();
+        let again = set_existing(
+            &updated,
+            &["mcp", "server", "first"],
+            "enabled",
+            Value::Bool(true),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(again.matches("enabled").count(), 1, "{again}");
         assert!(load(&again).mcp_server("first").unwrap().enabled);
 
-        // A table that is not there is `None`, so the caller decides whether to
-        // append one rather than getting a silently unchanged file back.
-        assert!(set_in_table(config, "[mcp.server.absent]", "enabled", "false").is_none());
+        // An object that is not there is `None`, so the caller decides what to
+        // say rather than getting a silently created connection.
+        assert!(set_existing(
+            config,
+            &["mcp", "server", "absent"],
+            "enabled",
+            Value::Bool(false)
+        )
+        .unwrap()
+        .is_none());
     }
 
-    /// A key is a key however it was spaced. Requiring a space after the name
-    /// meant `enabled=false` was not seen, a second `enabled` was appended,
-    /// and the config then failed to parse at all.
+    /// A file that is not JSON is an error, never a file quietly replaced by
+    /// one holding only the edit.
     #[test]
-    fn a_key_written_without_the_spacing_is_replaced_not_duplicated() {
-        use arsy_kernel::config::{Config, Layer, CONFIG_FILE};
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE);
-        let load = |body: &str| {
-            std::fs::write(&path, body).unwrap();
-            Config::load(&[(Layer::User, path.clone())]).expect("the file still loads")
-        };
-
-        for written in ["enabled=false", "enabled\t=  false", "  enabled = false"] {
-            let config = format!(
-                "schema_version = 1\n\n[mcp.server.first]\ntransport = \"stdio\"\ncommand = \"one\"\n{written}\n"
-            );
-
-            let updated = set_in_table(&config, "[mcp.server.first]", "enabled", "true").unwrap();
-
-            assert_eq!(
-                updated.matches("enabled").count(),
-                1,
-                "`{written}` was duplicated: {updated}"
-            );
-            assert!(
-                load(&updated).mcp_server("first").unwrap().enabled,
-                "{updated}"
-            );
-        }
+    fn a_file_that_is_not_json_is_refused() {
+        let error = set_default("schema_version = 1\n", "acme").unwrap_err();
+        assert!(error.contains("not valid JSON"), "{error}");
+        assert!(set_default("[1, 2]", "acme")
+            .unwrap_err()
+            .contains("not a JSON object"));
     }
 }

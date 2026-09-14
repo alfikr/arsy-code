@@ -1,5 +1,9 @@
 # Agent runtime
 
+Status: target design. The current source has a durable `TaskGraph` and an
+authority-attenuated but synchronous `task.spawn`; it does not yet implement the
+scheduler state machine below end to end. See [`31-roadmap.md`](31-roadmap.md).
+
 ## Problem and existing approaches
 
 Prompt-wrapped subagents lack durable identity, authority attenuation, supervision, and workspace ownership. OMP implements discoverable task agents and isolation policy (**V**); Codex has persisted multi-agent/tool flows (**V**); Claude documents isolated subagents and optional worktrees (**D**).
