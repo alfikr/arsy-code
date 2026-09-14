@@ -200,7 +200,10 @@ fn discover(workspace_root: &Path) -> Discovery {
                     reported(relative)
                 }
             })
-            .unwrap_or_else(|_| reported(&found))
+            // A git root above the workspace is reported as the absolute path it
+            // is, in the platform's own spelling: it is not a workspace-relative
+            // path, so the one-spelling rule does not apply to it.
+            .unwrap_or_else(|_| found.display().to_string())
     });
 
     let mut manifests = Vec::new();
