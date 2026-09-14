@@ -68,6 +68,20 @@ The package selects the matching native executable for macOS, glibc Linux, or
 Windows x64. Run `arsy doctor` after installation to inspect the active build
 and environment.
 
+## Install with curl / PowerShell
+
+```console
+curl -fsSL https://github.com/suiflex/arsy-code/releases/latest/download/install.sh | sh
+```
+
+```powershell
+irm https://github.com/suiflex/arsy-code/releases/latest/download/install.ps1 | iex
+```
+
+Both scripts verify the downloaded archive's SHA-256 checksum before
+installing; they do not yet verify the Sigstore signature described in
+[Install and verify](docs/34-distribution.md#install-and-verify). Prefer the
+canonical GitHub Release archive when that stronger guarantee matters.
 
 ### Complete command reference
 

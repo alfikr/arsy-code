@@ -72,12 +72,12 @@ Toolchain is pinned by `rust-version` in `Cargo.toml`. CI additionally runs
 ## Distribution
 
 Release channels: signed GitHub Release binaries, the SuiFlex Homebrew tap,
-the SuiFlex Scoop bucket, and the npm package `@suiflex/arsy-code` (a thin
+the SuiFlex Scoop bucket, the npm package `@suiflex/arsy-code` (a thin
 launcher with platform-filtered optional dependencies staged by
-`npm/scripts/stage-platform-package.mjs`). See
+`npm/scripts/stage-platform-package.mjs`), and `install.sh` / `install.ps1`
+(checksum-only — no Sigstore verification yet). See
 [docs/34-distribution.md](docs/34-distribution.md). Homebrew tap and Scoop
-bucket publishing, and a `curl | sh` installer, are documented target
-channels not yet wired into CI.
+bucket publishing are documented target channels not yet wired into CI.
 
 ## CI
 
