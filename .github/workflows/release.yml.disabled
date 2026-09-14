@@ -74,18 +74,19 @@ jobs:
             asset: arsy-windows-x86_64.zip
             exe: .exe
             archive: zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: arsy-windows-aarch64.zip
+            exe: .exe
+            archive: zip
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ inputs.tag || github.ref_name }}
-      - run: rustup toolchain install 1.85.0 --profile minimal
-      - run: cargo +1.85.0 build --workspace --all-features --locked --release
-      - name: Generate CycloneDX SBOM
-        run: |
-          cargo +1.85.0 install cargo-cyclonedx --version 0.5.9 --locked
-          cargo +1.85.0 cyclonedx --all --format json
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --workspace --all-features --locked --release
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -114,7 +115,34 @@ jobs:
           path: |
             dist/${{ matrix.asset }}
             dist/${{ matrix.asset }}.sha256
-            **/*.cdx.json
+          if-no-files-found: error
+
+  # The SBOM describes the workspace, not a target, so it is generated once here
+  # rather than six times in the build matrix, where `merge-multiple: true` would
+  # collapse six identical trees onto each other. cargo-cyclonedx writes one file
+  # per crate under crates/<crate>/; they are flattened into dist/ because
+  # action-gh-release's `files: dist/*` glob is single-level.
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Generate CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 install cargo-cyclonedx --version 0.5.9 --locked
+          cargo +1.98.0 cyclonedx --all --format json
+          mkdir -p dist
+          find . -name '*.cdx.json' -not -path './dist/*' -print0 |
+            xargs -0 -I{} sh -c 'cp "{}" "dist/$(basename "{}")"'
+          ls dist/*.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sbom
+          path: dist/*.cdx.json
           if-no-files-found: error
 
   # No signing yet: this attaches a plain SHA-256 per archive so install.sh /
@@ -122,17 +150,25 @@ jobs:
   # cosign-based verification stays the target for the canonical channel;
   # wire it in here before relying on it for anything beyond a checksum check.
   publish:
-    needs: build
+    needs: [build, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
+      # install.sh / install.ps1 ship as release assets because README and
+      # docs/34 point curl and irm at releases/latest/download/.
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           generate_release_notes: true
-          files: dist/*
+          files: |
+            dist/*
+            install.sh
+            install.ps1
