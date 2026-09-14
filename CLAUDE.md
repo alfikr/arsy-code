@@ -67,21 +67,21 @@ python3 fixtures/compat/check.py
 
 Toolchain is pinned by `rust-version` in `Cargo.toml`. CI additionally runs
 `cargo deny check` for advisory and license issues
-(`.github/workflows/ci.yml.disabled`).
+(`.github/workflows/ci.yml`).
 
 ## Distribution
 
-Release channels: signed GitHub Release binaries, the SuiFlex Homebrew tap,
-the SuiFlex Scoop bucket, the npm package `@suiflex/arsy-code` (a thin
-launcher with platform-filtered optional dependencies staged by
-`npm/scripts/stage-platform-package.mjs`), and `install.sh` / `install.ps1`
-(checksum-only — no Sigstore verification yet). See
-[docs/34-distribution.md](docs/34-distribution.md). Homebrew tap and Scoop
-bucket publishing are documented target channels not yet wired into CI.
+Release channels: GitHub Release binaries for six Tier 1 targets with a
+Sigstore-signed `SHA256SUMS`, the SuiFlex Homebrew tap, the SuiFlex Scoop
+bucket, the npm package `@suiflex/arsy-code` (a launcher that downloads and
+verifies the matching archive in a postinstall step), and `install.sh` /
+`install.ps1` (checksum-only — they do not check the signature). All of them
+are published by `.github/workflows/release.yml`. See
+[docs/34-distribution.md](docs/34-distribution.md).
 
 ## CI
 
-Workflows are parked as `*.yml.disabled` — see
-`.github/workflows/README.md` for why and how to restore one. GitHub only
-reads `.yml`, so nothing here runs, including manual dispatch, until the
-suffix is dropped.
+All workflows are active — see `.github/workflows/README.md` for the release
+path and the secrets it needs. Cut a release by dispatching
+`release-please.yml`, which calls `release.yml` and `npm-publish.yml`; pushing
+a tag by hand runs the same build but can double-publish to npm.

@@ -4121,7 +4121,7 @@ mod tests {
         operation::OperationKind,
         policy::ApprovalRequest,
     };
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     #[test]
     fn theme_answers_and_overrides_resolve() {
@@ -4183,9 +4183,11 @@ mod tests {
     fn first_frame_stream_resize_no_colour_and_approval_are_complete() {
         let session = SessionId::new();
         let mut state = TuiState::new("/repo".into(), session);
-        let started = Instant::now();
+        // No wall-clock assertion here: this test is about what the frame
+        // contains, and a render budget measured on a shared CI runner reports
+        // the runner's load, not a regression. Render cost is gated by the
+        // benchmark suite in performance.yml.
         let first = state.render(80, false);
-        assert!(started.elapsed() < Duration::from_millis(100));
         assert!(first.contains(">_ ARSY CODE"));
         assert!(first.contains("sandbox:"));
         assert!(first.contains("none · read-only"));

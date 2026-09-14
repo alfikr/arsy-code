@@ -169,6 +169,10 @@ fn definition(
             "give exactly one of --command <CMD> (stdio) or --url <URL> (http)",
         ))?,
     };
+    // Only emptiness is refused. These values are escaped on the way into the
+    // table, so a backslash or a quote no longer threatens the file -- and
+    // refusing them would rule out every Windows path. The server's name is a
+    // different matter: it becomes a bare table header, so it stays restricted.
     for value in [
         Some(transport.target()),
         arguments.command.clone(),
@@ -177,10 +181,8 @@ fn definition(
     .into_iter()
     .flatten()
     {
-        if !crate::config_edit::is_writable(&value) {
-            return Err(usage(format!(
-                "`{value}` cannot be written to a TOML file; quote-free ASCII only"
-            )));
+        if value.trim().is_empty() {
+            return Err(usage("a connection needs a non-empty command or URL"));
         }
     }
     Ok(McpServer {
@@ -201,16 +203,44 @@ fn header(name: &str) -> String {
     format!("[mcp.server.{name}]")
 }
 
+/// A value written as a TOML basic string.
+///
+/// These tables are written by hand, so every value has to be escaped on the
+/// way in or it will not read back: a Windows path carries backslashes, which
+/// TOML reads as escapes, and a quote anywhere in a command or argument would
+/// end the string and leave the rest to be parsed as TOML.
+fn basic_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{8}' => quoted.push_str("\\b"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\u{c}' => quoted.push_str("\\f"),
+            '\r' => quoted.push_str("\\r"),
+            control if control < ' ' || control == '\u{7f}' => {
+                quoted.push_str(&format!("\\u{:04X}", control as u32));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 fn table(server: &McpServer) -> String {
     let mut table = format!("{}\n", header(&server.name));
     match &server.transport {
         McpTransport::Stdio { command, args } => {
             table.push_str("transport = \"stdio\"\n");
-            table.push_str(&format!("command = \"{command}\"\n"));
+            table.push_str(&format!("command = {}\n", basic_string(command)));
             if !args.is_empty() {
                 let listed = args
                     .iter()
-                    .map(|argument| format!("\"{argument}\""))
+                    .map(|argument| basic_string(argument))
                     .collect::<Vec<_>>()
                     .join(", ");
                 table.push_str(&format!("args = [{listed}]\n"));
@@ -218,7 +248,7 @@ fn table(server: &McpServer) -> String {
         }
         McpTransport::Http { url } => {
             table.push_str("transport = \"http\"\n");
-            table.push_str(&format!("url = \"{url}\"\n"));
+            table.push_str(&format!("url = {}\n", basic_string(url)));
         }
     }
     if server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS {
@@ -617,6 +647,38 @@ mod tests {
         }
     }
 
+    /// A Windows path is a normal command. It was refused while these values
+    /// went into the file unescaped, which left `arsy mcp add` unusable on
+    /// Windows; the escaping is what makes accepting it safe.
+    #[test]
+    fn a_command_carrying_backslashes_and_quotes_is_accepted() {
+        let added = command(&[
+            "mcp",
+            "add",
+            "fixture",
+            "--command",
+            r"D:\a\arsy-code\target\debug\arsy.exe",
+            "--",
+            r#"--note="a" b"#,
+        ])
+        .expect("a Windows path is a command like any other");
+        let Command::McpAdd { server, .. } = added else {
+            panic!("expected an add");
+        };
+        assert_eq!(
+            server.transport,
+            McpTransport::Stdio {
+                command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
+                args: vec![r#"--note="a" b"#.to_owned()],
+            }
+        );
+
+        assert!(
+            command(&["mcp", "add", "fixture", "--command", "  "]).is_err(),
+            "an empty command is still refused"
+        );
+    }
+
     #[test]
     fn lifecycle_verbs_take_one_name_and_a_scope() {
         assert_eq!(
@@ -683,6 +745,35 @@ mod tests {
         assert_eq!(loaded.timeout_ms, 5_000);
         assert!(loaded.enabled);
         assert_eq!(loaded.trust, arsy_kernel::capability::PolicySource::User);
+
+        // A Windows path and a quoted argument survive the round trip. Written
+        // raw, the backslashes would read back as escapes and the quote would
+        // end the string, leaving the remainder to be parsed as TOML.
+        let awkward = McpServer {
+            name: "awkward".to_owned(),
+            transport: McpTransport::Stdio {
+                command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
+                args: vec![r#"--note="a" b"#.to_owned(), "\ttabbed".to_owned()],
+            },
+            ..stdio.clone()
+        };
+        let awkward_path = directory.path().join("awkward.toml");
+        std::fs::write(
+            &awkward_path,
+            crate::config_edit::append_table(
+                &crate::config_edit::ensure_schema(""),
+                &table(&awkward),
+            ),
+        )
+        .unwrap();
+        let config = arsy_kernel::config::Config::load(&[(Layer::User, awkward_path)]).unwrap();
+        assert_eq!(
+            config
+                .mcp_server("awkward")
+                .expect("an awkward table loads back")
+                .transport,
+            awkward.transport
+        );
 
         // Disabling flips one key and leaves the rest of the table alone.
         let disabled =

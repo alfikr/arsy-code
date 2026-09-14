@@ -71,6 +71,38 @@ impl FakeProvider {
 }
 
 /// Read one HTTP request and return its body.
+/// A `PreToolUse` guard on `fs.read` whose hook denies the call with `reason`.
+///
+/// The denial is written to a file in `directory` and the hook prints it, so
+/// the command carries no quotes for a shell to disagree about.
+fn denying_guard(directory: &Path, reason: &str) -> String {
+    let answer = directory.join("deny.json");
+    std::fs::write(
+        &answer,
+        format!(r#"{{"decision": "deny", "reason": "{reason}"}}"#),
+    )
+    .unwrap();
+    // Printing the file rather than the JSON keeps every quote out of the
+    // command line. `cmd /C` and `sh -c` disagree about quoting in ways no
+    // single string satisfies: sh strips the double quotes the JSON needs, and
+    // cmd strips them too once they reach it through Rust's own argument
+    // quoting.
+    let command = if cfg!(windows) {
+        format!("type {}", answer.display())
+    } else {
+        format!("cat {}", answer.display())
+    };
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "fs.read",
+                "hooks": [{"type": "command", "command": command}]
+            }]
+        }
+    })
+    .to_string()
+}
+
 fn read_request(stream: &mut std::net::TcpStream) -> String {
     let mut reader = BufReader::new(stream);
     let mut length = 0;
@@ -597,10 +629,7 @@ fn a_hook_denies_a_tool_call_and_the_model_is_told_why() {
     std::fs::create_dir_all(home.path().join(".arsy")).unwrap();
     std::fs::write(
         home.path().join(".arsy/guard.json"),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
-            {"type": "command",
-             "command": "echo '{\"decision\": \"deny\", \"reason\": \"notes are off limits\"}'"}
-        ]}]}}"#,
+        denying_guard(&home.path().join(".arsy"), "notes are off limits"),
     )
     .unwrap();
 
@@ -642,10 +671,7 @@ fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
     std::fs::create_dir_all(workspace.path().join(".arsy")).unwrap();
     std::fs::write(
         workspace.path().join(".arsy/guard.json"),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "fs.read", "hooks": [
-            {"type": "command",
-             "command": "echo '{\"decision\": \"deny\", \"reason\": \"the repo said no\"}'"}
-        ]}]}}"#,
+        denying_guard(&workspace.path().join(".arsy"), "the repo said no"),
     )
     .unwrap();
 
@@ -695,7 +721,9 @@ fn configure_trusting(home: &Path, port: u16, workspace: &Path) {
     configure(home, port);
     let mut config = std::fs::read_to_string(home.join("config.toml")).unwrap();
     config.push_str(&format!(
-        "[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+        // A literal key: a Windows path's backslashes are escapes in a TOML
+        // basic string.
+        "[project.'{}']\ntrust_level = \"trusted\"\n",
         workspace.display()
     ));
     std::fs::write(home.join("config.toml"), config).unwrap();

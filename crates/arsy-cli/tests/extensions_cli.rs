@@ -221,7 +221,9 @@ fn a_vouched_for_workspace_reports_its_hooks_as_loaded() {
     std::fs::write(
         home.path().join("config.toml"),
         format!(
-            "schema_version = 1\n[project.\"{}\"]\ntrust_level = \"trusted\"\n",
+            // A literal key: a Windows path's backslashes are escapes in a
+            // TOML basic string.
+            "schema_version = 1\n[project.'{}']\ntrust_level = \"trusted\"\n",
             workspace.path().display()
         ),
     )

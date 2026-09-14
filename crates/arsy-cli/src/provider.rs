@@ -732,13 +732,15 @@ mod tests {
         }
 
         let endpoint_config = |handle: String| {
+            // A literal string: a Windows path carries backslashes, and TOML
+            // reads \U in a basic string as the start of a unicode escape.
             config(&format!(
                 r#"
 schema_version = 1
 [provider.endpoint.myai]
 kind = "openai"
 base_url = "https://example.test/v1"
-credential = "{handle}"
+credential = '{handle}'
 "#
             ))
         };

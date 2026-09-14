@@ -60,16 +60,28 @@ and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-t
 
 ## Install with npm
 
-The native CLI is available for supported Tier 1 platforms through npm:
-
 ```console
 npm install --global @suiflex/arsy-code
 arsy --version
 ```
 
-The package selects the matching native executable for macOS, glibc Linux, or
-Windows x64. Run `arsy doctor` after installation to inspect the active build
-and environment.
+Installing downloads the binary for the host platform from the matching GitHub
+Release and verifies its SHA-256, so the install needs network access. macOS,
+glibc Linux, and Windows are supported on x86-64 and ARM64. Run `arsy doctor`
+afterwards to inspect the active build and environment.
+
+## Install with Homebrew
+
+```console
+brew install suiflex/tap/arsy-code
+```
+
+## Install with Scoop
+
+```console
+scoop bucket add suiflex https://github.com/suiflex/scoop-bucket
+scoop install arsy-code
+```
 
 ## Install with curl / PowerShell
 
@@ -82,9 +94,10 @@ irm https://github.com/suiflex/arsy-code/releases/latest/download/install.ps1 | 
 ```
 
 Both scripts verify the downloaded archive's SHA-256 checksum before
-installing; they do not yet verify the Sigstore signature described in
-[Install and verify](docs/34-distribution.md#install-and-verify). Prefer the
-canonical GitHub Release archive when that stronger guarantee matters.
+installing, but not the Sigstore signature. Releases do publish a signed
+`SHA256SUMS`; verify it yourself as described in
+[Install and verify](docs/34-distribution.md#install-and-verify) when that
+stronger guarantee matters.
 
 ### Complete command reference
 

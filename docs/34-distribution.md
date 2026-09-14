@@ -2,21 +2,17 @@
 
 ## Channels
 
-GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, `SHA256SUMS`, an SPDX SBOM, and Sigstore signatures and bundles. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
+GitHub Releases is the canonical channel. Each stable SemVer tag publishes one archive per supported target, a `.sha256` sidecar beside each, an aggregate `SHA256SUMS` with its Sigstore signature and bundle, and a CycloneDX SBOM. This keeps rollback possible without a privileged installer and gives every wrapper one immutable source of bytes.
 
 The supported convenience channels are a SuiFlex Homebrew tap for macOS/Linux, a SuiFlex Scoop bucket for Windows, the public npm package `@suiflex/arsy-code`, and `install.sh` / `install.ps1` published alongside each GitHub Release. All of them reference an exact GitHub Release artifact and its SHA-256 digest; none rebuild or mirror binaries. Cargo, unattended self-update, OS stores, and third-party package repositories remain out of scope until demand justifies them.
 
-`install.sh` and `install.ps1` are an interim, checksum-only channel: they verify the archive's SHA-256 digest but not yet the Sigstore signature described below, because release automation does not sign artifacts yet (see [Release gate](#release-gate)). Treat them as convenience for a local/dev install, not the channel to script unattended provisioning against until signing lands.
+`install.sh` and `install.ps1` are a checksum-only channel: they verify the archive's SHA-256 digest against its `.sha256` sidecar, but not the Sigstore signature described below. Release automation signs `SHA256SUMS`, so a caller that wants provenance verifies that file itself rather than relying on the scripts.
 
-The npm package is a thin launcher with platform-filtered optional dependencies:
-
-| npm package | Target |
-|---|---|
-| `@suiflex/arsy-code-darwin-arm64` | `aarch64-apple-darwin` |
-| `@suiflex/arsy-code-darwin-x64` | `x86_64-apple-darwin` |
-| `@suiflex/arsy-code-linux-arm64-gnu` | `aarch64-unknown-linux-gnu` |
-| `@suiflex/arsy-code-linux-x64-gnu` | `x86_64-unknown-linux-gnu` |
-| `@suiflex/arsy-code-win32-x64-msvc` | `x86_64-pc-windows-msvc` |
+The npm package carries no binary. Its postinstall script resolves the host
+platform, downloads that archive from the release matching the package version,
+verifies the digest against the published `.sha256`, and unpacks it into the
+package. An unsupported platform fails the install with an explicit diagnostic
+rather than installing a launcher that cannot run.
 
 ## Supported targets
 
@@ -27,6 +23,7 @@ The npm package is a thin launcher with platform-filtered optional dependencies:
 | macOS 13+ | Intel x86-64 | `x86_64-apple-darwin` | Tier 1 |
 | macOS 13+ | Apple silicon | `aarch64-apple-darwin` | Tier 1 |
 | Windows 10 22H2+ | x86-64 | `x86_64-pc-windows-msvc` | Tier 1 |
+| Windows 11 22H2+ | ARM64 | `aarch64-pc-windows-msvc` | Tier 1 |
 
 Tier 1 means native CI build and test, signed release artifacts, and security fixes. Other OS/architecture combinations are unsupported until native CI and sandbox conformance exist; WSL does not establish Windows support.
 
@@ -37,11 +34,17 @@ For the canonical channel, download the archive, `SHA256SUMS`, matching `.sig`, 
 ```console
 sha256sum --check --ignore-missing SHA256SUMS
 cosign verify-blob SHA256SUMS --signature SHA256SUMS.sig --bundle SHA256SUMS.bundle \
-  --certificate-identity-regexp '^https://github.com/suiflex/arsy-code/.github/workflows/release.yml@refs/tags/' \
+  --certificate-identity-regexp '^https://github.com/suiflex/arsy-code/.github/workflows/release.yml@refs/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-On macOS, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum`. On Windows, Scoop validates the manifest's pinned SHA-256 before installation. Homebrew likewise validates the formula's pinned `sha256`; both manifests are updated only after the canonical signature check passes in release automation.
+The certificate identity is the workflow that signed, not the tag. `release.yml`
+runs as a reusable workflow called by `release-please.yml`, so the ref embedded
+in the certificate is the branch that invoked it rather than `refs/tags/<tag>`.
+Pin the regexp to the exact identity a given release actually carries; `cosign
+verify-blob` prints the identity it found when the match fails.
+
+On macOS, use `shasum -a 256 -c SHA256SUMS` instead of `sha256sum`. On Windows, Scoop validates the manifest's pinned SHA-256 before installation. Homebrew likewise validates the formula's pinned `sha256`. Both manifests are rendered from this repository's `packaging/` templates and pushed only after the GitHub Release publishes, and both pin digests taken from that same build.
 
 For npm, install the public launcher package globally:
 
@@ -50,22 +53,10 @@ npm install --global @suiflex/arsy-code
 arsy doctor
 ```
 
-npm installs one platform-filtered native package as an optional dependency. The
-launcher supports only the Tier 1 targets listed above; on an unsupported OS or
-architecture, it exits with an explicit diagnostic.
-
-Release automation stages each native package from the matching Cargo binary:
-
-```console
-npm run stage:platform -- \
-  --target <rust-target> \
-  --binary <release-binary> \
-  --version <semver> \
-  --output npm/platforms/<package-name>
-```
-
-Publish all platform packages before publishing `@suiflex/arsy-code`, so npm
-can resolve the launcher's optional dependencies.
+The install needs network access at install time and honours the Tier 1 targets
+listed above. Because the archive comes from the release tagged `v<package
+version>`, the npm package can only be published after that release exists;
+`npm-publish.yml` is gated on `release.yml` completing for exactly that reason.
 
 For curl / PowerShell, install directly from the latest release:
 
@@ -102,4 +93,4 @@ Before replacement, stop active sessions cleanly. Config and session migrations 
 
 ## Release gate
 
-A release is publishable only when all Tier 1 native jobs pass, the lockfile and license policy pass, SBOM and checksums are generated from the final bytes, and signature verification succeeds in a clean job. Package manifests are downstream of that gate and must resolve to the same digests.
+A release is publishable only when all Tier 1 native jobs pass, the lockfile and license policy pass, and the SBOM and checksums are generated from the final bytes. `SHA256SUMS` is verified with `sha256sum --check` against those bytes before it is signed. Package manifests are downstream of that gate: the tap and bucket jobs run only after the release publishes, and pin digests from the same build.

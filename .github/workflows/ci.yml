@@ -32,7 +32,10 @@ jobs:
       - name: Clippy
         run: cargo +1.98.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
-        run: cargo +1.98.0 test --workspace --all-features --locked
+        # --no-fail-fast: without it cargo stops at the first target that
+        # fails, so a platform with several unrelated failures reveals one
+        # per run.
+        run: cargo +1.98.0 test --workspace --all-features --locked --no-fail-fast
       - name: Compatibility fixtures
         run: python3 fixtures/compat/check.py
 

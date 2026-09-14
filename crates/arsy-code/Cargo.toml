@@ -1,6 +1,7 @@
 [package]
 name = "arsy-code"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,8 +14,8 @@ wasm = ["dep:wasmtime"]
 remote-transports = []
 
 [dependencies]
-arsy-kernel = { version = "0.1.0", path = "../arsy-kernel" }
-arsy-pty = { version = "0.1.0", path = "../arsy-pty" }
+arsy-kernel = { path = "../arsy-kernel" }
+arsy-pty = { path = "../arsy-pty" }
 cap-std.workspace = true
 globset.workspace = true
 ignore = "=0.4.23"

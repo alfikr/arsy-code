@@ -1,0 +1,28 @@
+{
+  "name": "@suiflex/arsy-code",
+  "version": "0.0.0",
+  "description": "A local, auditable, model-independent software-engineering agent harness.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suiflex/arsy-code.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/suiflex/arsy-code",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "arsy": "bin/arsy.js"
+  },
+  "files": [
+    "bin/arsy.js",
+    "scripts/install.js"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

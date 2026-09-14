@@ -445,7 +445,46 @@ pub fn uri_path(uri: &str) -> PathBuf {
         decoded.push(raw[index]);
         index += 1;
     }
-    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+    PathBuf::from(native(&String::from_utf8_lossy(&decoded)))
+}
+
+/// The decoded URI body as a path this platform recognises.
+///
+/// `file_uri` turns every separator into `/` and puts a `/` in front of a path
+/// that has none, so on Windows `C:\\repo` leaves as `file:///C:/repo`. Undoing
+/// that is this function's whole job: without it the body comes back as
+/// `/C:/repo`, which shares no component with the workspace root, so every
+/// path a language server names looks like it escapes the workspace.
+///
+/// Unix keeps the body as it is, where it is already the path.
+fn native(body: &str) -> String {
+    if cfg!(windows) {
+        windows_path(body)
+    } else {
+        body.to_owned()
+    }
+}
+
+/// The Windows half, separate so it can be tested away from Windows.
+///
+/// `/C:/repo` is the drive path `C:/repo`. A verbatim root round-trips as
+/// `//?/C:/repo`, which has no leading slash to drop and must keep both of its
+/// leading separators.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_path(body: &str) -> String {
+    let body = match body.strip_prefix('/') {
+        Some(rest) if starts_with_drive(rest) => rest,
+        _ => body,
+    };
+    body.replace('/', "\\")
+}
+
+fn starts_with_drive(path: &str) -> bool {
+    let mut characters = path.chars();
+    characters
+        .next()
+        .is_some_and(|letter| letter.is_ascii_alphabetic())
+        && characters.next() == Some(':')
 }
 
 impl Drop for StdioTransport {
@@ -524,6 +563,58 @@ impl std::error::Error for LspError {}
 
 #[cfg(test)]
 mod tests {
+
+    /// The invariant the pair exists for: whatever `file_uri` encodes,
+    /// `uri_path` gives back. It held on Unix by accident -- the body of the
+    /// URI is already the path there -- and not at all on Windows, where every
+    /// path a language server named came back with a leading slash and forward
+    /// separators, matching no workspace root.
+    #[test]
+    fn a_path_survives_the_round_trip_through_a_file_uri() {
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\runner\repo")
+        } else {
+            PathBuf::from("/home/runner/repo")
+        };
+        let file = root.join("src").join("engine.rs");
+        assert_eq!(uri_path(&file_uri(&file)), file);
+        assert_eq!(
+            uri_path(&file_uri(&file)).strip_prefix(&root),
+            Ok(Path::new("src/engine.rs")),
+            "a round-tripped path still sits under the root it came from"
+        );
+    }
+
+    /// The rewrite only runs on Windows, so it is tested here rather than
+    /// nowhere: these are the exact bodies `file_uri` produces.
+    #[test]
+    fn a_uri_body_becomes_a_windows_path() {
+        assert_eq!(
+            windows_path("/C:/Users/runner/repo"),
+            r"C:\Users\runner\repo"
+        );
+        assert_eq!(
+            windows_path("//?/C:/Users/runner/repo"),
+            r"\\?\C:\Users\runner\repo",
+            "a verbatim root keeps both leading separators"
+        );
+        assert_eq!(
+            windows_path("/repo/src"),
+            r"\repo\src",
+            "no drive letter, so the leading separator is part of the path"
+        );
+    }
+
+    #[test]
+    fn a_drive_letter_is_recognised_only_where_one_is_written() {
+        assert!(starts_with_drive("C:/repo"));
+        assert!(starts_with_drive("c:/repo"));
+        assert!(!starts_with_drive("/repo"));
+        assert!(!starts_with_drive("repo"));
+        assert!(!starts_with_drive("1:/repo"));
+        assert!(!starts_with_drive(""));
+    }
+
     use super::*;
 
     struct CrashOnce {
