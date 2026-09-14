@@ -45,16 +45,19 @@ pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
 /// What an operator gets without saying: no unlock prompt to read metadata.
 pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
 
-/// How many independent tool calls one round may run at once by default.
+/// `execution.max_parallel`: how many independent tool calls one round may run
+/// at once.
 ///
 /// Four rather than one because a model that reads five files reads them in
 /// one round, and four rather than the core count because the calls are
 /// waiting on disk and on other people's servers, not on this machine's CPU.
+/// The number is the schema's, in `docs/35-configuration.md`; this is where it
+/// is enforced.
 pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
 
 /// The most any layer may ask for. A ceiling rather than a preference: a
-/// configuration file that asked for two hundred concurrent shell-adjacent
-/// calls would be describing a fork bomb.
+/// configuration file that asked for two hundred concurrent calls would be
+/// describing a fork bomb.
 pub const MAX_PARALLEL_TOOLS: usize = 16;
 
 const INERT_SECTIONS: &[&str] = &["compat", "context", "git", "sandbox", "storage", "ui"];
@@ -505,7 +508,7 @@ pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
     credential_store: Option<String>,
-    /// `execution.max_parallel_tools`. `None` is the built-in default.
+    /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
     /// `provider.allowed` and `model.allowed` after intersection. `None` means
@@ -835,8 +838,8 @@ impl Config {
                     // key here is accepted as it always was; only the one this
                     // build reads is validated.
                     let table = as_table(value, "execution", path)?;
-                    if let Some(value) = table.get("max_parallel_tools") {
-                        let key = "execution.max_parallel_tools";
+                    if let Some(value) = table.get("max_parallel") {
+                        let key = "execution.max_parallel";
                         let limit = value
                             .as_integer()
                             .and_then(|limit| usize::try_from(limit).ok())
@@ -2625,6 +2628,126 @@ default_effect = \"allow\"\n",
 
     fn load(files: &[(Layer, PathBuf)]) -> Config {
         Config::load(files).unwrap()
+    }
+
+    /// `execution.max_parallel` is the key `docs/35-configuration.md` already
+    /// names, with the default and the `min` merge it already specifies. The
+    /// spelling is asserted because a second key meaning the same thing is how
+    /// a schema and its implementation quietly stop being the same thing.
+    #[test]
+    fn the_parallel_ceiling_uses_the_documented_key_and_only_ever_narrows() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            load(&[]).max_parallel_tools(),
+            DEFAULT_PARALLEL_TOOLS,
+            "an unset key is the schema's default, not zero"
+        );
+
+        let enterprise = write(
+            directory.path(),
+            "enterprise.toml",
+            "schema_version = 1\n\n[execution]\nmax_parallel = 8\n",
+        );
+        let user = write(
+            directory.path(),
+            "user.toml",
+            "schema_version = 1\n\n[execution]\nmax_parallel = 2\n",
+        );
+        let greedy = write(
+            directory.path(),
+            "greedy.toml",
+            "schema_version = 1\n\n[execution]\nmax_parallel = 12\n",
+        );
+
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise.clone())]).max_parallel_tools(),
+            8
+        );
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise.clone()), (Layer::User, user),])
+                .max_parallel_tools(),
+            2,
+            "a lower layer may ask for less"
+        );
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise), (Layer::Workspace, greedy)])
+                .max_parallel_tools(),
+            8,
+            "and never for more, whatever it writes"
+        );
+
+        // Outside the range is refused rather than clamped: a typo that meant
+        // `4` and wrote `400` should be a diagnostic, not a fork bomb.
+        for bad in ["0", "1000", "\"four\""] {
+            let path = write(
+                directory.path(),
+                "bad.toml",
+                &format!("schema_version = 1\n\n[execution]\nmax_parallel = {bad}\n"),
+            );
+            assert!(
+                Config::load(&[(Layer::User, path)]).is_err(),
+                "max_parallel = {bad} was accepted"
+            );
+        }
+    }
+
+    /// A model nobody priced has no cost, and that is not the same as free.
+    #[test]
+    fn endpoint_pricing_is_read_per_model_and_absent_where_unset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            "pricing.toml",
+            r#"
+schema_version = 1
+
+[provider.endpoint.anthropic]
+kind = "anthropic"
+model = "opus"
+models = ["opus", "haiku"]
+
+[provider.endpoint.anthropic.pricing.opus]
+input_micros_per_million = 15000000
+output_micros_per_million = 75000000
+"#,
+        );
+        let config = load(&[(Layer::User, path)]);
+        let endpoint = config.endpoint(None).unwrap();
+
+        let opus = endpoint.pricing.get("opus").expect("a priced model");
+        assert_eq!(opus.input_micros_per_million, 15_000_000);
+        // 1000 in, 500 out, rounded up.
+        assert_eq!(opus.cost_micros(1_000, 500), 52_500);
+        assert_eq!(
+            opus.cost_micros(1, 0),
+            15,
+            "a part-micro charge is not lost"
+        );
+        assert!(
+            endpoint.pricing.get("haiku").is_none(),
+            "an unpriced model is absent, so a caller reports unknown rather than free"
+        );
+
+        // The rates are integers, and an unknown key inside the table is a
+        // typo in something that decides money.
+        for bad in [
+            "input_micros_per_million = \"lots\"",
+            "inpit_micros_per_million = 1",
+        ] {
+            let path = write(
+                directory.path(),
+                "bad-pricing.toml",
+                &format!(
+                    "schema_version = 1\n\n[provider.endpoint.a]\nkind = \"openai\"\n\n\
+                     [provider.endpoint.a.pricing.m]\n{bad}\noutput_micros_per_million = 1\n"
+                ),
+            );
+            assert!(
+                Config::load(&[(Layer::User, path)]).is_err(),
+                "accepted `{bad}`"
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ mod unix {
     use std::{
         fs::File,
         io,
-        os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd},
+        os::fd::{FromRawFd, OwnedFd, RawFd},
         process::{Command, Stdio},
     };
 
@@ -67,12 +67,18 @@ mod unix {
                 .stdin(Stdio::from(self.device.try_clone()?))
                 .stdout(Stdio::from(self.device.try_clone()?))
                 .stderr(Stdio::from(self.device.try_clone()?));
-            let device = self.device.try_clone()?.into_raw_fd();
+            // Moved into the closure as an `OwnedFd`, not handed over as a raw
+            // one. The closure lives as long as the `Command`, so the parent's
+            // copy is closed when the `Command` is dropped; a raw descriptor
+            // here would be closed by nobody, and every pty-backed start would
+            // leak one in a process that is meant to run for hours.
+            let device = self.device.try_clone()?;
             // SAFETY: `pre_exec` runs between fork and exec, where only
             // async-signal-safe calls are allowed. `setsid` and `ioctl` are
             // both on that list, and neither allocates nor takes a lock.
+            // `as_raw_fd` reads a field.
             unsafe {
-                use std::os::unix::process::CommandExt;
+                use std::os::unix::{io::AsRawFd, process::CommandExt};
                 command.pre_exec(move || {
                     // A new session, so the pseudoterminal can become this
                     // process's controlling terminal — without it, a job
@@ -80,7 +86,7 @@ mod unix {
                     if libc::setsid() == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::ioctl(device, libc::TIOCSCTTY.into(), 0) == -1 {
+                    if libc::ioctl(device.as_raw_fd(), libc::TIOCSCTTY.into(), 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     Ok(())

@@ -105,12 +105,20 @@ impl RepositoryMap {
     }
 
     /// Bring the map up to date with the workspace and store it.
+    ///
+    /// Written back only when the index actually changed. A turn that calls
+    /// `repo.map` on an untouched workspace should cost one digest per file
+    /// and nothing else; re-serializing the whole graph to disk on every call
+    /// would spend the most on exactly the repositories large enough to need
+    /// an incremental index in the first place.
     pub fn refresh(
         &mut self,
         workspace: &Workspace,
     ) -> Result<Refreshed, crate::graph::GraphError> {
         let delta = self.graph.index(workspace)?;
-        self.save();
+        if !delta.is_empty() {
+            self.save();
+        }
         Ok(Refreshed {
             files: self.graph.file_count(),
             reindexed: delta.reindexed(),
@@ -364,7 +372,22 @@ mod tests {
         );
         assert_eq!(again.unchanged, first.files);
 
-        // One file changes; only that file is reindexed.
+        // Nothing changed, so nothing was written either: the stored map is
+        // byte-for-byte the one that was already there.
+        let stored = std::fs::metadata(directory.path().join(MAP_PATH)).unwrap();
+        let written_at = stored.modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resumed.refresh(&workspace).unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join(MAP_PATH))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            written_at,
+            "an unchanged workspace must not rewrite the whole graph"
+        );
+
+        // One file changes; only that file is reindexed, and the map is stored.
         std::fs::write(
             directory.path().join("src/util.rs"),
             "pub fn helper() {}\npub struct Config;\npub fn added() {}\n",
@@ -372,6 +395,14 @@ mod tests {
         .unwrap();
         let incremental = resumed.refresh(&workspace).unwrap();
         assert_eq!(incremental.reindexed, 1, "{incremental:?}");
+        assert!(
+            std::fs::metadata(directory.path().join(MAP_PATH))
+                .unwrap()
+                .modified()
+                .unwrap()
+                > written_at,
+            "a change is written back"
+        );
     }
 
     #[test]

@@ -86,6 +86,9 @@ pub struct PollResult {
     pub timed_out: bool,
     /// Whether `process.stop` asked for this exit.
     pub stopped: bool,
+    /// Whether the watchdog lost track of the child and ended it rather than
+    /// report an exit it could not observe.
+    pub wait_failed: bool,
     /// Output since the previous poll, in the order it was printed.
     pub output: String,
     /// Bytes this session has produced in total, read or not.
@@ -125,6 +128,10 @@ struct Exit {
     status_code: Option<i32>,
     timed_out: bool,
     stopped: bool,
+    /// The watchdog could not ask whether the child had exited, so it ended it
+    /// rather than guess. Surfaced because the exit code that follows is the
+    /// one the kill produced, not the one the command chose.
+    wait_failed: bool,
 }
 
 struct Session {
@@ -140,6 +147,9 @@ struct Session {
     input: Mutex<Option<Box<dyn Write + Send>>>,
     stop_requested: Arc<AtomicBool>,
     exit: Arc<Mutex<Option<Exit>>>,
+    /// When the watchdog recorded that exit, so a finished session can be
+    /// pruned on age rather than on someone remembering to read it.
+    settled_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Session {
@@ -160,6 +170,32 @@ fn sessions() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Session>>> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+}
+
+/// How long a finished session's result stays readable before it is dropped.
+///
+/// A handle has to outlive the process it names — reading the exit code is the
+/// point — but not forever. Without this, a harness that runs for a day and
+/// starts a hundred background commands keeps a hundred dead entries in a
+/// static map, because eviction would depend on someone remembering to poll
+/// one last time. Ten minutes is far longer than the gap between a stop and
+/// the poll that reads its result, and far shorter than a session.
+const RETAIN_FINISHED: Duration = Duration::from_secs(10 * 60);
+
+/// Drop finished sessions nobody has looked at for [`RETAIN_FINISHED`].
+///
+/// Called when a session is started, which is the only moment the map grows,
+/// so the cost is paid by the thing that causes it. A running session is never
+/// pruned however old it is: a dev server is supposed to still be there.
+fn prune(sessions: &mut HashMap<String, Arc<Session>>) {
+    let now = Instant::now();
+    sessions.retain(|_, session| {
+        session
+            .settled_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none_or(|settled| now.duration_since(settled) < RETAIN_FINISHED)
+    });
 }
 
 /// The program a handle names, for the capability requirement of a call that
@@ -374,9 +410,11 @@ impl SessionExecutor {
 
         let stop_requested = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(Mutex::new(None));
+        let settled_at = Arc::new(Mutex::new(None));
         {
             let stop_requested = Arc::clone(&stop_requested);
             let exit = Arc::clone(&exit);
+            let settled_at = Arc::clone(&settled_at);
             let grace = self.grace;
             // The watchdog is the only owner of the `Child`, so nothing else
             // needs a lock to wait on it, and the exit status is recorded
@@ -388,6 +426,8 @@ impl SessionExecutor {
                     let _ = reader.join();
                 }
                 *exit.lock().unwrap_or_else(|error| error.into_inner()) = Some(recorded);
+                *settled_at.lock().unwrap_or_else(|error| error.into_inner()) =
+                    Some(Instant::now());
             });
         }
 
@@ -402,8 +442,13 @@ impl SessionExecutor {
             input: Mutex::new(input_sink),
             stop_requested,
             exit,
+            settled_at,
         });
-        sessions().insert(handle.clone(), session);
+        {
+            let mut sessions = sessions();
+            prune(&mut sessions);
+            sessions.insert(handle.clone(), session);
+        }
         Ok(StartResult {
             handle,
             argv,
@@ -459,12 +504,6 @@ impl SessionExecutor {
             )
         };
         let exit = session.exited();
-        // A finished session is forgotten once its last output has been read,
-        // so a long run does not accumulate dead handles — but only then, so
-        // the exit code of something that just failed is still readable.
-        if exit.is_some() && output.is_empty() {
-            sessions().remove(&session.handle);
-        }
         Ok(PollResult {
             handle: session.handle.clone(),
             argv: session.argv.clone(),
@@ -473,6 +512,7 @@ impl SessionExecutor {
             status_code: exit.and_then(|exit| exit.status_code),
             timed_out: exit.is_some_and(|exit| exit.timed_out),
             stopped: exit.is_some_and(|exit| exit.stopped),
+            wait_failed: exit.is_some_and(|exit| exit.wait_failed),
             output,
             total_output_bytes: total,
             dropped_output: dropped,
@@ -613,7 +653,21 @@ fn supervise(
                     ..Exit::default()
                 }
             }
-            Err(_) => return Exit::default(),
+            // A `try_wait` that fails says nothing about whether the child is
+            // gone. Returning as if it had exited would leave a live process
+            // holding its pipes open, and the reader threads the caller joins
+            // next would wait on those pipes forever — so the exit would never
+            // be recorded, and every later poll would answer `running: true`
+            // with no way to find out otherwise. End it instead, and say that
+            // is what happened.
+            Err(_) => {
+                let ended = crate::process::end(child, grace);
+                return Exit {
+                    status_code: ended.status.and_then(|status| status.code()),
+                    wait_failed: true,
+                    ..Exit::default()
+                };
+            }
             Ok(None) => {}
         }
         let stopped = stop_requested.load(Ordering::SeqCst);
@@ -624,6 +678,7 @@ fn supervise(
                 status_code: ended.status.and_then(|status| status.code()),
                 timed_out,
                 stopped,
+                wait_failed: false,
             };
         }
         thread::sleep(TICK);
@@ -877,6 +932,104 @@ mod tests {
         let done = harness.poll_until_done(started["handle"].as_str().unwrap());
         assert_eq!(done["timed_out"], true);
         assert_eq!(done["stopped"], false);
+    }
+
+    /// A stop is documented as safe to re-issue, and a poll must not be what
+    /// takes that away: reading the last of a finished process's output used to
+    /// evict it, so the stop that followed failed on an unknown handle.
+    #[test]
+    fn a_finished_session_stays_readable_and_stop_is_idempotent_after_a_poll() {
+        let harness = harness("idempotent-stop");
+        let started = harness
+            .call(
+                "process.start",
+                serde_json::json!({"argv": ["sh", "-c", "printf hi; exit 2"]}),
+            )
+            .unwrap();
+        let handle = started["handle"].as_str().unwrap().to_owned();
+
+        // Poll until it has exited and its output has been drained — the exact
+        // state that used to remove the session.
+        let done = harness.poll_until_done(&handle);
+        assert_eq!(done["status_code"], 2);
+        let drained = harness
+            .call(
+                "process.poll",
+                serde_json::json!({"handle": handle.clone()}),
+            )
+            .unwrap();
+        assert_eq!(drained["output"], "", "nothing is left to read");
+        assert_eq!(
+            drained["status_code"], 2,
+            "and the exit code is still readable after it"
+        );
+
+        let stopped = harness
+            .call(
+                "process.stop",
+                serde_json::json!({"handle": handle.clone()}),
+            )
+            .unwrap();
+        assert_eq!(
+            stopped["status_code"], 2,
+            "stopping something already stopped reports how it ended"
+        );
+        assert!(harness
+            .call("process.stop", serde_json::json!({"handle": handle}))
+            .is_ok());
+    }
+
+    /// A session that is finished and old is dropped; one still running is not,
+    /// however long it has been there.
+    #[test]
+    fn finished_sessions_are_pruned_on_age_and_running_ones_are_never_pruned() {
+        let harness = harness("prune");
+        let quick = harness
+            .call(
+                "process.start",
+                serde_json::json!({"argv": ["sh", "-c", "exit 0"]}),
+            )
+            .unwrap()["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let slow = harness
+            .call(
+                "process.start",
+                serde_json::json!({"argv": ["sh", "-c", "sleep 30"]}),
+            )
+            .unwrap()["handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        harness.poll_until_done(&quick);
+
+        // Backdate the finished one past the retention, which is what the
+        // clock would do given ten minutes.
+        {
+            let sessions = sessions();
+            let settled = sessions[&quick]
+                .settled_at
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .expect("a finished session records when it settled");
+            *sessions[&quick]
+                .settled_at
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(settled - RETAIN_FINISHED - Duration::from_secs(1));
+        }
+        prune(&mut sessions());
+
+        assert!(
+            !sessions().contains_key(&quick),
+            "a finished session older than the retention is dropped"
+        );
+        assert!(
+            sessions().contains_key(&slow),
+            "a running one is kept however long it runs"
+        );
+        let _ = harness.call("process.stop", serde_json::json!({"handle": slow}));
     }
 
     /// A handle is not a password: one task must not be able to reach another's

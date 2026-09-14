@@ -1725,6 +1725,11 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             }
             let status = if value.get("running").and_then(Value::as_bool) == Some(true) {
                 "still running".to_owned()
+            } else if value.get("wait_failed").and_then(Value::as_bool) == Some(true) {
+                // The exit code below came from the kill, not from the command,
+                // so a model must not read it as the command's own answer.
+                "lost track of and stopped; its exit code is the kill's, not the command's"
+                    .to_owned()
             } else if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
                 "stopped at its deadline".to_owned()
             } else {

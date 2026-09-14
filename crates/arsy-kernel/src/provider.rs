@@ -109,6 +109,27 @@ pub fn data_url(media_type: &str, data: &str) -> String {
     format!("data:{media_type};base64,{data}")
 }
 
+/// One message's content as a parts array: the text first, then the images.
+///
+/// Both OpenAI dialects splice a message the same way and differ only in how a
+/// part is spelled — `text` against `input_text`, an object `image_url`
+/// against a string one. Written once here so a fix to the shape (an empty
+/// text, a new field, an ordering rule) lands in both adapters rather than in
+/// whichever one the next reader happens to open.
+///
+/// `images` is emptied, because a caller that has already decided to use the
+/// array form has no second use for them.
+pub fn content_parts(text_type: &str, text: &str, images: &mut Vec<Value>) -> Vec<Value> {
+    let mut parts = Vec::with_capacity(images.len() + 1);
+    // An empty text part is not "no text", it is a part saying nothing, and
+    // some endpoints reject one.
+    if !text.is_empty() {
+        parts.push(serde_json::json!({"type": text_type, "text": text}));
+    }
+    parts.append(images);
+    parts
+}
+
 #[cfg(test)]
 mod base64_tests {
     use super::{base64, data_url};

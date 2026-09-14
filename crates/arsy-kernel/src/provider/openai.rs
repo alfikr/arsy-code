@@ -164,12 +164,10 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
         if images.is_empty() {
             wire.insert("content".to_owned(), json!(text));
         } else {
-            let mut parts = Vec::with_capacity(images.len() + 1);
-            if !text.is_empty() {
-                parts.push(json!({"type": "text", "text": text}));
-            }
-            parts.append(&mut images);
-            wire.insert("content".to_owned(), Value::Array(parts));
+            wire.insert(
+                "content".to_owned(),
+                Value::Array(super::content_parts("text", &text, &mut images)),
+            );
         }
         if !tool_calls.is_empty() {
             wire.insert("tool_calls".to_owned(), Value::Array(tool_calls));

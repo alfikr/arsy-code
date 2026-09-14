@@ -210,11 +210,7 @@ fn encode_message(message: &ModelMessage, out: &mut Vec<Value>) {
         }
     }
     if !text.is_empty() || !images.is_empty() {
-        let mut parts = Vec::with_capacity(images.len() + 1);
-        if !text.is_empty() {
-            parts.push(json!({"type": text_type, "text": text}));
-        }
-        parts.append(&mut images);
+        let parts = super::content_parts(text_type, &text, &mut images);
         out.push(json!({"type": "message", "role": role, "content": parts}));
     }
     for content in &message.content {
