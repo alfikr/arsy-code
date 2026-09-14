@@ -24,6 +24,10 @@ jobs:
   publish:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
+    # The npm Trusted Publisher for @suiflex/arsy-code is registered against this
+    # environment. The OIDC token only carries an `environment` claim when the job
+    # runs in one, and npm rejects the publish if the claim does not match.
+    environment: Release
     permissions:
       contents: read
       id-token: write
