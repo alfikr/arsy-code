@@ -1,6 +1,9 @@
-<p align="center"><img src="assets/arsy-code-logo.svg" alt="ARSY CODE logo" width="180" /></p>
+<p align="center"><img src="assets/logo.png" alt="ARSY logo" width="220" /></p>
 <h1 align="center">ARSY CODE</h1>
-<p align="center">A local, auditable, model-independent software-engineering agent harness.</p>
+<p align="center"><strong>A local, auditable, model-independent software-engineering agent harness.</strong></p>
+<p align="center">Plan · Orchestrate · Execute</p>
+
+<p align="center"><img src="assets/product-flow.png" alt="ARSY CODE flow from task planning through hooks, policy, tools, evidence, and verification" width="100%" /></p>
 
 **ARSY** is the core platform; this repository contains **ARSY CODE**, its terminal interface.
 
@@ -151,26 +154,6 @@ Global options can be used with commands that support them:
 `--output human|json|ci`, `--no-color`, `--help`, and `--version`.
 Run `arsy --help` for the exact syntax and availability of the current build. Commands that are
 roadmap-gated report a diagnostic instead of silently behaving differently.
-
-## Architecture at a glance
-
-```mermaid
-flowchart LR
-    U[CLI / TUI / CI] --> S[Session Engine]
-    S --> C[Context Builder]
-    S --> O[Agent Orchestrator]
-    O --> M[Model Gateway]
-    O --> P[Policy Engine]
-    P --> T[Operation Runtime]
-    T --> L[Local capabilities]
-    T --> X[MCP servers]
-    T --> R[Remote runners]
-    S --> E[(SQLite event log)]
-    O --> E
-    T --> E
-```
-
-The immutable event log is the source of truth. Models propose actions; policy decides whether they may run directly, require sandboxing or approval, or must be denied.
 
 ## Design documents
 

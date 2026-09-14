@@ -1638,25 +1638,80 @@ impl Composer {
 
 const LABEL_WIDTH: usize = 10;
 
-/// The mark from `assets/arsy-code-logo.svg`, reduced offline to half-block
-/// rows. The artwork is a single colour, so only the silhouette is stored —
-/// 22 columns by 11 rows of glyphs, not an embedded image.
-const LOGO_COLOUR: &str = "\x1b[38;2;64;220;121m";
 const LOGO_WIDTH: usize = 22;
+const LOGO_HEIGHT: usize = 11;
 const LOGO_GAP: usize = 3;
-const LOGO: [&str; 11] = [
-    " █▀▀▀▀▀▀▀     ▀▀▀▀▀▀▀▀",
-    "██     ▄▄▄███▄▄▄▄     ",
-    "██  ▄▄▀  ▄▀█▀▄  ▀▀▄▄  ",
-    "██ █▀▀▄▄█▀ █  ███▀▀█▄ ",
-    "▀▄█    █▀▀▄█   ▀▄   ▀▄",
-    "██▄   █    ██▀▀▄██   █",
-    "▄ ▀█▄█ ▄▄▄▀   ▄▀ ▀▄ █▀",
-    "██   ▀▀▀▀▀█▄▄█▄▄▄▄██  ",
-    "██         ▀▀█  ▄█    ",
-    "██            ▀██     ",
-    " █▄▄▄▄▄▄▄▄▄▄▄  ▀  ▄▄▄▄",
-];
+const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
+
+fn logo(colour: bool) -> &'static [String] {
+    static COLOUR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static MONOCHROME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if colour {
+        COLOUR.get_or_init(|| render_logo(true))
+    } else {
+        MONOCHROME.get_or_init(|| render_logo(false))
+    }
+}
+
+fn render_logo(colour: bool) -> Vec<String> {
+    let tree = resvg::usvg::Tree::from_data(LOGO_SVG, &resvg::usvg::Options::default())
+        .expect("embedded ARSY logo must be valid SVG");
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(LOGO_WIDTH as u32, (LOGO_HEIGHT * 2) as u32)
+        .expect("fixed logo canvas must be valid");
+    let scale = (LOGO_WIDTH as f32 / tree.size().width())
+        .min((LOGO_HEIGHT * 2) as f32 / tree.size().height());
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+
+    let pixels = pixmap.pixels();
+    (0..LOGO_HEIGHT)
+        .map(|row| {
+            let mut line = String::new();
+            for column in 0..LOGO_WIDTH {
+                let upper = logo_pixel(pixels[row * 2 * LOGO_WIDTH + column]);
+                let lower = logo_pixel(pixels[(row * 2 + 1) * LOGO_WIDTH + column]);
+                line.push_str(&half_block(upper, lower, colour));
+            }
+            line
+        })
+        .collect()
+}
+
+fn logo_pixel(pixel: resvg::tiny_skia::PremultipliedColorU8) -> Option<(u8, u8, u8)> {
+    let alpha = u16::from(pixel.alpha());
+    (alpha >= 24).then(|| {
+        let channel = |value: u8| ((u16::from(value) * 255 + alpha / 2) / alpha).min(255) as u8;
+        (
+            channel(pixel.red()),
+            channel(pixel.green()),
+            channel(pixel.blue()),
+        )
+    })
+}
+
+fn half_block(upper: Option<(u8, u8, u8)>, lower: Option<(u8, u8, u8)>, colour: bool) -> String {
+    if !colour {
+        return match (upper, lower) {
+            (None, None) => " ",
+            (Some(_), None) => "▀",
+            (None, Some(_)) => "▄",
+            (Some(_), Some(_)) => "█",
+        }
+        .to_owned();
+    }
+
+    match (upper, lower) {
+        (None, None) => " ".to_owned(),
+        (Some((r, g, b)), None) => format!("\x1b[38;2;{r};{g};{b}m▀{RESET}"),
+        (None, Some((r, g, b))) => format!("\x1b[38;2;{r};{g};{b}m▄{RESET}"),
+        (Some((r, g, b)), Some((br, bg, bb))) => {
+            format!("\x1b[38;2;{r};{g};{b}m\x1b[48;2;{br};{bg};{bb}m▀{RESET}")
+        }
+    }
+}
 
 fn paint(colour: bool, code: &str, text: &str) -> String {
     let text = safe_text(text);
@@ -2026,13 +2081,14 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     if inner < gutter + LABEL_WIDTH + 12 {
         return text;
     }
-    let offset = LOGO.len().saturating_sub(text.len()) / 2;
-    (0..LOGO.len().max(text.len() + offset))
+    let logo = logo(colour);
+    let offset = logo.len().saturating_sub(text.len()) / 2;
+    (0..logo.len().max(text.len() + offset))
         .map(|row| {
-            let mark = LOGO.get(row).map_or_else(
-                || " ".repeat(LOGO_WIDTH),
-                |art| paint(colour, LOGO_COLOUR, art),
-            );
+            let mark = logo
+                .get(row)
+                .cloned()
+                .unwrap_or_else(|| " ".repeat(LOGO_WIDTH));
             let line = row
                 .checked_sub(offset)
                 .and_then(|index| text.get(index))
@@ -4399,15 +4455,24 @@ mod tests {
 
         let wide = state.render(92, true);
         let rows: Vec<&str> = wide.lines().collect();
+        let first_mark = logo(true)
+            .iter()
+            .map(|row| strip_sgr(row))
+            .find(|row| !row.trim().is_empty())
+            .expect("rendered logo has a visible row");
         assert!(
-            rows[1].contains(LOGO[0]),
-            "mark starts on the first card row"
+            rows.iter().any(|row| strip_sgr(row).contains(&first_mark)),
+            "card contains the rendered mark"
         );
         assert!(
             strip_sgr(rows[3]).contains(">_ ARSY CODE"),
             "text is centred against it"
         );
-        assert_eq!(rows.len(), LOGO.len() + 2, "the mark sets the card height");
+        assert_eq!(
+            rows.len(),
+            logo(true).len() + 2,
+            "the mark sets the card height"
+        );
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
         }
@@ -4421,7 +4486,7 @@ mod tests {
 
         // Too narrow for both: the text wins, the mark is dropped.
         let narrow = state.render(40, true);
-        assert!(!narrow.contains(LOGO[0]));
+        assert!(!strip_sgr(&narrow).contains(&first_mark));
         assert!(strip_sgr(&narrow).contains(">_ ARSY CODE"));
     }
 
