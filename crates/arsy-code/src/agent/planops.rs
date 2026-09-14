@@ -1,11 +1,12 @@
-//! `plan.*`: a structured, durable task plan the model can create and revise.
+//! `plan.*`: a structured task plan retained for the current process.
 //!
 //! A long task is a sequence of steps, and a model that only ever says what it
 //! is doing right now loses the sequence the moment the transcript is
 //! trimmed. This gives the model a small ordered list it can create, revise,
-//! and re-read across a turn — the plan is the one thing [`budget`](super::budget)
-//! trimming is never allowed to make disappear, because it lives here rather
-//! than in the transcript.
+//! and re-read across turns in the same process — the plan is the one thing
+//! [`budget`](super::budget) trimming is never allowed to make disappear,
+//! because it lives here rather than in the transcript. It is not restored
+//! after process restart; durable commitments belong to `todo.*`.
 //!
 //! One executor per kind, same shape as [`fsops`](super::fsops): the kind
 //! decides the action, the schema decides what a call needs to say. Every

@@ -108,9 +108,9 @@ pub fn schema() -> ToolSchema {
         name: "task.spawn".to_owned(),
         description: format!(
             "Delegate a self-contained question to a subagent that can read and search but \
-             cannot write. Use it to investigate in parallel with your own work — \"where is X \
-             configured\", \"what calls Y\" — and not for anything that changes a file. Returns \
-             the subagent's answer. At most {MAX_CHILDREN} per turn."
+             cannot write. The current turn waits for the answer, so use it for bounded \
+             investigations such as \"where is X configured\" or \"what calls Y\", and not for \
+             anything that changes a file. At most {MAX_CHILDREN} per turn."
         ),
         input_schema: json!({
             "type": "object",
