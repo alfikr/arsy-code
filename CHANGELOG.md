@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/suiflex/arsy-code/compare/v0.1.0...v0.1.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* install the Linux credential-store dependencies in the release build ([72f81a0](https://github.com/suiflex/arsy-code/commit/72f81a0b662ba55df9075feecf018cedebddc674))
+* **release:** install the Linux credential-store dependencies ([b2e8b55](https://github.com/suiflex/arsy-code/commit/b2e8b55aae80f16c815761367ef371e4ddff3a1c))
+
 ## 0.1.0 (2026-09-14)
 
 
