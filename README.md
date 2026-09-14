@@ -55,6 +55,20 @@ The full surface — session, configuration, policy, credentials, connections, e
 and maintenance commands — is specified in [CLI and TUI surface](docs/36-cli-tui.md). Run
 `arsy --help` for the command surface available in the current build.
 
+## Install with npm
+
+The native CLI is available for supported Tier 1 platforms through npm:
+
+```console
+npm install --global @suiflex/arsy-code
+arsy --version
+```
+
+The package selects the matching native executable for macOS, glibc Linux, or
+Windows x64. Run `arsy doctor` after installation to inspect the active build
+and environment.
+
+
 ### Complete command reference
 
 ```console
