@@ -67,7 +67,7 @@ python3 fixtures/compat/check.py
 
 Toolchain is pinned by `rust-version` in `Cargo.toml`. CI additionally runs
 `cargo deny check` for advisory and license issues
-(`.github/workflows/ci.yml.disabled`).
+(`.github/workflows/ci.yml`).
 
 ## Distribution
 
