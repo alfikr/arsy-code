@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/suiflex/arsy-code/compare/v0.1.1...v0.1.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* compile the sandbox on aarch64 Linux ([338bc08](https://github.com/suiflex/arsy-code/commit/338bc0807798ccd132659b6a15df716a9b7c9b36))
+* **sandbox:** deny fork and vfork only where the kernel has them ([7e0dda5](https://github.com/suiflex/arsy-code/commit/7e0dda5182f0530ecd546bdf6a72a14a1db58863))
+
 ## [0.1.1](https://github.com/suiflex/arsy-code/compare/v0.1.0...v0.1.1) (2026-09-14)
 
 
