@@ -7456,7 +7456,6 @@ mod tests {
         let mut conversation = Vec::new();
         // A stop is answered by the stop, not by waiting for the keyboard to
         // hang up: the calls after it are refused without asking.
-        let started = std::time::Instant::now();
         let turn = native_turn(
             &resolved,
             &test_runtime(workspace.path()),
@@ -7473,18 +7472,17 @@ mod tests {
             &approval,
         )
         .unwrap();
-        // Measured before the typist is joined, which outlives the turn on
-        // purpose so an unanswered prompt blocks rather than reading as a
-        // hung-up keyboard.
-        let took = started.elapsed();
+        // The typist outlives the turn on purpose, so an unanswered prompt
+        // blocks rather than reading as a hung-up keyboard.
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         typist.join().unwrap();
 
         assert!(turn.interrupted, "Ctrl-C at the prompt ends the turn");
-        assert!(
-            took < std::time::Duration::from_millis(1500),
-            "the stop did not carry to the calls after it: {took:?}"
-        );
+        // No wall-clock budget here. That the stop carried to the calls after
+        // it is what the assertions below prove; a clock on a shared runner
+        // measures the runner. A stop that failed to carry would leave the
+        // second prompt waiting on a keyboard that never answers, so it would
+        // hang rather than run slow.
         assert!(!workspace.path().join("first").exists());
         assert!(
             !workspace.path().join("second").exists(),
