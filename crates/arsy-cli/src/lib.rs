@@ -5137,6 +5137,9 @@ fn drive_provider(
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
+    // A process group of its own, so a signal aimed at the harness does not also
+    // reach the provider child. There is no Windows equivalent to gate on.
+    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);

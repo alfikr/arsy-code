@@ -18,6 +18,9 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Intra-workspace crates are depended on by path and never published, so they
+# carry no version requirement. Wildcards from crates.io stay denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
