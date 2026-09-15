@@ -80,7 +80,17 @@ pub fn inspect(
             continue;
         }
         let declarations = if kind == "mcp" {
-            importer.mcp_declarations(ecosystem, working)
+            importer
+                .mcp_declarations(ecosystem, working)
+                .map(|mut in_workspace| {
+                    // Claude keeps user-scope connections in the operator's home
+                    // rather than in the checkout, so a workspace with no
+                    // `.mcp.json` still has connections the operator declared.
+                    if ecosystem == Ecosystem::Claude {
+                        in_workspace.extend(user_declarations());
+                    }
+                    in_workspace
+                })
         } else {
             importer.hook_declarations()
         }
@@ -373,6 +383,18 @@ fn details(kind: &str, entry: &Value) -> Vec<String> {
     rows
 }
 
+/// Claude's user-scope connections, from the operator's own `~/.claude.json`.
+///
+/// A file that cannot be read or does not parse yields nothing rather than
+/// failing the listing: it is not this workspace's file, and a listing that
+/// refuses to show the workspace's own connections because of it is worse
+/// than one that is short.
+fn user_declarations() -> Vec<serde_json::Value> {
+    arsy_kernel::config::home_config_file(".claude.json")
+        .map(|path| arsy_code::compat::user_mcp_declarations(&path).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 /// An empty result is ambiguous on its own, so it names what was read and which
 /// filters were applied — otherwise a typo in `--event` looks like a missing
 /// integration.
@@ -381,7 +403,7 @@ fn nothing_found(kind: &str, source: Option<&str>, event: Option<&str>) -> Strin
     // it: naming a file that was skipped sends the reader to the wrong place.
     let searched = if kind == "mcp" {
         [
-            (".mcp.json (claude)", "claude"),
+            (".mcp.json and ~/.claude.json (claude)", "claude"),
             (".codex/config.toml (codex)", "codex"),
             ("the nearest .omp/mcp.json (omp)", "omp"),
         ]

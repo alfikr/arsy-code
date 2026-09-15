@@ -30,7 +30,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mcp",
-        "inspect MCP declarations; list | show NAME, --source claude|codex|omp",
+        "MCP declarations; list | show NAME | import, --source claude|codex|omp",
     ),
     ("/hooks", "inspect Claude hooks; list, --event NAME"),
     (

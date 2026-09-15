@@ -86,6 +86,12 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
     }
 
     let scope = Scope::parse(arguments.scope.as_deref())?;
+    if action == "import" {
+        if !positional.is_empty() {
+            return Err(usage("mcp import takes no connection name"));
+        }
+        return Ok(Command::McpImport { scope });
+    }
     let name = if positional.is_empty() {
         return Err(usage(format!("mcp {action} requires a connection name")));
     } else {
@@ -269,6 +275,132 @@ pub fn add(
         "connected": false,
     }));
     Ok(0)
+}
+
+/// `arsy mcp import`: adopt the operator's Claude connections as ARSY ones.
+///
+/// Reading a declaration is not connecting to it, so a declared connection is
+/// inert until it is written into `arsy.json` — this is the step that adopts
+/// one. It is explicit rather than automatic because adopting a definition is
+/// what decides that a program may be started or a body may leave the machine,
+/// and that decision belongs to the operator, not to whatever a file happened
+/// to say.
+///
+/// A name that is already defined is left exactly as it is: an import must
+/// never quietly repoint a connection the operator configured themselves.
+pub fn import(
+    invocation: &Invocation,
+    scope: Scope,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let root = crate::workspace_root(&invocation.workspace)?;
+    let path = scope.path(&root)?;
+    let mut current = read(&path)?;
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    for declaration in declared_for_import(&root)? {
+        let server = server_from_declaration(&declaration)?;
+        if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)? {
+            skipped.push(server.name);
+            continue;
+        }
+        current = crate::config_edit::set(
+            &current,
+            &["mcp", "server"],
+            &server.name,
+            definition_json(&server),
+        )
+        .map_err(config_broken)?;
+        imported.push(server.name);
+    }
+    if !imported.is_empty() {
+        write(&path, &current)?;
+    }
+    emitter.result(json!({
+        "imported": imported,
+        "already_defined": skipped,
+        "scope": scope.as_str(),
+        "path": path.display().to_string(),
+        "connected": false,
+    }));
+    Ok(0)
+}
+
+/// Every Claude MCP declaration this workspace and this operator carry.
+fn declared_for_import(root: &Path) -> Result<Vec<Value>, Diagnostic> {
+    let importer = arsy_code::compat::CompatibilityImporter::new(root);
+    let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let working = if working.starts_with(root) {
+        working
+    } else {
+        root.to_path_buf()
+    };
+    let mut declarations = importer
+        .mcp_declarations(arsy_code::compat::Ecosystem::Claude, &working)
+        .map_err(|error| {
+            Diagnostic::error(
+                "ARSY-CMP-1001",
+                format!("claude import failed: {error}"),
+                "fix the source configuration; no connection was written",
+            )
+        })?;
+    if let Some(home) = arsy_kernel::config::home_config_file(".claude.json") {
+        declarations.extend(
+            arsy_code::compat::user_mcp_declarations(&home).map_err(|error| {
+                Diagnostic::error(
+                    "ARSY-CMP-1001",
+                    format!("{} could not be read: {error}", home.display()),
+                    "fix the file, or move the connection into arsy.json by hand",
+                )
+            })?,
+        );
+    }
+    Ok(declarations)
+}
+
+/// The ARSY definition a mapped declaration describes.
+fn server_from_declaration(declaration: &Value) -> Result<McpServer, Diagnostic> {
+    let text = |key: &str| declaration.get(key).and_then(Value::as_str).unwrap_or("");
+    let name = text("name").to_owned();
+    if !crate::config_edit::is_writable(&name) {
+        return Err(usage(format!(
+            "`{name}` cannot be used as a connection name; add it by hand"
+        )));
+    }
+    let transport = match text("transport") {
+        "stdio" => McpTransport::Stdio {
+            command: text("command").to_owned(),
+            args: declaration
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        },
+        "http" => McpTransport::Http {
+            url: text("url").to_owned(),
+        },
+        other => {
+            return Err(usage(format!(
+                "`{name}` declares the `{other}` transport, which ARSY does not \
+                 connect over; add it by hand if it can be reached another way"
+            )))
+        }
+    };
+    Ok(McpServer {
+        name,
+        transport,
+        // Declared elsewhere and adopted here: the operator asked for it, and
+        // the layer it lands in is what decides its authority.
+        enabled: true,
+        trust: arsy_kernel::config::policy_source(Layer::User),
+        timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+        max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+    })
 }
 
 pub fn remove(
@@ -509,6 +641,65 @@ mod tests {
 
     fn command(args: &[&str]) -> Result<Command, Diagnostic> {
         crate::parse(args.iter().map(|argument| (*argument).to_owned())).map(|it| it.command)
+    }
+
+    #[test]
+    fn an_import_adopts_a_declaration_once_and_never_repoints_one() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".claude.json"),
+            r#"{"mcpServers": {"docs": {"command": "docs-server", "args": ["--serve"]},
+                               "api": {"type": "http", "url": "https://api.test/mcp"}}}"#,
+        )
+        .unwrap();
+
+        let declarations =
+            arsy_code::compat::user_mcp_declarations(&home.path().join(".claude.json")).unwrap();
+        assert_eq!(declarations.len(), 2, "{declarations:?}");
+
+        let docs = declarations
+            .iter()
+            .find(|entry| entry["name"] == json!("docs"))
+            .expect("the stdio declaration is mapped");
+        let server = server_from_declaration(docs).unwrap();
+        assert_eq!(server.name, "docs");
+        assert!(server.enabled, "an adopted connection is usable");
+        assert_eq!(
+            server.transport,
+            McpTransport::Stdio {
+                command: "docs-server".to_owned(),
+                args: vec!["--serve".to_owned()],
+            }
+        );
+        // Adopted into a layer the operator owns, not left at the authority of
+        // the file it was read from.
+        assert_eq!(
+            server.trust,
+            arsy_kernel::config::policy_source(Layer::User)
+        );
+
+        // A name already defined is left alone rather than repointed.
+        let existing = crate::config_edit::set(
+            "{}",
+            &["mcp", "server"],
+            "docs",
+            definition_json(&McpServer {
+                name: "docs".to_owned(),
+                transport: McpTransport::Stdio {
+                    command: "mine".to_owned(),
+                    args: Vec::new(),
+                },
+                enabled: true,
+                trust: arsy_kernel::config::policy_source(Layer::User),
+                timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+                max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+            }),
+        )
+        .unwrap();
+        assert!(crate::config_edit::contains(&existing, &path_of("docs")).unwrap());
+        assert!(existing.contains("mine"), "{existing}");
+        let _ = workspace;
     }
 
     #[test]

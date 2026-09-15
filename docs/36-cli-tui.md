@@ -191,6 +191,20 @@ File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the
 exact content that changed instead of only reporting byte counts.
 
+`/mcp` lists the connections defined in `arsy.json` alongside the declarations
+mapped from other ecosystems. For Claude that is the workspace `.mcp.json` and
+the operator's own `~/.claude.json`, whose user-scope `mcpServers` are read by
+absolute path rather than through the workspace importer, which resolves only
+inside the checkout. A declaration is inert: `arsy mcp import [--scope
+user|workspace]` writes them into `arsy.json`, which is the step that makes
+them connectable, and it never repoints a name that is already defined.
+
+The launch card is reprinted whenever the model or the approval mode changes,
+so the card above the transcript describes the session that is running. On a
+terminal that speaks the Kitty graphics protocol the mark is drawn as an image
+rasterised from `assets/logo.svg`; every other terminal keeps the half-block
+mark.
+
 Checks: `cargo test -p arsy-cli --features tui`,
 `cargo test -p arsy-code --test compat_golden`, and
 `python3 crates/arsy-cli/tests/tui_smoke.py target/debug/arsy` (Unix, TUI build).

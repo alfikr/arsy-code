@@ -2344,6 +2344,15 @@ fn home_directory() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// A file another tool keeps directly in the operator's home directory.
+///
+/// Separate from `config_home`, which `ARSY_CONFIG_HOME` moves: pointing ARSY
+/// at a throwaway configuration must not also move where somebody else's
+/// settings are looked for.
+pub fn home_config_file(name: &str) -> Option<PathBuf> {
+    home_directory().map(|home| home.join(name))
+}
+
 /// Where the user configuration was kept before it moved to `~/.arsy`.
 ///
 /// Read once, by the migration in `arsy-cli`, so an operator who already had a

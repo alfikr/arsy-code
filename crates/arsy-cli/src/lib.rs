@@ -356,6 +356,9 @@ pub enum Command {
         provider: Option<String>,
         capability: Option<String>,
     },
+    McpImport {
+        scope: mcp::Scope,
+    },
     McpAdd {
         server: arsy_kernel::config::McpServer,
         scope: mcp::Scope,
@@ -1222,6 +1225,7 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             emitter,
         ),
         Command::McpAdd { server, scope } => mcp::add(invocation, server, *scope, emitter),
+        Command::McpImport { scope } => mcp::import(invocation, *scope, emitter),
         Command::McpRemove { name, scope } => mcp::remove(invocation, name, *scope, emitter),
         Command::McpEnable {
             name,
