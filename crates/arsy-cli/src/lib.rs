@@ -4768,6 +4768,565 @@ fn native_turn(
     Ok(Turn::default())
 }
 
+/// Take the terminal's size again, no more than ten times a second.
+///
+/// Answers whether it was measured on this pass, because the rows on screen
+/// were laid out for the size before it.
+#[cfg(feature = "tui")]
+fn remeasure(
+    painter: &Painter<'_>,
+    composer: &mut tui::Composer,
+    refreshed: &mut std::time::Instant,
+) -> bool {
+    if refreshed.elapsed() < std::time::Duration::from_millis(100) {
+        return false;
+    }
+    painter.width.set(tui::terminal_width());
+    composer.set_height(tui::terminal_rows());
+    *refreshed = std::time::Instant::now();
+    true
+}
+
+/// Start the provider and wire its three streams.
+///
+/// Stderr and the task being written are each read on their own thread, and
+/// the event stream on a third, so the main loop can watch the keyboard while
+/// the provider works — which is what lets Esc stop a turn and keeps the
+/// composer typeable.
+#[cfg(feature = "tui")]
+type ProviderStreams = (
+    tui::ProviderChild,
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Receiver<io::Result<()>>,
+    std::sync::mpsc::Receiver<io::Result<String>>,
+);
+
+#[cfg(feature = "tui")]
+fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<ProviderStreams> {
+    // A process group of its own, so a signal aimed at the harness does not also
+    // reach the provider child. There is no Windows equivalent to gate on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut child = tui::ProviderChild(child);
+    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
+    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
+        let _ = io::copy(&mut stderr, &mut io::sink());
+        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
+    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
+    let task = task.to_owned();
+    let (sent, input) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sent.send(stdin.write_all(task.as_bytes()));
+    });
+    // The event stream is read on a thread so the main loop can also watch the
+    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
+    // the composer alive and typeable while the provider works.
+    let stdout = child.0.stdout.take().expect("piped stdout is available");
+    let events = tui::provider_lines(stdout);
+    Ok((child, error_output, input, events))
+}
+
+/// The parts of a running turn an event can change.
+#[cfg(feature = "tui")]
+struct Streamlined<'a> {
+    outcome: &'a mut Turn,
+    finished: &'a mut Option<std::time::Instant>,
+    stopped_early: &'a mut bool,
+    seen_git: &'a mut std::collections::HashSet<String>,
+    /// The last row drawn, so an event that renders the same twice is drawn
+    /// once.
+    last_row: &'a mut Option<String>,
+}
+
+/// Read one line from the provider and draw what it says.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn show_event(
+    line: &str,
+    redactor: &Redactor,
+    child: &mut tui::ProviderChild,
+    painter: &Painter<'_>,
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    run: Streamlined<'_>,
+    colour: bool,
+    tick: usize,
+) -> io::Result<()> {
+    let line = redactor.sanitize(line).map_err(io::Error::other)?;
+    let event = serde_json::from_str::<Value>(&line)
+        .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
+    absorb_event(&event, run.outcome, run.finished);
+    let repeated_git = run.finished.is_none() && repeated_git(&event, run.seen_git);
+    if repeated_git {
+        *run.stopped_early = true;
+        *run.finished = Some(std::time::Instant::now());
+        child.stop(false);
+        note_repeated_git(run.outcome);
+        painter.row(
+            terminal,
+            composer,
+            Some(&tui::tool_result_row(
+                colour,
+                "git",
+                true,
+                "repeated successful command skipped",
+            )),
+            false,
+            run.outcome.queued.len(),
+            tick,
+        )?;
+    }
+    // A killed provider still flushes buffered events; showing them
+    // after the interrupt notice would contradict it.
+    if !run.outcome.interrupted && !repeated_git {
+        if let Some(row) = tui::render_codex_event(&line, colour) {
+            if run.last_row.as_ref() != Some(&row) {
+                painter.row(
+                    terminal,
+                    composer,
+                    Some(&row),
+                    false,
+                    run.outcome.queued.len(),
+                    tick,
+                )?;
+            }
+            *run.last_row = Some(row);
+        }
+    }
+    Ok(())
+}
+
+/// Say in the answer that a repeated Git command was stopped.
+///
+/// The turn ends here, so the reason has to reach the model in the answer
+/// itself: the row on screen is for the operator, not for the next request.
+#[cfg(feature = "tui")]
+fn note_repeated_git(outcome: &mut Turn) {
+    if !outcome.response.is_empty() {
+        outcome.response.push_str("\n\n");
+    }
+    outcome
+        .response
+        .push_str("The provider repeated a successful Git command; the duplicate was skipped.");
+}
+
+/// Take what an event says about the turn.
+///
+/// The provider's own words are the answer; a terminal event settles when the
+/// turn ended, whatever the process does afterwards.
+#[cfg(feature = "tui")]
+fn absorb_event(event: &Value, outcome: &mut Turn, finished: &mut Option<std::time::Instant>) {
+    if finished.is_none()
+        && matches!(
+            event["type"].as_str(),
+            Some("turn.completed" | "turn.failed")
+        )
+    {
+        *finished = Some(std::time::Instant::now());
+    }
+    outcome.provider_failed |= event["type"] == "turn.failed";
+    if event["type"] != "item.completed" || event["item"]["type"] != "agent_message" {
+        return;
+    }
+    if let Some(text) = event["item"]["text"].as_str() {
+        if !outcome.response.is_empty() {
+            outcome.response.push('\n');
+        }
+        outcome.response.push_str(text);
+    }
+}
+
+/// Whether the turn's loop carries on.
+#[cfg(feature = "tui")]
+enum Pass {
+    Go,
+    Stop,
+}
+
+/// The clocks a running provider turn watches.
+#[cfg(feature = "tui")]
+struct Clocks<'a> {
+    started: std::time::Instant,
+    status: &'a mut Option<std::process::ExitStatus>,
+    /// When the process was seen to have left.
+    exited: &'a mut Option<std::time::Instant>,
+    /// When the provider said the turn was over.
+    finished: &'a mut Option<std::time::Instant>,
+    last_event: std::time::Instant,
+    /// When a stop was asked for, so it can be escalated.
+    cancelling: Option<std::time::Instant>,
+    stopped_early: &'a mut bool,
+}
+
+/// Where the provider's process stands at the top of a pass.
+///
+/// The turn is over when the provider says it is over. A CLI that lingers
+/// after its terminal event — cleaning up a session, flushing telemetry —
+/// must not keep the clock running against an answer already on screen.
+#[cfg(feature = "tui")]
+fn lifecycle(child: &mut tui::ProviderChild, clocks: Clocks<'_>) -> io::Result<Pass> {
+    if clocks.status.is_none() {
+        *clocks.status = child.0.try_wait()?;
+        if clocks.status.is_some() {
+            *clocks.exited = Some(std::time::Instant::now());
+            child.stop(true);
+        }
+    }
+    if clocks
+        .exited
+        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+    {
+        return Ok(Pass::Stop);
+    }
+    // The turn is over when the provider says it is over. A CLI that
+    // lingers after its terminal event — cleaning up a session, flushing
+    // telemetry — must not keep the clock running against the answer that
+    // is already on screen.
+    //
+    // Trailing rows still land: the stream drains until it has been quiet
+    // for 250ms, and no longer than 2 seconds however talkative it stays.
+    if clocks.status.is_none()
+        && clocks.finished.is_some_and(|at: std::time::Instant| {
+            clocks.last_event.elapsed() >= std::time::Duration::from_millis(250)
+                || at.elapsed() >= std::time::Duration::from_secs(2)
+        })
+    {
+        *clocks.stopped_early = true;
+        child.stop(false);
+        return Ok(Pass::Stop);
+    }
+    if clocks.started.elapsed() >= std::time::Duration::from_secs(300) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "provider exceeded the 300-second turn deadline",
+        ));
+    }
+    if clocks
+        .cancelling
+        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+    {
+        child.stop(true);
+        *clocks.status = Some(child.0.wait()?);
+        return Ok(Pass::Stop);
+    }
+    Ok(Pass::Go)
+}
+
+/// The call a live view is watching.
+#[cfg(feature = "tui")]
+struct LiveCall<'a> {
+    name: &'a str,
+    /// Only a process can be cancelled part way; everything else runs to its
+    /// own end and Ctrl-C would leave the workspace half changed.
+    cancellable: bool,
+    operation_id: arsy_kernel::domain::OperationId,
+}
+
+/// Take the keys pressed while a call runs, answering whether it was
+/// cancelled.
+///
+/// `e` toggles how much of the output is shown. Every other key belongs to
+/// the composer and is read once the call is done.
+#[cfg(feature = "tui")]
+fn absorb_live_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    terminal: &mut io::Stdout,
+    call: LiveCall<'_>,
+    drawn_rows: &mut usize,
+    expanded: &mut bool,
+) -> io::Result<bool> {
+    let mut cancelled = false;
+    for key in keys.try_iter().filter_map(|byte| decoder.feed(byte)) {
+        match key {
+            tui::Key::Interrupt if call.cancellable => {
+                arsy_code::process::cancel(call.operation_id);
+                if *drawn_rows > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
+                    *drawn_rows = 0;
+                }
+                write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
+                terminal.flush()?;
+                cancelled = true;
+            }
+            tui::Key::Char('e' | 'E') => *expanded = !*expanded,
+            _ => {}
+        }
+    }
+    Ok(cancelled)
+}
+
+/// Take whatever a running command has printed since the last pass.
+///
+/// The tail is what a reader needs while it runs, so the buffer is capped and
+/// the oldest output is dropped rather than growing without bound.
+#[cfg(feature = "tui")]
+fn absorb_output(output: &std::sync::mpsc::Receiver<String>, live: &mut String) {
+    /// What is kept of a long-running command's output.
+    const KEEP_BYTES: usize = 16_384;
+
+    live.extend(output.try_iter());
+    if live.len() > KEEP_BYTES {
+        let oldest = live.len() - KEEP_BYTES;
+        live.drain(..oldest);
+    }
+}
+
+/// What a key press during a provider turn can reach.
+#[cfg(feature = "tui")]
+struct Keyboard<'a> {
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    composer: &'a mut tui::Composer,
+    approval: &'a approval::ApprovalCell,
+}
+
+/// The turn those keys can change.
+#[cfg(feature = "tui")]
+struct Turning<'a> {
+    outcome: &'a mut Turn,
+    cancelling: &'a mut Option<std::time::Instant>,
+    last_key: &'a mut std::time::Instant,
+}
+
+/// Take the keys waiting, without blocking on the next one.
+///
+/// Bounded per pass so a held key cannot starve the event stream: whatever is
+/// still waiting is read on the pass after this one.
+///
+/// Answers whether anything typed changed what is on screen.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn provider_keys(
+    board: Keyboard<'_>,
+    terminal: &mut io::Stdout,
+    painter: &Painter<'_>,
+    child: &mut tui::ProviderChild,
+    turning: Turning<'_>,
+    colour: bool,
+    tick: usize,
+) -> io::Result<bool> {
+    let mut typed = false;
+    for _ in 0..256 {
+        let byte = match board.keys.try_recv() {
+            Ok(byte) => byte,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                turning.outcome.quit = true;
+                stop_turn(turning.outcome, child, turning.cancelling);
+                break;
+            }
+        };
+        *turning.last_key = std::time::Instant::now();
+        let Some(key) = board.decoder.feed(byte) else {
+            continue;
+        };
+        // While the provider is running, Interrupt always means the turn,
+        // never the composer or the session — and it drops a queued
+        // follow-up, which was only queued to run after this turn.
+        if key == tui::Key::Interrupt {
+            if stop_turn(turning.outcome, child, turning.cancelling) {
+                painter.row(
+                    terminal,
+                    board.composer,
+                    Some(&tui::interrupted_row(colour)),
+                    true,
+                    0,
+                    tick,
+                )?;
+            }
+            continue;
+        }
+        match board.composer.press(key) {
+            // Shift+Tab is an immediate mode change, not a follow-up task.
+            // Keeping it out of the queue prevents a drafted chat line from
+            // being answered as if it were a second user message.
+            tui::Action::CycleMode => {
+                cycle_approval_mode(board.approval);
+                typed = true;
+            }
+            // A line sent while the provider is busy runs as soon as this
+            // turn ends, rather than being dropped or blocking.
+            tui::Action::Submit(line) if !line.trim().is_empty() => {
+                if turning.outcome.queued.len() < 16 {
+                    // Queued, not dropped: the row below says it was
+                    // taken, and the turn that follows this one runs it.
+                    turning.outcome.queued.push_back(line);
+                    painter.row(
+                        terminal,
+                        board.composer,
+                        Some("  Follow-up queued."),
+                        turning.cancelling.is_some(),
+                        turning.outcome.queued.len(),
+                        tick,
+                    )?;
+                } else {
+                    board.composer.restore(line);
+                    painter.row(
+                        terminal,
+                        board.composer,
+                        Some("  Queue full; draft retained."),
+                        turning.cancelling.is_some(),
+                        turning.outcome.queued.len(),
+                        tick,
+                    )?;
+                }
+            }
+            tui::Action::Submit(_) => typed = true,
+            tui::Action::Quit => {
+                turning.outcome.quit = true;
+                stop_turn(turning.outcome, child, turning.cancelling);
+            }
+            tui::Action::Redraw => typed = true,
+            tui::Action::None => {}
+        }
+    }
+    Ok(typed)
+}
+
+/// Draws the rows a provider turn produces, above the live composer.
+#[cfg(feature = "tui")]
+struct Painter<'a> {
+    colour: bool,
+    footer: &'a str,
+    /// Re-measured on the resize tick rather than per row.
+    width: std::cell::Cell<usize>,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "tui")]
+impl Painter<'_> {
+    /// One row, or none — either way the status under it is repainted.
+    ///
+    /// The composer is torn down and drawn again around each row, so the input
+    /// block is never overwritten by what lands above it.
+    fn row(
+        &self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        row: Option<&str>,
+        cancelling: bool,
+        queued: usize,
+        tick: usize,
+    ) -> io::Result<()> {
+        let mut frame = composer.clear();
+        if let Some(row) = row {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        let phase = if cancelling {
+            tui::TurnPhase::Cancelling
+        } else {
+            tui::TurnPhase::Working
+        };
+        let status = tui::turn_status(self.colour, phase, self.started.elapsed(), tick, queued);
+        frame.push_str(&composer.render_turn(self.width.get(), self.colour, &status, self.footer));
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    }
+}
+
+/// What the provider's exit says about the turn, once the turn itself is done.
+///
+/// A zero process exit must not mask a turn the provider reported as failed,
+/// so the event stream is read before the exit status.
+#[cfg(feature = "tui")]
+fn verdict(
+    child: &mut tui::ProviderChild,
+    route: &tui::ModelRoute,
+    status: Option<std::process::ExitStatus>,
+    stopped_early: bool,
+    outcome: &Turn,
+) -> io::Result<Option<String>> {
+    let status = match status {
+        Some(status) => status,
+        // The turn ended before the process did, so the process is asked to
+        // leave and then made to: waiting on a CLI that ignores the signal is
+        // the hang this exit was added to avoid.
+        None if stopped_early => reap(child)?,
+        None => child.0.wait()?,
+    };
+    Ok(if outcome.provider_failed {
+        Some(format!("{route} reported a failed turn"))
+    // A signal ARSY sent after a completed turn is its own exit code, not a
+    // verdict on the turn the provider already reported.
+    } else if status.success() || stopped_early {
+        None
+    } else {
+        Some(format!("{route} exited with status {status}"))
+    })
+}
+
+/// Wait briefly for a provider asked to leave, then make it.
+#[cfg(feature = "tui")]
+fn reap(child: &mut tui::ProviderChild) -> io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.stop(true);
+            return child.0.wait();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The error for a provider that closed its stream without ever saying the
+/// turn ended, carrying whatever it wrote to stderr.
+#[cfg(feature = "tui")]
+fn silent_provider(
+    errors: &std::sync::mpsc::Receiver<String>,
+    redactor: &Redactor,
+) -> io::Result<io::Error> {
+    let detail = errors
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .unwrap_or_default();
+    let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
+    Ok(io::Error::other(format!(
+        "provider closed its stream without a terminal turn event: {}",
+        terminal_text(detail.trim())
+    )))
+}
+
+/// Whether this event is a Git command that already succeeded this turn.
+///
+/// A provider that repeats a push or a commit would run it twice, so the
+/// duplicate is caught at its start event — before it gets a second chance —
+/// which means the set is filled by the completions that came before it.
+#[cfg(feature = "tui")]
+fn repeated_git(event: &Value, seen: &mut std::collections::HashSet<String>) -> bool {
+    if event["item"]["type"] != "command_execution" {
+        return false;
+    }
+    let Some(command) = event["item"]
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| command.contains("git "))
+    else {
+        return false;
+    };
+    match event["type"].as_str() {
+        Some("item.started") => seen.contains(command),
+        Some("item.completed") if event["item"]["exit_code"].as_i64() == Some(0) => {
+            !seen.insert(command.to_owned())
+        }
+        _ => false,
+    }
+}
+
 /// Stop the running turn.
 ///
 /// The queue goes with it: a follow-up was only queued to run after this turn,
@@ -5496,23 +6055,19 @@ fn dispatch_tool_live(
     terminal.flush()?;
     let mut last_rendered_lines = initial.len();
     loop {
-        while let Ok(byte) = keys.try_recv() {
-            match decoder.feed(byte) {
-                Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
-                    arsy_code::process::cancel(operation_id);
-                    if last_rendered_lines > 0 {
-                        write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
-                        last_rendered_lines = 0;
-                    }
-                    write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
-                    terminal.flush()?;
-                    cancelled = true;
-                }
-                Some(tui::Key::Char('e' | 'E')) => {
-                    expanded = !expanded;
-                }
-                _ => {}
-            }
+        if absorb_live_keys(
+            keys,
+            decoder,
+            terminal,
+            LiveCall {
+                name: &name,
+                cancellable: request.kind.to_string() == "process.exec",
+                operation_id,
+            },
+            &mut last_rendered_lines,
+            &mut expanded,
+        )? {
+            cancelled = true;
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
@@ -5524,13 +6079,7 @@ fn dispatch_tool_live(
                 return Ok((result, cancelled));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                while let Ok(chunk) = output_receiver.try_recv() {
-                    live_output.push_str(&chunk);
-                    if live_output.len() > 16_384 {
-                        let keep_from = live_output.len() - 16_384;
-                        live_output.drain(..keep_from);
-                    }
-                }
+                absorb_output(&output_receiver, &mut live_output);
                 frame = frame.wrapping_add(1);
                 let state = tui::RunningToolState {
                     name: name.as_str(),
@@ -5959,7 +6508,7 @@ fn external_status(
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn drive_provider(
-    mut command: std::process::Command,
+    command: std::process::Command,
     task: &str,
     route: &tui::ModelRoute,
     approval: &approval::ApprovalCell,
@@ -5970,38 +6519,7 @@ fn drive_provider(
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
-    // A process group of its own, so a signal aimed at the harness does not also
-    // reach the provider child. There is no Windows equivalent to gate on.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let mut child = tui::ProviderChild(child);
-    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
-    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
-        let _ = io::copy(&mut stderr, &mut io::sink());
-        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
-    });
-    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
-    let task = task.to_owned();
-    let (sent, input) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sent.send(stdin.write_all(task.as_bytes()));
-    });
-    // The event stream is read on a thread so the main loop can also watch the
-    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
-    // the composer alive and typeable while the provider works.
-    let stdout = child.0.stdout.take().expect("piped stdout is available");
-    let events = tui::provider_lines(stdout);
+    let (mut child, errors, input, events) = spawn_provider(command, task)?;
     let started = std::time::Instant::now();
     let mut cancelling = None;
     let mut stream_closed = false;
@@ -6015,31 +6533,14 @@ fn drive_provider(
     let mut outcome = Turn::default();
     let mut successful_git_commands = std::collections::HashSet::new();
     let mut terminal = io::stdout();
-    let width = std::cell::Cell::new(tui::terminal_width());
     composer.set_height(tui::terminal_rows());
-    let draw = |terminal: &mut io::Stdout,
-                composer: &mut tui::Composer,
-                row: Option<&str>,
-                cancelling: bool,
-                queued: usize,
-                tick: usize| {
-        // Rows land above the composer, which is torn down and repainted around
-        // each one so the input block is never overwritten.
-        let mut frame = composer.clear();
-        if let Some(row) = row {
-            frame.push_str(row);
-            frame.push('\n');
-        }
-        let phase = if cancelling {
-            tui::TurnPhase::Cancelling
-        } else {
-            tui::TurnPhase::Working
-        };
-        let status = tui::turn_status(colour, phase, started.elapsed(), tick, queued);
-        frame.push_str(&composer.render_turn(width.get(), colour, &status, footer));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    let painter = Painter {
+        colour,
+        footer,
+        width: std::cell::Cell::new(tui::terminal_width()),
+        started,
     };
-    draw(&mut terminal, composer, None, false, 0, 0)?;
+    painter.row(&mut terminal, composer, None, false, 0, 0)?;
     let mut refreshed = std::time::Instant::now();
     loop {
         let tick = (started.elapsed().as_millis() / 100) as usize;
@@ -6048,128 +6549,44 @@ fn drive_provider(
                 result?;
             }
         }
-        if status.is_none() {
-            status = child.0.try_wait()?;
-            if status.is_some() {
-                exited = Some(std::time::Instant::now());
-                child.stop(true);
-            }
+        match lifecycle(
+            &mut child,
+            Clocks {
+                started,
+                status: &mut status,
+                exited: &mut exited,
+                finished: &mut finished,
+                last_event,
+                cancelling,
+                stopped_early: &mut stopped_early,
+            },
+        )? {
+            Pass::Stop => break,
+            Pass::Go => {}
         }
-        if exited
-            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            break;
-        }
-        // The turn is over when the provider says it is over. A CLI that
-        // lingers after its terminal event — cleaning up a session, flushing
-        // telemetry — must not keep the clock running against the answer that
-        // is already on screen.
-        //
-        // Trailing rows still land: the stream drains until it has been quiet
-        // for 250ms, and no longer than 2 seconds however talkative it stays.
-        if status.is_none()
-            && finished.is_some_and(|at: std::time::Instant| {
-                last_event.elapsed() >= std::time::Duration::from_millis(250)
-                    || at.elapsed() >= std::time::Duration::from_secs(2)
-            })
-        {
-            stopped_early = true;
-            child.stop(false);
-            break;
-        }
-        if started.elapsed() >= std::time::Duration::from_secs(300) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "provider exceeded the 300-second turn deadline",
-            ));
-        }
-        if cancelling
-            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            child.stop(true);
-            status = Some(child.0.wait()?);
-            break;
-        }
-        let mut typed = false;
-        for _ in 0..256 {
-            let byte = match keys.try_recv() {
-                Ok(byte) => byte,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    outcome.quit = true;
-                    stop_turn(&mut outcome, &mut child, &mut cancelling);
-                    break;
-                }
-            };
-            last_key = std::time::Instant::now();
-            let Some(key) = decoder.feed(byte) else {
-                continue;
-            };
-            // While the provider is running, Interrupt always means the turn,
-            // never the composer or the session — and it drops a queued
-            // follow-up, which was only queued to run after this turn.
-            if key == tui::Key::Interrupt {
-                if stop_turn(&mut outcome, &mut child, &mut cancelling) {
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::interrupted_row(colour)),
-                        true,
-                        0,
-                        tick,
-                    )?;
-                }
-                continue;
-            }
-            match composer.press(key) {
-                // Shift+Tab is an immediate mode change, not a follow-up task.
-                // Keeping it out of the queue prevents a drafted chat line from
-                // being answered as if it were a second user message.
-                tui::Action::CycleMode => {
-                    cycle_approval_mode(approval);
-                    typed = true;
-                }
-                // A line sent while the provider is busy runs as soon as this
-                // turn ends, rather than being dropped or blocking.
-                tui::Action::Submit(line) if !line.trim().is_empty() => {
-                    if outcome.queued.len() < 16 {
-                        // Queued, not dropped: the row below says it was
-                        // taken, and the turn that follows this one runs it.
-                        outcome.queued.push_back(line);
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some("  Follow-up queued."),
-                            cancelling.is_some(),
-                            outcome.queued.len(),
-                            tick,
-                        )?;
-                    } else {
-                        composer.restore(line);
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some("  Queue full; draft retained."),
-                            cancelling.is_some(),
-                            outcome.queued.len(),
-                            tick,
-                        )?;
-                    }
-                }
-                tui::Action::Submit(_) => typed = true,
-                tui::Action::Quit => {
-                    outcome.quit = true;
-                    stop_turn(&mut outcome, &mut child, &mut cancelling);
-                }
-                tui::Action::Redraw => typed = true,
-                tui::Action::None => {}
-            }
-        }
+        let typed = provider_keys(
+            Keyboard {
+                keys,
+                decoder,
+                composer,
+                approval,
+            },
+            &mut terminal,
+            &painter,
+            &mut child,
+            Turning {
+                outcome: &mut outcome,
+                cancelling: &mut cancelling,
+                last_key: &mut last_key,
+            },
+            colour,
+            tick,
+        )?;
         if last_key.elapsed() >= std::time::Duration::from_millis(40)
             && decoder.flush_escape() == Some(tui::Key::Interrupt)
             && stop_turn(&mut outcome, &mut child, &mut cancelling)
         {
-            draw(
+            painter.row(
                 &mut terminal,
                 composer,
                 Some(&tui::interrupted_row(colour)),
@@ -6178,14 +6595,9 @@ fn drive_provider(
                 tick,
             )?;
         }
-        let resize_tick = refreshed.elapsed() >= std::time::Duration::from_millis(100);
-        if resize_tick {
-            width.set(tui::terminal_width());
-            composer.set_height(tui::terminal_rows());
-            refreshed = std::time::Instant::now();
-        }
+        let resize_tick = remeasure(&painter, composer, &mut refreshed);
         if typed || resize_tick {
-            draw(
+            painter.row(
                 &mut terminal,
                 composer,
                 None,
@@ -6198,95 +6610,28 @@ fn drive_provider(
             Ok(_) if outcome.interrupted => {}
             Ok(line) => {
                 last_event = std::time::Instant::now();
-                let line = line?;
-                let line = redactor.sanitize(&line).map_err(io::Error::other)?;
-                let event = serde_json::from_str::<Value>(&line)
-                    .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
-                if matches!(
-                    event["type"].as_str(),
-                    Some("turn.completed" | "turn.failed")
-                ) && finished.is_none()
-                {
-                    finished = Some(std::time::Instant::now());
-                }
-                if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" {
-                    if let Some(text) = event["item"]["text"].as_str() {
-                        if !outcome.response.is_empty() {
-                            outcome.response.push('\n');
-                        }
-                        outcome.response.push_str(text);
-                    }
-                }
-                outcome.provider_failed |= event["type"] == "turn.failed";
-                let repeated_git =
-                    if finished.is_none() && event["item"]["type"] == "command_execution" {
-                        event["item"]
-                            .get("command")
-                            .and_then(Value::as_str)
-                            .filter(|command| command.contains("git "))
-                            .is_some_and(|command| {
-                                if event["type"] == "item.started" {
-                                    // Stop at the start event, before a duplicate
-                                    // push or commit gets a second chance to run.
-                                    successful_git_commands.contains(command)
-                                } else if event["type"] == "item.completed"
-                                    && event["item"]["exit_code"].as_i64() == Some(0)
-                                {
-                                    !successful_git_commands.insert(command.to_owned())
-                                } else {
-                                    false
-                                }
-                            })
-                    } else {
-                        false
-                    };
-                if repeated_git {
-                    stopped_early = true;
-                    finished = Some(std::time::Instant::now());
-                    child.stop(false);
-                    let notice =
-                        "The provider repeated a successful Git command; the duplicate was skipped.";
-                    if !outcome.response.is_empty() {
-                        outcome.response.push_str("\n\n");
-                    }
-                    outcome.response.push_str(notice);
-                    let row = tui::tool_result_row(
-                        colour,
-                        "git",
-                        true,
-                        "repeated successful command skipped",
-                    );
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&row),
-                        false,
-                        outcome.queued.len(),
-                        tick,
-                    )?;
-                }
-                // A killed provider still flushes buffered events; showing them
-                // after the interrupt notice would contradict it.
-                if !outcome.interrupted && !repeated_git {
-                    if let Some(row) = tui::render_codex_event(&line, colour) {
-                        if last_row.as_ref() != Some(&row) {
-                            draw(
-                                &mut terminal,
-                                composer,
-                                Some(&row),
-                                false,
-                                outcome.queued.len(),
-                                tick,
-                            )?;
-                        }
-                        last_row = Some(row);
-                    }
-                }
+                show_event(
+                    &line?,
+                    redactor,
+                    &mut child,
+                    &painter,
+                    &mut terminal,
+                    composer,
+                    Streamlined {
+                        outcome: &mut outcome,
+                        finished: &mut finished,
+                        stopped_early: &mut stopped_early,
+                        seen_git: &mut successful_git_commands,
+                        last_row: &mut last_row,
+                    },
+                    colour,
+                    tick,
+                )?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Repaint so the spinner and clock stay alive while the
                 // provider is quiet, not just when an event or a key arrives.
-                draw(
+                painter.row(
                     &mut terminal,
                     composer,
                     None,
@@ -6307,47 +6652,10 @@ fn drive_provider(
     write!(terminal, "{}", composer.clear())?;
     terminal.flush()?;
     if !outcome.interrupted && finished.is_none() {
-        let detail = error_output
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .unwrap_or_default();
-        let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
-        return Err(io::Error::other(format!(
-            "provider closed its stream without a terminal turn event: {}",
-            terminal_text(detail.trim())
-        )));
+        return Err(silent_provider(&errors, redactor)?);
     }
-    // A zero process exit must not mask a turn the provider itself reported as
-    // failed, so the event stream is checked before the exit status.
     if !outcome.interrupted {
-        let status = match status {
-            Some(status) => status,
-            // The turn ended before the process did, so the process is asked to
-            // leave and then made to: waiting on a CLI that ignores the signal
-            // is the hang this exit was added to avoid.
-            None if stopped_early => {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                loop {
-                    if let Some(status) = child.0.try_wait()? {
-                        break status;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        child.stop(true);
-                        break child.0.wait()?;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-            None => child.0.wait()?,
-        };
-        outcome.failure = if outcome.provider_failed {
-            Some(format!("{route} reported a failed turn"))
-        // A signal ARSY sent after a completed turn is its own exit code, not a
-        // verdict on the turn the provider already reported.
-        } else if status.success() || stopped_early {
-            None
-        } else {
-            Some(format!("{route} exited with status {status}"))
-        };
+        outcome.failure = verdict(&mut child, route, status, stopped_early, &outcome)?;
     }
     Ok(outcome)
 }
