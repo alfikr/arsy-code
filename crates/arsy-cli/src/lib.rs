@@ -2612,27 +2612,18 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 ) =>
                 {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    let unchanged = match prompt {
-                        Prompt::Effort => effort_line(effort),
-                        Prompt::Theme => {
-                            // The preview left the palette on the last row
-                            // arrowed onto; put the committed one back.
-                            tui::set_palette(&theme, &theme_config.roles);
-                            format!("Theme unchanged: {theme}")
-                        }
-                        Prompt::Provider(_) => {
-                            draft = tui::ProviderDraft::default();
-                            "Provider unchanged.".to_owned()
-                        }
-                        Prompt::Auth(_) => {
-                            auth_draft.clear();
-                            "Auth unchanged.".to_owned()
-                        }
-                        Prompt::Resume => {
-                            format!("Session unchanged: {}.", state.session_id())
-                        }
-                        _ => format!("Model unchanged: {route}"),
-                    };
+                    let unchanged = leave_picker(
+                        &prompt,
+                        Leaving {
+                            effort,
+                            theme: &theme,
+                            roles: &theme_config.roles,
+                            draft: &mut draft,
+                            auth_draft: &mut auth_draft,
+                            session: state.session_id(),
+                            route: &route,
+                        },
+                    );
                     writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
                     prompt = Prompt::Task;
                     continue;
@@ -2696,17 +2687,22 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Resume => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
-                    Ok(picked_id) => {
-                        (conversation, history) =
-                            reconstruct_session_conversation(&workspace, picked_id);
-                        transcript.clear();
-                        state.set_session_id(picked_id);
-                        set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
-                        queued.clear();
+                    Ok(picked) => {
+                        let loaded = resume_into(
+                            picked,
+                            Restoring {
+                                workspace: &workspace,
+                                state: &mut state,
+                                conversation: &mut conversation,
+                                transcript: &mut transcript,
+                                history: &mut history,
+                                approval: &approval,
+                                queued: &mut queued,
+                            },
+                        );
                         writeln!(
                             stdout,
-                            "Resumed session {picked_id} ({} message(s) loaded).",
-                            conversation.len()
+                            "Resumed session {picked} ({loaded} message(s) loaded)."
                         )
                         .map_err(terminal_failed)?;
                         prompt = Prompt::Task;
@@ -2728,20 +2724,21 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                                 if let Some(action) = dialog.handle_key(key) {
                                     match action {
                                         tui::SessionAction::Resume(id) => {
-                                            (conversation, history) =
-                                                reconstruct_session_conversation(&workspace, id);
-                                            transcript.clear();
-                                            state.set_session_id(id);
-                                            set_approval_mode(
-                                                &approval,
-                                                &mut state,
-                                                approval::ApprovalMode::Default,
+                                            let loaded = resume_into(
+                                                id,
+                                                Restoring {
+                                                    workspace: &workspace,
+                                                    state: &mut state,
+                                                    conversation: &mut conversation,
+                                                    transcript: &mut transcript,
+                                                    history: &mut history,
+                                                    approval: &approval,
+                                                    queued: &mut queued,
+                                                },
                                             );
-                                            queued.clear();
                                             writeln!(
                                                 stdout,
-                                                "Resumed session {id} ({} message(s) loaded).",
-                                                conversation.len()
+                                                "Resumed session {id} ({loaded} message(s) loaded)."
                                             )
                                             .map_err(terminal_failed)?;
                                             prompt = Prompt::Task;
@@ -3067,68 +3064,31 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
-            Prompt::Task if line.trim() == "/auth" => {
+            Prompt::Task if opens_picker(&line) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                providers = configured_providers(invocation);
-                auth_draft.clear();
-                prompt = Prompt::Auth(tui::AuthStep::Pick);
-            }
-            Prompt::Task if line.trim() == "/model" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Re-read, so a model added to any endpoint since startup is
-                // offered without restarting.
-                models = {
-                    let mut models = endpoint_models(invocation);
-                    models.extend(tui::available_models());
-                    models
-                };
-                prompt = Prompt::Model;
+                if let Some(next) = open_picker(
+                    &line,
+                    invocation,
+                    Opening {
+                        models: &mut models,
+                        providers: &mut providers,
+                        chosen: &mut chosen_provider,
+                        draft: &mut draft,
+                        auth_draft: &mut auth_draft,
+                        effort: &mut effort,
+                        theme: &mut theme,
+                        roles: &theme_config.roles,
+                        state: &mut state,
+                    },
+                    &mut stdout,
+                    emitter,
+                )? {
+                    // `None` means the line answered outright rather than
+                    // opening a list, so the task prompt stays.
+                    prompt = next;
+                }
             }
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
-            Prompt::Task if line.split_whitespace().next() == Some("/provider") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                providers = configured_providers(invocation);
-                chosen_provider = configured_default(invocation);
-                draft = tui::ProviderDraft::default();
-                prompt = Prompt::Provider(tui::ProviderStep::Pick);
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // A bare `/effort` opens the list, so the levels can be read
-                // before one is chosen; `/effort high` still sets it outright.
-                match line.split_whitespace().nth(1) {
-                    None => prompt = Prompt::Effort,
-                    Some(answer) => match tui::resolve_effort_answer(answer, effort) {
-                        Ok(picked) => {
-                            effort = picked;
-                            state.set_effort(effort);
-                            remember_effort(effort, emitter);
-                            writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
-                        }
-                        Err(reason) => {
-                            writeln!(stdout, "{}", tui::safe_text(&reason))
-                                .map_err(terminal_failed)?;
-                        }
-                    },
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/theme") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // A bare `/theme` opens the list; `/theme light` sets it outright.
-                match line.split_whitespace().nth(1) {
-                    None => prompt = Prompt::Theme,
-                    Some(answer) => {
-                        apply_theme(
-                            answer,
-                            &mut theme,
-                            &theme_config.roles,
-                            &mut stdout,
-                            emitter,
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                }
-            }
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                 if line.split_whitespace().next() == Some("/help") {
@@ -3173,25 +3133,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     colour,
                     tui::branch(&workspace).as_deref(),
                 );
-                let selected_provider = if resolved_providers.contains_key(&route.provider) {
-                    resolved_providers.get(&route.provider)
-                } else if unavailable_providers.contains(&route.provider) {
-                    None
-                } else {
-                    let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
-                    let resolved = load_config(&workspace, &working, invocation.config.as_deref())
-                        .ok()
-                        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
-                    match resolved {
-                        Some(resolved) => {
-                            resolved_providers.insert(route.provider.clone(), resolved);
-                        }
-                        None => {
-                            unavailable_providers.insert(route.provider.clone());
-                        }
-                    }
-                    resolved_providers.get(&route.provider)
-                };
+                let selected_provider = resolve_route(
+                    invocation,
+                    &workspace,
+                    &route.provider,
+                    &mut resolved_providers,
+                    &mut unavailable_providers,
+                );
                 match run_turn(
                     invocation,
                     state.session_id(),
@@ -3225,74 +3173,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             && !turn.interrupted
                             && turn.failure.is_none()
                         {
-                            let projection =
-                                progress::plan(&workspace, &state.session_id().to_string());
-                            let structured = progress::human_plan(&projection);
-                            let has_structured_steps = projection["steps"]
-                                .as_array()
-                                .is_some_and(|steps| !steps.is_empty());
-                            let plan_preview =
-                                if has_structured_steps || turn.response.trim().is_empty() {
-                                    structured
-                                } else {
-                                    turn.response.clone()
-                                };
-                            match confirm_plan(
+                            settle_plan(
+                                &workspace,
+                                &turn.response,
+                                &approval,
+                                &mut state,
+                                &mut queued,
                                 &mut stdout,
                                 colour,
                                 &keys,
                                 &mut decoder,
-                                &plan_preview,
-                            )
-                            .map_err(terminal_failed)?
-                            {
-                                tui::AskDialogResult::Approve { note } => {
-                                    let mode = approval.approve_plan();
-                                    state.set_approval_mode(mode.label());
-                                    let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
-                                    if let Some(note) = note {
-                                        instruction
-                                            .push_str(&format!(" Operator constraint: {note}"));
-                                    }
-                                    queued.push_front(instruction);
-                                    writeln!(
-                                        stdout,
-                                        "Plan approved. Entering {} mode.",
-                                        mode.label()
-                                    )
-                                    .map_err(terminal_failed)?;
-                                }
-                                // The dialog's second choice is "continue
-                                // planning", so it stays in Plan Mode and
-                                // queues another planning turn.
-                                tui::AskDialogResult::AlwaysApprove { note } => {
-                                    queued.push_front(revise_instruction(note.as_deref()));
-                                }
-                                tui::AskDialogResult::CycleMode => {
-                                    let mode = cycle_approval_mode(&approval);
-                                    state.set_approval_mode(mode.label());
-                                    queued.clear();
-                                    writeln!(
-                                        stdout,
-                                        "Approval mode: {} — {}",
-                                        mode.label(),
-                                        mode.description()
-                                    )
-                                    .map_err(terminal_failed)?;
-                                }
-                                tui::AskDialogResult::Deny { .. }
-                                | tui::AskDialogResult::Cancel => {
-                                    let mode = approval.cancel_plan();
-                                    state.set_approval_mode(mode.label());
-                                    queued.clear();
-                                    writeln!(
-                                        stdout,
-                                        "Planning cancelled. Approval mode: {}.",
-                                        mode.label()
-                                    )
-                                    .map_err(terminal_failed)?;
-                                }
-                            }
+                            )?;
                         }
                     }
                     Err(diagnostic) => emitter.diagnostic(&diagnostic),
@@ -4766,6 +4657,259 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// The slash commands that choose a setting, by opening its list or by naming
+/// the answer on the same line.
+#[cfg(feature = "tui")]
+fn opens_picker(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/auth" | "/model" | "/provider" | "/effort" | "/theme")
+    )
+}
+
+/// What opening a picker re-reads or resets.
+#[cfg(feature = "tui")]
+struct Opening<'a> {
+    models: &'a mut Vec<tui::ModelChoice>,
+    providers: &'a mut Vec<String>,
+    chosen: &'a mut Option<String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    effort: &'a mut Option<Effort>,
+    theme: &'a mut String,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    state: &'a mut tui::TuiState,
+}
+
+/// Open the picker a slash command names, or take the answer it carried.
+///
+/// `Some` is the prompt that now collects the answer; `None` means the line
+/// answered outright and the task prompt stays.
+#[cfg(feature = "tui")]
+fn open_picker(
+    line: &str,
+    invocation: &Invocation,
+    opening: Opening<'_>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let mut words = line.split_whitespace();
+    let (command, answer) = (words.next(), words.next());
+    match command {
+        Some("/auth") => {
+            *opening.providers = configured_providers(invocation);
+            opening.auth_draft.clear();
+            Ok(Some(Prompt::Auth(tui::AuthStep::Pick)))
+        }
+        Some("/model") => {
+            // Re-read, so a model added to any endpoint since startup is
+            // offered without restarting.
+            let mut models = endpoint_models(invocation);
+            models.extend(tui::available_models());
+            *opening.models = models;
+            Ok(Some(Prompt::Model))
+        }
+        Some("/provider") => {
+            *opening.providers = configured_providers(invocation);
+            *opening.chosen = configured_default(invocation);
+            *opening.draft = tui::ProviderDraft::default();
+            Ok(Some(Prompt::Provider(tui::ProviderStep::Pick)))
+        }
+        // A bare `/effort` opens the list, so the levels can be read before
+        // one is chosen; `/effort high` still sets it outright.
+        Some("/effort") => match answer {
+            None => Ok(Some(Prompt::Effort)),
+            Some(answer) => {
+                take_effort(answer, opening.effort, opening.state, stdout, emitter)?;
+                Ok(None)
+            }
+        },
+        // A bare `/theme` opens the list; `/theme light` sets it outright.
+        Some("/theme") => match answer {
+            None => Ok(Some(Prompt::Theme)),
+            Some(answer) => {
+                apply_theme(answer, opening.theme, opening.roles, stdout, emitter)
+                    .map_err(terminal_failed)?;
+                Ok(None)
+            }
+        },
+        _ => Ok(None),
+    }
+}
+
+/// What a session being opened replaces.
+#[cfg(feature = "tui")]
+struct Restoring<'a> {
+    workspace: &'a Path,
+    state: &'a mut tui::TuiState,
+    conversation: &'a mut Vec<ModelMessage>,
+    transcript: &'a mut tui::Transcript,
+    history: &'a mut arsy_code::agent::budget::History,
+    approval: &'a approval::ApprovalCell,
+    queued: &'a mut std::collections::VecDeque<String>,
+}
+
+/// Open a recorded session, answering how many messages it carried.
+///
+/// The approval mode goes back to default and the queue is dropped: both
+/// belonged to the session being left, and carrying either into another one
+/// would give it authority nobody granted it there.
+#[cfg(feature = "tui")]
+fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize {
+    let (conversation, history) = reconstruct_session_conversation(restoring.workspace, session);
+    *restoring.conversation = conversation;
+    *restoring.history = history;
+    restoring.transcript.clear();
+    restoring.state.set_session_id(session);
+    set_approval_mode(
+        restoring.approval,
+        restoring.state,
+        approval::ApprovalMode::Default,
+    );
+    restoring.queued.clear();
+    restoring.conversation.len()
+}
+
+/// What a picker leaves behind when it is closed without an answer.
+#[cfg(feature = "tui")]
+struct Leaving<'a> {
+    effort: Option<Effort>,
+    theme: &'a str,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    session: SessionId,
+    route: &'a tui::ModelRoute,
+}
+
+/// Close a picker without taking an answer, and say what is still in force.
+///
+/// Ending input at a picker cancels the picker, not the session: the setting
+/// is unchanged and the task prompt returns.
+#[cfg(feature = "tui")]
+fn leave_picker(prompt: &Prompt, leaving: Leaving<'_>) -> String {
+    match prompt {
+        Prompt::Effort => effort_line(leaving.effort),
+        Prompt::Theme => {
+            // The preview left the palette on the last row arrowed onto; put
+            // the committed one back.
+            tui::set_palette(leaving.theme, leaving.roles);
+            format!("Theme unchanged: {}", leaving.theme)
+        }
+        Prompt::Provider(_) => {
+            *leaving.draft = tui::ProviderDraft::default();
+            "Provider unchanged.".to_owned()
+        }
+        Prompt::Auth(_) => {
+            leaving.auth_draft.clear();
+            "Auth unchanged.".to_owned()
+        }
+        Prompt::Resume => format!("Session unchanged: {}.", leaving.session),
+        _ => format!("Model unchanged: {}", leaving.route),
+    }
+}
+
+/// The provider for this route, resolved once and remembered.
+///
+/// A lookup that failed is remembered too: probing a credential store on every
+/// turn is slow, and asks the operating system for a credential the operator
+/// already declined once.
+#[cfg(feature = "tui")]
+fn resolve_route<'a>(
+    invocation: &Invocation,
+    workspace: &Path,
+    provider: &str,
+    resolved: &'a mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable: &mut std::collections::HashSet<String>,
+) -> Option<&'a provider::Resolved> {
+    if !resolved.contains_key(provider) && !unavailable.contains(provider) {
+        let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+        match load_config(workspace, &working, invocation.config.as_deref())
+            .ok()
+            .and_then(|config| provider::resolve(&config, Some(provider)).ok())
+        {
+            Some(found) => {
+                resolved.insert(provider.to_owned(), found);
+            }
+            None => {
+                unavailable.insert(provider.to_owned());
+            }
+        }
+    }
+    resolved.get(provider)
+}
+
+/// Ask the operator what to do with the plan a planning turn produced.
+///
+/// The structured plan is preferred over the prose, because that is what the
+/// harness recorded; the prose stands in only when no steps were written.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn settle_plan(
+    workspace: &Path,
+    response: &str,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let projection = progress::plan(workspace, &state.session_id().to_string());
+    let structured = progress::human_plan(&projection);
+    let has_steps = projection["steps"]
+        .as_array()
+        .is_some_and(|steps| !steps.is_empty());
+    let preview = if has_steps || response.trim().is_empty() {
+        structured
+    } else {
+        response.to_owned()
+    };
+    match confirm_plan(stdout, colour, keys, decoder, &preview).map_err(terminal_failed)? {
+        tui::AskDialogResult::Approve { note } => {
+            let mode = approval.approve_plan();
+            state.set_approval_mode(mode.label());
+            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
+            if let Some(note) = note {
+                instruction.push_str(&format!(" Operator constraint: {note}"));
+            }
+            queued.push_front(instruction);
+            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                .map_err(terminal_failed)?;
+        }
+        // The dialog's second choice is "continue planning", so it stays in
+        // Plan Mode and queues another planning turn.
+        tui::AskDialogResult::AlwaysApprove { note } => {
+            queued.push_front(revise_instruction(note.as_deref()));
+        }
+        tui::AskDialogResult::CycleMode => {
+            let mode = cycle_approval_mode(approval);
+            state.set_approval_mode(mode.label());
+            queued.clear();
+            writeln!(
+                stdout,
+                "Approval mode: {} — {}",
+                mode.label(),
+                mode.description()
+            )
+            .map_err(terminal_failed)?;
+        }
+        tui::AskDialogResult::Deny { .. } | tui::AskDialogResult::Cancel => {
+            let mode = approval.cancel_plan();
+            state.set_approval_mode(mode.label());
+            queued.clear();
+            writeln!(
+                stdout,
+                "Planning cancelled. Approval mode: {}.",
+                mode.label()
+            )
+            .map_err(terminal_failed)?;
+        }
+    }
+    Ok(())
 }
 
 /// Carry the provider wizard one step, and say which step comes next.
