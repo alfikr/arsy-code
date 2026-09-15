@@ -4640,6 +4640,319 @@ fn native_turn(
     Ok(Turn::default())
 }
 
+/// The reasoning box as it stands, and the buffer holding the part of the
+/// current line that has not been drawn.
+#[cfg(feature = "tui")]
+struct Reasoning<'a> {
+    colour: bool,
+    footer: &'a str,
+    status: &'a str,
+    open: bool,
+    buffer: &'a mut String,
+}
+
+/// Draw reasoning as it streams, returning whether the box is open.
+///
+/// A thinking section opens its own bordered box so reasoning is framed apart
+/// from the answer it precedes, and a row is drawn per line rather than per
+/// token.
+#[cfg(feature = "tui")]
+fn show_thinking(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    reasoning: Reasoning<'_>,
+    text: &str,
+) -> io::Result<bool> {
+    let width = tui::terminal_width();
+    let (colour, footer, status) = (reasoning.colour, reasoning.footer, reasoning.status);
+    if !reasoning.open {
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::thinking_box_top(width, colour),
+        )?;
+    }
+    reasoning.buffer.push_str(text);
+    for line in drain_lines(reasoning.buffer) {
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::thinking_box_row(width, colour, &line),
+        )?;
+    }
+    Ok(true)
+}
+
+/// Close the reasoning box, flushing whatever line it was part way through.
+#[cfg(feature = "tui")]
+fn close_thinking(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    buffer: &mut String,
+) -> io::Result<()> {
+    let width = tui::terminal_width();
+    if !buffer.trim().is_empty() {
+        let line = std::mem::take(buffer);
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::thinking_box_row(width, colour, &line),
+        )?;
+    }
+    stream_row(
+        terminal,
+        composer,
+        colour,
+        footer,
+        status,
+        &tui::thinking_box_bottom(width, colour),
+    )
+}
+
+/// Draw the answer as it streams, returning how many rows of it are still
+/// live — that is, part of a line the provider has not finished.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn show_answer(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    pending: &mut String,
+    mut live_lines: usize,
+) -> io::Result<usize> {
+    let complete = drain_lines(pending);
+    // The live rows held the part of a line still arriving. A finished line
+    // replaces them, so they are erased once before the first of them.
+    if live_lines > 0 && !complete.is_empty() {
+        erase_live_response(terminal, composer, live_lines)?;
+        live_lines = 0;
+    }
+    for line in complete {
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::assistant_row(colour, &line),
+        )?;
+    }
+    if pending.is_empty() {
+        return Ok(live_lines);
+    }
+    redraw_live_response(
+        terminal, composer, colour, footer, status, pending, live_lines,
+    )
+}
+
+/// Take the finished lines out of a streaming buffer, leaving whatever part of
+/// the next one has arrived.
+///
+/// One scan for the last break rather than one per line: a buffer is appended
+/// to on every delta, and re-scanning it from the front for each line it holds
+/// is quadratic in a long answer.
+#[cfg(feature = "tui")]
+fn drain_lines(buffer: &mut String) -> Vec<String> {
+    let Some(last) = buffer.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete: String = buffer.drain(..=last).collect();
+    complete.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+/// One finished row above the composer, with the status redrawn under it.
+#[cfg(feature = "tui")]
+fn stream_row(
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    row: &str,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    frame.push_str(row);
+    frame.push('\n');
+    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    write!(terminal, "{frame}").and_then(|()| terminal.flush())
+}
+
+/// What the keys pressed while a round streams amount to.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Typed {
+    /// Nothing that changes what is on screen.
+    Quiet,
+    Redraw,
+    Interrupted,
+}
+
+/// Take every key waiting, without blocking on the next one.
+///
+/// A turn is streaming while this runs, so the composer stays live: a
+/// follow-up can be queued, the approval mode can change, and the turn can be
+/// stopped, all without waiting for the provider to finish.
+#[cfg(feature = "tui")]
+fn drain_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+    outcome: &mut Turn,
+) -> Typed {
+    let mut typed = Typed::Quiet;
+    while let Ok(byte) = keys.try_recv() {
+        let Some(key) = decoder.feed(byte) else {
+            continue;
+        };
+        if key == tui::Key::Interrupt {
+            outcome.queued.clear();
+            outcome.interrupted = true;
+            return Typed::Interrupted;
+        }
+        match composer.press(key) {
+            // Shift+Tab changes authority immediately; it never becomes a
+            // model prompt or a queued follow-up.
+            tui::Action::CycleMode => {
+                cycle_approval_mode(approval);
+                typed = Typed::Redraw;
+            }
+            // Bounded as on the Codex route, so a held Enter cannot grow the
+            // queue without limit; past the bound the draft is handed back.
+            tui::Action::Submit(line) if !line.trim().is_empty() => {
+                if outcome.queued.len() < 16 {
+                    outcome.queued.push_back(line);
+                } else {
+                    composer.restore(line);
+                }
+            }
+            tui::Action::Submit(_) | tui::Action::Redraw => typed = Typed::Redraw,
+            tui::Action::Quit => outcome.quit = true,
+            tui::Action::None => {}
+        }
+    }
+    typed
+}
+
+/// The request one round of a turn sends.
+///
+/// Built per round rather than captured once: the instructions are discovered
+/// by walking the workspace, and an AGENTS.md the turn just edited is the one
+/// the next round should read.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn round_request(
+    resolved: &provider::Resolved,
+    runtime: &arsy_code::agent::ToolRuntime,
+    conversation: &[ModelMessage],
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    round: usize,
+) -> io::Result<CanonicalModelRequest> {
+    Ok(CanonicalModelRequest {
+        model: ModelKey {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        },
+        system: system_prompt(
+            runtime.workspace(),
+            &route.provider,
+            &route.model,
+            runtime.execution_mode(),
+        ),
+        messages: conversation.to_vec(),
+        tools: runtime.schemas(),
+        max_output_tokens: resolved.endpoint.max_output_tokens,
+        effort,
+        // One turn can take several requests, one per round of tool calls. The
+        // round is part of the key, because a retry must repeat its own
+        // request rather than collapse into the one before it.
+        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
+            .map_err(io::Error::other)?,
+    })
+}
+
+/// Read the provider's stream on its own thread, as the rows the turn draws.
+///
+/// The provider's events are turned into rows here rather than at the far end,
+/// so the drawing loop waits on one channel and nothing else.
+#[cfg(feature = "tui")]
+fn spawn_stream(
+    provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
+    request: CanonicalModelRequest,
+) -> std::sync::mpsc::Receiver<Result<Streamed, String>> {
+    let (rows, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stream = match arsy_kernel::provider::stream_with_retry(
+            provider.as_ref(),
+            &request,
+            &mut std::thread::sleep,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = rows.send(Err(error.to_string()));
+                return;
+            }
+        };
+        for event in stream {
+            let Some(message) = streamed(event) else {
+                continue;
+            };
+            let failed = message.is_err();
+            if rows.send(message).is_err() || failed {
+                return;
+            }
+        }
+    });
+    events
+}
+
+/// The row a provider event draws, or `None` for an event the turn does not
+/// show.
+#[cfg(feature = "tui")]
+fn streamed(
+    event: Result<ModelEvent, arsy_kernel::provider::ProviderError>,
+) -> Option<Result<Streamed, String>> {
+    Some(match event {
+        Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
+        Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
+        Ok(ModelEvent::Usage {
+            input_tokens,
+            output_tokens,
+        }) => Ok(Streamed::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+        Ok(ModelEvent::ToolCallCompleted {
+            id,
+            name,
+            arguments,
+            ..
+        }) => Ok(Streamed::Tool {
+            id,
+            name,
+            arguments,
+        }),
+        Ok(_) => return None,
+        Err(error) => Err(error.to_string()),
+    })
+}
+
 /// Say what a context trim removed, when it removed anything.
 ///
 /// A transcript that has outgrown the window fails at the provider, so the
@@ -5141,75 +5454,8 @@ fn native_status(
     composer: &mut tui::Composer,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
-    let request = CanonicalModelRequest {
-        model: ModelKey {
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-        },
-        // The harness's instructions and the project's, discovered by walking
-        // the workspace. Rebuilt per round rather than captured once: an
-        // AGENTS.md the turn just edited is the one the next round should read.
-        system: system_prompt(
-            runtime.workspace(),
-            &route.provider,
-            &route.model,
-            runtime.execution_mode(),
-        ),
-        messages: conversation.to_vec(),
-        tools: runtime.schemas(),
-        max_output_tokens: resolved.endpoint.max_output_tokens,
-        effort,
-        // One turn can take several requests, one per round of tool calls. The
-        // round is part of the key, because a retry must repeat its own
-        // request rather than collapse into the one before it.
-        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
-            .map_err(io::Error::other)?,
-    };
-
-    let provider = Arc::clone(&resolved.provider);
-    let (rows, events) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stream = match arsy_kernel::provider::stream_with_retry(
-            provider.as_ref(),
-            &request,
-            &mut std::thread::sleep,
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = rows.send(Err(error.to_string()));
-                return;
-            }
-        };
-        for event in stream {
-            let message = match event {
-                Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
-                Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
-                Ok(ModelEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                }) => Ok(Streamed::Usage {
-                    input_tokens,
-                    output_tokens,
-                }),
-                Ok(ModelEvent::ToolCallCompleted {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                }) => Ok(Streamed::Tool {
-                    id,
-                    name,
-                    arguments,
-                }),
-                Ok(_) => continue,
-                Err(error) => Err(error.to_string()),
-            };
-            let failed = message.is_err();
-            if rows.send(message).is_err() || failed {
-                return;
-            }
-        }
-    });
+    let request = round_request(resolved, runtime, conversation, route, effort, turn, round)?;
+    let events = spawn_stream(Arc::clone(&resolved.provider), request);
 
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
@@ -5256,49 +5502,21 @@ fn native_status(
     };
     draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
-        let mut typed = false;
-        while let Ok(byte) = keys.try_recv() {
-            let Some(key) = decoder.feed(byte) else {
-                continue;
-            };
-            if key == tui::Key::Interrupt {
-                outcome.queued.clear();
-                outcome.interrupted = true;
-                draw(
-                    &mut terminal,
-                    composer,
-                    Some(&tui::interrupted_row(colour)),
-                    &status_line(first_event, tick),
-                )?;
-                return finish(terminal, composer, outcome);
-            }
-            match composer.press(key) {
-                // Shift+Tab changes authority immediately; it never becomes a
-                // model prompt or a queued follow-up.
-                tui::Action::CycleMode => {
-                    cycle_approval_mode(approval);
-                    typed = true;
-                }
-                // Bounded as on the Codex route, so a held Enter cannot grow the
-                // queue without limit; past the bound the draft is handed back.
-                tui::Action::Submit(line) if !line.trim().is_empty() => {
-                    if outcome.queued.len() < 16 {
-                        outcome.queued.push_back(line);
-                    } else {
-                        composer.restore(line);
-                    }
-                }
-                tui::Action::Submit(_) => typed = true,
-                tui::Action::Quit => outcome.quit = true,
-                tui::Action::Redraw => typed = true,
-                tui::Action::None => {}
-            }
+        let typed = drain_keys(keys, decoder, composer, approval, &mut outcome);
+        if typed == Typed::Interrupted {
+            draw(
+                &mut terminal,
+                composer,
+                Some(&tui::interrupted_row(colour)),
+                &status_line(first_event, tick),
+            )?;
+            return finish(terminal, composer, outcome);
         }
         // The status is alive: the spinner advances and the seconds climb even
         // while the provider sends nothing, so a silent turn never reads as a
         // frozen one.
         tick = tick.wrapping_add(1);
-        if typed {
+        if typed == Typed::Redraw {
             draw(
                 &mut terminal,
                 composer,
@@ -5308,86 +5526,54 @@ fn native_status(
         }
         match events.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Ok(Streamed::Thinking(text))) => {
-                let width = tui::terminal_width();
-                // A thinking section opens its own bordered box so reasoning
-                // is visually framed apart from the answer it precedes.
-                if !thinking_open {
-                    thinking_open = true;
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_top(width, colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                thinking.push_str(&text);
-                while let Some(newline) = thinking.find('\n') {
-                    let line: String = thinking.drain(..=newline).collect();
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_row(width, colour, &line)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
+                let status = status_line(first_event, tick);
+                thinking_open = show_thinking(
+                    &mut terminal,
+                    composer,
+                    Reasoning {
+                        colour,
+                        footer,
+                        status: &status,
+                        open: thinking_open,
+                        buffer: &mut thinking,
+                    },
+                    &text,
+                )?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Text(text))) => {
                 outcome.response.push_str(&text);
-                let width = tui::terminal_width();
+                let status = status_line(first_event, tick);
+                if thinking_open {
+                    close_thinking(
+                        &mut terminal,
+                        composer,
+                        colour,
+                        footer,
+                        &status,
+                        &mut thinking,
+                    )?;
+                    thinking_open = false;
+                }
                 if !answer_open {
                     answer_open = true;
                     draw(
                         &mut terminal,
                         composer,
                         Some(&tui::assistant_header(colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                // Answer text closes the thinking box cleanly before the prose starts.
-                if thinking_open {
-                    thinking_open = false;
-                    if !thinking.trim().is_empty() {
-                        let line = std::mem::take(&mut thinking);
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some(&tui::thinking_box_row(width, colour, &line)),
-                            &status_line(first_event, tick),
-                        )?;
-                    }
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_bottom(width, colour)),
-                        &status_line(first_event, tick),
+                        &status,
                     )?;
                 }
                 pending.push_str(&text);
-                while let Some(newline) = pending.find('\n') {
-                    if live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live_lines)?;
-                        live_lines = 0;
-                    }
-                    let line: String = pending.drain(..=newline).collect();
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::assistant_row(colour, &line)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                if !pending.is_empty() {
-                    live_lines = redraw_live_response(
-                        &mut terminal,
-                        composer,
-                        colour,
-                        footer,
-                        &status_line(first_event, tick),
-                        &pending,
-                        live_lines,
-                    )?;
-                }
+                live_lines = show_answer(
+                    &mut terminal,
+                    composer,
+                    colour,
+                    footer,
+                    &status,
+                    &mut pending,
+                    live_lines,
+                )?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Usage {
