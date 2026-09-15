@@ -1784,7 +1784,7 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             } else {
                 String::new()
             };
-            (true, format!("{header}{body}"))
+            (true, format!("{header}{}", numbered_lines(body, first)))
         }
         "fs.list" => {
             let entries = value
@@ -1863,23 +1863,49 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
                 .unwrap_or_default();
             (true, summary.join("\n"))
         }
-        "fs.write" | "fs.edit" => {
+        "fs.write" => {
             let path = value
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or("the file");
-            let verb = if value.get("created").and_then(Value::as_bool) == Some(true) {
-                "created"
+            let created = value.get("created").and_then(Value::as_bool) == Some(true);
+            let verb = if created { "created" } else { "updated" };
+            let summary = format!(
+                "{verb} {path} ({} bytes)",
+                value.get("bytes").and_then(Value::as_u64).unwrap_or(0)
+            );
+            let detail = if created {
+                value
+                    .get("after")
+                    .and_then(Value::as_str)
+                    .filter(|content| !content.is_empty())
+                    .map(|content| format!("{}\n{summary}", edit_diff("", content, 1)))
+                    .unwrap_or(summary)
             } else {
-                "updated"
+                summary
             };
-            (
-                true,
-                format!(
-                    "{verb} {path} ({} bytes)",
-                    value.get("bytes").and_then(Value::as_u64).unwrap_or(0)
-                ),
-            )
+            (true, detail)
+        }
+        "fs.edit" => {
+            let path = value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("the file");
+            let summary = format!(
+                "updated {path} ({} bytes)",
+                value.get("bytes").and_then(Value::as_u64).unwrap_or(0)
+            );
+            let detail = match (
+                value.get("before").and_then(Value::as_str),
+                value.get("after").and_then(Value::as_str),
+                value.get("first_line").and_then(Value::as_u64),
+            ) {
+                (Some(before), Some(after), Some(first_line)) => {
+                    format!("{}\n{summary}", edit_diff(before, after, first_line))
+                }
+                _ => summary,
+            };
+            (true, detail)
         }
         "fs.delete" => (
             true,
@@ -1917,6 +1943,27 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
         ),
     }
+}
+
+fn numbered_lines(text: &str, first_line: u64) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>4} │ {line}", first_line + offset as u64))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn edit_diff(before: &str, after: &str, first_line: u64) -> String {
+    let removed = before
+        .lines()
+        .enumerate()
+        .map(|(offset, line)| format!("-{:>4} │ {line}", first_line + offset as u64));
+    let added_start = first_line;
+    let added = after
+        .lines()
+        .enumerate()
+        .map(|(offset, line)| format!("+{:>4} │ {line}", added_start + offset as u64));
+    removed.chain(added).collect::<Vec<_>>().join("\n")
 }
 
 /// The command a background result names, for a line that says which process

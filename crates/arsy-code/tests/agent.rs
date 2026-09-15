@@ -219,7 +219,7 @@ fn plan_mode_blocks_policy_allowed_writes_at_authorization_and_dispatch() {
     let arguments = json!({"path": "kept.txt", "content": "after\n"});
     assert_eq!(
         plan.invoke("fs.read", &json!({"path": "kept.txt"})).output,
-        "before"
+        "   1 │ before"
     );
     let request = normal.prepare("fs.write", &arguments).unwrap();
     let grants = normal.authorize(&request).approve().unwrap();
@@ -310,7 +310,7 @@ fn reading_returns_text_line_windows_and_reports_binary_without_decoding_it() {
 
     assert_eq!(
         ok(&runtime, "fs.read", json!({"path": "src/lib.rs"})),
-        "one\ntwo\nthree\nfour"
+        "   1 │ one\n   2 │ two\n   3 │ three\n   4 │ four"
     );
 
     // A window says which lines it is, so a following edit can be addressed.
@@ -319,7 +319,7 @@ fn reading_returns_text_line_windows_and_reports_binary_without_decoding_it() {
         "fs.read",
         json!({"path": "src/lib.rs", "offset": 2, "limit": 2}),
     );
-    assert_eq!(window, "lines 2-3 of 4\ntwo\nthree");
+    assert_eq!(window, "lines 2-3 of 4\n   2 │ two\n   3 │ three");
 
     let binary = ok(&runtime, "fs.read", json!({"path": "blob"}));
     assert!(binary.contains("binary file"), "{binary}");
@@ -408,10 +408,21 @@ fn editing_replaces_a_unique_anchor_and_refuses_an_ambiguous_one() {
     std::fs::write(root.path().join("main.rs"), "let a = 1;\nlet b = 1;\n").unwrap();
     let runtime = permissive(root.path());
 
-    ok(
+    let edited = attended(
         &runtime,
         "fs.edit",
-        json!({"path": "main.rs", "old_text": "let a = 1;", "new_text": "let a = 2;"}),
+        &json!({"path": "main.rs", "old_text": "let a = 1;", "new_text": "let a = 2;"}),
+    );
+    assert!(edited.success, "{}", edited.output);
+    assert!(
+        edited.output.contains("-   1 │ let a = 1;"),
+        "{}",
+        edited.output
+    );
+    assert!(
+        edited.output.contains("+   1 │ let a = 2;"),
+        "{}",
+        edited.output
     );
     assert_eq!(
         std::fs::read_to_string(root.path().join("main.rs")).unwrap(),
@@ -462,6 +473,11 @@ fn writing_creating_moving_and_deleting_report_what_they_changed() {
     );
     assert!(written.success, "{}", written.output);
     assert_eq!(written.changed_files, ["nested/deep/file.txt"]);
+    assert!(
+        written.output.contains("+   1 │ hello"),
+        "{}",
+        written.output
+    );
     assert_eq!(
         std::fs::read_to_string(root.path().join("nested/deep/file.txt")).unwrap(),
         "hello"
@@ -739,7 +755,7 @@ fn policy_decides_every_call_and_a_refusal_performs_nothing() {
 
     assert_eq!(
         ok(&runtime, "fs.read", json!({"path": "secret.txt"})),
-        "before"
+        "   1 │ before"
     );
 
     for (tool, arguments) in [
@@ -1014,7 +1030,7 @@ fn a_batch_runs_independent_reads_together_and_serializes_everything_else() {
         assert!(result.success, "{}", result.output);
         assert_eq!(
             result.output,
-            format!("body {index}"),
+            format!("   1 │ body {index}"),
             "a result is paired to its own call by position, whatever order it finished in"
         );
     }
@@ -1030,10 +1046,13 @@ fn a_batch_runs_independent_reads_together_and_serializes_everything_else() {
         ("fs.read".to_owned(), json!({"path": "f0.txt"})),
     ];
     let results = runtime.invoke_batch(&mixed, 4);
-    assert_eq!(results[0].output, "body 0", "the read before the write");
+    assert_eq!(
+        results[0].output, "   1 │ body 0",
+        "the read before the write"
+    );
     assert!(results[1].success);
     assert_eq!(
-        results[2].output, "rewritten",
+        results[2].output, "   1 │ rewritten",
         "a write is serialized against the reads around it, so ordering holds"
     );
 
@@ -1069,7 +1088,7 @@ fn a_batch_runs_independent_reads_together_and_serializes_everything_else() {
         .map(|result| result.output)
         .collect();
     assert_eq!(sequential, concurrent);
-    assert_eq!(sequential[0], "body 1");
+    assert_eq!(sequential[0], "   1 │ body 1");
 }
 
 #[test]
