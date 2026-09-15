@@ -2311,6 +2311,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
+    // The first drawing of the card, so the loop below does not read it as a
+    // change and repaint over the notices printed under it.
+    state.card_is_stale();
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -2339,6 +2342,17 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
+        // `/model`, `/approval` and Shift+Tab change what the launch card
+        // says, and the card is the first thing a reader checks. A fresh card
+        // is printed rather than the screen being repainted around the old
+        // one, because a repaint also erases the notices printed between the
+        // cards — including the line that just reported the change.
+        if state.card_is_stale() {
+            write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+            writeln!(stdout, "{}", state.render(tui::terminal_width(), colour))
+                .map_err(terminal_failed)?;
+            composer.invalidate();
+        }
         let status = match &prompt {
             // The branch is read per line rather than kept, so a checkout made
             // in another terminal shows up on the next prompt.
