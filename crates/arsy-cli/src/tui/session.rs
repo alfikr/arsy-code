@@ -235,99 +235,124 @@ impl SessionDialogState {
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<SessionAction> {
+        // Each mode reads the same keys differently, so which mode the dialog
+        // is in is the whole decision here.
         match self.mode {
-            SessionDialogMode::Select => match key {
-                Key::Up => {
-                    if !self.sessions.is_empty() {
-                        if self.selected == 0 {
-                            self.selected = self.sessions.len().saturating_sub(1);
-                        } else {
-                            self.selected -= 1;
-                        }
-                    }
-                    None
-                }
-                Key::Down => {
-                    if !self.sessions.is_empty() {
-                        if self.selected + 1 >= self.sessions.len() {
-                            self.selected = 0;
-                        } else {
-                            self.selected += 1;
-                        }
-                    }
-                    None
-                }
-                Key::Enter | Key::Newline => {
-                    if let Some(target) = self.sessions.get(self.selected) {
-                        Some(SessionAction::Resume(target.id))
-                    } else {
-                        Some(SessionAction::Cancel)
-                    }
-                }
-                Key::Char('r' | 'R') => {
-                    if let Some(target) = self.sessions.get(self.selected) {
-                        self.rename_buffer = target.title.clone().unwrap_or_default();
-                        self.mode = SessionDialogMode::Rename;
-                    }
-                    None
-                }
-                Key::Char('d' | 'D') => {
-                    if !self.sessions.is_empty() {
-                        self.mode = SessionDialogMode::ConfirmDelete;
-                    }
-                    None
-                }
-                Key::Char(c) if c.is_ascii_digit() && c != '0' => {
-                    let idx = (c as usize) - ('1' as usize);
-                    if idx < self.sessions.len() {
-                        self.selected = idx;
-                        return Some(SessionAction::Resume(self.sessions[idx].id));
-                    }
-                    None
-                }
-                Key::Interrupt => Some(SessionAction::Cancel),
-                _ => None,
-            },
-            SessionDialogMode::Rename => match key {
-                Key::Enter | Key::Newline => {
-                    let title = self.rename_buffer.trim().to_owned();
-                    if let Some(target) = self.sessions.get(self.selected) {
-                        Some(SessionAction::Rename(target.id, title))
-                    } else {
-                        self.mode = SessionDialogMode::Select;
-                        None
-                    }
-                }
-                Key::Char(c) => {
-                    self.rename_buffer.push(c);
-                    None
-                }
-                Key::Backspace => {
-                    self.rename_buffer.pop();
-                    None
-                }
-                Key::Interrupt => {
-                    self.mode = SessionDialogMode::Select;
-                    None
-                }
-                _ => None,
-            },
-            SessionDialogMode::ConfirmDelete => match key {
-                Key::Enter | Key::Newline | Key::Char('y' | 'Y') => {
-                    if let Some(target) = self.sessions.get(self.selected) {
-                        Some(SessionAction::Delete(target.id))
-                    } else {
-                        self.mode = SessionDialogMode::Select;
-                        None
-                    }
-                }
-                Key::Char('n' | 'N') | Key::Interrupt => {
-                    self.mode = SessionDialogMode::Select;
-                    None
-                }
-                _ => None,
-            },
+            SessionDialogMode::Select => self.select_key(key),
+            SessionDialogMode::Rename => self.rename_key(key),
+            SessionDialogMode::ConfirmDelete => self.confirm_delete_key(key),
         }
+    }
+
+    /// Picking a session from the list, or opening one of the other modes on
+    /// the one the marker stands on.
+    fn select_key(&mut self, key: Key) -> Option<SessionAction> {
+        match key {
+            Key::Up => {
+                self.step(false);
+                None
+            }
+            Key::Down => {
+                self.step(true);
+                None
+            }
+            Key::Enter | Key::Newline => Some(
+                self.marked()
+                    .map_or(SessionAction::Cancel, SessionAction::Resume),
+            ),
+            Key::Char('r' | 'R') => {
+                if let Some(target) = self.sessions.get(self.selected) {
+                    self.rename_buffer = target.title.clone().unwrap_or_default();
+                    self.mode = SessionDialogMode::Rename;
+                }
+                None
+            }
+            Key::Char('d' | 'D') => {
+                if !self.sessions.is_empty() {
+                    self.mode = SessionDialogMode::ConfirmDelete;
+                }
+                None
+            }
+            // A number takes that row directly, counting from one.
+            Key::Char(digit) if digit.is_ascii_digit() && digit != '0' => {
+                let index = (digit as usize) - ('1' as usize);
+                let target = self.sessions.get(index)?;
+                let id = target.id;
+                self.selected = index;
+                Some(SessionAction::Resume(id))
+            }
+            Key::Interrupt => Some(SessionAction::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Typing a new title. Leaving without one returns to the list.
+    fn rename_key(&mut self, key: Key) -> Option<SessionAction> {
+        match key {
+            Key::Enter | Key::Newline => {
+                let title = self.rename_buffer.trim().to_owned();
+                let id = self.marked()?;
+                Some(SessionAction::Rename(id, title))
+            }
+            Key::Char(character) => {
+                self.rename_buffer.push(character);
+                None
+            }
+            Key::Backspace => {
+                self.rename_buffer.pop();
+                None
+            }
+            Key::Interrupt => {
+                self.mode = SessionDialogMode::Select;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn confirm_delete_key(&mut self, key: Key) -> Option<SessionAction> {
+        match key {
+            Key::Enter | Key::Newline | Key::Char('y' | 'Y') => {
+                let id = self.marked()?;
+                Some(SessionAction::Delete(id))
+            }
+            Key::Char('n' | 'N') | Key::Interrupt => {
+                self.mode = SessionDialogMode::Select;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The session the marker stands on. Taking `None` returns to the list,
+    /// because a mode opened on a row that is no longer there has nothing to
+    /// act on.
+    fn marked(&mut self) -> Option<SessionId> {
+        match self.sessions.get(self.selected) {
+            Some(target) => Some(target.id),
+            None => {
+                self.mode = SessionDialogMode::Select;
+                None
+            }
+        }
+    }
+
+    /// Move the marker one row, wrapping at either end.
+    fn step(&mut self, forward: bool) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.selected = if forward {
+            if self.selected + 1 >= self.sessions.len() {
+                0
+            } else {
+                self.selected + 1
+            }
+        } else {
+            self.selected
+                .checked_sub(1)
+                .unwrap_or_else(|| self.sessions.len().saturating_sub(1))
+        };
     }
 }
 
