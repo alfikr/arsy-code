@@ -155,6 +155,15 @@ pub struct WriteResult {
     pub created: bool,
     pub bytes: u64,
     pub digest: String,
+    /// The replaced text, when this result came from `fs.edit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// The replacement text, when this result came from `fs.edit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// One-based line where the edit anchor started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_line: Option<u64>,
 }
 
 pub struct FileExecutor {
@@ -270,6 +279,9 @@ impl OperationExecutor for FileExecutor {
                             created: !existed,
                             bytes: content.len() as u64,
                             digest: digest.to_string(),
+                            before: (!existed).then(String::new),
+                            after: (!existed).then(|| content.to_owned()),
+                            first_line: (!existed).then_some(1),
                         },
                         request.actor.clone(),
                     )?,
@@ -416,6 +428,9 @@ fn apply_edit(
         ),
         None => None,
     };
+    let before_bytes = workspace.read(path, MAX_FILE_BYTES).map_err(resolve)?.bytes;
+    let before_text = String::from_utf8_lossy(&before_bytes);
+    let first_line = line_number(&before_text, old_text, occurrence);
     let edits = edit::apply_unversioned(
         workspace.path(),
         &[EditOperation {
@@ -439,7 +454,23 @@ fn apply_edit(
             .map(|content| content.bytes.len() as u64)
             .unwrap_or_default(),
         digest: applied.after.to_string(),
+        before: Some(old_text.to_owned()),
+        after: Some(new_text.to_owned()),
+        first_line: Some(first_line),
     })
+}
+/// Find the one-based line where the selected text anchor starts.
+fn line_number(text: &str, needle: &str, occurrence: Option<NonZeroU32>) -> u64 {
+    let wanted = occurrence.map_or(1, NonZeroU32::get) as usize;
+    let position = text
+        .match_indices(needle)
+        .nth(wanted.saturating_sub(1))
+        .map_or(0, |(position, _)| position);
+    text[..position]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u64
+        + 1
 }
 
 /// A resolve failure the model can act on.

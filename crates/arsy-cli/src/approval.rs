@@ -238,7 +238,13 @@ fn is_read(name: &str) -> bool {
 fn is_edit(name: &str) -> bool {
     matches!(
         name,
-        "fs.write" | "fs.create" | "fs.edit" | "fs.move" | "apply_patch"
+        "fs.write"
+            | "fs.create"
+            | "fs.edit"
+            | "fs.move"
+            | "fs.patch"
+            | "code.rename"
+            | "apply_patch"
     )
 }
 
@@ -324,6 +330,10 @@ mod tests {
             decide(ApprovalMode::AcceptEdits, "apply_patch"),
             Decision::Approve
         );
+        assert_eq!(
+            decide(ApprovalMode::AcceptEdits, "code.rename"),
+            Decision::Approve
+        );
         assert_eq!(decide(ApprovalMode::AcceptEdits, "bash"), Decision::Ask);
         assert_eq!(
             decide(ApprovalMode::AcceptEdits, "fs.delete"),
@@ -388,6 +398,16 @@ mod tests {
             ApprovalMode::BypassPermissions.cycle(),
             ApprovalMode::Default
         );
+    }
+    #[test]
+    fn an_explicit_mode_change_clears_plan_mode_instead_of_restoring_it() {
+        let cell = ApprovalCell::new(ApprovalMode::Default);
+        cell.enter_plan();
+        cell.set(ApprovalMode::Auto);
+
+        assert_eq!(cell.get(), ApprovalMode::Auto);
+        assert_eq!(cell.cancel_plan(), ApprovalMode::Auto);
+        assert_ne!(cell.get(), ApprovalMode::Plan);
     }
 
     #[test]

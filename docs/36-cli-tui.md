@@ -1,5 +1,16 @@
 # CLI and TUI surface
 
+The TUI renderer is split by responsibility under `crates/arsy-cli/src/tui/`:
+`layout` owns palette and terminal lifecycle, `bar` owns launch/session chrome,
+`chat` owns composer and conversation input, `progress` owns tool/provider
+cards, `approval` owns approval and plan dialogs, and `provider`/`session` own
+their pickers. `tui.rs` remains the public façade and shared terminal
+primitives, so the CLI orchestration keeps one stable import surface.
+
+Submitted prompts are labelled `› You`; model output begins with `✦ Response`.
+Tool and thinking cards stay between those markers, so the transcript has a
+visible user/harness boundary even when both contain plain text.
+
 ## Implemented integration workflows
 
 The command tables below include roadmap work. The current build provides
@@ -156,12 +167,43 @@ an older build cannot keep selecting an unusable model. Esc, Ctrl-C, or Ctrl-D a
 the picker leaves the model unchanged and returns to the task prompt.
 
 While a turn runs, the composer shows elapsed time and queued follow-ups (up to
-16 per running turn). MCP started/updated/completed events and failure details
+16 per running turn), and the active layout re-measures terminal width and
+height every 100ms. MCP started/updated/completed events and failure details
 appear above it. Esc/Ctrl-C cancels the turn and clears pending follow-ups;
-Ctrl-D on empty input cancels and exits. Cancellation escalates after two seconds.
 Provider turns currently have a fixed 300-second deadline and a 1 MiB per-event
 limit. The terminal is restored on exit and provider processes are cleaned up on
 I/O errors. JSON/CI output requires an explicit non-interactive command.
+
+Shift+Tab changes the approval mode immediately and never submits the drafted
+task or queues a follow-up. A plan completion opens a full-width `PLAN READY`
+card with the structured plan (or the provider's plan text when no structured
+steps were recorded); `PageUp`/`PageDown` scroll the preview. Changing mode
+while that card is open closes the card and clears pending implementation work.
+OpenAI-compatible requests disable parallel tool calls so the TUI presents one
+tool card at a time. A successful duplicate native tool call is answered from
+the earlier result, and a repeated successful Git command from the external
+Codex route is stopped before another execution when its start event arrives.
+Interactive task preparation does not probe every OS credential handle; a failed
+native provider lookup is cached for the session, and the selected native
+provider or the logged-in Codex CLI owns authentication.
+
+File reads show one-based line numbers. Newly created files and text edits show
+unified `-`/`+` rows with the anchor line, so the visible cards identify the
+exact content that changed instead of only reporting byte counts.
+
+`/mcp` lists the connections defined in `arsy.json` alongside the declarations
+mapped from other ecosystems. For Claude that is the workspace `.mcp.json` and
+the operator's own `~/.claude.json`, whose user-scope `mcpServers` are read by
+absolute path rather than through the workspace importer, which resolves only
+inside the checkout. A declaration is inert: `arsy mcp import [--scope
+user|workspace]` writes them into `arsy.json`, which is the step that makes
+them connectable, and it never repoints a name that is already defined.
+
+The launch card is reprinted whenever the model or the approval mode changes,
+so the card above the transcript describes the session that is running. On a
+terminal that speaks the Kitty graphics protocol the mark is drawn as an image
+rasterised from `assets/logo.svg`; every other terminal keeps the half-block
+mark.
 
 Checks: `cargo test -p arsy-cli --features tui`,
 `cargo test -p arsy-code --test compat_golden`, and

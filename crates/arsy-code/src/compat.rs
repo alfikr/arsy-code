@@ -784,6 +784,39 @@ fn claude_hooks(
     Ok(mapped)
 }
 
+/// The MCP connections the operator declared for Claude in their own home
+/// directory, rather than in a workspace.
+///
+/// This is deliberately not a `CompatibilityImporter` method: that importer
+/// resolves every path inside the workspace, and the guarantee that it cannot
+/// be talked into reading outside one is worth keeping. A file the operator
+/// owns is a different question to a file a repository carries, so it is read
+/// here, by absolute path, and nowhere else.
+///
+/// The declarations carry the same shape and the same `untrusted` trust label
+/// as any other: reading a definition is not connecting to it, and the layer
+/// that adopts one decides what it may do.
+pub fn user_mcp_declarations(path: &Path) -> Result<Vec<Value>, CompatError> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    if fs::metadata(path)?.len() > MAX_COMPAT_SOURCE_BYTES {
+        return Err(CompatError::Parse(format!(
+            "{} is larger than {MAX_COMPAT_SOURCE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let value: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+    let source = path.display().to_string();
+    servers
+        .iter()
+        .map(|(name, server)| mcp_definition(source.clone(), name, server, "mapped"))
+        .collect()
+}
+
 fn mcp_json(
     importer: &CompatibilityImporter,
     path: &Path,

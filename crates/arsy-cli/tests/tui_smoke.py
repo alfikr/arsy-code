@@ -134,14 +134,19 @@ def main():
             terminal.send(b"/plan cancel\r")
             terminal.expect("Planning cancelled. Approval mode: default.")
 
-            # Shift+Tab steps the same modes `/approval` sets, without Enter.
+            # Shift+Tab updates the footer directly and does not print a
+            # synthetic approval command for every key repeat.
             terminal.send(b"\x1b[Z")
-            terminal.expect("Approval mode: acceptEdits")
+            terminal.expect("acceptEdits")
             terminal.send(b"\x1b[Z")
-            terminal.expect("Approval mode: plan")
-            terminal.expect("PLAN")
+            terminal.expect("⏸ PLAN")
             terminal.send(b"/approval default\r")
             terminal.expect("Approval mode: default")
+            with terminal.lock:
+                approval_announcements = terminal.received.count(b"Approval mode:")
+                assert approval_announcements <= 2, (
+                    f"Shift+Tab printed {approval_announcements} approval announcements"
+                )
 
             # `/` opens the command menu, typing filters it, Down moves the
             # marker, and Enter takes the highlighted command, which a second
@@ -181,8 +186,7 @@ def main():
             terminal.expect("is a command")
             terminal.send(b"\x03")
             terminal.expect("Model unchanged")
-            assert not (root / "Library/Application Support/ARSY/model").exists()
-            assert not (root / "config/arsy/model").exists()
+            assert not (root / ".arsy/model").exists()
 
             # The effort picker is arrowed and taken like the command menu. It
             # opens marked at the current setting, which is unset here, and the
@@ -194,9 +198,7 @@ def main():
             terminal.expect("\u203a low")
             terminal.send(b"\r\r")
             terminal.expect("Effort: low")
-            assert (root / "Library/Application Support/ARSY/effort").exists() or (
-                root / "config/arsy/effort"
-            ).exists(), "an accepted effort was not remembered"
+            assert (root / ".arsy/effort").exists(), "an accepted effort was not remembered"
 
             # Leaving the picker cancels the picker, not the session: a command
             # that was never run before proves the task prompt came back.
@@ -216,9 +218,7 @@ def main():
             terminal.expect("› ocean")
             terminal.send(b"\r\r")
             terminal.expect("Theme: ocean")
-            assert (root / "Library/Application Support/ARSY/theme").exists() or (
-                root / "config/arsy/theme"
-            ).exists(), "the theme choice was not remembered"
+            assert (root / ".arsy/theme").exists(), "the theme choice was not remembered"
             terminal.send(b"/theme\r")
             terminal.expect("› ocean")
             terminal.send(b"\x03")
@@ -252,18 +252,16 @@ def main():
             terminal.expect("sign in to a provider with OAuth")
             terminal.send(b"list\r")
             terminal.expect("secret://file/acme.key")
-            written = (root / "Library/Application Support/ARSY/config.toml")
-            if not written.exists():
-                written = root / "config/arsy/config.toml"
-            body = written.read_text()
-            assert "[provider.endpoint.acme]" in body, body
-            assert 'base_url = "https://acme.test/v1"' in body, body
-            assert 'credential = "secret://file/acme.key"' in body, body
-            assert 'default = "acme"' in body, body
+            written = root / ".arsy/arsy.json"
+            body = json.loads(written.read_text())
+            endpoint = body["provider"]["endpoint"]["acme"]
+            assert body["provider"]["default"] == "acme", body
+            assert endpoint["base_url"] == "https://acme.test/v1", body
+            assert endpoint["credential"] == "secret://file/acme.key", body
             # One host, several models: a list on the endpoint rather than a
             # second endpoint duplicating its URL and credential.
-            assert 'model = "acme-1"' in body, body
-            assert 'models = ["acme-2"]' in body, body
+            assert endpoint["model"] == "acme-1", body
+            assert endpoint["models"] == ["acme-2"], body
 
             key = written.parent / "acme.key"
             assert key.read_text() == "sk-provider-wizard-value", "the credential was mangled"
@@ -295,14 +293,16 @@ def main():
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"no\r")
             terminal.expect("Provider unchanged")
-            assert "[provider.endpoint.acme]" in written.read_text()
+            assert "acme" in json.loads(written.read_text())["provider"]["endpoint"]
 
             terminal.send(b"/provider\r")
             terminal.send(b"-remove\r")
             terminal.send(b"acme\r")
             terminal.send(b"yes\r")
             terminal.expect("Removed provider acme")
-            assert "[provider.endpoint.acme]" not in written.read_text()
+            assert "acme" not in json.loads(written.read_text()).get("provider", {}).get(
+                "endpoint", {}
+            )
 
             terminal.send(b"\x1b[200~/quit\n\x1b[201~")
             time.sleep(0.15)

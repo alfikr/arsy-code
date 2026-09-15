@@ -356,6 +356,9 @@ pub enum Command {
         provider: Option<String>,
         capability: Option<String>,
     },
+    McpImport {
+        scope: mcp::Scope,
+    },
     McpAdd {
         server: arsy_kernel::config::McpServer,
         scope: mcp::Scope,
@@ -1088,75 +1091,41 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I, tty: bool) -> i32 {
 }
 
 fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    match &invocation.command {
-        Command::Help => {
-            let _ = write!(io::stdout(), "{USAGE}");
-            Ok(0)
-        }
-        Command::Version => {
-            let _ = writeln!(io::stdout(), "arsy {} ({})", arsy_code::VERSION, platform());
-            Ok(0)
-        }
-        Command::Tui if !tty => Err(Diagnostic::error(
-            "ARSY-SCH-1003",
-            "the interactive TUI requires a terminal",
-            "there is no terminal; use `arsy run <TASK>`",
-        )),
-        Command::Tui if emitter.output != Output::Human => Err(usage(
-            "the TUI requires human output; use an explicit command with --output json or ci",
-        )),
-        #[cfg(feature = "tui")]
-        Command::Tui => run_tui(invocation, emitter),
-        #[cfg(not(feature = "tui"))]
-        Command::Tui => Err(Diagnostic::error(
-            "ARSY-SCH-1003",
-            "the interactive TUI is disabled in this build",
-            "install a build with the `tui` feature",
-        )),
-        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
-        Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
-        Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
-        Command::Update { check_only } => execute_update(*check_only, emitter),
+    // Grouped by area rather than one flat dispatch: a reader after the
+    // session commands should not have to walk the credential ones to find
+    // them. The core arms come last because the interactive one needs to know
+    // whether it has a terminal, which none of the others care about.
+    execute_auth(invocation, tty, emitter)
+        .or_else(|| execute_session(invocation, emitter))
+        .or_else(|| execute_memory(invocation, emitter))
+        .or_else(|| execute_mcp(invocation, emitter))
+        .or_else(|| execute_code(invocation, tty, emitter))
+        .unwrap_or_else(|| execute_core(invocation, tty, emitter))
+}
+
+/// Credentials: what ARSY holds and for which provider.
+fn execute_auth(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::AuthSet { provider, handle } => {
             auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
         Command::AuthList => auth_list(invocation, emitter),
         Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
-        Command::Eval {
-            suite,
-            trials,
-            strict,
-            out,
-        } => {
-            let workspace = workspace_root(&invocation.workspace)?;
-            let report = eval::run(&workspace, suite, *trials, *strict, out.as_deref())?;
-            emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
-            Ok(0)
-        }
-        Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
-        Command::Inspect {
-            kind,
-            name,
-            source,
-            event,
-        } => {
-            let report = integrations::inspect(
-                &workspace_root(&invocation.workspace)?,
-                kind,
-                name.as_deref(),
-                source.as_deref(),
-                event.as_deref(),
-                invocation.config.as_deref(),
-            )?;
-            emitter.result(if emitter.output == Output::Json {
-                report
-            } else {
-                integrations::human_report(&report, kind, source.as_deref(), event.as_deref())
-            });
-            Ok(0)
-        }
-        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        _ => return None,
+    })
+}
+
+/// Recorded sessions and the artifacts they produced.
+fn execute_session(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::SessionList { limit } => session::list(invocation, *limit, emitter),
         Command::SessionShow {
             session,
@@ -1188,18 +1157,16 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::ArtifactExport { reference, out } => {
             evidence::export(invocation, *reference, out, emitter)
         }
-        Command::Gc {
-            apply,
-            retention_ms,
-        } => evidence::collect(invocation, *apply, *retention_ms, emitter),
-        Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
-        Command::CodeSymbol { name, tier, limit } => {
-            code::symbol(invocation, name, *tier, *limit, emitter)
-        }
-        Command::CodeInspect { operation, symbol } => {
-            code::inspect(invocation, operation, symbol, emitter)
-        }
-        Command::CodeDiagnostics { path } => code::diagnostics(invocation, path, emitter),
+        _ => return None,
+    })
+}
+
+/// The durable claims a workspace carries between sessions.
+fn execute_memory(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::MemoryList { scope, all } => {
             memory::list(invocation, scope.clone(), *all, emitter)
         }
@@ -1207,21 +1174,15 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             memory::remember(invocation, claim, scope.clone(), emitter)
         }
         Command::MemoryForget { id, reason } => memory::forget(invocation, *id, reason, emitter),
-        Command::Migrate { apply, backup } => {
-            session::migrate(invocation, *apply, backup.as_deref(), emitter)
-        }
-        Command::PolicyExplain {
-            operation,
-            resource,
-            actor,
-        } => policy::explain(
-            invocation,
-            operation,
-            resource.as_deref(),
-            actor.as_deref(),
-            emitter,
-        ),
+        _ => return None,
+    })
+}
+
+/// MCP connection definitions.
+fn execute_mcp(invocation: &Invocation, emitter: &mut Emitter) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::McpAdd { server, scope } => mcp::add(invocation, server, *scope, emitter),
+        Command::McpImport { scope } => mcp::import(invocation, *scope, emitter),
         Command::McpRemove { name, scope } => mcp::remove(invocation, name, *scope, emitter),
         Command::McpEnable {
             name,
@@ -1229,7 +1190,24 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             scope,
         } => mcp::set_enabled(invocation, name, *enabled, *scope, emitter),
         Command::McpTest { name, timeout_ms } => mcp::test(invocation, name, *timeout_ms, emitter),
-        Command::SkillList { source } => extensions::skills(invocation, source.as_deref(), emitter),
+        _ => return None,
+    })
+}
+
+/// Reading code: symbols, diagnostics, and the extension surface.
+fn execute_code(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::CodeSymbol { name, tier, limit } => {
+            code::symbol(invocation, name, *tier, *limit, emitter)
+        }
+        Command::CodeInspect { operation, symbol } => {
+            code::inspect(invocation, operation, symbol, emitter)
+        }
+        Command::CodeDiagnostics { path } => code::diagnostics(invocation, path, emitter),
         Command::PluginList { capabilities } => {
             extensions::list(invocation, *capabilities, emitter)
         }
@@ -1242,8 +1220,71 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::PluginRefresh { id, dry_run } => {
             extensions::refresh(invocation, id.as_deref(), *dry_run, emitter)
         }
-        Command::Serve => serve::run(invocation, emitter),
-        Command::ServeAcp => acp::run(invocation, emitter),
+        _ => return None,
+    })
+}
+
+/// Report the integrations a workspace declares.
+#[allow(clippy::too_many_arguments)]
+fn inspect_report(
+    invocation: &Invocation,
+    kind: &str,
+    name: Option<&str>,
+    source: Option<&str>,
+    event: Option<&str>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let report = integrations::inspect(
+        &workspace_root(&invocation.workspace)?,
+        kind,
+        name,
+        source,
+        event,
+        invocation.config.as_deref(),
+    )?;
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        integrations::human_report(&report, kind, source, event)
+    });
+    Ok(0)
+}
+
+/// Read-only questions about the workspace and what ARSY resolved for it.
+fn execute_inspect(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
+        Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
+        Command::Inspect {
+            kind,
+            name,
+            source,
+            event,
+        } => inspect_report(
+            invocation,
+            kind,
+            name.as_deref(),
+            source.as_deref(),
+            event.as_deref(),
+            emitter,
+        ),
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
+        Command::PolicyExplain {
+            operation,
+            resource,
+            actor,
+        } => policy::explain(
+            invocation,
+            operation,
+            resource.as_deref(),
+            actor.as_deref(),
+            emitter,
+        ),
+        Command::SkillList { source } => extensions::skills(invocation, source.as_deref(), emitter),
         Command::ProviderList { all } => provider::list(invocation, *all, emitter),
         Command::ModelList {
             provider,
@@ -1254,6 +1295,97 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             capability.as_deref(),
             emitter,
         ),
+        _ => return None,
+    })
+}
+
+/// Run an evaluation suite against this workspace.
+fn run_eval(
+    invocation: &Invocation,
+    suite: &Path,
+    trials: Option<u32>,
+    strict: bool,
+    out: Option<&Path>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let workspace = workspace_root(&invocation.workspace)?;
+    let report = eval::run(&workspace, suite, trials, strict, out)?;
+    emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
+    Ok(0)
+}
+
+/// Serving ARSY to something else, and running it unattended.
+fn execute_serve(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::Eval {
+            suite,
+            trials,
+            strict,
+            out,
+        } => run_eval(invocation, suite, *trials, *strict, out.as_deref(), emitter),
+        Command::Serve => serve::run(invocation, emitter),
+        Command::ServeAcp => acp::run(invocation, emitter),
+        _ => return None,
+    })
+}
+
+/// Running a task, and everything none of the other groups owns.
+fn execute_core(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    if let Some(result) = execute_inspect(invocation, emitter) {
+        return result;
+    }
+    if let Some(result) = execute_serve(invocation, emitter) {
+        return result;
+    }
+    match &invocation.command {
+        Command::Help => {
+            let _ = write!(io::stdout(), "{USAGE}");
+            Ok(0)
+        }
+        Command::Version => {
+            let _ = writeln!(io::stdout(), "arsy {} ({})", arsy_code::VERSION, platform());
+            Ok(0)
+        }
+        Command::Tui if !tty => Err(Diagnostic::error(
+            "ARSY-SCH-1003",
+            "the interactive TUI requires a terminal",
+            "there is no terminal; use `arsy run <TASK>`",
+        )),
+        Command::Tui if emitter.output != Output::Human => Err(usage(
+            "the TUI requires human output; use an explicit command with --output json or ci",
+        )),
+        #[cfg(feature = "tui")]
+        Command::Tui => run_tui(invocation, emitter),
+        #[cfg(not(feature = "tui"))]
+        Command::Tui => Err(Diagnostic::error(
+            "ARSY-SCH-1003",
+            "the interactive TUI is disabled in this build",
+            "install a build with the `tui` feature",
+        )),
+        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
+        Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
+        Command::Update { check_only } => execute_update(*check_only, emitter),
+        Command::Gc {
+            apply,
+            retention_ms,
+        } => evidence::collect(invocation, *apply, *retention_ms, emitter),
+        Command::Migrate { apply, backup } => {
+            session::migrate(invocation, *apply, backup.as_deref(), emitter)
+        }
+        // Every other command was answered by one of the groups above; the
+        // dispatch chain only reaches here when none of them owned it.
+        other => Err(Diagnostic::error(
+            "ARSY-SCH-1000",
+            format!("{other:?} is not dispatched"),
+            "this is a bug in ARSY; report it with the command you ran",
+        )),
     }
 }
 
@@ -1270,18 +1402,25 @@ fn execute_update(check_only: bool, emitter: &mut Emitter) -> Result<i32, Diagno
     Ok(0)
 }
 
-/// A redactor that knows every credential this workspace has stored, installed
-/// on the emitter so anything it prints goes through the same pipeline.
+/// A redactor that knows every non-interactive credential this workspace has
+/// stored, installed on the emitter so anything it prints goes through the
+/// same pipeline.
 fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, Diagnostic> {
     let mut broker = SecretBroker::new();
     broker.register_store(Box::new(OsCredentialStore));
     broker.register_store(Box::new(FileCredentialStore));
+    let interactive_tui = matches!(&invocation.command, Command::Tui);
     for record in catalog(CatalogStore::resolve(invocation))? {
-        // A handle that will not open — a locked keychain, a revoked entry, a
-        // record left behind by a provider since removed — has no value that
-        // could reach the output, so there is nothing for the redactor to
-        // miss. Failing the turn here would fail every turn, including the
-        // ones that never touch that provider.
+        // Opening every OS handle just to prepare a TUI task triggers a
+        // keychain prompt before the selected provider or Codex CLI is used.
+        // The interactive provider owns its selected credential; the fallback
+        // Codex CLI owns its login. File credentials remain safe to preload.
+        if interactive_tui && record.handle.store() == OS_STORE_ID {
+            continue;
+        }
+        // A handle that will not open — a revoked entry, a record left behind
+        // by a provider since removed — has no value that could reach output,
+        // so there is nothing for the redactor to miss.
         let _ = broker.resolve(&record.handle);
     }
     emitter.install_redactor(broker.redactor().clone());
@@ -1427,6 +1566,53 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
     json!({"configuration": listing})
 }
 
+/// Replace a file's contents in one step.
+///
+/// A `write` truncates before it writes, so anything reading the file in
+/// between sees it empty — and an empty `arsy.json` is a fatal parse error
+/// rather than a missing layer. Staging beside the destination and renaming
+/// over it means a reader sees either the old contents or the new ones.
+fn replace_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("a settings file needs a directory"))?;
+    std::fs::create_dir_all(parent)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("settings"),
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(body)?;
+        file.sync_all()
+    })();
+    if written.is_ok() {
+        // The staged file is new, so it carries the umask rather than whatever
+        // the destination was set to. An operator who tightened a settings
+        // file must not have that undone by the next write that touches it.
+        #[cfg(unix)]
+        if let Ok(existing) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = existing.permissions().mode();
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode));
+        }
+        // Rename replaces on every target ARSY ships for, so nothing is left
+        // half written even when the destination is already there.
+        if let Err(error) = std::fs::rename(&staged, path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&staged);
+    written
+}
+
 /// Create `~/.arsy/arsy.json` when it is not there yet, carrying over the
 /// `config.toml` an older ARSY kept in the platform configuration directory.
 ///
@@ -1463,16 +1649,33 @@ fn bootstrap_user_config() {
         return;
     }
     let body = carried.unwrap_or_else(|| "{}".to_owned());
-    // `create_new`: two ARSY processes starting at once must not have one of
-    // them truncate what the other just carried over.
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        let _ = file.write_all(body.trim_end().as_bytes());
-        let _ = file.write_all(b"\n");
+    // Staged beside the destination and linked into place, so a second ARSY
+    // starting at the same time reads either nothing or the whole file. A
+    // created-then-written file is visible while it is still empty, and an
+    // empty `arsy.json` is a fatal parse error rather than a missing layer.
+    //
+    // `hard_link` rather than the rename `replace_file` uses: it fails when
+    // the destination exists, so neither process truncates what the other
+    // carried over.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        arsy_kernel::config::CONFIG_FILE,
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let Ok(mut file) = std::fs::File::create(&staged) else {
+        return;
+    };
+    let written = file
+        .write_all(body.trim_end().as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_ok() {
+        let _ = std::fs::hard_link(&staged, &path);
     }
+    let _ = std::fs::remove_file(&staged);
 }
 
 /// Read every configuration layer for this workspace.
@@ -2165,73 +2368,26 @@ fn set_approval_mode(
 }
 
 #[cfg(feature = "tui")]
+fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalMode {
+    let mode = approval.get().cycle();
+    approval.set(mode);
+    mode
+}
+
+#[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
 
-    // A configured endpoint is preferred, because it is the one ARSY talks to
-    // itself. The Codex CLI stays the fallback for an operator who has not
-    // configured anything, so this session keeps working as it did.
-    //
-    // ponytail: resolved once, so an OAuth access token is the one this
-    // session started with; a session outliving the token's lifetime would
-    // need re-resolving per turn, which costs a credential-store read each
-    // time. An API key does not expire, and `arsy run` resolves per
-    // invocation, so only a long interactive OAuth session is affected.
-    let native = load_config(&workspace, &workspace, invocation.config.as_deref())
-        .and_then(|config| {
-            let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
-            // `--model` is checked here rather than defaulted: a model the
-            // ceiling excludes must not open a session that would dispatch to
-            // it, and falling back to the configured one would obey a flag the
-            // operator did not give.
-            let model = match invocation.model.as_deref() {
-                Some(_) => {
-                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
-                }
-                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
-            };
-            Ok((resolved, model))
-        })
-        .ok();
-    let detected = match &native {
-        Some((resolved, model)) => Some(tui::ModelRoute {
-            provider: resolved.endpoint.id.clone(),
-            model: model.clone(),
-        }),
-        None => tui::detect_model_route(),
-    };
-    // Nothing configured and no Codex login is not fatal: the session still
-    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
-    // is refused, which `provider_available` gates below.
-    let provider_available = detected.is_some();
-    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
-        provider: tui::CODEX_PROVIDER.to_owned(),
-        model: "default".into(),
-    });
-    let native = native.map(|(resolved, _)| resolved);
+    let Opened {
+        native,
+        native_requested,
+        detected,
+        provider_available,
+    } = open_route(invocation, &workspace)?;
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
-    // The palette is fixed before the first frame. A rejected `[theme]`
-    // override is reported and dropped, never left to blank the screen.
-    let theme_config = load_config(&workspace, &workspace, invocation.config.as_deref())
-        .map(|config| config.theme().clone())
-        .unwrap_or_default();
-    let (mut theme, palette) = resolve_palette(&theme_config);
-    match palette {
-        Ok(palette) => tui::activate_palette(palette),
-        Err(reason) => {
-            emitter.diagnostic(&Diagnostic::warning(
-                "ARSY-UIX-1002",
-                format!("a [theme] override was ignored: {reason}"),
-                "use #rrggbb colours and role names ARSY knows (see /help)",
-            ));
-            if let Some(palette) = tui::builtin_palette(&theme) {
-                tui::activate_palette(palette);
-            }
-        }
-    }
-
+    let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
     let mut models = {
         let mut models = endpoint_models(invocation);
         models.extend(tui::available_models());
@@ -2239,11 +2395,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-    let mut resolved_providers: std::collections::HashMap<String, provider::Resolved> =
-        std::collections::HashMap::new();
-    if let Some(resolved) = native.clone() {
-        resolved_providers.insert(route.provider.clone(), resolved);
-    }
+    let (mut resolved_providers, mut unavailable_providers) =
+        seed_providers(native, native_requested.as_deref(), &route.provider);
     let mut effort = saved_effort();
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
@@ -2252,6 +2405,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // once `/provider` has switched and the restart has not happened yet.
     let mut chosen_provider = configured_default(invocation);
     let mut conversation: Vec<ModelMessage> = Vec::new();
+    let mut transcript = tui::Transcript::default();
     // The events the restored prefix came from, so a compaction of it can cite
     // something a reader can still open.
     let mut history = arsy_code::agent::budget::History::default();
@@ -2264,6 +2418,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
+    // The first drawing of the card, so the loop below does not read it as a
+    // change and repaint over the notices printed under it.
+    state.card_is_stale();
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -2292,55 +2449,56 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
-        let status = match &prompt {
-            // The branch is read per line rather than kept, so a checkout made
-            // in another terminal shows up on the next prompt.
-            Prompt::Task => state.status_row(
-                tui::terminal_width(),
-                colour,
-                tui::branch(&workspace).as_deref(),
-            ),
-            Prompt::Model => tui::model_prompt(&models, &route, colour),
-            Prompt::Effort => tui::effort_prompt(effort, colour),
-            Prompt::Theme => tui::theme_prompt(&theme, colour),
-            Prompt::Provider(step) => step.prompt(&draft, colour),
-            Prompt::Auth(step) => step.prompt(&auth_draft, colour),
-            Prompt::Resume => tui::session_prompt(&sessions, colour),
-            Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
-        };
+        // `/model`, `/approval` and Shift+Tab change what the launch card
+        // says, and the card is the first thing a reader checks. A fresh card
+        // is printed rather than the screen being repainted around the old
+        // one, because a repaint also erases the notices printed between the
+        // cards — including the line that just reported the change.
+        if state.card_is_stale() {
+            write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+            writeln!(stdout, "{}", state.render(tui::terminal_width(), colour))
+                .map_err(terminal_failed)?;
+            composer.invalidate();
+        }
+        let status = prompt_status(
+            &prompt,
+            Picker {
+                state: &state,
+                workspace: &workspace,
+                models: &models,
+                route: &mut route,
+                effort,
+                theme: &theme,
+                draft: &draft,
+                auth_draft: &auth_draft,
+                sessions: &sessions,
+                providers: &providers,
+                chosen_provider: chosen_provider.as_deref(),
+            },
+            colour,
+        );
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
-        match prompt {
-            Prompt::Model => {
-                let (rows, selected) = tui::model_rows(&models, &route);
-                composer.offer(rows, selected);
-            }
-            Prompt::Effort => {
-                composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
-            }
-            Prompt::Theme => {
-                composer.offer_table(Some(tui::THEMES), tui::theme_row(&theme));
-            }
-            Prompt::Provider(step) => composer.offer(
-                step.rows(&providers, &route.provider, chosen_provider.as_deref()),
-                0,
-            ),
-            Prompt::Auth(step) => {
-                let handles = catalog_handles(invocation);
-                composer.offer(step.rows(&providers, &handles), 0);
-            }
-            Prompt::Resume => {
-                let (rows, selected) = tui::session_rows(&sessions, Some(state.session_id()));
-                composer.offer(rows, selected);
-            }
-            _ => composer.offer(None, 0),
-        }
-        // A credential is typed, never shown, and never remembered.
-        composer.set_masked(
-            matches!(prompt, Prompt::Provider(step) if step.masked())
-                || matches!(prompt, Prompt::Auth(step) if step.masked()),
+        offer_rows(
+            &prompt,
+            &mut composer,
+            Picker {
+                state: &state,
+                workspace: &workspace,
+                models: &models,
+                route: &mut route,
+                effort,
+                theme: &theme,
+                draft: &draft,
+                auth_draft: &auth_draft,
+                sessions: &sessions,
+                providers: &providers,
+                chosen_provider: chosen_provider.as_deref(),
+            },
+            invocation,
         );
+        composer.set_masked(masked(&prompt));
         // While the theme picker is open, repaint in whichever theme is
         // arrowed onto so it can be seen before Enter takes it.
         let preview_theme = |name: &str| tui::set_palette(name, &theme_config.roles);
@@ -2348,54 +2506,37 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Theme => Some(&preview_theme),
             _ => None,
         };
-        let line = match queued.pop_front() {
-            Some(line) => line,
-            None => match read_line(
-                &keys,
-                &mut decoder,
-                &mut composer,
-                &mut stdout,
+        let input = match queued.pop_front() {
+            Some(line) => tui::Action::Submit(line),
+            None => match read_line(ReadLineContext {
+                keys: &keys,
+                decoder: &mut decoder,
+                composer: &mut composer,
+                stdout: &mut stdout,
                 colour,
-                &status,
+                status: &status,
                 preview,
-            )? {
-                Some(line) => line,
+                transcript: &mut transcript,
+                state: &state,
+            })? {
+                Some(input) => input,
                 // Ending input at a picker cancels the picker, not the
                 // session: the setting is unchanged and the task prompt
-                // returns. Every picker has to be listed here, or leaving one
-                // exits ARSY instead.
-                None if matches!(
-                    prompt,
-                    Prompt::Model
-                        | Prompt::Effort
-                        | Prompt::Theme
-                        | Prompt::Provider(_)
-                        | Prompt::Auth(_)
-                        | Prompt::Resume
-                ) =>
-                {
+                // returns. Ending it at the task prompt ends the session.
+                None if cancels_to_task(&prompt) => {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    let unchanged = match prompt {
-                        Prompt::Effort => effort_line(effort),
-                        Prompt::Theme => {
-                            // The preview left the palette on the last row
-                            // arrowed onto; put the committed one back.
-                            tui::set_palette(&theme, &theme_config.roles);
-                            format!("Theme unchanged: {theme}")
-                        }
-                        Prompt::Provider(_) => {
-                            draft = tui::ProviderDraft::default();
-                            "Provider unchanged.".to_owned()
-                        }
-                        Prompt::Auth(_) => {
-                            auth_draft.clear();
-                            "Auth unchanged.".to_owned()
-                        }
-                        Prompt::Resume => {
-                            format!("Session unchanged: {}.", state.session_id())
-                        }
-                        _ => format!("Model unchanged: {route}"),
-                    };
+                    let unchanged = leave_picker(
+                        &prompt,
+                        Leaving {
+                            effort,
+                            theme: &theme,
+                            roles: &theme_config.roles,
+                            draft: &mut draft,
+                            auth_draft: &mut auth_draft,
+                            session: state.session_id(),
+                            route: &mut route,
+                        },
+                    );
                     writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
                     prompt = Prompt::Task;
                     continue;
@@ -2403,700 +2544,103 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 None => break,
             },
         };
-        match prompt {
-            Prompt::Provider(step) => {
-                // `clear` rather than `commit`, so no answer — least of all the
-                // credential — is painted into the scrollback.
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match provider_step(invocation, step, &line, &mut draft, &providers) {
-                    Ok(ProviderNext::Ask(next)) => prompt = Prompt::Provider(next),
-                    Ok(ProviderNext::Done(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        providers = configured_providers(invocation);
-                        chosen_provider = configured_default(invocation);
-                        // Configuration decides the provider, so the session has
-                        // to be restarted to pick up a change to it rather than
-                        // pretend the running one moved.
-                        writeln!(
-                            stdout,
-                            "{}",
-                            tui::safe_text("Restart ARSY for the change to take effect.")
-                        )
-                        .map_err(terminal_failed)?;
-                        draft = tui::ProviderDraft::default();
-                        prompt = Prompt::Task;
-                    }
-                    Ok(ProviderNext::Cancelled(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        draft = tui::ProviderDraft::default();
-                        prompt = Prompt::Task;
-                    }
-                    // The step stays open so the answer can be retyped against
-                    // the question that is still on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Effort => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_effort_answer(&line, effort) {
-                    Ok(picked) => {
-                        effort = picked;
-                        state.set_effort(effort);
-                        remember_effort(effort, emitter);
-                        writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    // As with the model picker, the list stays open so the
-                    // answer can be retyped against what is already on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Theme => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // On a rejected answer the list stays open so it can be retyped.
-                if apply_theme(&line, &mut theme, &theme_config.roles, &mut stdout, emitter)
-                    .map_err(terminal_failed)?
-                {
-                    prompt = Prompt::Task;
-                }
-            }
-            Prompt::Model => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_model(&line, &models, &route) {
-                    Ok(picked) => {
-                        route = picked;
-                        remember_model(&route, emitter);
-                        state.set_model_route(route.clone());
-                        writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    // The picker stays open so the answer can be retyped
-                    // against the list that is already on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Auth(step) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match auth_step(
-                    invocation,
-                    step,
-                    &line,
-                    &mut auth_draft,
-                    &providers,
-                    emitter,
-                ) {
-                    Ok(AuthNext::Ask(next)) => prompt = Prompt::Auth(next),
-                    Ok(AuthNext::Done(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        auth_draft.clear();
-                        prompt = Prompt::Task;
-                    }
-                    Ok(AuthNext::Cancelled(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        auth_draft.clear();
-                        prompt = Prompt::Task;
-                    }
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Resume => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
-                    Ok(picked_id) => {
-                        (conversation, history) =
-                            reconstruct_session_conversation(&workspace, picked_id);
-                        state.set_session_id(picked_id);
-                        set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
-                        queued.clear();
-                        writeln!(
-                            stdout,
-                            "Resumed session {picked_id} ({} message(s) loaded).",
-                            conversation.len()
-                        )
-                        .map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Session(mut dialog) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let width = tui::terminal_width();
-                writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
-                stdout.flush().map_err(terminal_failed)?;
-                loop {
-                    match keys.recv() {
-                        Ok(byte) => {
-                            if let Some(key) = decoder.feed(byte) {
-                                if let Some(action) = dialog.handle_key(key) {
-                                    match action {
-                                        tui::SessionAction::Resume(id) => {
-                                            (conversation, history) =
-                                                reconstruct_session_conversation(&workspace, id);
-                                            state.set_session_id(id);
-                                            set_approval_mode(
-                                                &approval,
-                                                &mut state,
-                                                approval::ApprovalMode::Default,
-                                            );
-                                            queued.clear();
-                                            writeln!(
-                                                stdout,
-                                                "Resumed session {id} ({} message(s) loaded).",
-                                                conversation.len()
-                                            )
-                                            .map_err(terminal_failed)?;
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Rename(id, title) => {
-                                            if let Ok(store) = open_store(&workspace) {
-                                                let _ = store.set_session_title(id, &title);
-                                            }
-                                            writeln!(
-                                                stdout,
-                                                "Renamed session {id} to \"{title}\"."
-                                            )
-                                            .map_err(terminal_failed)?;
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Delete(id) => {
-                                            let is_current = id == state.session_id();
-                                            if let Ok(store) = open_store(&workspace) {
-                                                let _ = store.delete_session(id);
-                                            }
-                                            if is_current {
-                                                let new_session = SessionId::new();
-                                                state.set_session_id(new_session);
-                                                conversation.clear();
-                                                history =
-                                                    arsy_code::agent::budget::History::default();
-                                                set_approval_mode(
-                                                    &approval,
-                                                    &mut state,
-                                                    approval::ApprovalMode::Default,
-                                                );
-                                                queued.clear();
-                                                writeln!(
-                                                    stdout,
-                                                    "Deleted current session. Started fresh session {new_session}."
-                                                )
-                                                .map_err(terminal_failed)?;
-                                            } else {
-                                                writeln!(stdout, "Deleted session {id}.")
-                                                    .map_err(terminal_failed)?;
-                                            }
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Cancel => {
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
-                                        .map_err(terminal_failed)?;
-                                    stdout.flush().map_err(terminal_failed)?;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            prompt = Prompt::Task;
-                            break;
-                        }
-                    }
-                }
-            }
-            Prompt::Task if line.trim() == "/new" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let new_session = SessionId::new();
-                state.set_session_id(new_session);
-                conversation.clear();
-                history = arsy_code::agent::budget::History::default();
-                set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
-                queued.clear();
-                writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.trim() == "/clear" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                conversation.clear();
-                history = arsy_code::agent::budget::History::default();
-                queued.clear();
-                writeln!(
-                    stdout,
-                    "Cleared conversation context for session {}.",
-                    state.session_id()
-                )
-                .map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/resume") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match line.split_whitespace().nth(1) {
-                    None => {
-                        sessions = load_workspace_sessions(&workspace);
-                        prompt = Prompt::Resume;
-                    }
-                    Some(id_str) => match id_str.parse::<SessionId>() {
-                        Ok(id) => {
-                            (conversation, history) =
-                                reconstruct_session_conversation(&workspace, id);
-                            state.set_session_id(id);
-                            set_approval_mode(
-                                &approval,
-                                &mut state,
-                                approval::ApprovalMode::Default,
-                            );
-                            queued.clear();
-                            writeln!(
-                                stdout,
-                                "Resumed session {id} ({} message(s) loaded).",
-                                conversation.len()
-                            )
-                            .map_err(terminal_failed)?;
-                        }
-                        Err(_) => {
-                            writeln!(stdout, "Invalid session ID `{id_str}`.")
-                                .map_err(terminal_failed)?;
-                        }
-                    },
-                }
-            }
-            Prompt::Task if line.trim() == "/update" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                writeln!(
-                    stdout,
-                    "arsy-code v{} is up to date.",
-                    env!("CARGO_PKG_VERSION")
-                )
-                .map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/rename") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let title = line.trim_start_matches("/rename").trim();
-                if title.is_empty() {
-                    writeln!(stdout, "Usage: /rename <TITLE>").map_err(terminal_failed)?;
-                } else {
-                    if let Ok(store) = open_store(&workspace) {
-                        let _ = store.set_session_title(state.session_id(), title);
-                    }
-                    writeln!(
-                        stdout,
-                        "Renamed session {} to \"{title}\".",
-                        state.session_id()
-                    )
-                    .map_err(terminal_failed)?;
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/session") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let mut parts = line.split_whitespace().skip(1);
-                match parts.next() {
-                    None => {
-                        let sess = load_workspace_sessions(&workspace);
-                        let dialog = tui::SessionDialogState::new(sess, state.session_id());
-                        prompt = Prompt::Session(dialog);
-                    }
-                    Some("list") => {
-                        sessions = load_workspace_sessions(&workspace);
-                        prompt = Prompt::Resume;
-                    }
-                    Some("rename") => {
-                        let title = parts.collect::<Vec<_>>().join(" ");
-                        if title.is_empty() {
-                            writeln!(stdout, "Usage: /session rename <TITLE>")
-                                .map_err(terminal_failed)?;
-                        } else {
-                            if let Ok(store) = open_store(&workspace) {
-                                let _ = store.set_session_title(state.session_id(), &title);
-                            }
-                            writeln!(
-                                stdout,
-                                "Renamed session {} to \"{title}\".",
-                                state.session_id()
-                            )
-                            .map_err(terminal_failed)?;
-                        }
-                    }
-                    Some("delete" | "rm" | "remove") => {
-                        let target_id = parts
-                            .next()
-                            .and_then(|id_str| id_str.parse::<SessionId>().ok())
-                            .unwrap_or_else(|| state.session_id());
-                        let is_current = target_id == state.session_id();
-                        if let Ok(store) = open_store(&workspace) {
-                            let _ = store.delete_session(target_id);
-                        }
-                        if is_current {
-                            let new_session = SessionId::new();
-                            state.set_session_id(new_session);
-                            conversation.clear();
-                            history = arsy_code::agent::budget::History::default();
-                            set_approval_mode(
-                                &approval,
-                                &mut state,
-                                approval::ApprovalMode::Default,
-                            );
-                            queued.clear();
-                            writeln!(
-                                stdout,
-                                "Deleted current session. Started fresh session {new_session}."
-                            )
-                            .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "Deleted session {target_id}.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    _ => {
-                        writeln!(
-                            stdout,
-                            "Usage: /session [list | rename <TITLE> | delete [ID]]"
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/plan") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match plan_command(&line) {
-                    PlanCommand::Revise(note) => {
-                        approval.enter_plan();
-                        state.set_approval_mode(approval.get().label());
-                        queued.push_front(revise_instruction(note.as_deref()));
-                    }
-                    PlanCommand::Approve => {
-                        if approval.get() == approval::ApprovalMode::Plan {
-                            let mode = approval.approve_plan();
-                            state.set_approval_mode(mode.label());
-                            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
-                            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
-                                .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "No plan is awaiting approval.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    PlanCommand::Cancel => {
-                        if approval.get() == approval::ApprovalMode::Plan {
-                            let mode = approval.cancel_plan();
-                            state.set_approval_mode(mode.label());
-                            writeln!(
-                                stdout,
-                                "Planning cancelled. Approval mode: {}.",
-                                mode.label()
-                            )
-                            .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "Plan Mode is not active.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    PlanCommand::Show => {
-                        // The live plan for this session's scope, which is the
-                        // one the turn's `plan_*` tools have been writing to.
-                        let projection =
-                            progress::plan(&workspace, &state.session_id().to_string());
-                        write!(stdout, "{}", progress::human_plan(&projection))
-                            .map_err(terminal_failed)?;
-                    }
-                    PlanCommand::Enter(task) => {
-                        approval.enter_plan();
-                        state.set_approval_mode(approval.get().label());
-                        writeln!(
-                            stdout,
-                            "Plan Mode active — workspace mutations are blocked."
-                        )
-                        .map_err(terminal_failed)?;
-                        if let Some(task) = task {
-                            queued.push_front(task);
-                        }
-                    }
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/todo") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Read from the store rather than from the turn's runtime: the
-                // checklist is durable, so what is on disk is the answer even
-                // if this session has not touched it yet.
-                let projection = open_store(&workspace).ok().and_then(|store| {
-                    progress::todos(store as Arc<dyn EventStore>, state.session_id())
-                });
-                match projection {
-                    Some(projection) => {
-                        write!(stdout, "{}", progress::human_todos(&projection))
-                            .map_err(terminal_failed)?;
-                    }
-                    None => writeln!(stdout, "This session's TODOs could not be read.")
-                        .map_err(terminal_failed)?,
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|argument| match argument {
-                        // What Shift+Tab sends. Resolved here so the shortcut
-                        // and the typed command take the same path.
-                        "cycle" => Some(approval.get().cycle()),
-                        _ => approval::ApprovalMode::parse(argument),
-                    }) {
-                    Some(mode) => {
-                        set_approval_mode(&approval, &mut state, mode);
-                        writeln!(
-                            stdout,
-                            "Approval mode: {} — {}",
-                            mode.label(),
-                            mode.description()
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                    None => {
-                        let current = approval.get();
-                        writeln!(
-                            stdout,
-                            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
-                            current.label(),
-                            current.description()
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Task if line.trim() == "/auth" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                providers = configured_providers(invocation);
-                auth_draft.clear();
-                prompt = Prompt::Auth(tui::AuthStep::Pick);
-            }
-            Prompt::Task if line.trim() == "/model" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Re-read, so a model added to any endpoint since startup is
-                // offered without restarting.
-                models = {
-                    let mut models = endpoint_models(invocation);
-                    models.extend(tui::available_models());
-                    models
-                };
-                prompt = Prompt::Model;
-            }
-            Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
-            Prompt::Task if line.split_whitespace().next() == Some("/provider") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                providers = configured_providers(invocation);
-                chosen_provider = configured_default(invocation);
-                draft = tui::ProviderDraft::default();
-                prompt = Prompt::Provider(tui::ProviderStep::Pick);
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/effort") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // A bare `/effort` opens the list, so the levels can be read
-                // before one is chosen; `/effort high` still sets it outright.
-                match line.split_whitespace().nth(1) {
-                    None => prompt = Prompt::Effort,
-                    Some(answer) => match tui::resolve_effort_answer(answer, effort) {
-                        Ok(picked) => {
-                            effort = picked;
-                            state.set_effort(effort);
-                            remember_effort(effort, emitter);
-                            writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
-                        }
-                        Err(reason) => {
-                            writeln!(stdout, "{}", tui::safe_text(&reason))
-                                .map_err(terminal_failed)?;
-                        }
-                    },
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/theme") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // A bare `/theme` opens the list; `/theme light` sets it outright.
-                match line.split_whitespace().nth(1) {
-                    None => prompt = Prompt::Theme,
-                    Some(answer) => {
-                        apply_theme(
-                            answer,
-                            &mut theme,
-                            &theme_config.roles,
-                            &mut stdout,
-                            emitter,
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Task if line.trim().starts_with('/') => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                if line.split_whitespace().next() == Some("/help") {
-                    write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed)?;
-                } else if let Some(args) = inspection_args(&line) {
-                    match parse(args) {
-                        Ok(parsed) => {
-                            let inspection = Invocation {
-                                command: parsed.command,
-                                ..invocation.clone()
-                            };
-                            if let Err(diagnostic) = execute(&inspection, false, emitter) {
-                                emitter.diagnostic(&diagnostic);
-                            }
-                        }
-                        Err(diagnostic) => emitter.diagnostic(&diagnostic),
-                    }
-                } else {
-                    writeln!(stdout, "Unknown command. Use /help for available actions.")
-                        .map_err(terminal_failed)?;
-                }
-            }
-            Prompt::Task if line.trim().is_empty() => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-            }
-            Prompt::Task => {
-                write!(stdout, "{}", composer.commit(&line, colour)).map_err(terminal_failed)?;
-                stdout.flush().map_err(terminal_failed)?;
-                if !provider_available {
-                    emitter.diagnostic(&Diagnostic::error(
-                        ARSY_PRV_1000,
-                        "provider unavailable",
-                        "configure a `[provider.endpoint.<name>]` table and run `arsy auth set \
-                         <name>`, or run codex login, then restart ARSY; /mcp and /hooks remain \
-                         available",
-                    ));
-                    continue;
-                }
-                let footer = state.status_row(
-                    tui::terminal_width(),
-                    colour,
-                    tui::branch(&workspace).as_deref(),
-                );
-                let selected_provider = if resolved_providers.contains_key(&route.provider) {
-                    resolved_providers.get(&route.provider)
-                } else {
-                    let working = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
-                    let resolved = load_config(&workspace, &working, invocation.config.as_deref())
-                        .ok()
-                        .and_then(|config| provider::resolve(&config, Some(&route.provider)).ok());
-                    if let Some(resolved) = resolved {
-                        resolved_providers.insert(route.provider.clone(), resolved);
-                    }
-                    resolved_providers.get(&route.provider)
-                };
-                match run_turn(
-                    invocation,
-                    state.session_id(),
-                    selected_provider,
-                    &line,
-                    &history,
-                    &route,
-                    effort,
-                    colour,
-                    &footer,
-                    &mut conversation,
-                    &keys,
-                    &mut decoder,
-                    &mut composer,
-                    &approval,
-                    emitter,
-                ) {
-                    Ok(turn) if turn.quit => break,
-                    Ok(turn) => {
-                        if turn.interrupted {
-                            queued.clear();
-                        }
-                        queued.extend(turn.queued);
-                        if approval.get() == approval::ApprovalMode::Plan
-                            && !turn.interrupted
-                            && turn.failure.is_none()
-                        {
-                            match confirm_plan(&mut stdout, colour, &keys, &mut decoder)
-                                .map_err(terminal_failed)?
-                            {
-                                tui::AskDialogResult::Approve { note } => {
-                                    let mode = approval.approve_plan();
-                                    state.set_approval_mode(mode.label());
-                                    let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
-                                    if let Some(note) = note {
-                                        instruction
-                                            .push_str(&format!(" Operator constraint: {note}"));
-                                    }
-                                    queued.push_front(instruction);
-                                    writeln!(
-                                        stdout,
-                                        "Plan approved. Entering {} mode.",
-                                        mode.label()
-                                    )
-                                    .map_err(terminal_failed)?;
-                                }
-                                // The dialog's second choice is "continue
-                                // planning", so it stays in Plan Mode and
-                                // queues another planning turn.
-                                tui::AskDialogResult::AlwaysApprove { note } => {
-                                    queued.push_front(revise_instruction(note.as_deref()));
-                                }
-                                tui::AskDialogResult::Deny { .. }
-                                | tui::AskDialogResult::Cancel => {
-                                    let mode = approval.cancel_plan();
-                                    state.set_approval_mode(mode.label());
-                                    queued.clear();
-                                    writeln!(
-                                        stdout,
-                                        "Planning cancelled. Approval mode: {}.",
-                                        mode.label()
-                                    )
-                                    .map_err(terminal_failed)?;
-                                }
-                            }
-                        }
-                    }
-                    Err(diagnostic) => emitter.diagnostic(&diagnostic),
-                }
-            }
-        }
+        // Shift+Tab changes the mode where it stands: it never becomes a line
+        // for the prompt to answer. Every other action redraws and nothing
+        // more.
+        let Some(line) = submitted(input, &approval, &mut state) else {
+            continue;
+        };
+        let pass = answer_prompt(
+            prompt,
+            &line,
+            invocation,
+            Typing {
+                workspace: &workspace,
+                colour,
+                provider_available,
+                route: &mut route,
+                effort: &mut effort,
+                models: &mut models,
+                providers: &mut providers,
+                chosen: &mut chosen_provider,
+                draft: &mut draft,
+                auth_draft: &mut auth_draft,
+                theme: &mut theme,
+                roles: &theme_config.roles,
+                sessions: &mut sessions,
+                resolved_providers: &mut resolved_providers,
+                unavailable_providers: &mut unavailable_providers,
+            },
+            Restoring {
+                workspace: &workspace,
+                state: &mut state,
+                conversation: &mut conversation,
+                transcript: &mut transcript,
+                history: &mut history,
+                approval: &approval,
+                queued: &mut queued,
+            },
+            &mut stdout,
+            &keys,
+            &mut decoder,
+            &mut composer,
+            emitter,
+        )?;
+        prompt = match pass {
+            TaskPass::Stop => break,
+            TaskPass::Ask(next) => next,
+            TaskPass::Go => Prompt::Task,
+        };
     }
     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
     stdout.flush().map_err(terminal_failed)?;
     Ok(0)
 }
 
-/// Collect one line, repainting the composer after every key that changes it.
+/// Collect input, repainting the composer after every key that changes it.
 ///
-/// Returns `None` when the session should end (Ctrl-D, or Ctrl-C on an empty
-/// line), which mirrors what a shell does.
+/// `CycleMode` is returned separately from submitted text so Shift+Tab never
+/// becomes a task or a history entry. `None` means the session should end.
 #[cfg(feature = "tui")]
-fn read_line(
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    stdout: &mut impl Write,
+struct ReadLineContext<'a> {
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    composer: &'a mut tui::Composer,
+    stdout: &'a mut dyn Write,
     colour: bool,
-    status: &str,
-    // Called with the highlighted row before each repaint, so a picker can
-    // preview the choice the reader is arrowed onto (the theme picker repaints
-    // in that theme's colours).
-    preview: Option<&dyn Fn(&str)>,
-) -> Result<Option<String>, Diagnostic> {
+    status: &'a str,
+    preview: Option<&'a dyn Fn(&str)>,
+    transcript: &'a mut tui::Transcript,
+    state: &'a tui::TuiState,
+}
+
+fn read_line(
+    ReadLineContext {
+        keys,
+        decoder,
+        composer,
+        stdout,
+        colour,
+        status,
+        preview,
+        transcript,
+        state,
+    }: ReadLineContext<'_>,
+) -> Result<Option<tui::Action>, Diagnostic> {
     let mut width = tui::terminal_width();
     composer.set_height(tui::terminal_rows());
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
-        if measured.elapsed() >= std::time::Duration::from_secs(1) {
-            width = tui::terminal_width();
+        if measured.elapsed() >= std::time::Duration::from_millis(100) {
+            let next_width = tui::terminal_width();
+            if next_width != width {
+                transcript
+                    .repaint(stdout, next_width, colour, state)
+                    .map_err(terminal_failed)?;
+                composer.invalidate();
+            }
+            width = next_width;
             composer.set_height(tui::terminal_rows());
             measured = std::time::Instant::now();
         }
@@ -3112,7 +2656,8 @@ fn read_line(
                 Ok(byte) => decoder.feed(byte),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     let key = decoder.flush_escape();
-                    if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_secs(1) {
+                    if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100)
+                    {
                         break;
                     }
                     key
@@ -3121,7 +2666,8 @@ fn read_line(
             };
             let Some(key) = key else { continue };
             match composer.press(key) {
-                tui::Action::Submit(line) => return Ok(Some(line)),
+                tui::Action::Submit(line) => return Ok(Some(tui::Action::Submit(line))),
+                tui::Action::CycleMode => return Ok(Some(tui::Action::CycleMode)),
                 tui::Action::Quit => return Ok(None),
                 tui::Action::Redraw => break,
                 tui::Action::None => {}
@@ -3179,10 +2725,7 @@ fn saved_route() -> Option<tui::ModelRoute> {
 fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     let path = model_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{route}\n"))
+    replace_file(&path, format!("{route}\n").as_bytes())
 }
 
 /// The remembered reasoning effort, beside the remembered model.
@@ -3206,11 +2749,8 @@ fn saved_effort() -> Option<Effort> {
 fn save_effort(effort: Option<Effort>) -> io::Result<()> {
     let path = effort_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     match effort {
-        Some(effort) => std::fs::write(path, format!("{effort}\n")),
+        Some(effort) => replace_file(&path, format!("{effort}\n").as_bytes()),
         None => match std::fs::remove_file(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -3238,10 +2778,7 @@ fn saved_theme() -> Option<String> {
 fn save_theme(name: &str) -> io::Result<()> {
     let path = theme_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{name}\n"))
+    replace_file(&path, format!("{name}\n").as_bytes())
 }
 
 #[cfg(feature = "tui")]
@@ -3896,10 +3433,7 @@ fn write_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(),
         Err(error) => return Err(format!("the configuration could not be read: {error}")),
     };
     let updated = edit(&original)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(&path, updated)
+    replace_file(&path, updated.as_bytes())
         .map_err(|error| format!("the configuration could not be written: {error}"))
 }
 
@@ -3995,6 +3529,7 @@ fn run_turn(
     colour: bool,
     footer: &str,
     conversation: &mut Vec<ModelMessage>,
+    transcript: &mut tui::Transcript,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
@@ -4053,13 +3588,14 @@ fn run_turn(
             keys,
             decoder,
             composer,
+            transcript,
             approval,
         ),
         None => external_status(
             &root,
             &task,
             route,
-            approval.get(),
+            approval,
             colour,
             footer,
             keys,
@@ -4094,6 +3630,9 @@ fn run_turn(
             return Ok(Turn::default());
         }
     };
+    if !turn.interrupted && turn.failure.is_none() {
+        transcript.push_assistant(&turn.response);
+    }
     emitter.trace(
         "turn.finished",
         json!({
@@ -4225,6 +3764,17 @@ const MAX_TOOL_ROUNDS: usize = 24;
 
 /// What the operator said about one tool call.
 #[cfg(feature = "tui")]
+fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
+    // A timeout is execution metadata, not command identity. Otherwise a
+    // provider can evade duplicate protection by changing only the deadline.
+    let identity = if name == "bash" {
+        arguments.get("command").cloned().unwrap_or(Value::Null)
+    } else {
+        arguments.clone()
+    };
+    format!("{name}\0{identity}")
+}
+#[cfg(feature = "tui")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Answer {
     Yes {
@@ -4262,6 +3812,7 @@ fn native_turn(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    transcript: &mut tui::Transcript,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
     // rather than taken from the last one: an audit that reads a tool-using
@@ -4274,30 +3825,18 @@ fn native_turn(
             outcome.usage = json!({"input_tokens": *input, "output_tokens": *output});
         }
     };
+    // Successful calls are memoized within this turn. If a provider asks for
+    // the exact same effect again, return the first result instead of running
+    // it twice or burning all 24 rounds.
+    let mut completed_calls = std::collections::HashMap::<String, String>::new();
     for round in 0..MAX_TOOL_ROUNDS {
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
-        let trimmed =
-            arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history));
-        if trimmed.changed() {
-            let mut terminal = io::stdout();
-            writeln!(
-                terminal,
-                "{}",
-                tui::tool_result_row(
-                    colour,
-                    "context",
-                    true,
-                    &format!(
-                        "elided {} tool result(s) and compacted {} earlier message(s) to stay \
-                         within {} tokens",
-                        trimmed.elided, trimmed.summarized, trimmed.after
-                    )
-                )
-            )?;
-            terminal.flush()?;
-        }
+        report_trim(
+            colour,
+            &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
+        )?;
         let mut outcome = native_status(
             resolved,
             runtime,
@@ -4311,6 +3850,7 @@ fn native_turn(
             keys,
             decoder,
             composer,
+            approval,
         )?;
         charge(&mut outcome, &mut input_tokens, &mut output_tokens);
         if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
@@ -4342,44 +3882,64 @@ fn native_turn(
 
         let mut results = Vec::with_capacity(calls.len());
         let mut terminal = io::stdout();
+        let mut all_repeated = true;
         for (id, name, arguments) in &calls {
             let summary = runtime.summarize(name, arguments);
+            let fingerprint = tool_call_fingerprint(name, arguments);
+            let cached = completed_calls.get(&fingerprint).cloned();
+            let repeated = cached.is_some();
             // Once the turn is stopped the remaining calls are still answered,
             // because a call the provider sent needs a result; they are simply
             // answered without running anything.
-            let (content, is_error) = if outcome.interrupted {
-                ("The operator declined to run this call.".to_owned(), true)
-            } else {
-                match execute_call(
-                    runtime,
-                    &mut terminal,
-                    colour,
-                    name,
-                    arguments,
-                    &summary,
-                    keys,
-                    decoder,
-                    approval,
-                )? {
-                    Executed::Answered(mut result) => {
-                        if !result.changed_files.is_empty() {
-                            result.output.push_str("\nChanged files:\n");
-                            for path in &result.changed_files {
-                                result.output.push_str(&format!("  • {path}\n"));
-                            }
-                        }
-                        (result.output, !result.success)
-                    }
-                    Executed::Stopped => {
-                        outcome.interrupted = true;
-                        writeln!(terminal, "{}", tui::interrupted_row(colour))?;
-                        ("The operator stopped the turn.".to_owned(), true)
-                    }
+            let (content, is_error) = match (outcome.interrupted, cached) {
+                // Once the turn is stopped the remaining calls are still
+                // answered, because a call the provider sent needs a result;
+                // they are simply answered without running anything.
+                (true, _) => {
+                    all_repeated = false;
+                    ("The operator declined to run this call.".to_owned(), true)
+                }
+                (false, Some(previous)) => (
+                    format!(
+                        "This exact tool call already completed successfully; skipped duplicate.\n\
+                         {previous}"
+                    ),
+                    false,
+                ),
+                (false, None) => {
+                    all_repeated = false;
+                    run_call(
+                        runtime,
+                        &mut terminal,
+                        colour,
+                        &summary,
+                        Call {
+                            name,
+                            arguments,
+                            fingerprint,
+                        },
+                        Answering {
+                            keys,
+                            decoder,
+                            approval,
+                            completed: &mut completed_calls,
+                            interrupted: &mut outcome.interrupted,
+                        },
+                    )?
                 }
             };
-            writeln!(
-                terminal,
-                "{}",
+            if !repeated {
+                transcript.push_tool(
+                    name,
+                    &summary,
+                    &content,
+                    !is_error,
+                    std::time::Duration::from_millis(50),
+                );
+            }
+            let card = if repeated {
+                tui::tool_result_row(colour, name, true, "duplicate skipped")
+            } else {
                 tui::tool_card(
                     tui::terminal_width(),
                     colour,
@@ -4389,6 +3949,13 @@ fn native_turn(
                     !is_error,
                     std::time::Duration::from_millis(50),
                 )
+            };
+            writeln!(
+                terminal,
+                "{}{}{}",
+                tui::DISABLE_AUTOWRAP,
+                card,
+                tui::ENABLE_AUTOWRAP
             )?;
             terminal.flush()?;
             results.push(ModelContent::ToolResult {
@@ -4401,6 +3968,12 @@ fn native_turn(
             role: ModelRole::User,
             content: results,
         });
+        if all_repeated && !calls.is_empty() {
+            outcome.response =
+                "The requested operation already completed; a repeated tool call was skipped."
+                    .to_owned();
+            return Ok(outcome);
+        }
         // The response of a round that called tools belongs to the history
         // above, not to the answer this turn returns.
         outcome.response.clear();
@@ -4415,6 +3988,2470 @@ fn native_turn(
         }
     }
     Ok(Turn::default())
+}
+
+/// Take the terminal's size again, no more than ten times a second.
+///
+/// Answers whether it was measured on this pass, because the rows on screen
+/// were laid out for the size before it.
+#[cfg(feature = "tui")]
+fn remeasure(
+    painter: &Painter<'_>,
+    composer: &mut tui::Composer,
+    refreshed: &mut std::time::Instant,
+) -> bool {
+    if refreshed.elapsed() < std::time::Duration::from_millis(100) {
+        return false;
+    }
+    painter.width.set(tui::terminal_width());
+    composer.set_height(tui::terminal_rows());
+    *refreshed = std::time::Instant::now();
+    true
+}
+
+/// Start the provider and wire its three streams.
+///
+/// Stderr and the task being written are each read on their own thread, and
+/// the event stream on a third, so the main loop can watch the keyboard while
+/// the provider works — which is what lets Esc stop a turn and keeps the
+/// composer typeable.
+#[cfg(feature = "tui")]
+type ProviderStreams = (
+    tui::ProviderChild,
+    std::sync::mpsc::Receiver<String>,
+    std::sync::mpsc::Receiver<io::Result<()>>,
+    std::sync::mpsc::Receiver<io::Result<String>>,
+);
+
+#[cfg(feature = "tui")]
+fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<ProviderStreams> {
+    // A process group of its own, so a signal aimed at the harness does not also
+    // reach the provider child. There is no Windows equivalent to gate on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut child = tui::ProviderChild(child);
+    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
+    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
+        let _ = io::copy(&mut stderr, &mut io::sink());
+        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
+    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
+    let task = task.to_owned();
+    let (sent, input) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sent.send(stdin.write_all(task.as_bytes()));
+    });
+    // The event stream is read on a thread so the main loop can also watch the
+    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
+    // the composer alive and typeable while the provider works.
+    let stdout = child.0.stdout.take().expect("piped stdout is available");
+    let events = tui::provider_lines(stdout);
+    Ok((child, error_output, input, events))
+}
+
+/// The line an action carries, if it carries one.
+#[cfg(feature = "tui")]
+fn submitted(
+    input: tui::Action,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+) -> Option<String> {
+    match input {
+        tui::Action::Submit(line) => Some(line),
+        tui::Action::CycleMode => {
+            let mode = cycle_approval_mode(approval);
+            state.set_approval_mode(mode.label());
+            None
+        }
+        tui::Action::Quit | tui::Action::Redraw | tui::Action::None => None,
+    }
+}
+
+/// Whether the answer being typed is a credential, which is shown as bullets,
+/// never painted into the scrollback, and never remembered.
+#[cfg(feature = "tui")]
+fn masked(prompt: &Prompt) -> bool {
+    matches!(prompt, Prompt::Provider(step) if step.masked())
+        || matches!(prompt, Prompt::Auth(step) if step.masked())
+}
+
+/// Whether ending input here closes a picker rather than the session.
+///
+/// Every picker has to be named, or leaving one exits ARSY instead.
+#[cfg(feature = "tui")]
+fn cancels_to_task(prompt: &Prompt) -> bool {
+    matches!(
+        prompt,
+        Prompt::Model
+            | Prompt::Effort
+            | Prompt::Theme
+            | Prompt::Provider(_)
+            | Prompt::Auth(_)
+            | Prompt::Resume
+    )
+}
+
+/// Answer the line at whichever prompt collected it.
+///
+/// Every picker clears the composer rather than committing it, so no answer —
+/// least of all a credential — is painted into the scrollback.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn answer_prompt(
+    prompt: Prompt,
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if matches!(prompt, Prompt::Task) {
+        return answer_task(
+            line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
+        );
+    }
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    let next = match prompt {
+        Prompt::Provider(step) => take_provider(
+            invocation,
+            step,
+            line,
+            typing.draft,
+            typing.providers,
+            typing.chosen,
+            stdout,
+        )?,
+        Prompt::Effort => take_effort(line, typing.effort, restoring.state, stdout, emitter)?,
+        // On a rejected answer the list stays open so it can be retyped.
+        Prompt::Theme => {
+            if apply_theme(line, typing.theme, typing.roles, stdout, emitter)
+                .map_err(terminal_failed)?
+            {
+                Prompt::Task
+            } else {
+                Prompt::Theme
+            }
+        }
+        Prompt::Model => take_model(
+            line,
+            typing.models,
+            typing.route,
+            restoring.state,
+            stdout,
+            emitter,
+        )?,
+        Prompt::Auth(step) => take_auth(
+            invocation,
+            step,
+            line,
+            typing.auth_draft,
+            typing.providers,
+            stdout,
+            emitter,
+        )?,
+        Prompt::Resume => take_resume(line, typing.sessions, restoring, stdout)?,
+        Prompt::Session(dialog) => {
+            run_session_dialog(dialog, restoring, stdout, typing.colour, keys, decoder)?;
+            Prompt::Task
+        }
+        Prompt::Task => Prompt::Task,
+    };
+    Ok(TaskPass::Ask(next))
+}
+
+/// Open the session the answer names, or leave the list open.
+#[cfg(feature = "tui")]
+fn take_resume(
+    line: &str,
+    sessions: &[tui::SessionChoice],
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_session_answer(line, sessions, restoring.state.session_id()) {
+        Ok(picked) => {
+            let loaded = resume_into(picked, restoring);
+            writeln!(
+                stdout,
+                "Resumed session {picked} ({loaded} message(s) loaded)."
+            )
+            .map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Resume)
+        }
+    }
+}
+
+/// Where the session goes after a line typed at the task prompt.
+#[cfg(feature = "tui")]
+enum TaskPass {
+    /// Carry on at the task prompt.
+    Go,
+    /// Collect the next answer at this prompt instead.
+    Ask(Prompt),
+    Stop,
+}
+
+/// What a line typed at the task prompt can reach, apart from the session
+/// itself.
+#[cfg(feature = "tui")]
+struct Typing<'a> {
+    workspace: &'a Path,
+    colour: bool,
+    provider_available: bool,
+    route: &'a mut tui::ModelRoute,
+    effort: &'a mut Option<Effort>,
+    models: &'a mut Vec<tui::ModelChoice>,
+    providers: &'a mut Vec<String>,
+    chosen: &'a mut Option<String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    theme: &'a mut String,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    sessions: &'a mut Vec<tui::SessionChoice>,
+    resolved_providers: &'a mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable_providers: &'a mut std::collections::HashSet<String>,
+}
+
+/// Answer a line typed at the task prompt.
+///
+/// A slash command is answered here; anything else is the task itself and is
+/// sent to the model.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn answer_task(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if matches!(line.trim(), ":quit" | "/quit" | "/exit") {
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        return Ok(TaskPass::Stop);
+    }
+    if line.trim().starts_with('/') || line.trim().is_empty() {
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        return slash_command(line, invocation, typing, restoring, stdout, emitter);
+    }
+    run_task(
+        line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
+    )
+}
+
+/// Answer a slash command typed at the task prompt.
+#[cfg(feature = "tui")]
+fn slash_command(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if manages_session(line) {
+        let next = manage_session(line, restoring, typing.sessions, stdout)?;
+        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
+    }
+    if steers_turn(line) {
+        steer_turn(
+            line,
+            typing.workspace,
+            restoring.approval,
+            restoring.state,
+            restoring.queued,
+            stdout,
+        )?;
+        return Ok(TaskPass::Go);
+    }
+    if opens_picker(line) {
+        let next = open_picker(
+            line,
+            invocation,
+            Opening {
+                models: typing.models,
+                providers: typing.providers,
+                chosen: typing.chosen,
+                draft: typing.draft,
+                auth_draft: typing.auth_draft,
+                effort: typing.effort,
+                theme: typing.theme,
+                roles: typing.roles,
+                state: restoring.state,
+            },
+            stdout,
+            emitter,
+        )?;
+        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
+    }
+    // An empty line is not a command and not a task: nothing to answer.
+    if !line.trim().is_empty() {
+        inspect_command(line, invocation, stdout, typing.colour, emitter)?;
+    }
+    Ok(TaskPass::Go)
+}
+
+/// Send the line to the model as the task it is.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn run_task(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    restoring.transcript.push_user(line);
+    write!(stdout, "{}", composer.commit(line, typing.colour)).map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    if !typing.provider_available {
+        emitter.diagnostic(&Diagnostic::error(
+            ARSY_PRV_1000,
+            "provider unavailable",
+            "configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or \
+             run codex login, then restart ARSY; /mcp and /hooks remain available",
+        ));
+        return Ok(TaskPass::Go);
+    }
+    let resolved = resolve_route(
+        invocation,
+        typing.workspace,
+        &typing.route.provider,
+        typing.resolved_providers,
+        typing.unavailable_providers,
+    );
+    let footer = restoring.state.status_row(
+        tui::terminal_width(),
+        typing.colour,
+        tui::branch(typing.workspace).as_deref(),
+    );
+    let pass = take_turn(
+        invocation,
+        resolved,
+        line,
+        &footer,
+        Running {
+            workspace: typing.workspace,
+            route: typing.route,
+            effort: *typing.effort,
+            colour: typing.colour,
+            state: restoring.state,
+            conversation: restoring.conversation,
+            transcript: restoring.transcript,
+            history: restoring.history,
+            approval: restoring.approval,
+            queued: restoring.queued,
+        },
+        stdout,
+        keys,
+        decoder,
+        composer,
+        emitter,
+    )?;
+    Ok(match pass {
+        Pass::Stop => TaskPass::Stop,
+        Pass::Go => TaskPass::Go,
+    })
+}
+
+/// What a turn runs against, and what it is allowed to change.
+#[cfg(feature = "tui")]
+struct Running<'a> {
+    workspace: &'a Path,
+    route: &'a tui::ModelRoute,
+    effort: Option<Effort>,
+    colour: bool,
+    state: &'a mut tui::TuiState,
+    conversation: &'a mut Vec<ModelMessage>,
+    transcript: &'a mut tui::Transcript,
+    history: &'a arsy_code::agent::budget::History,
+    approval: &'a approval::ApprovalCell,
+    queued: &'a mut std::collections::VecDeque<String>,
+}
+
+/// Run one turn and settle what it left behind.
+///
+/// Answers whether the session carries on: a turn can end it, and nothing
+/// after that should run.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_turn(
+    invocation: &Invocation,
+    resolved: Option<&provider::Resolved>,
+    line: &str,
+    footer: &str,
+    running: Running<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<Pass, Diagnostic> {
+    let turn = match run_turn(
+        invocation,
+        running.state.session_id(),
+        resolved,
+        line,
+        running.history,
+        running.route,
+        running.effort,
+        running.colour,
+        footer,
+        running.conversation,
+        running.transcript,
+        keys,
+        decoder,
+        composer,
+        running.approval,
+        emitter,
+    ) {
+        Ok(turn) if turn.quit => return Ok(Pass::Stop),
+        Ok(turn) => turn,
+        Err(diagnostic) => {
+            emitter.diagnostic(&diagnostic);
+            return Ok(Pass::Go);
+        }
+    };
+    // A stopped turn takes the queue with it: a follow-up was queued to run
+    // after this one, not instead of the stop.
+    if turn.interrupted {
+        running.queued.clear();
+    }
+    running.queued.extend(turn.queued);
+    // Mode changes made while the provider was streaming happen through the
+    // shared cell; refresh the visible projection before deciding whether a
+    // plan dialog is still appropriate.
+    running
+        .state
+        .set_approval_mode(running.approval.get().label());
+    if running.approval.get() == approval::ApprovalMode::Plan
+        && !turn.interrupted
+        && turn.failure.is_none()
+    {
+        settle_plan(
+            running.workspace,
+            &turn.response,
+            running.approval,
+            running.state,
+            running.queued,
+            stdout,
+            running.colour,
+            keys,
+            decoder,
+        )?;
+    }
+    Ok(Pass::Go)
+}
+
+/// Answer a slash command that only reads: help, or one of the inspections
+/// the CLI already answers.
+///
+/// The inspection runs through the same parser and the same dispatch a typed
+/// `arsy` command does, so the two can never drift apart.
+#[cfg(feature = "tui")]
+fn inspect_command(
+    line: &str,
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    if line.split_whitespace().next() == Some("/help") {
+        return write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed);
+    }
+    let Some(args) = inspection_args(line) else {
+        return writeln!(stdout, "Unknown command. Use /help for available actions.")
+            .map_err(terminal_failed);
+    };
+    match parse(args) {
+        Ok(parsed) => {
+            let inspection = Invocation {
+                command: parsed.command,
+                ..invocation.clone()
+            };
+            if let Err(diagnostic) = execute(&inspection, false, emitter) {
+                emitter.diagnostic(&diagnostic);
+            }
+        }
+        Err(diagnostic) => emitter.diagnostic(&diagnostic),
+    }
+    Ok(())
+}
+
+/// Fix the palette before the first frame.
+///
+/// A rejected `[theme]` override is reported and dropped, never left to blank
+/// the screen.
+#[cfg(feature = "tui")]
+fn open_palette(
+    invocation: &Invocation,
+    workspace: &Path,
+    emitter: &mut Emitter,
+) -> (arsy_kernel::config::Theme, String) {
+    let config = load_config(workspace, workspace, invocation.config.as_deref())
+        .map(|config| config.theme().clone())
+        .unwrap_or_default();
+    let (theme, palette) = resolve_palette(&config);
+    match palette {
+        Ok(palette) => tui::activate_palette(palette),
+        Err(reason) => {
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-UIX-1002",
+                format!("a [theme] override was ignored: {reason}"),
+                "use #rrggbb colours and role names ARSY knows (see /help)",
+            ));
+            if let Some(palette) = tui::builtin_palette(&theme) {
+                tui::activate_palette(palette);
+            }
+        }
+    }
+    (config, theme)
+}
+
+/// What the session already knows about its providers before the first turn.
+///
+/// A failed native resolution is remembered as unavailable so it is not probed
+/// again on every turn while the external Codex login is still working.
+#[cfg(feature = "tui")]
+fn seed_providers(
+    native: Option<provider::Resolved>,
+    requested: Option<&str>,
+    route: &str,
+) -> (
+    std::collections::HashMap<String, provider::Resolved>,
+    std::collections::HashSet<String>,
+) {
+    let mut resolved = std::collections::HashMap::new();
+    let mut unavailable = std::collections::HashSet::new();
+    match native {
+        Some(found) => {
+            resolved.insert(route.to_owned(), found);
+        }
+        None => {
+            if let Some(requested) = requested.filter(|requested| *requested != "auto") {
+                unavailable.insert(requested.to_owned());
+            }
+        }
+    }
+    (resolved, unavailable)
+}
+
+/// The provider and model a session opens with.
+#[cfg(feature = "tui")]
+struct Opened {
+    native: Option<provider::Resolved>,
+    /// What was asked for, which is not always what resolved.
+    native_requested: Option<String>,
+    detected: tui::ModelRoute,
+    provider_available: bool,
+}
+
+/// Resolve which provider and model this session starts on.
+///
+/// A configured endpoint is preferred, because it is the one ARSY talks to
+/// itself. The Codex CLI stays the fallback for an operator who has not
+/// configured anything, so an existing session keeps working as it did.
+///
+/// Nothing configured and no Codex login is not fatal: the session still opens
+/// so `/mcp` and `/hooks` can inspect the workspace, and only a task turn is
+/// refused.
+///
+/// ponytail: resolved once, so an OAuth access token is the one this session
+/// started with; a session outliving the token's lifetime would need
+/// re-resolving per turn, which costs a credential-store read each time. An
+/// API key does not expire, and `arsy run` resolves per invocation, so only a
+/// long interactive OAuth session is affected.
+#[cfg(feature = "tui")]
+fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Opened, Diagnostic> {
+    let native_requested = invocation.provider.clone().or_else(|| {
+        load_config(workspace, workspace, invocation.config.as_deref())
+            .ok()
+            .and_then(|config| config.provider_default().map(str::to_owned))
+    });
+    let native = load_config(workspace, workspace, invocation.config.as_deref())
+        .and_then(|config| {
+            let resolved = provider::resolve(&config, native_requested.as_deref())?;
+            // `--model` is checked here rather than defaulted: a model the
+            // ceiling excludes must not open a session that would dispatch to
+            // it, and falling back to the configured one would obey a flag the
+            // operator did not give.
+            let model = match invocation.model.as_deref() {
+                Some(_) => {
+                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
+                }
+                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
+            };
+            Ok((resolved, model))
+        })
+        .ok();
+    let detected = match &native {
+        Some((resolved, model)) => Some(tui::ModelRoute {
+            provider: resolved.endpoint.id.clone(),
+            model: model.clone(),
+        }),
+        None => tui::detect_model_route(),
+    };
+    // Nothing configured and no Codex login is not fatal: the session still
+    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
+    // is refused, which `provider_available` gates below.
+    let provider_available = detected.is_some();
+    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
+        provider: tui::CODEX_PROVIDER.to_owned(),
+        model: "default".into(),
+    });
+    Ok(Opened {
+        native: native.map(|(resolved, _)| resolved),
+        native_requested,
+        detected,
+        provider_available,
+    })
+}
+
+/// The slash commands that change how the next turn is allowed to act, or
+/// report what the session has recorded about its work.
+#[cfg(feature = "tui")]
+fn steers_turn(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/plan" | "/todo" | "/approval")
+    )
+}
+
+#[cfg(feature = "tui")]
+fn steer_turn(
+    line: &str,
+    workspace: &Path,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    match line.split_whitespace().next() {
+        Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
+        Some("/todo") => show_todos(workspace, state.session_id(), stdout),
+        Some("/approval") => set_mode(line, approval, state, stdout),
+        _ => Ok(()),
+    }
+}
+
+/// Enter, revise, approve, cancel or show the plan.
+#[cfg(feature = "tui")]
+fn plan_step(
+    line: &str,
+    workspace: &Path,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    match plan_command(line) {
+        PlanCommand::Revise(note) => {
+            approval.enter_plan();
+            state.set_approval_mode(approval.get().label());
+            queued.push_front(revise_instruction(note.as_deref()));
+            Ok(())
+        }
+        PlanCommand::Approve if approval.get() == approval::ApprovalMode::Plan => {
+            let mode = approval.approve_plan();
+            state.set_approval_mode(mode.label());
+            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
+            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                .map_err(terminal_failed)
+        }
+        PlanCommand::Approve => {
+            writeln!(stdout, "No plan is awaiting approval.").map_err(terminal_failed)
+        }
+        PlanCommand::Cancel if approval.get() == approval::ApprovalMode::Plan => {
+            let mode = approval.cancel_plan();
+            state.set_approval_mode(mode.label());
+            writeln!(
+                stdout,
+                "Planning cancelled. Approval mode: {}.",
+                mode.label()
+            )
+            .map_err(terminal_failed)
+        }
+        PlanCommand::Cancel => {
+            writeln!(stdout, "Plan Mode is not active.").map_err(terminal_failed)
+        }
+        // The live plan for this session's scope, which is the one the turn's
+        // `plan_*` tools have been writing to.
+        PlanCommand::Show => {
+            let projection = progress::plan(workspace, &state.session_id().to_string());
+            write!(stdout, "{}", progress::human_plan(&projection)).map_err(terminal_failed)
+        }
+        PlanCommand::Enter(task) => {
+            approval.enter_plan();
+            state.set_approval_mode(approval.get().label());
+            writeln!(
+                stdout,
+                "Plan Mode active — workspace mutations are blocked."
+            )
+            .map_err(terminal_failed)?;
+            if let Some(task) = task {
+                queued.push_front(task);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The session's durable checklist.
+///
+/// Read from the store rather than from the turn's runtime: the checklist
+/// outlives a turn, so what is on disk is the answer even if this session has
+/// not touched it yet.
+#[cfg(feature = "tui")]
+fn show_todos(
+    workspace: &Path,
+    session: SessionId,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let projection = open_store(workspace)
+        .ok()
+        .and_then(|store| progress::todos(store as Arc<dyn EventStore>, session));
+    match projection {
+        Some(projection) => {
+            write!(stdout, "{}", progress::human_todos(&projection)).map_err(terminal_failed)
+        }
+        None => {
+            writeln!(stdout, "This session's TODOs could not be read.").map_err(terminal_failed)
+        }
+    }
+}
+
+/// Take the approval mode a command named, or report the one in force.
+#[cfg(feature = "tui")]
+fn set_mode(
+    line: &str,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let named = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|argument| match argument {
+            // What Shift+Tab sends. Resolved here so the shortcut and the
+            // typed command take the same path.
+            "cycle" => Some(approval.get().cycle()),
+            _ => approval::ApprovalMode::parse(argument),
+        });
+    let Some(mode) = named else {
+        let current = approval.get();
+        return writeln!(
+            stdout,
+            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
+            current.label(),
+            current.description()
+        )
+        .map_err(terminal_failed);
+    };
+    set_approval_mode(approval, state, mode);
+    writeln!(
+        stdout,
+        "Approval mode: {} — {}",
+        mode.label(),
+        mode.description()
+    )
+    .map_err(terminal_failed)
+}
+
+/// Drive the session dialog until it is answered or left.
+///
+/// The dialog owns the keyboard while it is open: it is a list in front of the
+/// reader, and every key belongs to it until it closes.
+#[cfg(feature = "tui")]
+fn run_session_dialog(
+    mut dialog: tui::SessionDialogState,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let width = tui::terminal_width();
+    writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    loop {
+        // A keyboard that hung up leaves the dialog, rather than holding the
+        // session on a list nothing can answer.
+        let Ok(byte) = keys.recv() else {
+            return Ok(());
+        };
+        let Some(action) = decoder.feed(byte).and_then(|key| dialog.handle_key(key)) else {
+            write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
+                .map_err(terminal_failed)?;
+            stdout.flush().map_err(terminal_failed)?;
+            continue;
+        };
+        let borrowed = Restoring {
+            workspace: restoring.workspace,
+            state: restoring.state,
+            conversation: restoring.conversation,
+            transcript: restoring.transcript,
+            history: restoring.history,
+            approval: restoring.approval,
+            queued: restoring.queued,
+        };
+        match action {
+            tui::SessionAction::Resume(id) => {
+                let loaded = resume_into(id, borrowed);
+                writeln!(stdout, "Resumed session {id} ({loaded} message(s) loaded).")
+                    .map_err(terminal_failed)?;
+            }
+            tui::SessionAction::Rename(id, title) => {
+                if let Ok(store) = open_store(borrowed.workspace) {
+                    let _ = store.set_session_title(id, &title);
+                }
+                writeln!(stdout, "Renamed session {id} to \"{title}\".")
+                    .map_err(terminal_failed)?;
+            }
+            tui::SessionAction::Delete(id) => {
+                delete_session(Some(&id.to_string()), borrowed, stdout)?;
+            }
+            tui::SessionAction::Cancel => {}
+        }
+        return Ok(());
+    }
+}
+
+/// The slash commands that act on the recorded session rather than on the
+/// conversation with the model.
+#[cfg(feature = "tui")]
+fn manages_session(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session")
+    )
+}
+
+/// Start, clear, open, rename or delete a session.
+///
+/// `Some` is the dialog or picker the command opened; `None` means it was
+/// answered on the line and the task prompt stays.
+#[cfg(feature = "tui")]
+fn manage_session(
+    line: &str,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("/new") => {
+            let started = start_session(restoring);
+            writeln!(stdout, "Started new session {started}.").map_err(terminal_failed)?;
+            Ok(None)
+        }
+        // The session is kept; only what the model is told about it is
+        // dropped, so the recording stays whole.
+        Some("/clear") => {
+            let session = restoring.state.session_id();
+            restoring.conversation.clear();
+            *restoring.history = arsy_code::agent::budget::History::default();
+            restoring.queued.clear();
+            writeln!(
+                stdout,
+                "Cleared conversation context for session {session}."
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+        Some("/resume") => resume_command(words.next(), restoring, sessions, stdout),
+        Some("/update") => {
+            writeln!(
+                stdout,
+                "arsy-code v{} is up to date.",
+                env!("CARGO_PKG_VERSION")
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+        Some("/rename") => {
+            let title = line.trim_start_matches("/rename").trim();
+            rename_session(title, "/rename <TITLE>", restoring, stdout)?;
+            Ok(None)
+        }
+        Some("/session") => session_command(words, restoring, sessions, stdout),
+        _ => Ok(None),
+    }
+}
+
+/// Open a session by id, or the list of them when none was named.
+#[cfg(feature = "tui")]
+fn resume_command(
+    id: Option<&str>,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let Some(id) = id else {
+        *sessions = load_workspace_sessions(restoring.workspace);
+        return Ok(Some(Prompt::Resume));
+    };
+    let Ok(parsed) = id.parse::<SessionId>() else {
+        writeln!(stdout, "Invalid session ID `{id}`.").map_err(terminal_failed)?;
+        return Ok(None);
+    };
+    let loaded = resume_into(parsed, restoring);
+    writeln!(
+        stdout,
+        "Resumed session {parsed} ({loaded} message(s) loaded)."
+    )
+    .map_err(terminal_failed)?;
+    Ok(None)
+}
+
+/// `/session`, with or without a word after it.
+#[cfg(feature = "tui")]
+fn session_command<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    match words.next() {
+        None => Ok(Some(Prompt::Session(tui::SessionDialogState::new(
+            load_workspace_sessions(restoring.workspace),
+            restoring.state.session_id(),
+        )))),
+        Some("list") => {
+            *sessions = load_workspace_sessions(restoring.workspace);
+            Ok(Some(Prompt::Resume))
+        }
+        Some("rename") => {
+            let title = words.collect::<Vec<_>>().join(" ");
+            rename_session(&title, "/session rename <TITLE>", restoring, stdout)?;
+            Ok(None)
+        }
+        Some("delete" | "rm" | "remove") => {
+            delete_session(words.next(), restoring, stdout)?;
+            Ok(None)
+        }
+        _ => {
+            writeln!(
+                stdout,
+                "Usage: /session [list | rename <TITLE> | delete [ID]]"
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Give the current session a title, or say how to.
+#[cfg(feature = "tui")]
+fn rename_session(
+    title: &str,
+    usage: &str,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    if title.is_empty() {
+        return writeln!(stdout, "Usage: {usage}").map_err(terminal_failed);
+    }
+    let session = restoring.state.session_id();
+    if let Ok(store) = open_store(restoring.workspace) {
+        let _ = store.set_session_title(session, title);
+    }
+    writeln!(stdout, "Renamed session {session} to \"{title}\".").map_err(terminal_failed)
+}
+
+/// Delete a session, starting a fresh one when it was the open one.
+#[cfg(feature = "tui")]
+fn delete_session(
+    id: Option<&str>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let current = restoring.state.session_id();
+    let target = id
+        .and_then(|id| id.parse::<SessionId>().ok())
+        .unwrap_or(current);
+    if let Ok(store) = open_store(restoring.workspace) {
+        let _ = store.delete_session(target);
+    }
+    if target != current {
+        return writeln!(stdout, "Deleted session {target}.").map_err(terminal_failed);
+    }
+    let started = start_session(restoring);
+    writeln!(
+        stdout,
+        "Deleted current session. Started fresh session {started}."
+    )
+    .map_err(terminal_failed)
+}
+
+/// Begin a session with nothing carried over from the one before it.
+#[cfg(feature = "tui")]
+fn start_session(restoring: Restoring<'_>) -> SessionId {
+    let started = SessionId::new();
+    restoring.state.set_session_id(started);
+    restoring.conversation.clear();
+    restoring.transcript.clear();
+    *restoring.history = arsy_code::agent::budget::History::default();
+    set_approval_mode(
+        restoring.approval,
+        restoring.state,
+        approval::ApprovalMode::Default,
+    );
+    restoring.queued.clear();
+    started
+}
+
+/// The slash commands that choose a setting, by opening its list or by naming
+/// the answer on the same line.
+#[cfg(feature = "tui")]
+fn opens_picker(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/auth" | "/model" | "/provider" | "/effort" | "/theme")
+    )
+}
+
+/// What opening a picker re-reads or resets.
+#[cfg(feature = "tui")]
+struct Opening<'a> {
+    models: &'a mut Vec<tui::ModelChoice>,
+    providers: &'a mut Vec<String>,
+    chosen: &'a mut Option<String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    effort: &'a mut Option<Effort>,
+    theme: &'a mut String,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    state: &'a mut tui::TuiState,
+}
+
+/// Open the picker a slash command names, or take the answer it carried.
+///
+/// `Some` is the prompt that now collects the answer; `None` means the line
+/// answered outright and the task prompt stays.
+#[cfg(feature = "tui")]
+fn open_picker(
+    line: &str,
+    invocation: &Invocation,
+    opening: Opening<'_>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let mut words = line.split_whitespace();
+    let (command, answer) = (words.next(), words.next());
+    match command {
+        Some("/auth") => {
+            *opening.providers = configured_providers(invocation);
+            opening.auth_draft.clear();
+            Ok(Some(Prompt::Auth(tui::AuthStep::Pick)))
+        }
+        Some("/model") => {
+            // Re-read, so a model added to any endpoint since startup is
+            // offered without restarting.
+            let mut models = endpoint_models(invocation);
+            models.extend(tui::available_models());
+            *opening.models = models;
+            Ok(Some(Prompt::Model))
+        }
+        Some("/provider") => {
+            *opening.providers = configured_providers(invocation);
+            *opening.chosen = configured_default(invocation);
+            *opening.draft = tui::ProviderDraft::default();
+            Ok(Some(Prompt::Provider(tui::ProviderStep::Pick)))
+        }
+        // A bare `/effort` opens the list, so the levels can be read before
+        // one is chosen; `/effort high` still sets it outright.
+        Some("/effort") => match answer {
+            None => Ok(Some(Prompt::Effort)),
+            Some(answer) => {
+                take_effort(answer, opening.effort, opening.state, stdout, emitter)?;
+                Ok(None)
+            }
+        },
+        // A bare `/theme` opens the list; `/theme light` sets it outright.
+        Some("/theme") => match answer {
+            None => Ok(Some(Prompt::Theme)),
+            Some(answer) => {
+                apply_theme(answer, opening.theme, opening.roles, stdout, emitter)
+                    .map_err(terminal_failed)?;
+                Ok(None)
+            }
+        },
+        _ => Ok(None),
+    }
+}
+
+/// What a session being opened replaces.
+#[cfg(feature = "tui")]
+struct Restoring<'a> {
+    workspace: &'a Path,
+    state: &'a mut tui::TuiState,
+    conversation: &'a mut Vec<ModelMessage>,
+    transcript: &'a mut tui::Transcript,
+    history: &'a mut arsy_code::agent::budget::History,
+    approval: &'a approval::ApprovalCell,
+    queued: &'a mut std::collections::VecDeque<String>,
+}
+
+/// Open a recorded session, answering how many messages it carried.
+///
+/// The approval mode goes back to default and the queue is dropped: both
+/// belonged to the session being left, and carrying either into another one
+/// would give it authority nobody granted it there.
+#[cfg(feature = "tui")]
+fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize {
+    let (conversation, history) = reconstruct_session_conversation(restoring.workspace, session);
+    *restoring.conversation = conversation;
+    *restoring.history = history;
+    restoring.transcript.clear();
+    restoring.state.set_session_id(session);
+    set_approval_mode(
+        restoring.approval,
+        restoring.state,
+        approval::ApprovalMode::Default,
+    );
+    restoring.queued.clear();
+    restoring.conversation.len()
+}
+
+/// What a picker leaves behind when it is closed without an answer.
+#[cfg(feature = "tui")]
+struct Leaving<'a> {
+    effort: Option<Effort>,
+    theme: &'a str,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    session: SessionId,
+    route: &'a tui::ModelRoute,
+}
+
+/// Close a picker without taking an answer, and say what is still in force.
+///
+/// Ending input at a picker cancels the picker, not the session: the setting
+/// is unchanged and the task prompt returns.
+#[cfg(feature = "tui")]
+fn leave_picker(prompt: &Prompt, leaving: Leaving<'_>) -> String {
+    match prompt {
+        Prompt::Effort => effort_line(leaving.effort),
+        Prompt::Theme => {
+            // The preview left the palette on the last row arrowed onto; put
+            // the committed one back.
+            tui::set_palette(leaving.theme, leaving.roles);
+            format!("Theme unchanged: {}", leaving.theme)
+        }
+        Prompt::Provider(_) => {
+            *leaving.draft = tui::ProviderDraft::default();
+            "Provider unchanged.".to_owned()
+        }
+        Prompt::Auth(_) => {
+            leaving.auth_draft.clear();
+            "Auth unchanged.".to_owned()
+        }
+        Prompt::Resume => format!("Session unchanged: {}.", leaving.session),
+        _ => format!("Model unchanged: {}", leaving.route),
+    }
+}
+
+/// The provider for this route, resolved once and remembered.
+///
+/// A lookup that failed is remembered too: probing a credential store on every
+/// turn is slow, and asks the operating system for a credential the operator
+/// already declined once.
+#[cfg(feature = "tui")]
+fn resolve_route<'a>(
+    invocation: &Invocation,
+    workspace: &Path,
+    provider: &str,
+    resolved: &'a mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable: &mut std::collections::HashSet<String>,
+) -> Option<&'a provider::Resolved> {
+    if !resolved.contains_key(provider) && !unavailable.contains(provider) {
+        let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+        match load_config(workspace, &working, invocation.config.as_deref())
+            .ok()
+            .and_then(|config| provider::resolve(&config, Some(provider)).ok())
+        {
+            Some(found) => {
+                resolved.insert(provider.to_owned(), found);
+            }
+            None => {
+                unavailable.insert(provider.to_owned());
+            }
+        }
+    }
+    resolved.get(provider)
+}
+
+/// Ask the operator what to do with the plan a planning turn produced.
+///
+/// The structured plan is preferred over the prose, because that is what the
+/// harness recorded; the prose stands in only when no steps were written.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn settle_plan(
+    workspace: &Path,
+    response: &str,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let projection = progress::plan(workspace, &state.session_id().to_string());
+    let structured = progress::human_plan(&projection);
+    let has_steps = projection["steps"]
+        .as_array()
+        .is_some_and(|steps| !steps.is_empty());
+    let preview = if has_steps || response.trim().is_empty() {
+        structured
+    } else {
+        response.to_owned()
+    };
+    match confirm_plan(stdout, colour, keys, decoder, &preview).map_err(terminal_failed)? {
+        tui::AskDialogResult::Approve { note } => {
+            let mode = approval.approve_plan();
+            state.set_approval_mode(mode.label());
+            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
+            if let Some(note) = note {
+                instruction.push_str(&format!(" Operator constraint: {note}"));
+            }
+            queued.push_front(instruction);
+            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                .map_err(terminal_failed)?;
+        }
+        // The dialog's second choice is "continue planning", so it stays in
+        // Plan Mode and queues another planning turn.
+        tui::AskDialogResult::AlwaysApprove { note } => {
+            queued.push_front(revise_instruction(note.as_deref()));
+        }
+        tui::AskDialogResult::CycleMode => {
+            let mode = cycle_approval_mode(approval);
+            state.set_approval_mode(mode.label());
+            queued.clear();
+            writeln!(
+                stdout,
+                "Approval mode: {} — {}",
+                mode.label(),
+                mode.description()
+            )
+            .map_err(terminal_failed)?;
+        }
+        tui::AskDialogResult::Deny { .. } | tui::AskDialogResult::Cancel => {
+            let mode = approval.cancel_plan();
+            state.set_approval_mode(mode.label());
+            queued.clear();
+            writeln!(
+                stdout,
+                "Planning cancelled. Approval mode: {}.",
+                mode.label()
+            )
+            .map_err(terminal_failed)?;
+        }
+    }
+    Ok(())
+}
+
+/// Carry the provider wizard one step, and say which step comes next.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_provider(
+    invocation: &Invocation,
+    step: tui::ProviderStep,
+    line: &str,
+    draft: &mut tui::ProviderDraft,
+    providers: &mut Vec<String>,
+    chosen: &mut Option<String>,
+    stdout: &mut io::Stdout,
+) -> Result<Prompt, Diagnostic> {
+    let message = match provider_step(invocation, step, line, draft, providers) {
+        Ok(ProviderNext::Ask(next)) => return Ok(Prompt::Provider(next)),
+        Ok(ProviderNext::Done(message)) => {
+            writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+            *providers = configured_providers(invocation);
+            *chosen = configured_default(invocation);
+            *draft = tui::ProviderDraft::default();
+            // Configuration decides the provider, so the session has to be
+            // restarted to pick up a change to it rather than pretend the
+            // running one moved.
+            "Restart ARSY for the change to take effect.".to_owned()
+        }
+        Ok(ProviderNext::Cancelled(message)) => {
+            *draft = tui::ProviderDraft::default();
+            message
+        }
+        // The step stays open so the answer can be retyped against the
+        // question that is still on screen.
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            return Ok(Prompt::Provider(step));
+        }
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+    Ok(Prompt::Task)
+}
+
+/// Take the reasoning effort the operator picked.
+///
+/// A rejected answer leaves the list open so it can be retyped against what is
+/// already on screen.
+#[cfg(feature = "tui")]
+fn take_effort(
+    line: &str,
+    effort: &mut Option<Effort>,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_effort_answer(line, *effort) {
+        Ok(picked) => {
+            *effort = picked;
+            state.set_effort(*effort);
+            remember_effort(*effort, emitter);
+            writeln!(stdout, "{}", effort_line(*effort)).map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Effort)
+        }
+    }
+}
+
+/// Take the model the operator picked, and remember it for the next run.
+#[cfg(feature = "tui")]
+fn take_model(
+    line: &str,
+    models: &[tui::ModelChoice],
+    route: &mut tui::ModelRoute,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_model(line, models, route) {
+        Ok(picked) => {
+            *route = picked;
+            remember_model(route, emitter);
+            state.set_model_route(route.clone());
+            writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Model)
+        }
+    }
+}
+
+/// Carry the credential wizard one step, and say which step comes next.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_auth(
+    invocation: &Invocation,
+    step: tui::AuthStep,
+    line: &str,
+    draft: &mut String,
+    providers: &[String],
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    let (message, next) = match auth_step(invocation, step, line, draft, providers, emitter) {
+        Ok(AuthNext::Ask(next)) => return Ok(Prompt::Auth(next)),
+        // Finished or abandoned, the draft goes either way: a credential is
+        // never left in memory for the next question to pick up.
+        Ok(AuthNext::Done(message) | AuthNext::Cancelled(message)) => {
+            draft.clear();
+            (message, Prompt::Task)
+        }
+        Err(reason) => (reason, Prompt::Auth(step)),
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+    Ok(next)
+}
+
+/// What the pickers read to draw themselves.
+#[cfg(feature = "tui")]
+struct Picker<'a> {
+    state: &'a tui::TuiState,
+    workspace: &'a Path,
+    models: &'a [tui::ModelChoice],
+    route: &'a tui::ModelRoute,
+    effort: Option<Effort>,
+    theme: &'a str,
+    draft: &'a tui::ProviderDraft,
+    auth_draft: &'a str,
+    sessions: &'a [tui::SessionChoice],
+    providers: &'a [String],
+    chosen_provider: Option<&'a str>,
+}
+
+/// The line under the composer: the status row, or whatever the open picker
+/// wants said above its rows.
+#[cfg(feature = "tui")]
+fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -> String {
+    match prompt {
+        // The branch is read per line rather than kept, so a checkout made in
+        // another terminal shows up on the next prompt.
+        Prompt::Task => picker.state.status_row(
+            tui::terminal_width(),
+            colour,
+            tui::branch(picker.workspace).as_deref(),
+        ),
+        Prompt::Model => tui::model_prompt(picker.models, picker.route, colour),
+        Prompt::Effort => tui::effort_prompt(picker.effort, colour),
+        Prompt::Theme => tui::theme_prompt(picker.theme, colour),
+        Prompt::Provider(step) => step.prompt(picker.draft, colour),
+        Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
+        Prompt::Resume => tui::session_prompt(picker.sessions, colour),
+        Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
+    }
+}
+
+/// The rows the open picker offers, and which of them is marked.
+#[cfg(feature = "tui")]
+fn offer_rows(
+    prompt: &Prompt,
+    composer: &mut tui::Composer,
+    picker: Picker<'_>,
+    invocation: &Invocation,
+) {
+    match prompt {
+        Prompt::Model => {
+            let (rows, selected) = tui::model_rows(picker.models, picker.route);
+            composer.offer(rows, selected);
+        }
+        Prompt::Effort => {
+            composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(picker.effort))
+        }
+        Prompt::Theme => composer.offer_table(Some(tui::THEMES), tui::theme_row(picker.theme)),
+        Prompt::Provider(step) => composer.offer(
+            step.rows(
+                picker.providers,
+                &picker.route.provider,
+                picker.chosen_provider,
+            ),
+            0,
+        ),
+        Prompt::Auth(step) => {
+            let handles = catalog_handles(invocation);
+            composer.offer(step.rows(picker.providers, &handles), 0);
+        }
+        Prompt::Resume => {
+            let (rows, selected) =
+                tui::session_rows(picker.sessions, Some(picker.state.session_id()));
+            composer.offer(rows, selected);
+        }
+        _ => composer.offer(None, 0),
+    }
+}
+
+/// The parts of a running turn an event can change.
+#[cfg(feature = "tui")]
+struct Streamlined<'a> {
+    outcome: &'a mut Turn,
+    finished: &'a mut Option<std::time::Instant>,
+    stopped_early: &'a mut bool,
+    seen_git: &'a mut std::collections::HashSet<String>,
+    /// The last row drawn, so an event that renders the same twice is drawn
+    /// once.
+    last_row: &'a mut Option<String>,
+}
+
+/// Read one line from the provider and draw what it says.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn show_event(
+    line: &str,
+    redactor: &Redactor,
+    child: &mut tui::ProviderChild,
+    painter: &Painter<'_>,
+    terminal: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    run: Streamlined<'_>,
+    colour: bool,
+    tick: usize,
+) -> io::Result<()> {
+    let line = redactor.sanitize(line).map_err(io::Error::other)?;
+    let event = serde_json::from_str::<Value>(&line)
+        .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
+    absorb_event(&event, run.outcome, run.finished);
+    let repeated_git = run.finished.is_none() && repeated_git(&event, run.seen_git);
+    if repeated_git {
+        *run.stopped_early = true;
+        *run.finished = Some(std::time::Instant::now());
+        child.stop(false);
+        note_repeated_git(run.outcome);
+        painter.row(
+            terminal,
+            composer,
+            Some(&tui::tool_result_row(
+                colour,
+                "git",
+                true,
+                "repeated successful command skipped",
+            )),
+            false,
+            run.outcome.queued.len(),
+            tick,
+        )?;
+    }
+    // A killed provider still flushes buffered events; showing them
+    // after the interrupt notice would contradict it.
+    if !run.outcome.interrupted && !repeated_git {
+        if let Some(row) = tui::render_codex_event(&line, colour) {
+            if run.last_row.as_ref() != Some(&row) {
+                painter.row(
+                    terminal,
+                    composer,
+                    Some(&row),
+                    false,
+                    run.outcome.queued.len(),
+                    tick,
+                )?;
+            }
+            *run.last_row = Some(row);
+        }
+    }
+    Ok(())
+}
+
+/// Say in the answer that a repeated Git command was stopped.
+///
+/// The turn ends here, so the reason has to reach the model in the answer
+/// itself: the row on screen is for the operator, not for the next request.
+#[cfg(feature = "tui")]
+fn note_repeated_git(outcome: &mut Turn) {
+    if !outcome.response.is_empty() {
+        outcome.response.push_str("\n\n");
+    }
+    outcome
+        .response
+        .push_str("The provider repeated a successful Git command; the duplicate was skipped.");
+}
+
+/// Take what an event says about the turn.
+///
+/// The provider's own words are the answer; a terminal event settles when the
+/// turn ended, whatever the process does afterwards.
+#[cfg(feature = "tui")]
+fn absorb_event(event: &Value, outcome: &mut Turn, finished: &mut Option<std::time::Instant>) {
+    if finished.is_none()
+        && matches!(
+            event["type"].as_str(),
+            Some("turn.completed" | "turn.failed")
+        )
+    {
+        *finished = Some(std::time::Instant::now());
+    }
+    outcome.provider_failed |= event["type"] == "turn.failed";
+    if event["type"] != "item.completed" || event["item"]["type"] != "agent_message" {
+        return;
+    }
+    if let Some(text) = event["item"]["text"].as_str() {
+        if !outcome.response.is_empty() {
+            outcome.response.push('\n');
+        }
+        outcome.response.push_str(text);
+    }
+}
+
+/// Whether the turn's loop carries on.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Pass {
+    Go,
+    Stop,
+}
+
+/// The clocks a running provider turn watches.
+#[cfg(feature = "tui")]
+struct Clocks<'a> {
+    started: std::time::Instant,
+    status: &'a mut Option<std::process::ExitStatus>,
+    /// When the process was seen to have left.
+    exited: &'a mut Option<std::time::Instant>,
+    /// When the provider said the turn was over.
+    finished: &'a mut Option<std::time::Instant>,
+    last_event: std::time::Instant,
+    /// When a stop was asked for, so it can be escalated.
+    cancelling: Option<std::time::Instant>,
+    stopped_early: &'a mut bool,
+}
+
+/// Where the provider's process stands at the top of a pass.
+///
+/// The turn is over when the provider says it is over. A CLI that lingers
+/// after its terminal event — cleaning up a session, flushing telemetry —
+/// must not keep the clock running against an answer already on screen.
+#[cfg(feature = "tui")]
+fn lifecycle(child: &mut tui::ProviderChild, clocks: Clocks<'_>) -> io::Result<Pass> {
+    if clocks.status.is_none() {
+        *clocks.status = child.0.try_wait()?;
+        if clocks.status.is_some() {
+            *clocks.exited = Some(std::time::Instant::now());
+            child.stop(true);
+        }
+    }
+    if clocks
+        .exited
+        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+    {
+        return Ok(Pass::Stop);
+    }
+    // The turn is over when the provider says it is over. A CLI that
+    // lingers after its terminal event — cleaning up a session, flushing
+    // telemetry — must not keep the clock running against the answer that
+    // is already on screen.
+    //
+    // Trailing rows still land: the stream drains until it has been quiet
+    // for 250ms, and no longer than 2 seconds however talkative it stays.
+    if clocks.status.is_none()
+        && clocks.finished.is_some_and(|at: std::time::Instant| {
+            clocks.last_event.elapsed() >= std::time::Duration::from_millis(250)
+                || at.elapsed() >= std::time::Duration::from_secs(2)
+        })
+    {
+        *clocks.stopped_early = true;
+        child.stop(false);
+        return Ok(Pass::Stop);
+    }
+    if clocks.started.elapsed() >= std::time::Duration::from_secs(300) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "provider exceeded the 300-second turn deadline",
+        ));
+    }
+    if clocks
+        .cancelling
+        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
+    {
+        child.stop(true);
+        *clocks.status = Some(child.0.wait()?);
+        return Ok(Pass::Stop);
+    }
+    Ok(Pass::Go)
+}
+
+/// The call a live view is watching.
+#[cfg(feature = "tui")]
+struct LiveCall<'a> {
+    name: &'a str,
+    /// Only a process can be cancelled part way; everything else runs to its
+    /// own end and Ctrl-C would leave the workspace half changed.
+    cancellable: bool,
+    operation_id: arsy_kernel::domain::OperationId,
+}
+
+/// Take the keys pressed while a call runs, answering whether it was
+/// cancelled.
+///
+/// `e` toggles how much of the output is shown. Every other key belongs to
+/// the composer and is read once the call is done.
+#[cfg(feature = "tui")]
+fn absorb_live_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    terminal: &mut io::Stdout,
+    call: LiveCall<'_>,
+    drawn_rows: &mut usize,
+    expanded: &mut bool,
+) -> io::Result<bool> {
+    let mut cancelled = false;
+    for key in keys.try_iter().filter_map(|byte| decoder.feed(byte)) {
+        match key {
+            tui::Key::Interrupt if call.cancellable => {
+                arsy_code::process::cancel(call.operation_id);
+                if *drawn_rows > 0 {
+                    write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
+                    *drawn_rows = 0;
+                }
+                write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
+                terminal.flush()?;
+                cancelled = true;
+            }
+            tui::Key::Char('e' | 'E') => *expanded = !*expanded,
+            _ => {}
+        }
+    }
+    Ok(cancelled)
+}
+
+/// Take whatever a running command has printed since the last pass.
+///
+/// The tail is what a reader needs while it runs, so the buffer is capped and
+/// the oldest output is dropped rather than growing without bound.
+#[cfg(feature = "tui")]
+fn absorb_output(output: &std::sync::mpsc::Receiver<String>, live: &mut String) {
+    /// What is kept of a long-running command's output.
+    const KEEP_BYTES: usize = 16_384;
+
+    live.extend(output.try_iter());
+    if live.len() > KEEP_BYTES {
+        let oldest = live.len() - KEEP_BYTES;
+        live.drain(..oldest);
+    }
+}
+
+/// What a key press during a provider turn can reach.
+#[cfg(feature = "tui")]
+struct Keyboard<'a> {
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    composer: &'a mut tui::Composer,
+    approval: &'a approval::ApprovalCell,
+}
+
+/// The turn those keys can change.
+#[cfg(feature = "tui")]
+struct Turning<'a> {
+    outcome: &'a mut Turn,
+    cancelling: &'a mut Option<std::time::Instant>,
+    last_key: &'a mut std::time::Instant,
+}
+
+/// Take the keys waiting, without blocking on the next one.
+///
+/// Bounded per pass so a held key cannot starve the event stream: whatever is
+/// still waiting is read on the pass after this one.
+///
+/// Answers whether anything typed changed what is on screen.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn provider_keys(
+    board: Keyboard<'_>,
+    terminal: &mut io::Stdout,
+    painter: &Painter<'_>,
+    child: &mut tui::ProviderChild,
+    turning: Turning<'_>,
+    colour: bool,
+    tick: usize,
+) -> io::Result<bool> {
+    let mut typed = false;
+    for _ in 0..256 {
+        let byte = match board.keys.try_recv() {
+            Ok(byte) => byte,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                turning.outcome.quit = true;
+                stop_turn(turning.outcome, child, turning.cancelling);
+                break;
+            }
+        };
+        *turning.last_key = std::time::Instant::now();
+        let Some(key) = board.decoder.feed(byte) else {
+            continue;
+        };
+        // While the provider is running, Interrupt always means the turn,
+        // never the composer or the session — and it drops a queued
+        // follow-up, which was only queued to run after this turn.
+        if key == tui::Key::Interrupt {
+            if stop_turn(turning.outcome, child, turning.cancelling) {
+                painter.row(
+                    terminal,
+                    board.composer,
+                    Some(&tui::interrupted_row(colour)),
+                    true,
+                    0,
+                    tick,
+                )?;
+            }
+            continue;
+        }
+        match board.composer.press(key) {
+            // Shift+Tab is an immediate mode change, not a follow-up task.
+            // Keeping it out of the queue prevents a drafted chat line from
+            // being answered as if it were a second user message.
+            tui::Action::CycleMode => {
+                cycle_approval_mode(board.approval);
+                typed = true;
+            }
+            // A line sent while the provider is busy runs as soon as this
+            // turn ends, rather than being dropped or blocking.
+            tui::Action::Submit(line) if !line.trim().is_empty() => {
+                if turning.outcome.queued.len() < 16 {
+                    // Queued, not dropped: the row below says it was
+                    // taken, and the turn that follows this one runs it.
+                    turning.outcome.queued.push_back(line);
+                    painter.row(
+                        terminal,
+                        board.composer,
+                        Some("  Follow-up queued."),
+                        turning.cancelling.is_some(),
+                        turning.outcome.queued.len(),
+                        tick,
+                    )?;
+                } else {
+                    board.composer.restore(line);
+                    painter.row(
+                        terminal,
+                        board.composer,
+                        Some("  Queue full; draft retained."),
+                        turning.cancelling.is_some(),
+                        turning.outcome.queued.len(),
+                        tick,
+                    )?;
+                }
+            }
+            tui::Action::Submit(_) => typed = true,
+            tui::Action::Quit => {
+                turning.outcome.quit = true;
+                stop_turn(turning.outcome, child, turning.cancelling);
+            }
+            tui::Action::Redraw => typed = true,
+            tui::Action::None => {}
+        }
+    }
+    Ok(typed)
+}
+
+/// Draws the rows a provider turn produces, above the live composer.
+#[cfg(feature = "tui")]
+struct Painter<'a> {
+    colour: bool,
+    footer: &'a str,
+    /// Re-measured on the resize tick rather than per row.
+    width: std::cell::Cell<usize>,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "tui")]
+impl Painter<'_> {
+    /// One row, or none — either way the status under it is repainted.
+    ///
+    /// The composer is torn down and drawn again around each row, so the input
+    /// block is never overwritten by what lands above it.
+    fn row(
+        &self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        row: Option<&str>,
+        cancelling: bool,
+        queued: usize,
+        tick: usize,
+    ) -> io::Result<()> {
+        let mut frame = composer.clear();
+        if let Some(row) = row {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        let phase = if cancelling {
+            tui::TurnPhase::Cancelling
+        } else {
+            tui::TurnPhase::Working
+        };
+        let status = tui::turn_status(self.colour, phase, self.started.elapsed(), tick, queued);
+        frame.push_str(&composer.render_turn(self.width.get(), self.colour, &status, self.footer));
+        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    }
+}
+
+/// What the provider's exit says about the turn, once the turn itself is done.
+///
+/// A zero process exit must not mask a turn the provider reported as failed,
+/// so the event stream is read before the exit status.
+#[cfg(feature = "tui")]
+fn verdict(
+    child: &mut tui::ProviderChild,
+    route: &tui::ModelRoute,
+    status: Option<std::process::ExitStatus>,
+    stopped_early: bool,
+    outcome: &Turn,
+) -> io::Result<Option<String>> {
+    let status = match status {
+        Some(status) => status,
+        // The turn ended before the process did, so the process is asked to
+        // leave and then made to: waiting on a CLI that ignores the signal is
+        // the hang this exit was added to avoid.
+        None if stopped_early => reap(child)?,
+        None => child.0.wait()?,
+    };
+    Ok(if outcome.provider_failed {
+        Some(format!("{route} reported a failed turn"))
+    // A signal ARSY sent after a completed turn is its own exit code, not a
+    // verdict on the turn the provider already reported.
+    } else if status.success() || stopped_early {
+        None
+    } else {
+        Some(format!("{route} exited with status {status}"))
+    })
+}
+
+/// Wait briefly for a provider asked to leave, then make it.
+#[cfg(feature = "tui")]
+fn reap(child: &mut tui::ProviderChild) -> io::Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        if let Some(status) = child.0.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.stop(true);
+            return child.0.wait();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The error for a provider that closed its stream without ever saying the
+/// turn ended, carrying whatever it wrote to stderr.
+#[cfg(feature = "tui")]
+fn silent_provider(
+    errors: &std::sync::mpsc::Receiver<String>,
+    redactor: &Redactor,
+) -> io::Result<io::Error> {
+    let detail = errors
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .unwrap_or_default();
+    let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
+    Ok(io::Error::other(format!(
+        "provider closed its stream without a terminal turn event: {}",
+        terminal_text(detail.trim())
+    )))
+}
+
+/// Whether this event is a Git command that already succeeded this turn.
+///
+/// A provider that repeats a push or a commit would run it twice, so the
+/// duplicate is caught at its start event — before it gets a second chance —
+/// which means the set is filled by the completions that came before it.
+#[cfg(feature = "tui")]
+fn repeated_git(event: &Value, seen: &mut std::collections::HashSet<String>) -> bool {
+    if event["item"]["type"] != "command_execution" {
+        return false;
+    }
+    let Some(command) = event["item"]
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| command.contains("git "))
+    else {
+        return false;
+    };
+    match event["type"].as_str() {
+        Some("item.started") => seen.contains(command),
+        Some("item.completed") if event["item"]["exit_code"].as_i64() == Some(0) => {
+            !seen.insert(command.to_owned())
+        }
+        _ => false,
+    }
+}
+
+/// Stop the running turn.
+///
+/// The queue goes with it: a follow-up was only queued to run after this turn,
+/// and the operator stopping the turn is not asking for the next one. The
+/// moment the stop began is kept so an unresponsive provider can be escalated
+/// from a polite stop to a kill.
+///
+/// Answers whether this call was the one that started the stop, because that
+/// is when the row saying so is drawn — a second Ctrl-C must not draw it again.
+#[cfg(feature = "tui")]
+fn stop_turn(
+    outcome: &mut Turn,
+    child: &mut tui::ProviderChild,
+    cancelling: &mut Option<std::time::Instant>,
+) -> bool {
+    outcome.queued.clear();
+    outcome.interrupted = true;
+    if cancelling.is_some() {
+        return false;
+    }
+    *cancelling = Some(std::time::Instant::now());
+    child.stop(false);
+    true
+}
+
+/// What a streaming round has put on screen so far.
+///
+/// Reasoning and the answer hold separate buffers and separate boxes, so the
+/// verbose stream reads as distinct parts of the turn rather than one grey
+/// blur. Deltas arrive token by token and a row is drawn per line, so what is
+/// left of an unfinished line is kept here until the rest of it arrives.
+#[cfg(feature = "tui")]
+#[derive(Default)]
+struct Streaming {
+    /// Answer text not yet ended by a line break.
+    pending: String,
+    /// Reasoning not yet ended by a line break.
+    thinking: String,
+    thinking_open: bool,
+    answer_open: bool,
+    /// Rows drawn for `pending`, which a finished line replaces.
+    live_lines: usize,
+}
+
+#[cfg(feature = "tui")]
+impl Streaming {
+    /// Draw reasoning as it streams, opening its box on the first delta.
+    fn reason(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        let width = tui::terminal_width();
+        if !self.thinking_open {
+            self.thinking_open = true;
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_top(width, colour),
+            )?;
+        }
+        self.thinking.push_str(text);
+        for line in drain_lines(&mut self.thinking) {
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_row(width, colour, &line),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Draw the answer as it streams. Answer text closes the reasoning box
+    /// first, so the prose never starts inside it.
+    fn answer(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        self.close_thinking(terminal, composer, colour, footer, status)?;
+        if !self.answer_open {
+            self.answer_open = true;
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::assistant_header(colour),
+            )?;
+        }
+        self.pending.push_str(text);
+        let complete = drain_lines(&mut self.pending);
+        // The live rows held the part of a line still arriving. A finished
+        // line replaces them, so they are erased once before the first.
+        if self.live_lines > 0 && !complete.is_empty() {
+            erase_live_response(terminal, composer, self.live_lines)?;
+            self.live_lines = 0;
+        }
+        for line in complete {
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::assistant_row(colour, &line),
+            )?;
+        }
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.live_lines = redraw_live_response(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &self.pending,
+            self.live_lines,
+        )?;
+        Ok(())
+    }
+
+    /// Close the round: finish whatever box is open and settle the last line.
+    fn close(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        self.close_thinking(terminal, composer, colour, footer, status)?;
+        if self.live_lines > 0 {
+            erase_live_response(terminal, composer, self.live_lines)?;
+            self.live_lines = 0;
+        }
+        if self.pending.trim().is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.pending);
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::assistant_row(colour, &line),
+        )
+    }
+
+    /// Close the reasoning box if it is open, flushing the line it was part
+    /// way through.
+    fn close_thinking(
+        &mut self,
+        terminal: &mut dyn Write,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        if !self.thinking_open {
+            return Ok(());
+        }
+        self.thinking_open = false;
+        let width = tui::terminal_width();
+        if !self.thinking.trim().is_empty() {
+            let line = std::mem::take(&mut self.thinking);
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_row(width, colour, &line),
+            )?;
+        }
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::thinking_box_bottom(width, colour),
+        )
+    }
+}
+
+/// Take the finished lines out of a streaming buffer, leaving whatever part of
+/// the next one has arrived.
+///
+/// One scan for the last break rather than one per line: a buffer is appended
+/// to on every delta, and re-scanning it from the front for each line it holds
+/// is quadratic in a long answer.
+#[cfg(feature = "tui")]
+fn drain_lines(buffer: &mut String) -> Vec<String> {
+    let Some(last) = buffer.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete: String = buffer.drain(..=last).collect();
+    complete.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+/// One finished row above the composer, with the status redrawn under it.
+#[cfg(feature = "tui")]
+fn stream_row(
+    terminal: &mut dyn Write,
+    composer: &mut tui::Composer,
+    colour: bool,
+    footer: &str,
+    status: &str,
+    row: &str,
+) -> io::Result<()> {
+    let mut frame = composer.clear();
+    frame.push_str(row);
+    frame.push('\n');
+    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
+    write!(terminal, "{frame}").and_then(|()| terminal.flush())
+}
+
+/// What the keys pressed while a round streams amount to.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Typed {
+    /// Nothing that changes what is on screen.
+    Quiet,
+    Redraw,
+    Interrupted,
+}
+
+/// Take every key waiting, without blocking on the next one.
+///
+/// A turn is streaming while this runs, so the composer stays live: a
+/// follow-up can be queued, the approval mode can change, and the turn can be
+/// stopped, all without waiting for the provider to finish.
+#[cfg(feature = "tui")]
+fn drain_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+    outcome: &mut Turn,
+) -> Typed {
+    let mut typed = Typed::Quiet;
+    while let Ok(byte) = keys.try_recv() {
+        let Some(key) = decoder.feed(byte) else {
+            continue;
+        };
+        if key == tui::Key::Interrupt {
+            outcome.queued.clear();
+            outcome.interrupted = true;
+            return Typed::Interrupted;
+        }
+        match composer.press(key) {
+            // Shift+Tab changes authority immediately; it never becomes a
+            // model prompt or a queued follow-up.
+            tui::Action::CycleMode => {
+                cycle_approval_mode(approval);
+                typed = Typed::Redraw;
+            }
+            // Bounded as on the Codex route, so a held Enter cannot grow the
+            // queue without limit; past the bound the draft is handed back.
+            tui::Action::Submit(line) if !line.trim().is_empty() => {
+                if outcome.queued.len() < 16 {
+                    outcome.queued.push_back(line);
+                } else {
+                    composer.restore(line);
+                }
+            }
+            tui::Action::Submit(_) | tui::Action::Redraw => typed = Typed::Redraw,
+            tui::Action::Quit => outcome.quit = true,
+            tui::Action::None => {}
+        }
+    }
+    typed
+}
+
+/// The request one round of a turn sends.
+///
+/// Built per round rather than captured once: the instructions are discovered
+/// by walking the workspace, and an AGENTS.md the turn just edited is the one
+/// the next round should read.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn round_request(
+    resolved: &provider::Resolved,
+    runtime: &arsy_code::agent::ToolRuntime,
+    conversation: &[ModelMessage],
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    round: usize,
+) -> io::Result<CanonicalModelRequest> {
+    Ok(CanonicalModelRequest {
+        model: ModelKey {
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+        },
+        system: system_prompt(
+            runtime.workspace(),
+            &route.provider,
+            &route.model,
+            runtime.execution_mode(),
+        ),
+        messages: conversation.to_vec(),
+        tools: runtime.schemas(),
+        max_output_tokens: resolved.endpoint.max_output_tokens,
+        effort,
+        // One turn can take several requests, one per round of tool calls. The
+        // round is part of the key, because a retry must repeat its own
+        // request rather than collapse into the one before it.
+        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
+            .map_err(io::Error::other)?,
+    })
+}
+
+/// Read the provider's stream on its own thread, as the rows the turn draws.
+///
+/// The provider's events are turned into rows here rather than at the far end,
+/// so the drawing loop waits on one channel and nothing else.
+#[cfg(feature = "tui")]
+fn spawn_stream(
+    provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
+    request: CanonicalModelRequest,
+) -> std::sync::mpsc::Receiver<Result<Streamed, String>> {
+    let (rows, events) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stream = match arsy_kernel::provider::stream_with_retry(
+            provider.as_ref(),
+            &request,
+            &mut std::thread::sleep,
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let _ = rows.send(Err(error.to_string()));
+                return;
+            }
+        };
+        for event in stream {
+            let Some(message) = streamed(event) else {
+                continue;
+            };
+            let failed = message.is_err();
+            if rows.send(message).is_err() || failed {
+                return;
+            }
+        }
+    });
+    events
+}
+
+/// The row a provider event draws, or `None` for an event the turn does not
+/// show.
+#[cfg(feature = "tui")]
+fn streamed(
+    event: Result<ModelEvent, arsy_kernel::provider::ProviderError>,
+) -> Option<Result<Streamed, String>> {
+    Some(match event {
+        Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
+        Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
+        Ok(ModelEvent::Usage {
+            input_tokens,
+            output_tokens,
+        }) => Ok(Streamed::Usage {
+            input_tokens,
+            output_tokens,
+        }),
+        Ok(ModelEvent::ToolCallCompleted {
+            id,
+            name,
+            arguments,
+            ..
+        }) => Ok(Streamed::Tool {
+            id,
+            name,
+            arguments,
+        }),
+        Ok(_) => return None,
+        Err(error) => Err(error.to_string()),
+    })
+}
+
+/// Say what a context trim removed, when it removed anything.
+///
+/// A transcript that has outgrown the window fails at the provider, so the
+/// operator is told what was elided rather than watching the turn shrink
+/// invisibly.
+#[cfg(feature = "tui")]
+fn report_trim(colour: bool, trimmed: &arsy_code::agent::budget::Trimmed) -> io::Result<()> {
+    if !trimmed.changed() {
+        return Ok(());
+    }
+    let mut terminal = io::stdout();
+    writeln!(
+        terminal,
+        "{}",
+        tui::tool_result_row(
+            colour,
+            "context",
+            true,
+            &format!(
+                "elided {} tool result(s) and compacted {} earlier message(s) to stay \
+                 within {} tokens",
+                trimmed.elided, trimmed.summarized, trimmed.after
+            )
+        )
+    )?;
+    terminal.flush()
+}
+
+/// The call being answered.
+#[cfg(feature = "tui")]
+struct Call<'a> {
+    name: &'a str,
+    arguments: &'a Value,
+    /// Identifies the effect, so an identical later call can be answered from
+    /// this one's result.
+    fingerprint: String,
+}
+
+/// What answering a call is allowed to touch.
+#[cfg(feature = "tui")]
+struct Answering<'a> {
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    approval: &'a approval::ApprovalCell,
+    completed: &'a mut std::collections::HashMap<String, String>,
+    interrupted: &'a mut bool,
+}
+
+/// Run one call and turn what happened into the result the provider is sent.
+#[cfg(feature = "tui")]
+fn run_call(
+    runtime: &arsy_code::agent::ToolRuntime,
+    terminal: &mut io::Stdout,
+    colour: bool,
+    summary: &str,
+    call: Call<'_>,
+    answering: Answering<'_>,
+) -> io::Result<(String, bool)> {
+    // A new effect can invalidate an earlier read or command result, so only
+    // reuse calls until the next effectful call.
+    if !runtime.is_observational(call.name, call.arguments) {
+        answering.completed.clear();
+    }
+    match execute_call(
+        runtime,
+        terminal,
+        colour,
+        call.name,
+        call.arguments,
+        summary,
+        answering.keys,
+        answering.decoder,
+        answering.approval,
+    )? {
+        Executed::Answered(mut result) => {
+            if !result.changed_files.is_empty() {
+                result.output.push_str("\nChanged files:\n");
+                for path in &result.changed_files {
+                    result.output.push_str(&format!("  • {path}\n"));
+                }
+            }
+            if result.success {
+                answering
+                    .completed
+                    .insert(call.fingerprint, result.output.clone());
+            }
+            Ok((result.output, !result.success))
+        }
+        Executed::Stopped => {
+            *answering.interrupted = true;
+            writeln!(terminal, "{}", tui::interrupted_row(colour))?;
+            Ok(("The operator stopped the turn.".to_owned(), true))
+        }
+    }
 }
 
 /// What happened to one tool call.
@@ -4444,62 +6481,28 @@ fn execute_call(
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Executed> {
-    use arsy_code::agent::Authorization;
-
     let started = std::time::Instant::now();
     let request = match runtime.prepare(name, arguments) {
         Ok(request) => request,
         Err(failure) => return Ok(Executed::Answered(*failure)),
     };
-    let refused =
-        |reason: String| Executed::Answered(arsy_code::agent::ToolResult::refused(name, reason));
     let authorization = runtime.authorize(&request);
-    let (grants, approval_note) = match &authorization {
-        Authorization::Allowed(grants) => (grants.clone(), None),
-        Authorization::Denied(reason) => return Ok(refused(reason.clone())),
-        Authorization::NeedsApproval { .. } => match approval::decide(approval.get(), name) {
-            approval::Decision::Approve => match authorization.approve() {
-                Ok(grants) => (grants, None),
-                Err(error) => {
-                    return Ok(refused(format!(
-                        "the approval could not be turned into a grant: {error}"
-                    )))
-                }
-            },
-            approval::Decision::Refuse => {
-                return Ok(refused(format!(
-                    "the current approval mode ({}) refuses this call without asking: {}",
-                    approval.get().label(),
-                    authorization.requested()
-                )))
-            }
-            approval::Decision::Ask => {
-                let reason = authorization.requested();
-                let preview = format_tool_preview(name, arguments);
-                match confirm_tool(
-                    terminal, colour, name, summary, &reason, preview, keys, decoder, approval,
-                )? {
-                    Answer::Yes { note } => match authorization.approve() {
-                        Ok(grants) => (grants, note),
-                        Err(error) => {
-                            return Ok(refused(format!(
-                                "the approval could not be turned into a grant: {error}"
-                            )))
-                        }
-                    },
-                    Answer::No { note } => {
-                        let message = note.map_or_else(
-                            || "The operator declined to run this call.".to_owned(),
-                            |note| {
-                                format!("The operator declined to run this call. Feedback: {note}")
-                            },
-                        );
-                        return Ok(refused(message));
-                    }
-                    Answer::Stop => return Ok(Executed::Stopped),
-                }
-            }
+    let (grants, approval_note) = match authorize(
+        terminal,
+        colour,
+        Asking {
+            name,
+            arguments,
+            summary,
+            keys,
+            decoder,
+            approval,
         },
+        authorization,
+    )? {
+        Granted::Run { grants, note } => (grants, note),
+        Granted::Refused(result) => return Ok(Executed::Answered(*result)),
+        Granted::Stopped => return Ok(Executed::Stopped),
     };
     let (mut result, cancelled) = dispatch_tool_live(
         terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
@@ -4511,6 +6514,125 @@ fn execute_call(
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
     Ok(Executed::Answered(result))
+}
+
+/// What deciding a call needs in order to ask about it.
+#[cfg(feature = "tui")]
+struct Asking<'a> {
+    name: &'a str,
+    arguments: &'a Value,
+    summary: &'a str,
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    approval: &'a approval::ApprovalCell,
+}
+
+/// What authorizing a call decided.
+#[cfg(feature = "tui")]
+enum Granted {
+    Run {
+        grants: Vec<arsy_kernel::capability::CapabilityGrant>,
+        /// What the operator said when they approved it, if anything.
+        note: Option<String>,
+    },
+    /// The call does not run, and this is what the provider is told.
+    Refused(Box<arsy_code::agent::ToolResult>),
+    Stopped,
+}
+
+/// Turn an authorization into grants, asking the operator when the mode says
+/// to ask.
+///
+/// Separate from running the call: what a call is allowed to do is decided
+/// before anything happens, and reading that decision should not mean reading
+/// the execution as well.
+#[cfg(feature = "tui")]
+fn authorize(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    asking: Asking<'_>,
+    authorization: arsy_code::agent::Authorization,
+) -> io::Result<Granted> {
+    use arsy_code::agent::Authorization;
+
+    let name = asking.name;
+    let requested = match &authorization {
+        Authorization::Allowed(grants) => {
+            return Ok(Granted::Run {
+                grants: grants.clone(),
+                note: None,
+            })
+        }
+        Authorization::Denied(reason) => return Ok(refused(name, reason.clone())),
+        Authorization::NeedsApproval { .. } => authorization.requested(),
+    };
+    match approval::decide(asking.approval.get(), name) {
+        approval::Decision::Approve => Ok(granted(authorization, name, None)),
+        approval::Decision::Refuse => Ok(refused(
+            name,
+            format!(
+                "the current approval mode ({}) refuses this call without asking: {}",
+                asking.approval.get().label(),
+                requested
+            ),
+        )),
+        approval::Decision::Ask => {
+            let preview = format_tool_preview(name, asking.arguments);
+            match confirm_tool(
+                terminal,
+                colour,
+                name,
+                asking.summary,
+                &requested,
+                preview,
+                asking.keys,
+                asking.decoder,
+                asking.approval,
+            )? {
+                Answer::Yes { note } => Ok(granted(authorization, name, note)),
+                Answer::No { note } => Ok(refused(
+                    name,
+                    note.map_or_else(
+                        || "The operator declined to run this call.".to_owned(),
+                        |note| format!("The operator declined to run this call. Feedback: {note}"),
+                    ),
+                )),
+                Answer::Stop => Ok(Granted::Stopped),
+            }
+        }
+    }
+}
+
+/// Turn an approved authorization into the grants the call runs under.
+#[cfg(feature = "tui")]
+fn granted(
+    authorization: arsy_code::agent::Authorization,
+    name: &str,
+    note: Option<String>,
+) -> Granted {
+    match authorization.approve() {
+        Ok(grants) => Granted::Run { grants, note },
+        Err(error) => refused(
+            name,
+            format!("the approval could not be turned into a grant: {error}"),
+        ),
+    }
+}
+
+/// The answer a call that will not run sends back to the provider.
+#[cfg(feature = "tui")]
+fn refused(name: &str, reason: String) -> Granted {
+    Granted::Refused(Box::new(arsy_code::agent::ToolResult::refused(
+        name, reason,
+    )))
+}
+
+fn write_unwrapped_lines(terminal: &mut impl Write, lines: &[String]) -> io::Result<()> {
+    write!(terminal, "{}", tui::DISABLE_AUTOWRAP)?;
+    for line in lines {
+        writeln!(terminal, "{line}")?;
+    }
+    write!(terminal, "{}", tui::ENABLE_AUTOWRAP)
 }
 
 #[cfg(feature = "tui")]
@@ -4563,29 +6685,23 @@ fn dispatch_tool_live(
         expanded,
     };
     let initial = tui::tool_running_box(tui::terminal_width(), colour, &initial_state);
-    for line in &initial {
-        writeln!(terminal, "{line}")?;
-    }
+    write_unwrapped_lines(terminal, &initial)?;
     terminal.flush()?;
     let mut last_rendered_lines = initial.len();
     loop {
-        while let Ok(byte) = keys.try_recv() {
-            match decoder.feed(byte) {
-                Some(tui::Key::Interrupt) if request.kind.to_string() == "process.exec" => {
-                    arsy_code::process::cancel(operation_id);
-                    if last_rendered_lines > 0 {
-                        write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
-                        last_rendered_lines = 0;
-                    }
-                    write!(terminal, "\r\x1b[K  ✦ Cancelling {name}…\n")?;
-                    terminal.flush()?;
-                    cancelled = true;
-                }
-                Some(tui::Key::Char('e' | 'E')) => {
-                    expanded = !expanded;
-                }
-                _ => {}
-            }
+        if absorb_live_keys(
+            keys,
+            decoder,
+            terminal,
+            LiveCall {
+                name: &name,
+                cancellable: request.kind.to_string() == "process.exec",
+                operation_id,
+            },
+            &mut last_rendered_lines,
+            &mut expanded,
+        )? {
+            cancelled = true;
         }
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
@@ -4597,13 +6713,7 @@ fn dispatch_tool_live(
                 return Ok((result, cancelled));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                while let Ok(chunk) = output_receiver.try_recv() {
-                    live_output.push_str(&chunk);
-                    if live_output.len() > 16_384 {
-                        let keep_from = live_output.len() - 16_384;
-                        live_output.drain(..keep_from);
-                    }
-                }
+                absorb_output(&output_receiver, &mut live_output);
                 frame = frame.wrapping_add(1);
                 let state = tui::RunningToolState {
                     name: name.as_str(),
@@ -4617,9 +6727,7 @@ fn dispatch_tool_live(
                 if last_rendered_lines > 0 {
                     write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
                 }
-                for line in &status_lines {
-                    writeln!(terminal, "{line}")?;
-                }
+                write_unwrapped_lines(terminal, &status_lines)?;
                 terminal.flush()?;
                 last_rendered_lines = status_lines.len();
             }
@@ -4701,6 +6809,7 @@ fn confirm_tool(
                                 return Ok(Answer::Yes { note });
                             }
                             tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
+                            tui::AskDialogResult::CycleMode => continue,
                             tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
                         }
                     } else {
@@ -4723,11 +6832,14 @@ fn confirm_plan(
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    preview: &str,
 ) -> io::Result<tui::AskDialogResult> {
-    let mut dialog = tui::AskDialogState::for_plan();
+    let mut dialog = tui::AskDialogState::for_plan(preview.to_owned());
+    dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
     let width = tui::terminal_width();
-    let mut rendered_lines = dialog.render(width, colour).lines().count();
-    writeln!(terminal, "{}", dialog.render(width, colour))?;
+    let mut frame = dialog.render(width, colour);
+    let mut rendered_lines = frame.lines().count();
+    writeln!(terminal, "{frame}")?;
     terminal.flush()?;
     loop {
         let Ok(byte) = keys.recv() else {
@@ -4741,7 +6853,8 @@ fn confirm_plan(
             terminal.flush()?;
             return Ok(result);
         }
-        let frame = dialog.render(width, colour);
+        dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
+        frame = dialog.render(width, colour);
         write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
         terminal.flush()?;
         rendered_lines = frame.lines().count();
@@ -4750,7 +6863,7 @@ fn confirm_plan(
 
 #[cfg(feature = "tui")]
 fn redraw_live_response(
-    terminal: &mut io::Stdout,
+    terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
     footer: &str,
@@ -4775,7 +6888,7 @@ fn redraw_live_response(
 
 #[cfg(feature = "tui")]
 fn erase_live_response(
-    terminal: &mut io::Stdout,
+    terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     lines: usize,
 ) -> io::Result<()> {
@@ -4811,76 +6924,10 @@ fn native_status(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
-    let request = CanonicalModelRequest {
-        model: ModelKey {
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-        },
-        // The harness's instructions and the project's, discovered by walking
-        // the workspace. Rebuilt per round rather than captured once: an
-        // AGENTS.md the turn just edited is the one the next round should read.
-        system: system_prompt(
-            runtime.workspace(),
-            &route.provider,
-            &route.model,
-            runtime.execution_mode(),
-        ),
-        messages: conversation.to_vec(),
-        tools: runtime.schemas(),
-        max_output_tokens: resolved.endpoint.max_output_tokens,
-        effort,
-        // One turn can take several requests, one per round of tool calls. The
-        // round is part of the key, because a retry must repeat its own
-        // request rather than collapse into the one before it.
-        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
-            .map_err(io::Error::other)?,
-    };
-
-    let provider = Arc::clone(&resolved.provider);
-    let (rows, events) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stream = match arsy_kernel::provider::stream_with_retry(
-            provider.as_ref(),
-            &request,
-            &mut std::thread::sleep,
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = rows.send(Err(error.to_string()));
-                return;
-            }
-        };
-        for event in stream {
-            let message = match event {
-                Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
-                Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
-                Ok(ModelEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                }) => Ok(Streamed::Usage {
-                    input_tokens,
-                    output_tokens,
-                }),
-                Ok(ModelEvent::ToolCallCompleted {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                }) => Ok(Streamed::Tool {
-                    id,
-                    name,
-                    arguments,
-                }),
-                Ok(_) => continue,
-                Err(error) => Err(error.to_string()),
-            };
-            let failed = message.is_err();
-            if rows.send(message).is_err() || failed {
-                return;
-            }
-        }
-    });
+    let request = round_request(resolved, runtime, conversation, route, effort, turn, round)?;
+    let events = spawn_stream(Arc::clone(&resolved.provider), request);
 
     let mut outcome = Turn::default();
     let mut terminal = io::stdout();
@@ -4890,11 +6937,7 @@ fn native_status(
     // Thinking and the answer hold separate buffers, and each thinking section
     // is announced once with its own header row, so the verbose stream reads as
     // distinct parts of the turn rather than one grey blur.
-    let mut pending = String::new();
-    let mut thinking = String::new();
-    let mut thinking_open = false;
-    let mut answer_open = false;
-    let mut live_lines = 0usize;
+    let mut live = Streaming::default();
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -4927,43 +6970,21 @@ fn native_status(
     };
     draw(&mut terminal, composer, None, &status_line(false, 0))?;
     loop {
-        let mut typed = false;
-        while let Ok(byte) = keys.try_recv() {
-            let Some(key) = decoder.feed(byte) else {
-                continue;
-            };
-            if key == tui::Key::Interrupt {
-                outcome.queued.clear();
-                outcome.interrupted = true;
-                draw(
-                    &mut terminal,
-                    composer,
-                    Some(&tui::interrupted_row(colour)),
-                    &status_line(first_event, tick),
-                )?;
-                return finish(terminal, composer, outcome);
-            }
-            match composer.press(key) {
-                // Bounded as on the Codex route, so a held Enter cannot grow the
-                // queue without limit; past the bound the draft is handed back.
-                tui::Action::Submit(line) if !line.trim().is_empty() => {
-                    if outcome.queued.len() < 16 {
-                        outcome.queued.push_back(line);
-                    } else {
-                        composer.restore(line);
-                    }
-                }
-                tui::Action::Submit(_) => typed = true,
-                tui::Action::Quit => outcome.quit = true,
-                tui::Action::Redraw => typed = true,
-                tui::Action::None => {}
-            }
+        let typed = drain_keys(keys, decoder, composer, approval, &mut outcome);
+        if typed == Typed::Interrupted {
+            draw(
+                &mut terminal,
+                composer,
+                Some(&tui::interrupted_row(colour)),
+                &status_line(first_event, tick),
+            )?;
+            return finish(terminal, composer, outcome);
         }
         // The status is alive: the spinner advances and the seconds climb even
         // while the provider sends nothing, so a silent turn never reads as a
         // frozen one.
         tick = tick.wrapping_add(1);
-        if typed {
+        if typed == Typed::Redraw {
             draw(
                 &mut terminal,
                 composer,
@@ -4973,86 +6994,14 @@ fn native_status(
         }
         match events.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Ok(Streamed::Thinking(text))) => {
-                let width = tui::terminal_width();
-                // A thinking section opens its own bordered box so reasoning
-                // is visually framed apart from the answer it precedes.
-                if !thinking_open {
-                    thinking_open = true;
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_top(width, colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                thinking.push_str(&text);
-                while let Some(newline) = thinking.find('\n') {
-                    let line: String = thinking.drain(..=newline).collect();
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_row(width, colour, &line)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
+                let status = status_line(first_event, tick);
+                live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Text(text))) => {
                 outcome.response.push_str(&text);
-                let width = tui::terminal_width();
-                if !answer_open {
-                    answer_open = true;
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::assistant_header(colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                // Answer text closes the thinking box cleanly before the prose starts.
-                if thinking_open {
-                    thinking_open = false;
-                    if !thinking.trim().is_empty() {
-                        let line = std::mem::take(&mut thinking);
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some(&tui::thinking_box_row(width, colour, &line)),
-                            &status_line(first_event, tick),
-                        )?;
-                    }
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::thinking_box_bottom(width, colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                pending.push_str(&text);
-                while let Some(newline) = pending.find('\n') {
-                    if live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live_lines)?;
-                        live_lines = 0;
-                    }
-                    let line: String = pending.drain(..=newline).collect();
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::assistant_row(colour, &line)),
-                        &status_line(first_event, tick),
-                    )?;
-                }
-                if !pending.is_empty() {
-                    live_lines = redraw_live_response(
-                        &mut terminal,
-                        composer,
-                        colour,
-                        footer,
-                        &status_line(first_event, tick),
-                        &pending,
-                        live_lines,
-                    )?;
-                }
+                let status = status_line(first_event, tick);
+                live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Usage {
@@ -5077,8 +7026,8 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
-                    if live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live_lines)?;
+                    if live.live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live.live_lines)?;
                     }
                     draw(
                         &mut terminal,
@@ -5099,35 +7048,13 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let width = tui::terminal_width();
-    if thinking_open {
-        if !thinking.trim().is_empty() {
-            let line = std::mem::take(&mut thinking);
-            draw(
-                &mut terminal,
-                composer,
-                Some(&tui::thinking_box_row(width, colour, &line)),
-                &status_line(first_event, tick),
-            )?;
-        }
-        draw(
-            &mut terminal,
-            composer,
-            Some(&tui::thinking_box_bottom(width, colour)),
-            &status_line(first_event, tick),
-        )?;
-    }
-    if live_lines > 0 {
-        erase_live_response(&mut terminal, composer, live_lines)?;
-    }
-    if !pending.trim().is_empty() {
-        draw(
-            &mut terminal,
-            composer,
-            Some(&tui::assistant_row(colour, &pending)),
-            &status_line(first_event, tick),
-        )?;
-    }
+    live.close(
+        &mut terminal,
+        composer,
+        colour,
+        footer,
+        &status_line(first_event, tick),
+    )?;
     finish(terminal, composer, outcome)
 }
 
@@ -5165,7 +7092,7 @@ fn external_status(
     workspace: &Path,
     task: &str,
     route: &tui::ModelRoute,
-    mode: approval::ApprovalMode,
+    approval: &approval::ApprovalCell,
     colour: bool,
     footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -5173,6 +7100,7 @@ fn external_status(
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
+    let mode = approval.get();
     let mut command = std::process::Command::new("codex");
     command.args([
         "exec",
@@ -5207,16 +7135,17 @@ fn external_status(
         task.to_owned()
     };
     drive_provider(
-        command, &task, route, colour, footer, keys, decoder, composer, redactor,
+        command, &task, route, approval, colour, footer, keys, decoder, composer, redactor,
     )
 }
 
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn drive_provider(
-    mut command: std::process::Command,
+    command: std::process::Command,
     task: &str,
     route: &tui::ModelRoute,
+    approval: &approval::ApprovalCell,
     colour: bool,
     footer: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -5224,38 +7153,7 @@ fn drive_provider(
     composer: &mut tui::Composer,
     redactor: &Redactor,
 ) -> io::Result<Turn> {
-    // A process group of its own, so a signal aimed at the harness does not also
-    // reach the provider child. There is no Windows equivalent to gate on.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let mut child = tui::ProviderChild(child);
-    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
-    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
-        let _ = io::copy(&mut stderr, &mut io::sink());
-        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
-    });
-    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
-    let task = task.to_owned();
-    let (sent, input) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sent.send(stdin.write_all(task.as_bytes()));
-    });
-    // The event stream is read on a thread so the main loop can also watch the
-    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
-    // the composer alive and typeable while the provider works.
-    let stdout = child.0.stdout.take().expect("piped stdout is available");
-    let events = tui::provider_lines(stdout);
+    let (mut child, errors, input, events) = spawn_provider(command, task)?;
     let started = std::time::Instant::now();
     let mut cancelling = None;
     let mut stream_closed = false;
@@ -5267,32 +7165,16 @@ fn drive_provider(
     let mut exited = None;
     let mut status: Option<std::process::ExitStatus> = None;
     let mut outcome = Turn::default();
+    let mut successful_git_commands = std::collections::HashSet::new();
     let mut terminal = io::stdout();
-    let width = std::cell::Cell::new(tui::terminal_width());
     composer.set_height(tui::terminal_rows());
-    let draw = |terminal: &mut io::Stdout,
-                composer: &mut tui::Composer,
-                row: Option<&str>,
-                cancelling: bool,
-                queued: usize,
-                tick: usize| {
-        // Rows land above the composer, which is torn down and repainted around
-        // each one so the input block is never overwritten.
-        let mut frame = composer.clear();
-        if let Some(row) = row {
-            frame.push_str(row);
-            frame.push('\n');
-        }
-        let phase = if cancelling {
-            tui::TurnPhase::Cancelling
-        } else {
-            tui::TurnPhase::Working
-        };
-        let status = tui::turn_status(colour, phase, started.elapsed(), tick, queued);
-        frame.push_str(&composer.render_turn(width.get(), colour, &status, footer));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
+    let painter = Painter {
+        colour,
+        footer,
+        width: std::cell::Cell::new(tui::terminal_width()),
+        started,
     };
-    draw(&mut terminal, composer, None, false, 0, 0)?;
+    painter.row(&mut terminal, composer, None, false, 0, 0)?;
     let mut refreshed = std::time::Instant::now();
     loop {
         let tick = (started.elapsed().as_millis() / 100) as usize;
@@ -5301,136 +7183,44 @@ fn drive_provider(
                 result?;
             }
         }
-        if status.is_none() {
-            status = child.0.try_wait()?;
-            if status.is_some() {
-                exited = Some(std::time::Instant::now());
-                child.stop(true);
-            }
+        match lifecycle(
+            &mut child,
+            Clocks {
+                started,
+                status: &mut status,
+                exited: &mut exited,
+                finished: &mut finished,
+                last_event,
+                cancelling,
+                stopped_early: &mut stopped_early,
+            },
+        )? {
+            Pass::Stop => break,
+            Pass::Go => {}
         }
-        if exited
-            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            break;
-        }
-        // The turn is over when the provider says it is over. A CLI that
-        // lingers after its terminal event — cleaning up a session, flushing
-        // telemetry — must not keep the clock running against the answer that
-        // is already on screen.
-        //
-        // Trailing rows still land: the stream drains until it has been quiet
-        // for 250ms, and no longer than 2 seconds however talkative it stays.
-        if status.is_none()
-            && finished.is_some_and(|at: std::time::Instant| {
-                last_event.elapsed() >= std::time::Duration::from_millis(250)
-                    || at.elapsed() >= std::time::Duration::from_secs(2)
-            })
-        {
-            stopped_early = true;
-            child.stop(false);
-            break;
-        }
-        if started.elapsed() >= std::time::Duration::from_secs(300) {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "provider exceeded the 300-second turn deadline",
-            ));
-        }
-        if cancelling
-            .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-        {
-            child.stop(true);
-            status = Some(child.0.wait()?);
-            break;
-        }
-        let mut typed = false;
-        for _ in 0..256 {
-            let byte = match keys.try_recv() {
-                Ok(byte) => byte,
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    outcome.quit = true;
-                    if cancelling.is_none() {
-                        cancelling = Some(std::time::Instant::now());
-                        child.stop(false);
-                        outcome.interrupted = true;
-                        outcome.queued.clear();
-                    }
-                    break;
-                }
-            };
-            last_key = std::time::Instant::now();
-            let Some(key) = decoder.feed(byte) else {
-                continue;
-            };
-            // While the provider is running, Interrupt always means the turn,
-            // never the composer or the session — and it drops a queued
-            // follow-up, which was only queued to run after this turn.
-            if key == tui::Key::Interrupt {
-                outcome.queued.clear();
-                if !outcome.interrupted {
-                    outcome.interrupted = true;
-                    cancelling = Some(std::time::Instant::now());
-                    child.stop(false);
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::interrupted_row(colour)),
-                        true,
-                        0,
-                        tick,
-                    )?;
-                }
-                continue;
-            }
-            match composer.press(key) {
-                // A line sent while the provider is busy runs as soon as this
-                // turn ends, rather than being dropped or blocking.
-                tui::Action::Submit(line) if !line.trim().is_empty() => {
-                    if outcome.queued.len() < 16 {
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some("  Follow-up queued."),
-                            cancelling.is_some(),
-                            outcome.queued.len(),
-                            tick,
-                        )?;
-                    } else {
-                        composer.restore(line);
-                        draw(
-                            &mut terminal,
-                            composer,
-                            Some("  Queue full; draft retained."),
-                            cancelling.is_some(),
-                            outcome.queued.len(),
-                            tick,
-                        )?;
-                    }
-                }
-                tui::Action::Submit(_) => typed = true,
-                tui::Action::Quit => {
-                    outcome.quit = true;
-                    outcome.interrupted = true;
-                    outcome.queued.clear();
-                    if cancelling.is_none() {
-                        cancelling = Some(std::time::Instant::now());
-                        child.stop(false);
-                    }
-                }
-                tui::Action::Redraw => typed = true,
-                tui::Action::None => {}
-            }
-        }
+        let typed = provider_keys(
+            Keyboard {
+                keys,
+                decoder,
+                composer,
+                approval,
+            },
+            &mut terminal,
+            &painter,
+            &mut child,
+            Turning {
+                outcome: &mut outcome,
+                cancelling: &mut cancelling,
+                last_key: &mut last_key,
+            },
+            colour,
+            tick,
+        )?;
         if last_key.elapsed() >= std::time::Duration::from_millis(40)
             && decoder.flush_escape() == Some(tui::Key::Interrupt)
-            && !outcome.interrupted
+            && stop_turn(&mut outcome, &mut child, &mut cancelling)
         {
-            outcome.interrupted = true;
-            outcome.queued.clear();
-            cancelling = Some(std::time::Instant::now());
-            child.stop(false);
-            draw(
+            painter.row(
                 &mut terminal,
                 composer,
                 Some(&tui::interrupted_row(colour)),
@@ -5439,14 +7229,9 @@ fn drive_provider(
                 tick,
             )?;
         }
-        let resize_tick = refreshed.elapsed() >= std::time::Duration::from_secs(1);
-        if resize_tick {
-            width.set(tui::terminal_width());
-            composer.set_height(tui::terminal_rows());
-            refreshed = std::time::Instant::now();
-        }
+        let resize_tick = remeasure(&painter, composer, &mut refreshed);
         if typed || resize_tick {
-            draw(
+            painter.row(
                 &mut terminal,
                 composer,
                 None,
@@ -5459,48 +7244,28 @@ fn drive_provider(
             Ok(_) if outcome.interrupted => {}
             Ok(line) => {
                 last_event = std::time::Instant::now();
-                let line = line?;
-                let line = redactor.sanitize(&line).map_err(io::Error::other)?;
-                let event = serde_json::from_str::<Value>(&line)
-                    .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
-                if matches!(
-                    event["type"].as_str(),
-                    Some("turn.completed" | "turn.failed")
-                ) && finished.is_none()
-                {
-                    finished = Some(std::time::Instant::now());
-                }
-                if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" {
-                    if let Some(text) = event["item"]["text"].as_str() {
-                        if !outcome.response.is_empty() {
-                            outcome.response.push('\n');
-                        }
-                        outcome.response.push_str(text);
-                    }
-                }
-                outcome.provider_failed |= event["type"] == "turn.failed";
-                // A killed provider still flushes buffered events; showing them
-                // after the interrupt notice would contradict it.
-                if !outcome.interrupted {
-                    if let Some(row) = tui::render_codex_event(&line, colour) {
-                        if last_row.as_ref() != Some(&row) {
-                            draw(
-                                &mut terminal,
-                                composer,
-                                Some(&row),
-                                false,
-                                outcome.queued.len(),
-                                tick,
-                            )?;
-                        }
-                        last_row = Some(row);
-                    }
-                }
+                show_event(
+                    &line?,
+                    redactor,
+                    &mut child,
+                    &painter,
+                    &mut terminal,
+                    composer,
+                    Streamlined {
+                        outcome: &mut outcome,
+                        finished: &mut finished,
+                        stopped_early: &mut stopped_early,
+                        seen_git: &mut successful_git_commands,
+                        last_row: &mut last_row,
+                    },
+                    colour,
+                    tick,
+                )?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Repaint so the spinner and clock stay alive while the
                 // provider is quiet, not just when an event or a key arrives.
-                draw(
+                painter.row(
                     &mut terminal,
                     composer,
                     None,
@@ -5521,47 +7286,10 @@ fn drive_provider(
     write!(terminal, "{}", composer.clear())?;
     terminal.flush()?;
     if !outcome.interrupted && finished.is_none() {
-        let detail = error_output
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .unwrap_or_default();
-        let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
-        return Err(io::Error::other(format!(
-            "provider closed its stream without a terminal turn event: {}",
-            terminal_text(detail.trim())
-        )));
+        return Err(silent_provider(&errors, redactor)?);
     }
-    // A zero process exit must not mask a turn the provider itself reported as
-    // failed, so the event stream is checked before the exit status.
     if !outcome.interrupted {
-        let status = match status {
-            Some(status) => status,
-            // The turn ended before the process did, so the process is asked to
-            // leave and then made to: waiting on a CLI that ignores the signal
-            // is the hang this exit was added to avoid.
-            None if stopped_early => {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                loop {
-                    if let Some(status) = child.0.try_wait()? {
-                        break status;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        child.stop(true);
-                        break child.0.wait()?;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-            None => child.0.wait()?,
-        };
-        outcome.failure = if outcome.provider_failed {
-            Some(format!("{route} reported a failed turn"))
-        // A signal ARSY sent after a completed turn is its own exit code, not a
-        // verdict on the turn the provider already reported.
-        } else if status.success() || stopped_early {
-            None
-        } else {
-            Some(format!("{route} exited with status {status}"))
-        };
+        outcome.failure = verdict(&mut child, route, status, stopped_early, &outcome)?;
     }
     Ok(outcome)
 }
@@ -7137,6 +8865,38 @@ mod tests {
     /// A first run creates the settings file and never replaces one that is
     /// already there.
     #[test]
+    #[cfg(unix)]
+    fn replacing_a_settings_file_is_atomic_and_keeps_the_mode_it_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("nested").join("arsy.json");
+
+        // A file that is not there yet is created, directories and all.
+        replace_file(&path, b"{}\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+
+        // An operator who tightened the file keeps that across a write: the
+        // staged file is new, so it would otherwise carry only the umask.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        replace_file(&path, b"{ }\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ }\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a tightened settings file is not loosened by the next write"
+        );
+
+        // Nothing staged is left behind for the next reader to trip over.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "arsy.json")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
         let directory = tempfile::tempdir().unwrap();
@@ -7445,6 +9205,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
             &approval,
         )
         .unwrap();
@@ -7528,6 +9289,78 @@ mod tests {
             "each round is its own request"
         );
     }
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_successful_duplicate_command_runs_once_and_finishes_the_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let command = "printf x >> duplicate-command-marker";
+        let (resolved, scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": command}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-2".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": command, "timeout_ms": 600000}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "run the command once".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &resolved,
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+        )
+        .unwrap();
+
+        assert!(turn.failure.is_none(), "{:?}", turn.failure);
+        assert!(turn.response.contains("repeated tool call was skipped"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("duplicate-command-marker")).unwrap(),
+            "x"
+        );
+        let seen_count = scripted
+            .seen
+            .lock()
+            .map(|seen| seen.len())
+            .unwrap_or_default();
+        assert_eq!(
+            seen_count, 2,
+            "the duplicate was stopped before another provider round"
+        );
+    }
 
     #[cfg(feature = "tui")]
     #[test]
@@ -7572,6 +9405,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
             &approval,
         )
         .unwrap();
@@ -7639,6 +9473,7 @@ mod tests {
             &keys,
             &mut tui::Keys::default(),
             &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
             &approval,
         )
         .unwrap();
@@ -8387,6 +10222,104 @@ mod tests {
         );
     }
 
+    /// Reasoning is framed apart from the answer it precedes, so the box has
+    /// to be finished before the answer's header opens. ARSY drew the header
+    /// first, which left it between the box's last line and its bottom border.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_answer_closes_the_reasoning_box_before_it_opens_its_own() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+
+        live.reason(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            "weighing it up\n",
+        )
+        .unwrap();
+        live.answer(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            "the answer\n",
+        )
+        .unwrap();
+
+        let drawn = String::from_utf8(screen).unwrap();
+        let closed = drawn.find('╰').expect("the reasoning box is closed");
+        let header = drawn.find("Response").expect("the answer announces itself");
+        let prose = drawn.find("the answer").expect("the answer is drawn");
+        assert!(
+            closed < header,
+            "the box closes before the header:\n{drawn}"
+        );
+        assert!(
+            header < prose,
+            "the header comes before the prose:\n{drawn}"
+        );
+    }
+
+    #[cfg(all(feature = "tui", unix))]
+    #[test]
+    fn a_follow_up_typed_during_a_provider_turn_is_carried_to_the_next_one() {
+        use std::time::Duration;
+        let route = tui::ModelRoute {
+            provider: tui::CODEX_PROVIDER.to_owned(),
+            model: "default".to_owned(),
+        };
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (sender, keys) = std::sync::mpsc::channel();
+        let typist = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            for byte in b"next thing\r" {
+                let _ = sender.send(*byte);
+            }
+            // The keyboard outlives the turn, so the loop never reads the
+            // follow-up as the operator hanging up.
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        // Streams for a moment, so there is a turn to type into, then ends.
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' '{\"type\":\"turn.started\"}'; sleep 0.4; \
+             printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+        ]);
+        let result = drive_provider(
+            command,
+            "task\n",
+            &route,
+            &approval,
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+        typist.join().unwrap();
+
+        // Reported as queued and actually queued: a row that says a follow-up
+        // was taken, over a queue that dropped it, is worse than refusing it.
+        assert_eq!(
+            result.queued.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["next thing"],
+            "the follow-up runs after this turn"
+        );
+        assert!(
+            !result.interrupted,
+            "typing a follow-up does not stop the turn"
+        );
+    }
+
     #[cfg(all(feature = "tui", unix))]
     #[test]
     fn interactive_provider_cancellation_and_terminal_failures_are_bounded() {
@@ -8395,6 +10328,8 @@ mod tests {
             provider: tui::CODEX_PROVIDER.to_owned(),
             model: "default".to_owned(),
         };
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
         let (sender, keys) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
@@ -8409,6 +10344,7 @@ mod tests {
             command,
             &"x".repeat(131_072),
             &route,
+            &approval,
             false,
             "  footer",
             &keys,
@@ -8429,6 +10365,7 @@ mod tests {
             command,
             "task\n",
             &route,
+            &approval,
             false,
             "  footer",
             &keys,
@@ -8461,6 +10398,7 @@ mod tests {
             command,
             "task\n",
             &route,
+            &approval,
             false,
             "  footer",
             &keys,
@@ -8482,6 +10420,40 @@ mod tests {
             !result.interrupted,
             "the turn completed, it was not cancelled"
         );
+    }
+    #[cfg(all(feature = "tui", unix))]
+    #[test]
+    fn external_provider_skips_a_repeated_successful_git_command() {
+        let route = tui::ModelRoute {
+            provider: tui::CODEX_PROVIDER.to_owned(),
+            model: "default".to_owned(),
+        };
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let (_sender, keys) = std::sync::mpsc::channel();
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            r#"read task; printf '%s\n' '{"type":"item.completed","item":{"type":"command_execution","command":"git remote -v && git push -u origin feat/x","exit_code":0}}'; printf '%s\n' '{"type":"item.started","item":{"type":"command_execution","command":"git remote -v && git push -u origin feat/x"}}'; sleep 1"#,
+        ]);
+
+        let result = drive_provider(
+            command,
+            "task\n",
+            &route,
+            &approval,
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+
+        assert!(result.failure.is_none(), "{:?}", result.failure);
+        assert!(!result.interrupted);
+        assert!(result.response.contains("duplicate was skipped"));
     }
 
     /// The catalog is written by one version and read by the next, so a
