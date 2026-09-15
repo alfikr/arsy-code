@@ -4640,108 +4640,137 @@ fn native_turn(
     Ok(Turn::default())
 }
 
-/// The reasoning box as it stands, and the buffer holding the part of the
-/// current line that has not been drawn.
-#[cfg(feature = "tui")]
-struct Reasoning<'a> {
-    colour: bool,
-    footer: &'a str,
-    status: &'a str,
-    open: bool,
-    buffer: &'a mut String,
-}
-
-/// Draw reasoning as it streams, returning whether the box is open.
+/// What a streaming round has put on screen so far.
 ///
-/// A thinking section opens its own bordered box so reasoning is framed apart
-/// from the answer it precedes, and a row is drawn per line rather than per
-/// token.
+/// Reasoning and the answer hold separate buffers and separate boxes, so the
+/// verbose stream reads as distinct parts of the turn rather than one grey
+/// blur. Deltas arrive token by token and a row is drawn per line, so what is
+/// left of an unfinished line is kept here until the rest of it arrives.
 #[cfg(feature = "tui")]
-fn show_thinking(
-    terminal: &mut io::Stdout,
-    composer: &mut tui::Composer,
-    reasoning: Reasoning<'_>,
-    text: &str,
-) -> io::Result<bool> {
-    let width = tui::terminal_width();
-    let (colour, footer, status) = (reasoning.colour, reasoning.footer, reasoning.status);
-    if !reasoning.open {
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::thinking_box_top(width, colour),
-        )?;
-    }
-    reasoning.buffer.push_str(text);
-    for line in drain_lines(reasoning.buffer) {
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::thinking_box_row(width, colour, &line),
-        )?;
-    }
-    Ok(true)
+#[derive(Default)]
+struct Streaming {
+    /// Answer text not yet ended by a line break.
+    pending: String,
+    /// Reasoning not yet ended by a line break.
+    thinking: String,
+    thinking_open: bool,
+    answer_open: bool,
+    /// Rows drawn for `pending`, which a finished line replaces.
+    live_lines: usize,
 }
 
-/// Close the reasoning box, flushing whatever line it was part way through.
 #[cfg(feature = "tui")]
-fn close_thinking(
-    terminal: &mut io::Stdout,
-    composer: &mut tui::Composer,
-    colour: bool,
-    footer: &str,
-    status: &str,
-    buffer: &mut String,
-) -> io::Result<()> {
-    let width = tui::terminal_width();
-    if !buffer.trim().is_empty() {
-        let line = std::mem::take(buffer);
-        stream_row(
+impl Streaming {
+    /// Draw reasoning as it streams, opening its box on the first delta.
+    fn reason(
+        &mut self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        let width = tui::terminal_width();
+        if !self.thinking_open {
+            self.thinking_open = true;
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_top(width, colour),
+            )?;
+        }
+        self.thinking.push_str(text);
+        for line in drain_lines(&mut self.thinking) {
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_row(width, colour, &line),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Draw the answer as it streams. Answer text closes the reasoning box
+    /// first, so the prose never starts inside it.
+    fn answer(
+        &mut self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+        text: &str,
+    ) -> io::Result<()> {
+        self.close_thinking(terminal, composer, colour, footer, status)?;
+        if !self.answer_open {
+            self.answer_open = true;
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::assistant_header(colour),
+            )?;
+        }
+        self.pending.push_str(text);
+        let complete = drain_lines(&mut self.pending);
+        // The live rows held the part of a line still arriving. A finished
+        // line replaces them, so they are erased once before the first.
+        if self.live_lines > 0 && !complete.is_empty() {
+            erase_live_response(terminal, composer, self.live_lines)?;
+            self.live_lines = 0;
+        }
+        for line in complete {
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::assistant_row(colour, &line),
+            )?;
+        }
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        self.live_lines = redraw_live_response(
             terminal,
             composer,
             colour,
             footer,
             status,
-            &tui::thinking_box_row(width, colour, &line),
+            &self.pending,
+            self.live_lines,
         )?;
+        Ok(())
     }
-    stream_row(
-        terminal,
-        composer,
-        colour,
-        footer,
-        status,
-        &tui::thinking_box_bottom(width, colour),
-    )
-}
 
-/// Draw the answer as it streams, returning how many rows of it are still
-/// live — that is, part of a line the provider has not finished.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn show_answer(
-    terminal: &mut io::Stdout,
-    composer: &mut tui::Composer,
-    colour: bool,
-    footer: &str,
-    status: &str,
-    pending: &mut String,
-    mut live_lines: usize,
-) -> io::Result<usize> {
-    let complete = drain_lines(pending);
-    // The live rows held the part of a line still arriving. A finished line
-    // replaces them, so they are erased once before the first of them.
-    if live_lines > 0 && !complete.is_empty() {
-        erase_live_response(terminal, composer, live_lines)?;
-        live_lines = 0;
-    }
-    for line in complete {
+    /// Close the round: finish whatever box is open and settle the last line.
+    fn close(
+        &mut self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        self.close_thinking(terminal, composer, colour, footer, status)?;
+        if self.live_lines > 0 {
+            erase_live_response(terminal, composer, self.live_lines)?;
+            self.live_lines = 0;
+        }
+        if self.pending.trim().is_empty() {
+            return Ok(());
+        }
+        let line = std::mem::take(&mut self.pending);
         stream_row(
             terminal,
             composer,
@@ -4749,14 +4778,44 @@ fn show_answer(
             footer,
             status,
             &tui::assistant_row(colour, &line),
-        )?;
+        )
     }
-    if pending.is_empty() {
-        return Ok(live_lines);
+
+    /// Close the reasoning box if it is open, flushing the line it was part
+    /// way through.
+    fn close_thinking(
+        &mut self,
+        terminal: &mut io::Stdout,
+        composer: &mut tui::Composer,
+        colour: bool,
+        footer: &str,
+        status: &str,
+    ) -> io::Result<()> {
+        if !self.thinking_open {
+            return Ok(());
+        }
+        self.thinking_open = false;
+        let width = tui::terminal_width();
+        if !self.thinking.trim().is_empty() {
+            let line = std::mem::take(&mut self.thinking);
+            stream_row(
+                terminal,
+                composer,
+                colour,
+                footer,
+                status,
+                &tui::thinking_box_row(width, colour, &line),
+            )?;
+        }
+        stream_row(
+            terminal,
+            composer,
+            colour,
+            footer,
+            status,
+            &tui::thinking_box_bottom(width, colour),
+        )
     }
-    redraw_live_response(
-        terminal, composer, colour, footer, status, pending, live_lines,
-    )
 }
 
 /// Take the finished lines out of a streaming buffer, leaving whatever part of
@@ -5542,11 +5601,7 @@ fn native_status(
     // Thinking and the answer hold separate buffers, and each thinking section
     // is announced once with its own header row, so the verbose stream reads as
     // distinct parts of the turn rather than one grey blur.
-    let mut pending = String::new();
-    let mut thinking = String::new();
-    let mut thinking_open = false;
-    let mut answer_open = false;
-    let mut live_lines = 0usize;
+    let mut live = Streaming::default();
     let started = std::time::Instant::now();
     let mut tick = 0usize;
     // A static `Working…` line cannot tell a slow connect from a hang; the
@@ -5604,53 +5659,13 @@ fn native_status(
         match events.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(Ok(Streamed::Thinking(text))) => {
                 let status = status_line(first_event, tick);
-                thinking_open = show_thinking(
-                    &mut terminal,
-                    composer,
-                    Reasoning {
-                        colour,
-                        footer,
-                        status: &status,
-                        open: thinking_open,
-                        buffer: &mut thinking,
-                    },
-                    &text,
-                )?;
+                live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Text(text))) => {
                 outcome.response.push_str(&text);
                 let status = status_line(first_event, tick);
-                if thinking_open {
-                    close_thinking(
-                        &mut terminal,
-                        composer,
-                        colour,
-                        footer,
-                        &status,
-                        &mut thinking,
-                    )?;
-                    thinking_open = false;
-                }
-                if !answer_open {
-                    answer_open = true;
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::assistant_header(colour)),
-                        &status,
-                    )?;
-                }
-                pending.push_str(&text);
-                live_lines = show_answer(
-                    &mut terminal,
-                    composer,
-                    colour,
-                    footer,
-                    &status,
-                    &mut pending,
-                    live_lines,
-                )?;
+                live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
                 first_event = true;
             }
             Ok(Ok(Streamed::Usage {
@@ -5675,8 +5690,8 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if decoder.flush_escape() == Some(tui::Key::Interrupt) {
                     outcome.interrupted = true;
-                    if live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live_lines)?;
+                    if live.live_lines > 0 {
+                        erase_live_response(&mut terminal, composer, live.live_lines)?;
                     }
                     draw(
                         &mut terminal,
@@ -5697,35 +5712,13 @@ fn native_status(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let width = tui::terminal_width();
-    if thinking_open {
-        if !thinking.trim().is_empty() {
-            let line = std::mem::take(&mut thinking);
-            draw(
-                &mut terminal,
-                composer,
-                Some(&tui::thinking_box_row(width, colour, &line)),
-                &status_line(first_event, tick),
-            )?;
-        }
-        draw(
-            &mut terminal,
-            composer,
-            Some(&tui::thinking_box_bottom(width, colour)),
-            &status_line(first_event, tick),
-        )?;
-    }
-    if live_lines > 0 {
-        erase_live_response(&mut terminal, composer, live_lines)?;
-    }
-    if !pending.trim().is_empty() {
-        draw(
-            &mut terminal,
-            composer,
-            Some(&tui::assistant_row(colour, &pending)),
-            &status_line(first_event, tick),
-        )?;
-    }
+    live.close(
+        &mut terminal,
+        composer,
+        colour,
+        footer,
+        &status_line(first_event, tick),
+    )?;
     finish(terminal, composer, outcome)
 }
 
