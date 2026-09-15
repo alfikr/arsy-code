@@ -4640,6 +4640,31 @@ fn native_turn(
     Ok(Turn::default())
 }
 
+/// Stop the running turn.
+///
+/// The queue goes with it: a follow-up was only queued to run after this turn,
+/// and the operator stopping the turn is not asking for the next one. The
+/// moment the stop began is kept so an unresponsive provider can be escalated
+/// from a polite stop to a kill.
+///
+/// Answers whether this call was the one that started the stop, because that
+/// is when the row saying so is drawn — a second Ctrl-C must not draw it again.
+#[cfg(feature = "tui")]
+fn stop_turn(
+    outcome: &mut Turn,
+    child: &mut tui::ProviderChild,
+    cancelling: &mut Option<std::time::Instant>,
+) -> bool {
+    outcome.queued.clear();
+    outcome.interrupted = true;
+    if cancelling.is_some() {
+        return false;
+    }
+    *cancelling = Some(std::time::Instant::now());
+    child.stop(false);
+    true
+}
+
 /// What a streaming round has put on screen so far.
 ///
 /// Reasoning and the answer hold separate buffers and separate boxes, so the
@@ -5944,12 +5969,7 @@ fn drive_provider(
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     outcome.quit = true;
-                    if cancelling.is_none() {
-                        cancelling = Some(std::time::Instant::now());
-                        child.stop(false);
-                        outcome.interrupted = true;
-                        outcome.queued.clear();
-                    }
+                    stop_turn(&mut outcome, &mut child, &mut cancelling);
                     break;
                 }
             };
@@ -5961,11 +5981,7 @@ fn drive_provider(
             // never the composer or the session — and it drops a queued
             // follow-up, which was only queued to run after this turn.
             if key == tui::Key::Interrupt {
-                outcome.queued.clear();
-                if !outcome.interrupted {
-                    outcome.interrupted = true;
-                    cancelling = Some(std::time::Instant::now());
-                    child.stop(false);
+                if stop_turn(&mut outcome, &mut child, &mut cancelling) {
                     draw(
                         &mut terminal,
                         composer,
@@ -6012,12 +6028,7 @@ fn drive_provider(
                 tui::Action::Submit(_) => typed = true,
                 tui::Action::Quit => {
                     outcome.quit = true;
-                    outcome.interrupted = true;
-                    outcome.queued.clear();
-                    if cancelling.is_none() {
-                        cancelling = Some(std::time::Instant::now());
-                        child.stop(false);
-                    }
+                    stop_turn(&mut outcome, &mut child, &mut cancelling);
                 }
                 tui::Action::Redraw => typed = true,
                 tui::Action::None => {}
@@ -6025,12 +6036,8 @@ fn drive_provider(
         }
         if last_key.elapsed() >= std::time::Duration::from_millis(40)
             && decoder.flush_escape() == Some(tui::Key::Interrupt)
-            && !outcome.interrupted
+            && stop_turn(&mut outcome, &mut child, &mut cancelling)
         {
-            outcome.interrupted = true;
-            outcome.queued.clear();
-            cancelling = Some(std::time::Instant::now());
-            child.stop(false);
             draw(
                 &mut terminal,
                 composer,
