@@ -96,6 +96,9 @@ impl<T: WireTransport> OpenAiProvider<T> {
                 "tools".to_owned(),
                 Value::Array(request.tools.iter().map(encode_tool).collect()),
             );
+            // Keep model-generated calls aligned with the host's sequential
+            // execution and the TUI's one-card-at-a-time presentation.
+            body.insert("parallel_tool_calls".to_owned(), json!(false));
         }
         WireRequest {
             url: format!("{}/chat/completions", self.base_url.trim_end_matches('/')),

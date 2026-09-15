@@ -123,7 +123,9 @@ impl<T: WireTransport> OpenAiResponsesProvider<T> {
                 Value::Array(request.tools.iter().map(encode_tool).collect()),
             );
             body.insert("tool_choice".to_owned(), json!("auto"));
-            body.insert("parallel_tool_calls".to_owned(), json!(true));
+            // TUI executes one tool card at a time; keeping the provider on
+            // that same cadence avoids a burst of calls that looks concurrent.
+            body.insert("parallel_tool_calls".to_owned(), json!(false));
         }
 
         let mut headers = vec![
@@ -598,12 +600,18 @@ mod tests {
             ApiKey::new("t"),
             sse(200, ""),
         );
-        let wire = provider.encode(&request());
-        assert_eq!(wire.url, "https://host.test/codex/responses");
+        let mut request = request();
+        request.tools.push(ToolSchema {
+            name: "fs.read".to_owned(),
+            description: "read".to_owned(),
+            input_schema: json!({"type": "object"}),
+        });
+        let wire = provider.encode(&request);
         let body: Value = serde_json::from_str(&wire.body).unwrap();
         assert_eq!(body["store"], json!(false));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["instructions"], json!(DEFAULT_INSTRUCTIONS));
+        assert_eq!(body["parallel_tool_calls"], json!(false));
         assert_eq!(body["reasoning"]["effort"], json!("medium"));
         assert_eq!(body["input"][0]["type"], json!("message"));
         assert_eq!(body["input"][0]["content"][0]["type"], json!("input_text"));

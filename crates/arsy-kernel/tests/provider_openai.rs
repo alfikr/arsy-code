@@ -135,6 +135,7 @@ fn a_request_carries_the_dialect_headers_and_folds_the_system_prompt_into_messag
     );
     assert_eq!(body["tools"][0]["type"], json!("function"));
     assert_eq!(body["tools"][0]["function"]["name"], json!("fs.read"));
+    assert_eq!(body["parallel_tool_calls"], json!(false));
     assert_eq!(
         body["tools"][0]["function"]["parameters"]["type"],
         json!("object"),
