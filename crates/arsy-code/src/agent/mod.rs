@@ -1617,32 +1617,57 @@ fn observational(contract: &arsy_kernel::operation::OperationContract) -> bool {
 }
 
 /// Render one operation's result as the text the model reads.
+/// How one tool's result reads in the transcript, and whether it succeeded.
+///
+/// Dispatch by area rather than one arm per tool: what a command's exit code
+/// means, what a file operation changed, and what a search found are three
+/// different readings, and a reader after one of them should not have to walk
+/// the other two.
 fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
-    match name {
-        "bash" => {
-            let mut merged = evidence.join("");
-            if merged.trim().is_empty() {
-                merged = "(no output)".to_owned();
-            }
-            let code = value.get("status_code").and_then(Value::as_i64);
-            if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
-                return (
-                    false,
-                    format!("{merged}\n\nCommand exceeded its deadline and was stopped"),
-                );
-            }
-            match code {
-                Some(0) => (true, merged),
-                Some(code) => (
-                    false,
-                    format!("{merged}\n\nCommand exited with code {code}"),
-                ),
-                None => (
-                    false,
-                    format!("{merged}\n\nCommand was terminated by a signal"),
-                ),
-            }
-        }
+    present_process(name, value, evidence)
+        .or_else(|| present_files(name, value))
+        .or_else(|| present_search(name, value))
+        .or_else(|| present_remote(name, value))
+        .unwrap_or_else(|| {
+            (
+                true,
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+            )
+        })
+}
+
+/// Commands: what the process printed, and what its exit says about it.
+/// What a finished command printed, and how it ended.
+///
+/// A non-zero exit is a failed tool call: a model that reads the output alone
+/// cannot tell a command that worked from one that did not.
+fn present_bash(value: &Value, evidence: &[String]) -> (bool, String) {
+    let mut merged = evidence.join("");
+    if merged.trim().is_empty() {
+        merged = "(no output)".to_owned();
+    }
+    if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return (
+            false,
+            format!("{merged}\n\nCommand exceeded its deadline and was stopped"),
+        );
+    }
+    match value.get("status_code").and_then(Value::as_i64) {
+        Some(0) => (true, merged),
+        Some(code) => (
+            false,
+            format!("{merged}\n\nCommand exited with code {code}"),
+        ),
+        None => (
+            false,
+            format!("{merged}\n\nCommand was terminated by a signal"),
+        ),
+    }
+}
+
+fn present_process(name: &str, value: &Value, evidence: &[String]) -> Option<(bool, String)> {
+    Some(match name {
+        "bash" => present_bash(value, evidence),
         // A background call succeeded when the call succeeded. Whether the
         // process it names failed is information, not a tool error: reporting
         // an exit code as a failed tool call would make a model retry the poll
@@ -1661,44 +1686,6 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
                 }
             ),
         ),
-        "repo_map" => {
-            let projection = value
-                .get("projection")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            (
-                true,
-                format!(
-                    "{projection}\n({} file(s) reparsed, {} unchanged, {} not parsed)",
-                    value.get("reindexed").and_then(Value::as_u64).unwrap_or(0),
-                    value.get("unchanged").and_then(Value::as_u64).unwrap_or(0),
-                    value.get("unparsed").and_then(Value::as_u64).unwrap_or(0),
-                ),
-            )
-        }
-        "web_fetch" => {
-            let status = value.get("status").and_then(Value::as_u64).unwrap_or(0);
-            let mut text = format!(
-                "{} — HTTP {status}, {} bytes{}\n\n{}",
-                value.get("url").and_then(Value::as_str).unwrap_or("?"),
-                value.get("bytes").and_then(Value::as_u64).unwrap_or(0),
-                if value.get("extracted").and_then(Value::as_bool) == Some(true) {
-                    ", HTML reduced to its text"
-                } else {
-                    ""
-                },
-                value
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-            );
-            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
-                text.push_str("\n\n(the response was cut at its byte limit)");
-            }
-            // A 404 that came back is a fetch that worked; only the request
-            // failing is a tool failure, and that is an error, not a result.
-            (true, text)
-        }
         "bash_write" => (
             true,
             format!(
@@ -1740,52 +1727,62 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             };
             (true, format!("{text}\n\n{} — {status}", argv_of(value)))
         }
-        "fs.read" => {
-            if value.get("binary").and_then(Value::as_bool) == Some(true) {
-                return (
-                    true,
-                    format!(
-                        "{} is a binary file; it was not decoded.",
-                        value
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .unwrap_or("the file")
-                    ),
-                );
-            }
-            let first = value.get("first_line").and_then(Value::as_u64).unwrap_or(1);
-            let returned = value
-                .get("lines_returned")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let total = value
-                .get("total_lines")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let body = value
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            // Nothing came back, so say why rather than returning an empty
-            // string a model would read as an empty file. The two causes are
-            // different questions, and only one of them has a next step.
-            if returned == 0 {
-                return (
-                    true,
-                    if total == 0 {
-                        "(empty file)".to_owned()
-                    } else {
-                        format!("(offset {first} is past the end; the file has {total} lines)")
-                    },
-                );
-            }
-            let header = if returned < total {
-                format!("lines {first}-{} of {total}\n", first + returned - 1)
+        _ => return None,
+    })
+}
+
+/// File operations: what was read, and what changed.
+/// What a read returned: the lines themselves, or why there were none.
+fn present_read(value: &Value) -> (bool, String) {
+    if value.get("binary").and_then(Value::as_bool) == Some(true) {
+        return (
+            true,
+            format!(
+                "{} is a binary file; it was not decoded.",
+                value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the file")
+            ),
+        );
+    }
+    let first = value.get("first_line").and_then(Value::as_u64).unwrap_or(1);
+    let returned = value
+        .get("lines_returned")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = value
+        .get("total_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let body = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Nothing came back, so say why rather than returning an empty
+    // string a model would read as an empty file. The two causes are
+    // different questions, and only one of them has a next step.
+    if returned == 0 {
+        return (
+            true,
+            if total == 0 {
+                "(empty file)".to_owned()
             } else {
-                String::new()
-            };
-            (true, format!("{header}{}", numbered_lines(body, first)))
-        }
+                format!("(offset {first} is past the end; the file has {total} lines)")
+            },
+        );
+    }
+    let header = if returned < total {
+        format!("lines {first}-{} of {total}\n", first + returned - 1)
+    } else {
+        String::new()
+    };
+    (true, format!("{header}{}", numbered_lines(body, first)))
+}
+
+fn present_files(name: &str, value: &Value) -> Option<(bool, String)> {
+    Some(match name {
+        "fs.read" => present_read(value),
         "fs.list" => {
             let entries = value
                 .get("entries")
@@ -1812,42 +1809,6 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             } else {
                 (true, entries.join("\n"))
             }
-        }
-        "search.text" => {
-            let hits: Vec<String> = value
-                .get("hits")
-                .and_then(Value::as_array)
-                .map(|hits| {
-                    hits.iter()
-                        .map(|hit| {
-                            format!(
-                                "{}:{}: {}",
-                                hit.get("path").and_then(Value::as_str).unwrap_or("?"),
-                                hit.get("line").and_then(Value::as_u64).unwrap_or(0),
-                                hit.get("text")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .trim()
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            (true, listing(hits, value, "no matches"))
-        }
-        "search.files" => {
-            let paths: Vec<String> = value
-                .get("paths")
-                .and_then(Value::as_array)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            (true, listing(paths, value, "no files matched"))
         }
         "apply_patch" => {
             let summary: Vec<String> = value
@@ -1929,6 +1890,94 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
         // server that reports the call as failed produces a failed result, so
         // the model treats it the way it treats any other refusal rather than
         // reading "isError: true" out of a JSON dump and continuing.
+        _ => return None,
+    })
+}
+
+/// Searching and mapping the repository: what was found.
+fn present_search(name: &str, value: &Value) -> Option<(bool, String)> {
+    Some(match name {
+        "search.text" => {
+            let hits: Vec<String> = value
+                .get("hits")
+                .and_then(Value::as_array)
+                .map(|hits| {
+                    hits.iter()
+                        .map(|hit| {
+                            format!(
+                                "{}:{}: {}",
+                                hit.get("path").and_then(Value::as_str).unwrap_or("?"),
+                                hit.get("line").and_then(Value::as_u64).unwrap_or(0),
+                                hit.get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .trim()
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (true, listing(hits, value, "no matches"))
+        }
+        "search.files" => {
+            let paths: Vec<String> = value
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (true, listing(paths, value, "no files matched"))
+        }
+        "repo_map" => {
+            let projection = value
+                .get("projection")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (
+                true,
+                format!(
+                    "{projection}\n({} file(s) reparsed, {} unchanged, {} not parsed)",
+                    value.get("reindexed").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("unchanged").and_then(Value::as_u64).unwrap_or(0),
+                    value.get("unparsed").and_then(Value::as_u64).unwrap_or(0),
+                ),
+            )
+        }
+        _ => return None,
+    })
+}
+
+/// What came back from outside the workspace.
+fn present_remote(name: &str, value: &Value) -> Option<(bool, String)> {
+    Some(match name {
+        "web_fetch" => {
+            let status = value.get("status").and_then(Value::as_u64).unwrap_or(0);
+            let mut text = format!(
+                "{} — HTTP {status}, {} bytes{}\n\n{}",
+                value.get("url").and_then(Value::as_str).unwrap_or("?"),
+                value.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                if value.get("extracted").and_then(Value::as_bool) == Some(true) {
+                    ", HTML reduced to its text"
+                } else {
+                    ""
+                },
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+            if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+                text.push_str("\n\n(the response was cut at its byte limit)");
+            }
+            // A 404 that came back is a fetch that worked; only the request
+            // failing is a tool failure, and that is an error, not a result.
+            (true, text)
+        }
         name if name.starts_with("mcp__") => {
             let body = value
                 .get("text")
@@ -1938,11 +1987,8 @@ fn present(name: &str, value: &Value, evidence: &[String]) -> (bool, String) {
             let failed = value.get("is_error").and_then(Value::as_bool) == Some(true);
             (!failed, body)
         }
-        _ => (
-            true,
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
-        ),
-    }
+        _ => return None,
+    })
 }
 
 fn numbered_lines(text: &str, first_line: u64) -> String {
