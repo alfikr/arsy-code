@@ -1464,6 +1464,15 @@ fn replace_file(path: &Path, body: &[u8]) -> io::Result<()> {
         file.sync_all()
     })();
     if written.is_ok() {
+        // The staged file is new, so it carries the umask rather than whatever
+        // the destination was set to. An operator who tightened a settings
+        // file must not have that undone by the next write that touches it.
+        #[cfg(unix)]
+        if let Ok(existing) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = existing.permissions().mode();
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode));
+        }
         // Rename replaces on every target ARSY ships for, so nothing is left
         // half written even when the destination is already there.
         if let Err(error) = std::fs::rename(&staged, path) {
@@ -7450,6 +7459,38 @@ mod tests {
 
     /// A first run creates the settings file and never replaces one that is
     /// already there.
+    #[test]
+    #[cfg(unix)]
+    fn replacing_a_settings_file_is_atomic_and_keeps_the_mode_it_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("nested").join("arsy.json");
+
+        // A file that is not there yet is created, directories and all.
+        replace_file(&path, b"{}\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+
+        // An operator who tightened the file keeps that across a write: the
+        // staged file is new, so it would otherwise carry only the umask.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        replace_file(&path, b"{ }\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ }\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a tightened settings file is not loosened by the next write"
+        );
+
+        // Nothing staged is left behind for the next reader to trip over.
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "arsy.json")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     fn a_first_run_creates_the_settings_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
