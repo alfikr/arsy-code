@@ -5076,62 +5076,28 @@ fn execute_call(
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Executed> {
-    use arsy_code::agent::Authorization;
-
     let started = std::time::Instant::now();
     let request = match runtime.prepare(name, arguments) {
         Ok(request) => request,
         Err(failure) => return Ok(Executed::Answered(*failure)),
     };
-    let refused =
-        |reason: String| Executed::Answered(arsy_code::agent::ToolResult::refused(name, reason));
     let authorization = runtime.authorize(&request);
-    let (grants, approval_note) = match &authorization {
-        Authorization::Allowed(grants) => (grants.clone(), None),
-        Authorization::Denied(reason) => return Ok(refused(reason.clone())),
-        Authorization::NeedsApproval { .. } => match approval::decide(approval.get(), name) {
-            approval::Decision::Approve => match authorization.approve() {
-                Ok(grants) => (grants, None),
-                Err(error) => {
-                    return Ok(refused(format!(
-                        "the approval could not be turned into a grant: {error}"
-                    )))
-                }
-            },
-            approval::Decision::Refuse => {
-                return Ok(refused(format!(
-                    "the current approval mode ({}) refuses this call without asking: {}",
-                    approval.get().label(),
-                    authorization.requested()
-                )))
-            }
-            approval::Decision::Ask => {
-                let reason = authorization.requested();
-                let preview = format_tool_preview(name, arguments);
-                match confirm_tool(
-                    terminal, colour, name, summary, &reason, preview, keys, decoder, approval,
-                )? {
-                    Answer::Yes { note } => match authorization.approve() {
-                        Ok(grants) => (grants, note),
-                        Err(error) => {
-                            return Ok(refused(format!(
-                                "the approval could not be turned into a grant: {error}"
-                            )))
-                        }
-                    },
-                    Answer::No { note } => {
-                        let message = note.map_or_else(
-                            || "The operator declined to run this call.".to_owned(),
-                            |note| {
-                                format!("The operator declined to run this call. Feedback: {note}")
-                            },
-                        );
-                        return Ok(refused(message));
-                    }
-                    Answer::Stop => return Ok(Executed::Stopped),
-                }
-            }
+    let (grants, approval_note) = match authorize(
+        terminal,
+        colour,
+        Asking {
+            name,
+            arguments,
+            summary,
+            keys,
+            decoder,
+            approval,
         },
+        authorization,
+    )? {
+        Granted::Run { grants, note } => (grants, note),
+        Granted::Refused(result) => return Ok(Executed::Answered(*result)),
+        Granted::Stopped => return Ok(Executed::Stopped),
     };
     let (mut result, cancelled) = dispatch_tool_live(
         terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
@@ -5143,6 +5109,117 @@ fn execute_call(
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
     Ok(Executed::Answered(result))
+}
+
+/// What deciding a call needs in order to ask about it.
+#[cfg(feature = "tui")]
+struct Asking<'a> {
+    name: &'a str,
+    arguments: &'a Value,
+    summary: &'a str,
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    approval: &'a approval::ApprovalCell,
+}
+
+/// What authorizing a call decided.
+#[cfg(feature = "tui")]
+enum Granted {
+    Run {
+        grants: Vec<arsy_kernel::capability::CapabilityGrant>,
+        /// What the operator said when they approved it, if anything.
+        note: Option<String>,
+    },
+    /// The call does not run, and this is what the provider is told.
+    Refused(Box<arsy_code::agent::ToolResult>),
+    Stopped,
+}
+
+/// Turn an authorization into grants, asking the operator when the mode says
+/// to ask.
+///
+/// Separate from running the call: what a call is allowed to do is decided
+/// before anything happens, and reading that decision should not mean reading
+/// the execution as well.
+#[cfg(feature = "tui")]
+fn authorize(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    asking: Asking<'_>,
+    authorization: arsy_code::agent::Authorization,
+) -> io::Result<Granted> {
+    use arsy_code::agent::Authorization;
+
+    let name = asking.name;
+    let requested = match &authorization {
+        Authorization::Allowed(grants) => {
+            return Ok(Granted::Run {
+                grants: grants.clone(),
+                note: None,
+            })
+        }
+        Authorization::Denied(reason) => return Ok(refused(name, reason.clone())),
+        Authorization::NeedsApproval { .. } => authorization.requested(),
+    };
+    match approval::decide(asking.approval.get(), name) {
+        approval::Decision::Approve => Ok(granted(authorization, name, None)),
+        approval::Decision::Refuse => Ok(refused(
+            name,
+            format!(
+                "the current approval mode ({}) refuses this call without asking: {}",
+                asking.approval.get().label(),
+                requested
+            ),
+        )),
+        approval::Decision::Ask => {
+            let preview = format_tool_preview(name, asking.arguments);
+            match confirm_tool(
+                terminal,
+                colour,
+                name,
+                asking.summary,
+                &requested,
+                preview,
+                asking.keys,
+                asking.decoder,
+                asking.approval,
+            )? {
+                Answer::Yes { note } => Ok(granted(authorization, name, note)),
+                Answer::No { note } => Ok(refused(
+                    name,
+                    note.map_or_else(
+                        || "The operator declined to run this call.".to_owned(),
+                        |note| format!("The operator declined to run this call. Feedback: {note}"),
+                    ),
+                )),
+                Answer::Stop => Ok(Granted::Stopped),
+            }
+        }
+    }
+}
+
+/// Turn an approved authorization into the grants the call runs under.
+#[cfg(feature = "tui")]
+fn granted(
+    authorization: arsy_code::agent::Authorization,
+    name: &str,
+    note: Option<String>,
+) -> Granted {
+    match authorization.approve() {
+        Ok(grants) => Granted::Run { grants, note },
+        Err(error) => refused(
+            name,
+            format!("the approval could not be turned into a grant: {error}"),
+        ),
+    }
+}
+
+/// The answer a call that will not run sends back to the provider.
+#[cfg(feature = "tui")]
+fn refused(name: &str, reason: String) -> Granted {
+    Granted::Refused(Box::new(arsy_code::agent::ToolResult::refused(
+        name, reason,
+    )))
 }
 
 fn write_unwrapped_lines(terminal: &mut impl Write, lines: &[String]) -> io::Result<()> {
