@@ -6010,7 +6010,7 @@ impl Streaming {
     /// Draw reasoning as it streams, opening its box on the first delta.
     fn reason(
         &mut self,
-        terminal: &mut io::Stdout,
+        terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
         footer: &str,
@@ -6047,7 +6047,7 @@ impl Streaming {
     /// first, so the prose never starts inside it.
     fn answer(
         &mut self,
-        terminal: &mut io::Stdout,
+        terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
         footer: &str,
@@ -6102,7 +6102,7 @@ impl Streaming {
     /// Close the round: finish whatever box is open and settle the last line.
     fn close(
         &mut self,
-        terminal: &mut io::Stdout,
+        terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
         footer: &str,
@@ -6131,7 +6131,7 @@ impl Streaming {
     /// way through.
     fn close_thinking(
         &mut self,
-        terminal: &mut io::Stdout,
+        terminal: &mut dyn Write,
         composer: &mut tui::Composer,
         colour: bool,
         footer: &str,
@@ -6182,7 +6182,7 @@ fn drain_lines(buffer: &mut String) -> Vec<String> {
 /// One finished row above the composer, with the status redrawn under it.
 #[cfg(feature = "tui")]
 fn stream_row(
-    terminal: &mut io::Stdout,
+    terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
     footer: &str,
@@ -6863,7 +6863,7 @@ fn confirm_plan(
 
 #[cfg(feature = "tui")]
 fn redraw_live_response(
-    terminal: &mut io::Stdout,
+    terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     colour: bool,
     footer: &str,
@@ -6888,7 +6888,7 @@ fn redraw_live_response(
 
 #[cfg(feature = "tui")]
 fn erase_live_response(
-    terminal: &mut io::Stdout,
+    terminal: &mut dyn Write,
     composer: &mut tui::Composer,
     lines: usize,
 ) -> io::Result<()> {
@@ -10219,6 +10219,49 @@ mod tests {
         assert_eq!(
             approval::decide(approval.get(), "fs.write"),
             approval::Decision::Approve
+        );
+    }
+
+    /// Reasoning is framed apart from the answer it precedes, so the box has
+    /// to be finished before the answer's header opens. ARSY drew the header
+    /// first, which left it between the box's last line and its bottom border.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn an_answer_closes_the_reasoning_box_before_it_opens_its_own() {
+        let mut live = Streaming::default();
+        let mut composer = tui::Composer::default();
+        let mut screen: Vec<u8> = Vec::new();
+
+        live.reason(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            "weighing it up\n",
+        )
+        .unwrap();
+        live.answer(
+            &mut screen,
+            &mut composer,
+            false,
+            "",
+            "status",
+            "the answer\n",
+        )
+        .unwrap();
+
+        let drawn = String::from_utf8(screen).unwrap();
+        let closed = drawn.find('╰').expect("the reasoning box is closed");
+        let header = drawn.find("Response").expect("the answer announces itself");
+        let prose = drawn.find("the answer").expect("the answer is drawn");
+        assert!(
+            closed < header,
+            "the box closes before the header:\n{drawn}"
+        );
+        assert!(
+            header < prose,
+            "the header comes before the prose:\n{drawn}"
         );
     }
 
