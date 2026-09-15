@@ -2379,74 +2379,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
 
-    // A configured endpoint is preferred, because it is the one ARSY talks to
-    // itself. The Codex CLI stays the fallback for an operator who has not
-    // configured anything, so this session keeps working as it did.
-    //
-    // ponytail: resolved once, so an OAuth access token is the one this
-    // session started with; a session outliving the token's lifetime would
-    // need re-resolving per turn, which costs a credential-store read each
-    // time. An API key does not expire, and `arsy run` resolves per
-    // invocation, so only a long interactive OAuth session is affected.
-    let native_requested = invocation.provider.clone().or_else(|| {
-        load_config(&workspace, &workspace, invocation.config.as_deref())
-            .ok()
-            .and_then(|config| config.provider_default().map(str::to_owned))
-    });
-    let native = load_config(&workspace, &workspace, invocation.config.as_deref())
-        .and_then(|config| {
-            let resolved = provider::resolve(&config, native_requested.as_deref())?;
-            // `--model` is checked here rather than defaulted: a model the
-            // ceiling excludes must not open a session that would dispatch to
-            // it, and falling back to the configured one would obey a flag the
-            // operator did not give.
-            let model = match invocation.model.as_deref() {
-                Some(_) => {
-                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
-                }
-                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
-            };
-            Ok((resolved, model))
-        })
-        .ok();
-    let detected = match &native {
-        Some((resolved, model)) => Some(tui::ModelRoute {
-            provider: resolved.endpoint.id.clone(),
-            model: model.clone(),
-        }),
-        None => tui::detect_model_route(),
-    };
-    // Nothing configured and no Codex login is not fatal: the session still
-    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
-    // is refused, which `provider_available` gates below.
-    let provider_available = detected.is_some();
-    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
-        provider: tui::CODEX_PROVIDER.to_owned(),
-        model: "default".into(),
-    });
-    let native = native.map(|(resolved, _)| resolved);
+    let Opened {
+        native,
+        native_requested,
+        detected,
+        provider_available,
+    } = open_route(invocation, &workspace)?;
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
-    // The palette is fixed before the first frame. A rejected `[theme]`
-    // override is reported and dropped, never left to blank the screen.
-    let theme_config = load_config(&workspace, &workspace, invocation.config.as_deref())
-        .map(|config| config.theme().clone())
-        .unwrap_or_default();
-    let (mut theme, palette) = resolve_palette(&theme_config);
-    match palette {
-        Ok(palette) => tui::activate_palette(palette),
-        Err(reason) => {
-            emitter.diagnostic(&Diagnostic::warning(
-                "ARSY-UIX-1002",
-                format!("a [theme] override was ignored: {reason}"),
-                "use #rrggbb colours and role names ARSY knows (see /help)",
-            ));
-            if let Some(palette) = tui::builtin_palette(&theme) {
-                tui::activate_palette(palette);
-            }
-        }
-    }
-
+    let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
     let mut models = {
         let mut models = endpoint_models(invocation);
         models.extend(tui::available_models());
@@ -2454,22 +2395,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-    let mut resolved_providers: std::collections::HashMap<String, provider::Resolved> =
-        std::collections::HashMap::new();
-    // A failed native resolution must not probe the same OS credential again
-    // on every turn while the external Codex login is still available.
-    let mut unavailable_providers = std::collections::HashSet::new();
-    if native.is_none() {
-        if let Some(provider) = native_requested
-            .as_deref()
-            .filter(|provider| *provider != "auto")
-        {
-            unavailable_providers.insert(provider.to_owned());
-        }
-    }
-    if let Some(resolved) = native.clone() {
-        resolved_providers.insert(route.provider.clone(), resolved);
-    }
+    let (mut resolved_providers, mut unavailable_providers) =
+        seed_providers(native, native_requested.as_deref(), &route.provider);
     let mut effort = saved_effort();
     // What `/provider` is holding between its questions, and the list it offers.
     let mut draft = tui::ProviderDraft::default();
@@ -4355,6 +4282,135 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// Fix the palette before the first frame.
+///
+/// A rejected `[theme]` override is reported and dropped, never left to blank
+/// the screen.
+#[cfg(feature = "tui")]
+fn open_palette(
+    invocation: &Invocation,
+    workspace: &Path,
+    emitter: &mut Emitter,
+) -> (arsy_kernel::config::Theme, String) {
+    let config = load_config(workspace, workspace, invocation.config.as_deref())
+        .map(|config| config.theme().clone())
+        .unwrap_or_default();
+    let (theme, palette) = resolve_palette(&config);
+    match palette {
+        Ok(palette) => tui::activate_palette(palette),
+        Err(reason) => {
+            emitter.diagnostic(&Diagnostic::warning(
+                "ARSY-UIX-1002",
+                format!("a [theme] override was ignored: {reason}"),
+                "use #rrggbb colours and role names ARSY knows (see /help)",
+            ));
+            if let Some(palette) = tui::builtin_palette(&theme) {
+                tui::activate_palette(palette);
+            }
+        }
+    }
+    (config, theme)
+}
+
+/// What the session already knows about its providers before the first turn.
+///
+/// A failed native resolution is remembered as unavailable so it is not probed
+/// again on every turn while the external Codex login is still working.
+#[cfg(feature = "tui")]
+fn seed_providers(
+    native: Option<provider::Resolved>,
+    requested: Option<&str>,
+    route: &str,
+) -> (
+    std::collections::HashMap<String, provider::Resolved>,
+    std::collections::HashSet<String>,
+) {
+    let mut resolved = std::collections::HashMap::new();
+    let mut unavailable = std::collections::HashSet::new();
+    match native {
+        Some(found) => {
+            resolved.insert(route.to_owned(), found);
+        }
+        None => {
+            if let Some(requested) = requested.filter(|requested| *requested != "auto") {
+                unavailable.insert(requested.to_owned());
+            }
+        }
+    }
+    (resolved, unavailable)
+}
+
+/// The provider and model a session opens with.
+#[cfg(feature = "tui")]
+struct Opened {
+    native: Option<provider::Resolved>,
+    /// What was asked for, which is not always what resolved.
+    native_requested: Option<String>,
+    detected: tui::ModelRoute,
+    provider_available: bool,
+}
+
+/// Resolve which provider and model this session starts on.
+///
+/// A configured endpoint is preferred, because it is the one ARSY talks to
+/// itself. The Codex CLI stays the fallback for an operator who has not
+/// configured anything, so an existing session keeps working as it did.
+///
+/// Nothing configured and no Codex login is not fatal: the session still opens
+/// so `/mcp` and `/hooks` can inspect the workspace, and only a task turn is
+/// refused.
+///
+/// ponytail: resolved once, so an OAuth access token is the one this session
+/// started with; a session outliving the token's lifetime would need
+/// re-resolving per turn, which costs a credential-store read each time. An
+/// API key does not expire, and `arsy run` resolves per invocation, so only a
+/// long interactive OAuth session is affected.
+#[cfg(feature = "tui")]
+fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Opened, Diagnostic> {
+    let native_requested = invocation.provider.clone().or_else(|| {
+        load_config(workspace, workspace, invocation.config.as_deref())
+            .ok()
+            .and_then(|config| config.provider_default().map(str::to_owned))
+    });
+    let native = load_config(workspace, workspace, invocation.config.as_deref())
+        .and_then(|config| {
+            let resolved = provider::resolve(&config, native_requested.as_deref())?;
+            // `--model` is checked here rather than defaulted: a model the
+            // ceiling excludes must not open a session that would dispatch to
+            // it, and falling back to the configured one would obey a flag the
+            // operator did not give.
+            let model = match invocation.model.as_deref() {
+                Some(_) => {
+                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
+                }
+                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
+            };
+            Ok((resolved, model))
+        })
+        .ok();
+    let detected = match &native {
+        Some((resolved, model)) => Some(tui::ModelRoute {
+            provider: resolved.endpoint.id.clone(),
+            model: model.clone(),
+        }),
+        None => tui::detect_model_route(),
+    };
+    // Nothing configured and no Codex login is not fatal: the session still
+    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
+    // is refused, which `provider_available` gates below.
+    let provider_available = detected.is_some();
+    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
+        provider: tui::CODEX_PROVIDER.to_owned(),
+        model: "default".into(),
+    });
+    Ok(Opened {
+        native: native.map(|(resolved, _)| resolved),
+        native_requested,
+        detected,
+        provider_available,
+    })
 }
 
 /// The slash commands that change how the next turn is allowed to act, or
