@@ -147,7 +147,11 @@ impl TuiState {
             rows.push(paint(colour, sgr_assistant(), text));
         }
 
-        let rows = beside_logo(rows, inner, colour);
+        // One blank line inside each border, so the card breathes rather than
+        // starting on the rule.
+        let mut rows = beside_logo(rows, inner, colour);
+        rows.insert(0, String::new());
+        rows.push(String::new());
         let rule = "─".repeat(width.saturating_sub(2));
         let mut lines = vec![paint(colour, sgr_border(), &format!("╭{rule}╮"))];
         for row in &rows {
@@ -285,16 +289,21 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     if inner < gutter + LABEL_WIDTH + 12 {
         return text;
     }
+    // Whichever column is shorter is centred against the other, so the mark
+    // sits beside the middle of the label rows rather than being pinned to
+    // their first line.
     let logo = logo(colour);
-    let offset = logo.len().saturating_sub(text.len()) / 2;
-    (0..logo.len().max(text.len() + offset))
+    let mark_offset = text.len().saturating_sub(logo.len()) / 2;
+    let text_offset = logo.len().saturating_sub(text.len()) / 2;
+    (0..(logo.len() + mark_offset).max(text.len() + text_offset))
         .map(|row| {
-            let mark = logo
-                .get(row)
+            let mark = row
+                .checked_sub(mark_offset)
+                .and_then(|index| logo.get(index))
                 .cloned()
                 .unwrap_or_else(|| " ".repeat(LOGO_WIDTH));
             let line = row
-                .checked_sub(offset)
+                .checked_sub(text_offset)
                 .and_then(|index| text.get(index))
                 .map_or("", String::as_str);
             format!("{mark}{}{line}", " ".repeat(LOGO_GAP))

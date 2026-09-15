@@ -227,8 +227,8 @@ pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
 
 const LABEL_WIDTH: usize = 10;
 
-const LOGO_WIDTH: usize = 22;
-const LOGO_HEIGHT: usize = 11;
+const LOGO_WIDTH: usize = 10;
+const LOGO_HEIGHT: usize = 5;
 const LOGO_GAP: usize = 3;
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 
@@ -833,15 +833,24 @@ mod tests {
             rows.iter().any(|row| strip_sgr(row).contains(&first_mark)),
             "card contains the rendered mark"
         );
+        // Border, a blank line, then the title: the labels set the height and
+        // the mark is centred against them, not the other way round.
         assert!(
-            strip_sgr(rows[3]).contains(">_ ARSY CODE"),
-            "text is centred against it"
+            strip_sgr(rows[2]).contains(">_ ARSY CODE"),
+            "the title leads the card"
         );
         assert_eq!(
             rows.len(),
-            logo(true).len() + 2,
-            "the mark sets the card height"
+            // model, directory, sandbox, session, mode, the blank under the
+            // title, and the title, inside a blank line and a border each side.
+            7 + 2 + 2,
+            "the labels set the card height"
         );
+        let marked = rows
+            .iter()
+            .position(|row| strip_sgr(row).contains(&first_mark))
+            .expect("the mark is on the card");
+        assert!(marked > 2, "the mark is centred against the labels");
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
         }
@@ -854,7 +863,7 @@ mod tests {
         assert!(cut.contains('…'));
 
         // Too narrow for both: the text wins, the mark is dropped.
-        let narrow = state.render(40, true);
+        let narrow = state.render(32, true);
         assert!(!strip_sgr(&narrow).contains(&first_mark));
         assert!(strip_sgr(&narrow).contains(">_ ARSY CODE"));
     }
