@@ -506,81 +506,96 @@ impl Composer {
     }
 
     pub fn press(&mut self, key: Key) -> Action {
+        // Editing the line, moving through it, and what ends it are three
+        // separate readings of the same key; the first that owns the key
+        // answers.
+        if let Some(action) = self.edit(key) {
+            return action;
+        }
+        if let Some(action) = self.navigate(key) {
+            return action;
+        }
+        self.finish(key)
+    }
+
+    /// The keys that change the text of the line.
+    fn edit(&mut self, key: Key) -> Option<Action> {
         match key {
             Key::Char(character) if !character.is_control() => {
                 self.buffer.insert(self.byte_at(self.caret), character);
                 self.caret += 1;
-                self.selected = 0;
-                Action::Redraw
             }
             Key::Newline => {
                 self.buffer.insert(self.byte_at(self.caret), '\n');
                 self.caret += 1;
-                self.selected = 0;
-                Action::Redraw
             }
             Key::Backspace if self.caret > 0 => {
                 self.buffer.remove(self.byte_at(self.caret - 1));
                 self.caret -= 1;
-                self.selected = 0;
-                Action::Redraw
             }
             Key::Delete if self.caret < self.buffer.chars().count() => {
                 self.buffer.remove(self.byte_at(self.caret));
-                self.selected = 0;
-                Action::Redraw
-            }
-            // An open menu owns Up/Down: it is the list in front of the reader,
-            // and history is still one Escape or Backspace away. The ends wrap,
-            // so a short list is never a dead end in one direction.
-            Key::Up if !self.menu().is_empty() => self.mark(false),
-            Key::Down if !self.menu().is_empty() => self.mark(true),
-            Key::Up if !self.history.is_empty() => self.recall(true),
-            Key::Down if self.history_index.is_some() => self.recall(false),
-            Key::Left if self.caret > 0 => {
-                self.caret -= 1;
-                Action::Redraw
-            }
-            Key::Right if self.caret < self.buffer.chars().count() => {
-                self.caret += 1;
-                Action::Redraw
-            }
-            Key::WordLeft => {
-                self.word_left();
-                Action::Redraw
-            }
-            Key::WordRight => {
-                self.word_right();
-                Action::Redraw
             }
             Key::WordBackspace => {
                 self.word_backspace();
-                Action::Redraw
+                return Some(Action::Redraw);
+            }
+            _ => return None,
+        }
+        // Any edit makes the menu's mark stale: it belonged to the line as it
+        // read before the key.
+        self.selected = 0;
+        Some(Action::Redraw)
+    }
+
+    /// The keys that move through the line, the menu, or the history.
+    fn navigate(&mut self, key: Key) -> Option<Action> {
+        match key {
+            // An open menu owns Up/Down: it is the list in front of the reader,
+            // and history is still one Escape or Backspace away. The ends wrap,
+            // so a short list is never a dead end in one direction.
+            Key::Up if !self.menu().is_empty() => Some(self.mark(false)),
+            Key::Down if !self.menu().is_empty() => Some(self.mark(true)),
+            Key::Up if !self.history.is_empty() => Some(self.recall(true)),
+            Key::Down if self.history_index.is_some() => Some(self.recall(false)),
+            Key::Left if self.caret > 0 => {
+                self.caret -= 1;
+                Some(Action::Redraw)
+            }
+            Key::Right if self.caret < self.buffer.chars().count() => {
+                self.caret += 1;
+                Some(Action::Redraw)
+            }
+            Key::WordLeft => {
+                self.word_left();
+                Some(Action::Redraw)
+            }
+            Key::WordRight => {
+                self.word_right();
+                Some(Action::Redraw)
             }
             Key::Home => {
                 self.caret = 0;
-                Action::Redraw
+                Some(Action::Redraw)
             }
             Key::End => {
                 self.caret = self.buffer.chars().count();
-                Action::Redraw
+                Some(Action::Redraw)
             }
+            _ => None,
+        }
+    }
+
+    /// The keys that end the line, one way or another.
+    fn finish(&mut self, key: Key) -> Action {
+        match key {
             // Enter takes the highlighted command, unless the line already is
             // one: otherwise a typed-out `/quit` would refuse to send itself.
             Key::Enter if self.completion().is_some() => {
                 self.restore(self.completion().unwrap_or_default());
                 Action::Redraw
             }
-            Key::Enter => {
-                let line = self.take();
-                if !self.masked && !line.trim().is_empty() && self.history.back() != Some(&line) {
-                    self.history.push_back(line.clone());
-                    if self.history.len() > 100 {
-                        self.history.pop_front();
-                    }
-                }
-                Action::Submit(line)
-            }
+            Key::Enter => Action::Submit(self.submit()),
             // Ctrl-C clears a drafted line first, and only quits once there is
             // nothing left to lose.
             Key::Interrupt if !self.buffer.is_empty() => {
@@ -593,6 +608,19 @@ impl Composer {
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,
         }
+    }
+
+    /// Take the line and remember it, unless it is blank, masked, or the same
+    /// as the line before it.
+    fn submit(&mut self) -> String {
+        let line = self.take();
+        if !self.masked && !line.trim().is_empty() && self.history.back() != Some(&line) {
+            self.history.push_back(line.clone());
+            if self.history.len() > 100 {
+                self.history.pop_front();
+            }
+        }
+        line
     }
 
     /// The row the mark is on, for a caller that needs to see the selection
