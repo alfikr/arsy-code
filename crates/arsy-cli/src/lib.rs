@@ -1470,16 +1470,32 @@ fn bootstrap_user_config() {
         return;
     }
     let body = carried.unwrap_or_else(|| "{}".to_owned());
-    // `create_new`: two ARSY processes starting at once must not have one of
-    // them truncate what the other just carried over.
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        let _ = file.write_all(body.trim_end().as_bytes());
-        let _ = file.write_all(b"\n");
+    // Written beside the destination and linked into place, so a second ARSY
+    // starting at the same time reads either nothing or the whole file. A
+    // created-then-written file is visible while it is still empty, and an
+    // empty `arsy.json` is a fatal parse error rather than a missing layer.
+    //
+    // `hard_link` is the create-if-absent half: it fails when the destination
+    // exists, so neither process truncates what the other carried over.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        arsy_kernel::config::CONFIG_FILE,
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let Ok(mut file) = std::fs::File::create(&staged) else {
+        return;
+    };
+    let written = file
+        .write_all(body.trim_end().as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_ok() {
+        let _ = std::fs::hard_link(&staged, &path);
     }
+    let _ = std::fs::remove_file(&staged);
 }
 
 /// Read every configuration layer for this workspace.
