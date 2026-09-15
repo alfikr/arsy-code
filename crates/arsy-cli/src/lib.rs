@@ -2533,50 +2533,44 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 .map_err(terminal_failed)?;
             composer.invalidate();
         }
-        let status = match &prompt {
-            // The branch is read per line rather than kept, so a checkout made
-            // in another terminal shows up on the next prompt.
-            Prompt::Task => state.status_row(
-                tui::terminal_width(),
-                colour,
-                tui::branch(&workspace).as_deref(),
-            ),
-            Prompt::Model => tui::model_prompt(&models, &route, colour),
-            Prompt::Effort => tui::effort_prompt(effort, colour),
-            Prompt::Theme => tui::theme_prompt(&theme, colour),
-            Prompt::Provider(step) => step.prompt(&draft, colour),
-            Prompt::Auth(step) => step.prompt(&auth_draft, colour),
-            Prompt::Resume => tui::session_prompt(&sessions, colour),
-            Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
-        };
+        let status = prompt_status(
+            &prompt,
+            Picker {
+                state: &state,
+                workspace: &workspace,
+                models: &models,
+                route: &route,
+                effort,
+                theme: &theme,
+                draft: &draft,
+                auth_draft: &auth_draft,
+                sessions: &sessions,
+                providers: &providers,
+                chosen_provider: chosen_provider.as_deref(),
+            },
+            colour,
+        );
         // Derived from the prompt once per line, so the command menu can never
         // drift out of step with which prompt is collecting the answer.
         composer.set_picking(!matches!(prompt, Prompt::Task));
-        match prompt {
-            Prompt::Model => {
-                let (rows, selected) = tui::model_rows(&models, &route);
-                composer.offer(rows, selected);
-            }
-            Prompt::Effort => {
-                composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(effort));
-            }
-            Prompt::Theme => {
-                composer.offer_table(Some(tui::THEMES), tui::theme_row(&theme));
-            }
-            Prompt::Provider(step) => composer.offer(
-                step.rows(&providers, &route.provider, chosen_provider.as_deref()),
-                0,
-            ),
-            Prompt::Auth(step) => {
-                let handles = catalog_handles(invocation);
-                composer.offer(step.rows(&providers, &handles), 0);
-            }
-            Prompt::Resume => {
-                let (rows, selected) = tui::session_rows(&sessions, Some(state.session_id()));
-                composer.offer(rows, selected);
-            }
-            _ => composer.offer(None, 0),
-        }
+        offer_rows(
+            &prompt,
+            &mut composer,
+            Picker {
+                state: &state,
+                workspace: &workspace,
+                models: &models,
+                route: &route,
+                effort,
+                theme: &theme,
+                draft: &draft,
+                auth_draft: &auth_draft,
+                sessions: &sessions,
+                providers: &providers,
+                chosen_provider: chosen_provider.as_deref(),
+            },
+            invocation,
+        );
         // A credential is typed, never shown, and never remembered.
         composer.set_masked(
             matches!(prompt, Prompt::Provider(step) if step.masked())
@@ -2660,54 +2654,19 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 // `clear` rather than `commit`, so no answer — least of all the
                 // credential — is painted into the scrollback.
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match provider_step(invocation, step, &line, &mut draft, &providers) {
-                    Ok(ProviderNext::Ask(next)) => prompt = Prompt::Provider(next),
-                    Ok(ProviderNext::Done(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        providers = configured_providers(invocation);
-                        chosen_provider = configured_default(invocation);
-                        // Configuration decides the provider, so the session has
-                        // to be restarted to pick up a change to it rather than
-                        // pretend the running one moved.
-                        writeln!(
-                            stdout,
-                            "{}",
-                            tui::safe_text("Restart ARSY for the change to take effect.")
-                        )
-                        .map_err(terminal_failed)?;
-                        draft = tui::ProviderDraft::default();
-                        prompt = Prompt::Task;
-                    }
-                    Ok(ProviderNext::Cancelled(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        draft = tui::ProviderDraft::default();
-                        prompt = Prompt::Task;
-                    }
-                    // The step stays open so the answer can be retyped against
-                    // the question that is still on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
+                prompt = take_provider(
+                    invocation,
+                    step,
+                    &line,
+                    &mut draft,
+                    &mut providers,
+                    &mut chosen_provider,
+                    &mut stdout,
+                )?;
             }
             Prompt::Effort => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_effort_answer(&line, effort) {
-                    Ok(picked) => {
-                        effort = picked;
-                        state.set_effort(effort);
-                        remember_effort(effort, emitter);
-                        writeln!(stdout, "{}", effort_line(effort)).map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    // As with the model picker, the list stays open so the
-                    // answer can be retyped against what is already on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
+                prompt = take_effort(&line, &mut effort, &mut state, &mut stdout, emitter)?;
             }
             Prompt::Theme => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -2720,48 +2679,19 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             }
             Prompt::Model => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_model(&line, &models, &route) {
-                    Ok(picked) => {
-                        route = picked;
-                        remember_model(&route, emitter);
-                        state.set_model_route(route.clone());
-                        writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    // The picker stays open so the answer can be retyped
-                    // against the list that is already on screen.
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
+                prompt = take_model(&line, &models, &mut route, &mut state, &mut stdout, emitter)?;
             }
             Prompt::Auth(step) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match auth_step(
+                prompt = take_auth(
                     invocation,
                     step,
                     &line,
                     &mut auth_draft,
                     &providers,
+                    &mut stdout,
                     emitter,
-                ) {
-                    Ok(AuthNext::Ask(next)) => prompt = Prompt::Auth(next),
-                    Ok(AuthNext::Done(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        auth_draft.clear();
-                        prompt = Prompt::Task;
-                    }
-                    Ok(AuthNext::Cancelled(message)) => {
-                        writeln!(stdout, "{}", tui::safe_text(&message))
-                            .map_err(terminal_failed)?;
-                        auth_draft.clear();
-                        prompt = Prompt::Task;
-                    }
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
+                )?;
             }
             Prompt::Resume => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -4836,6 +4766,199 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// Carry the provider wizard one step, and say which step comes next.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_provider(
+    invocation: &Invocation,
+    step: tui::ProviderStep,
+    line: &str,
+    draft: &mut tui::ProviderDraft,
+    providers: &mut Vec<String>,
+    chosen: &mut Option<String>,
+    stdout: &mut io::Stdout,
+) -> Result<Prompt, Diagnostic> {
+    let message = match provider_step(invocation, step, line, draft, providers) {
+        Ok(ProviderNext::Ask(next)) => return Ok(Prompt::Provider(next)),
+        Ok(ProviderNext::Done(message)) => {
+            writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+            *providers = configured_providers(invocation);
+            *chosen = configured_default(invocation);
+            *draft = tui::ProviderDraft::default();
+            // Configuration decides the provider, so the session has to be
+            // restarted to pick up a change to it rather than pretend the
+            // running one moved.
+            "Restart ARSY for the change to take effect.".to_owned()
+        }
+        Ok(ProviderNext::Cancelled(message)) => {
+            *draft = tui::ProviderDraft::default();
+            message
+        }
+        // The step stays open so the answer can be retyped against the
+        // question that is still on screen.
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            return Ok(Prompt::Provider(step));
+        }
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+    Ok(Prompt::Task)
+}
+
+/// Take the reasoning effort the operator picked.
+///
+/// A rejected answer leaves the list open so it can be retyped against what is
+/// already on screen.
+#[cfg(feature = "tui")]
+fn take_effort(
+    line: &str,
+    effort: &mut Option<Effort>,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_effort_answer(line, *effort) {
+        Ok(picked) => {
+            *effort = picked;
+            state.set_effort(*effort);
+            remember_effort(*effort, emitter);
+            writeln!(stdout, "{}", effort_line(*effort)).map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Effort)
+        }
+    }
+}
+
+/// Take the model the operator picked, and remember it for the next run.
+#[cfg(feature = "tui")]
+fn take_model(
+    line: &str,
+    models: &[tui::ModelChoice],
+    route: &mut tui::ModelRoute,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_model(line, models, route) {
+        Ok(picked) => {
+            *route = picked;
+            remember_model(route, emitter);
+            state.set_model_route(route.clone());
+            writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Model)
+        }
+    }
+}
+
+/// Carry the credential wizard one step, and say which step comes next.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_auth(
+    invocation: &Invocation,
+    step: tui::AuthStep,
+    line: &str,
+    draft: &mut String,
+    providers: &[String],
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<Prompt, Diagnostic> {
+    let (message, next) = match auth_step(invocation, step, line, draft, providers, emitter) {
+        Ok(AuthNext::Ask(next)) => return Ok(Prompt::Auth(next)),
+        // Finished or abandoned, the draft goes either way: a credential is
+        // never left in memory for the next question to pick up.
+        Ok(AuthNext::Done(message) | AuthNext::Cancelled(message)) => {
+            draft.clear();
+            (message, Prompt::Task)
+        }
+        Err(reason) => (reason, Prompt::Auth(step)),
+    };
+    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+    Ok(next)
+}
+
+/// What the pickers read to draw themselves.
+#[cfg(feature = "tui")]
+struct Picker<'a> {
+    state: &'a tui::TuiState,
+    workspace: &'a Path,
+    models: &'a [tui::ModelChoice],
+    route: &'a tui::ModelRoute,
+    effort: Option<Effort>,
+    theme: &'a str,
+    draft: &'a tui::ProviderDraft,
+    auth_draft: &'a str,
+    sessions: &'a [tui::SessionChoice],
+    providers: &'a [String],
+    chosen_provider: Option<&'a str>,
+}
+
+/// The line under the composer: the status row, or whatever the open picker
+/// wants said above its rows.
+#[cfg(feature = "tui")]
+fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -> String {
+    match prompt {
+        // The branch is read per line rather than kept, so a checkout made in
+        // another terminal shows up on the next prompt.
+        Prompt::Task => picker.state.status_row(
+            tui::terminal_width(),
+            colour,
+            tui::branch(picker.workspace).as_deref(),
+        ),
+        Prompt::Model => tui::model_prompt(picker.models, picker.route, colour),
+        Prompt::Effort => tui::effort_prompt(picker.effort, colour),
+        Prompt::Theme => tui::theme_prompt(picker.theme, colour),
+        Prompt::Provider(step) => step.prompt(picker.draft, colour),
+        Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
+        Prompt::Resume => tui::session_prompt(picker.sessions, colour),
+        Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
+    }
+}
+
+/// The rows the open picker offers, and which of them is marked.
+#[cfg(feature = "tui")]
+fn offer_rows(
+    prompt: &Prompt,
+    composer: &mut tui::Composer,
+    picker: Picker<'_>,
+    invocation: &Invocation,
+) {
+    match prompt {
+        Prompt::Model => {
+            let (rows, selected) = tui::model_rows(picker.models, picker.route);
+            composer.offer(rows, selected);
+        }
+        Prompt::Effort => {
+            composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(picker.effort))
+        }
+        Prompt::Theme => composer.offer_table(Some(tui::THEMES), tui::theme_row(picker.theme)),
+        Prompt::Provider(step) => composer.offer(
+            step.rows(
+                picker.providers,
+                &picker.route.provider,
+                picker.chosen_provider,
+            ),
+            0,
+        ),
+        Prompt::Auth(step) => {
+            let handles = catalog_handles(invocation);
+            composer.offer(step.rows(picker.providers, &handles), 0);
+        }
+        Prompt::Resume => {
+            let (rows, selected) =
+                tui::session_rows(picker.sessions, Some(picker.state.session_id()));
+            composer.offer(rows, selected);
+        }
+        _ => composer.offer(None, 0),
+    }
 }
 
 /// The parts of a running turn an event can change.
