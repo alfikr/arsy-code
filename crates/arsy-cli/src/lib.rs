@@ -1091,75 +1091,41 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I, tty: bool) -> i32 {
 }
 
 fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    match &invocation.command {
-        Command::Help => {
-            let _ = write!(io::stdout(), "{USAGE}");
-            Ok(0)
-        }
-        Command::Version => {
-            let _ = writeln!(io::stdout(), "arsy {} ({})", arsy_code::VERSION, platform());
-            Ok(0)
-        }
-        Command::Tui if !tty => Err(Diagnostic::error(
-            "ARSY-SCH-1003",
-            "the interactive TUI requires a terminal",
-            "there is no terminal; use `arsy run <TASK>`",
-        )),
-        Command::Tui if emitter.output != Output::Human => Err(usage(
-            "the TUI requires human output; use an explicit command with --output json or ci",
-        )),
-        #[cfg(feature = "tui")]
-        Command::Tui => run_tui(invocation, emitter),
-        #[cfg(not(feature = "tui"))]
-        Command::Tui => Err(Diagnostic::error(
-            "ARSY-SCH-1003",
-            "the interactive TUI is disabled in this build",
-            "install a build with the `tui` feature",
-        )),
-        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
-        Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
-        Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
-        Command::Update { check_only } => execute_update(*check_only, emitter),
+    // Grouped by area rather than one flat dispatch: a reader after the
+    // session commands should not have to walk the credential ones to find
+    // them. The core arms come last because the interactive one needs to know
+    // whether it has a terminal, which none of the others care about.
+    execute_auth(invocation, tty, emitter)
+        .or_else(|| execute_session(invocation, emitter))
+        .or_else(|| execute_memory(invocation, emitter))
+        .or_else(|| execute_mcp(invocation, emitter))
+        .or_else(|| execute_code(invocation, tty, emitter))
+        .unwrap_or_else(|| execute_core(invocation, tty, emitter))
+}
+
+/// Credentials: what ARSY holds and for which provider.
+fn execute_auth(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::AuthSet { provider, handle } => {
             auth_set(invocation, provider, handle.as_deref(), tty, emitter)
         }
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
         Command::AuthList => auth_list(invocation, emitter),
         Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
-        Command::Eval {
-            suite,
-            trials,
-            strict,
-            out,
-        } => {
-            let workspace = workspace_root(&invocation.workspace)?;
-            let report = eval::run(&workspace, suite, *trials, *strict, out.as_deref())?;
-            emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
-            Ok(0)
-        }
-        Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
-        Command::Inspect {
-            kind,
-            name,
-            source,
-            event,
-        } => {
-            let report = integrations::inspect(
-                &workspace_root(&invocation.workspace)?,
-                kind,
-                name.as_deref(),
-                source.as_deref(),
-                event.as_deref(),
-                invocation.config.as_deref(),
-            )?;
-            emitter.result(if emitter.output == Output::Json {
-                report
-            } else {
-                integrations::human_report(&report, kind, source.as_deref(), event.as_deref())
-            });
-            Ok(0)
-        }
-        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        _ => return None,
+    })
+}
+
+/// Recorded sessions and the artifacts they produced.
+fn execute_session(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::SessionList { limit } => session::list(invocation, *limit, emitter),
         Command::SessionShow {
             session,
@@ -1191,18 +1157,16 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::ArtifactExport { reference, out } => {
             evidence::export(invocation, *reference, out, emitter)
         }
-        Command::Gc {
-            apply,
-            retention_ms,
-        } => evidence::collect(invocation, *apply, *retention_ms, emitter),
-        Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
-        Command::CodeSymbol { name, tier, limit } => {
-            code::symbol(invocation, name, *tier, *limit, emitter)
-        }
-        Command::CodeInspect { operation, symbol } => {
-            code::inspect(invocation, operation, symbol, emitter)
-        }
-        Command::CodeDiagnostics { path } => code::diagnostics(invocation, path, emitter),
+        _ => return None,
+    })
+}
+
+/// The durable claims a workspace carries between sessions.
+fn execute_memory(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::MemoryList { scope, all } => {
             memory::list(invocation, scope.clone(), *all, emitter)
         }
@@ -1210,20 +1174,13 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             memory::remember(invocation, claim, scope.clone(), emitter)
         }
         Command::MemoryForget { id, reason } => memory::forget(invocation, *id, reason, emitter),
-        Command::Migrate { apply, backup } => {
-            session::migrate(invocation, *apply, backup.as_deref(), emitter)
-        }
-        Command::PolicyExplain {
-            operation,
-            resource,
-            actor,
-        } => policy::explain(
-            invocation,
-            operation,
-            resource.as_deref(),
-            actor.as_deref(),
-            emitter,
-        ),
+        _ => return None,
+    })
+}
+
+/// MCP connection definitions.
+fn execute_mcp(invocation: &Invocation, emitter: &mut Emitter) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
         Command::McpAdd { server, scope } => mcp::add(invocation, server, *scope, emitter),
         Command::McpImport { scope } => mcp::import(invocation, *scope, emitter),
         Command::McpRemove { name, scope } => mcp::remove(invocation, name, *scope, emitter),
@@ -1233,7 +1190,24 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             scope,
         } => mcp::set_enabled(invocation, name, *enabled, *scope, emitter),
         Command::McpTest { name, timeout_ms } => mcp::test(invocation, name, *timeout_ms, emitter),
-        Command::SkillList { source } => extensions::skills(invocation, source.as_deref(), emitter),
+        _ => return None,
+    })
+}
+
+/// Reading code: symbols, diagnostics, and the extension surface.
+fn execute_code(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::CodeSymbol { name, tier, limit } => {
+            code::symbol(invocation, name, *tier, *limit, emitter)
+        }
+        Command::CodeInspect { operation, symbol } => {
+            code::inspect(invocation, operation, symbol, emitter)
+        }
+        Command::CodeDiagnostics { path } => code::diagnostics(invocation, path, emitter),
         Command::PluginList { capabilities } => {
             extensions::list(invocation, *capabilities, emitter)
         }
@@ -1246,8 +1220,71 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
         Command::PluginRefresh { id, dry_run } => {
             extensions::refresh(invocation, id.as_deref(), *dry_run, emitter)
         }
-        Command::Serve => serve::run(invocation, emitter),
-        Command::ServeAcp => acp::run(invocation, emitter),
+        _ => return None,
+    })
+}
+
+/// Report the integrations a workspace declares.
+#[allow(clippy::too_many_arguments)]
+fn inspect_report(
+    invocation: &Invocation,
+    kind: &str,
+    name: Option<&str>,
+    source: Option<&str>,
+    event: Option<&str>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let report = integrations::inspect(
+        &workspace_root(&invocation.workspace)?,
+        kind,
+        name,
+        source,
+        event,
+        invocation.config.as_deref(),
+    )?;
+    emitter.result(if emitter.output == Output::Json {
+        report
+    } else {
+        integrations::human_report(&report, kind, source, event)
+    });
+    Ok(0)
+}
+
+/// Read-only questions about the workspace and what ARSY resolved for it.
+fn execute_inspect(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::Doctor { strict } => Ok(doctor(invocation, *strict, emitter)),
+        Command::CompatExplain { ecosystem } => compat_explain(invocation, *ecosystem, emitter),
+        Command::Inspect {
+            kind,
+            name,
+            source,
+            event,
+        } => inspect_report(
+            invocation,
+            kind,
+            name.as_deref(),
+            source.as_deref(),
+            event.as_deref(),
+            emitter,
+        ),
+        Command::ConfigExplain { key } => config_explain(invocation, key.as_deref(), emitter),
+        Command::Review { base, strict } => review::run(invocation, base, *strict, emitter),
+        Command::PolicyExplain {
+            operation,
+            resource,
+            actor,
+        } => policy::explain(
+            invocation,
+            operation,
+            resource.as_deref(),
+            actor.as_deref(),
+            emitter,
+        ),
+        Command::SkillList { source } => extensions::skills(invocation, source.as_deref(), emitter),
         Command::ProviderList { all } => provider::list(invocation, *all, emitter),
         Command::ModelList {
             provider,
@@ -1258,6 +1295,97 @@ fn execute(invocation: &Invocation, tty: bool, emitter: &mut Emitter) -> Result<
             capability.as_deref(),
             emitter,
         ),
+        _ => return None,
+    })
+}
+
+/// Run an evaluation suite against this workspace.
+fn run_eval(
+    invocation: &Invocation,
+    suite: &Path,
+    trials: Option<u32>,
+    strict: bool,
+    out: Option<&Path>,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    let workspace = workspace_root(&invocation.workspace)?;
+    let report = eval::run(&workspace, suite, trials, strict, out)?;
+    emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
+    Ok(0)
+}
+
+/// Serving ARSY to something else, and running it unattended.
+fn execute_serve(
+    invocation: &Invocation,
+    emitter: &mut Emitter,
+) -> Option<Result<i32, Diagnostic>> {
+    Some(match &invocation.command {
+        Command::Eval {
+            suite,
+            trials,
+            strict,
+            out,
+        } => run_eval(invocation, suite, *trials, *strict, out.as_deref(), emitter),
+        Command::Serve => serve::run(invocation, emitter),
+        Command::ServeAcp => acp::run(invocation, emitter),
+        _ => return None,
+    })
+}
+
+/// Running a task, and everything none of the other groups owns.
+fn execute_core(
+    invocation: &Invocation,
+    tty: bool,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    if let Some(result) = execute_inspect(invocation, emitter) {
+        return result;
+    }
+    if let Some(result) = execute_serve(invocation, emitter) {
+        return result;
+    }
+    match &invocation.command {
+        Command::Help => {
+            let _ = write!(io::stdout(), "{USAGE}");
+            Ok(0)
+        }
+        Command::Version => {
+            let _ = writeln!(io::stdout(), "arsy {} ({})", arsy_code::VERSION, platform());
+            Ok(0)
+        }
+        Command::Tui if !tty => Err(Diagnostic::error(
+            "ARSY-SCH-1003",
+            "the interactive TUI requires a terminal",
+            "there is no terminal; use `arsy run <TASK>`",
+        )),
+        Command::Tui if emitter.output != Output::Human => Err(usage(
+            "the TUI requires human output; use an explicit command with --output json or ci",
+        )),
+        #[cfg(feature = "tui")]
+        Command::Tui => run_tui(invocation, emitter),
+        #[cfg(not(feature = "tui"))]
+        Command::Tui => Err(Diagnostic::error(
+            "ARSY-SCH-1003",
+            "the interactive TUI is disabled in this build",
+            "install a build with the `tui` feature",
+        )),
+        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
+        Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
+        Command::Update { check_only } => execute_update(*check_only, emitter),
+        Command::Gc {
+            apply,
+            retention_ms,
+        } => evidence::collect(invocation, *apply, *retention_ms, emitter),
+        Command::Migrate { apply, backup } => {
+            session::migrate(invocation, *apply, backup.as_deref(), emitter)
+        }
+        // Every other command was answered by one of the groups above; the
+        // dispatch chain only reaches here when none of them owned it.
+        other => Err(Diagnostic::error(
+            "ARSY-SCH-1000",
+            format!("{other:?} is not dispatched"),
+            "this is a bug in ARSY; report it with the command you ran",
+        )),
     }
 }
 
