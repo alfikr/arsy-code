@@ -2659,10 +2659,27 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 )?;
                 prompt = Prompt::Task;
             }
-            Prompt::Task if manages_session(&line) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                if let Some(next) = manage_session(
+            Prompt::Task => {
+                let pass = answer_task(
                     &line,
+                    invocation,
+                    Typing {
+                        workspace: &workspace,
+                        colour,
+                        provider_available,
+                        route: &route,
+                        effort: &mut effort,
+                        models: &mut models,
+                        providers: &mut providers,
+                        chosen: &mut chosen_provider,
+                        draft: &mut draft,
+                        auth_draft: &mut auth_draft,
+                        theme: &mut theme,
+                        roles: &theme_config.roles,
+                        sessions: &mut sessions,
+                        resolved_providers: &mut resolved_providers,
+                        unavailable_providers: &mut unavailable_providers,
+                    },
                     Restoring {
                         workspace: &workspace,
                         state: &mut state,
@@ -2672,106 +2689,16 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                         approval: &approval,
                         queued: &mut queued,
                     },
-                    &mut sessions,
-                    &mut stdout,
-                )? {
-                    prompt = next;
-                }
-            }
-            Prompt::Task if steers_turn(&line) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                steer_turn(
-                    &line,
-                    &workspace,
-                    &approval,
-                    &mut state,
-                    &mut queued,
-                    &mut stdout,
-                )?;
-            }
-            Prompt::Task if opens_picker(&line) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                if let Some(next) = open_picker(
-                    &line,
-                    invocation,
-                    Opening {
-                        models: &mut models,
-                        providers: &mut providers,
-                        chosen: &mut chosen_provider,
-                        draft: &mut draft,
-                        auth_draft: &mut auth_draft,
-                        effort: &mut effort,
-                        theme: &mut theme,
-                        roles: &theme_config.roles,
-                        state: &mut state,
-                    },
-                    &mut stdout,
-                    emitter,
-                )? {
-                    // `None` means the line answered outright rather than
-                    // opening a list, so the task prompt stays.
-                    prompt = next;
-                }
-            }
-            Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
-            Prompt::Task if line.trim().starts_with('/') => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                inspect_command(&line, invocation, &mut stdout, colour, emitter)?;
-            }
-            Prompt::Task if line.trim().is_empty() => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-            }
-            Prompt::Task => {
-                transcript.push_user(&line);
-                write!(stdout, "{}", composer.commit(&line, colour)).map_err(terminal_failed)?;
-                stdout.flush().map_err(terminal_failed)?;
-                if !provider_available {
-                    emitter.diagnostic(&Diagnostic::error(
-                        ARSY_PRV_1000,
-                        "provider unavailable",
-                        "configure a `[provider.endpoint.<name>]` table and run `arsy auth set \
-                         <name>`, or run codex login, then restart ARSY; /mcp and /hooks remain \
-                         available",
-                    ));
-                    continue;
-                }
-                let selected_provider = resolve_route(
-                    invocation,
-                    &workspace,
-                    &route.provider,
-                    &mut resolved_providers,
-                    &mut unavailable_providers,
-                );
-                let footer = state.status_row(
-                    tui::terminal_width(),
-                    colour,
-                    tui::branch(&workspace).as_deref(),
-                );
-                let pass = take_turn(
-                    invocation,
-                    selected_provider,
-                    &line,
-                    &footer,
-                    Running {
-                        workspace: &workspace,
-                        route: &route,
-                        effort,
-                        colour,
-                        state: &mut state,
-                        conversation: &mut conversation,
-                        transcript: &mut transcript,
-                        history: &history,
-                        approval: &approval,
-                        queued: &mut queued,
-                    },
                     &mut stdout,
                     &keys,
                     &mut decoder,
                     &mut composer,
                     emitter,
                 )?;
-                if pass == Pass::Stop {
-                    break;
+                match pass {
+                    TaskPass::Stop => break,
+                    TaskPass::Ask(next) => prompt = next,
+                    TaskPass::Go => {}
                 }
             }
         }
@@ -4242,6 +4169,186 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// Where the session goes after a line typed at the task prompt.
+#[cfg(feature = "tui")]
+enum TaskPass {
+    /// Carry on at the task prompt.
+    Go,
+    /// Collect the next answer at this prompt instead.
+    Ask(Prompt),
+    Stop,
+}
+
+/// What a line typed at the task prompt can reach, apart from the session
+/// itself.
+#[cfg(feature = "tui")]
+struct Typing<'a> {
+    workspace: &'a Path,
+    colour: bool,
+    provider_available: bool,
+    route: &'a tui::ModelRoute,
+    effort: &'a mut Option<Effort>,
+    models: &'a mut Vec<tui::ModelChoice>,
+    providers: &'a mut Vec<String>,
+    chosen: &'a mut Option<String>,
+    draft: &'a mut tui::ProviderDraft,
+    auth_draft: &'a mut String,
+    theme: &'a mut String,
+    roles: &'a std::collections::BTreeMap<String, String>,
+    sessions: &'a mut Vec<tui::SessionChoice>,
+    resolved_providers: &'a mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable_providers: &'a mut std::collections::HashSet<String>,
+}
+
+/// Answer a line typed at the task prompt.
+///
+/// A slash command is answered here; anything else is the task itself and is
+/// sent to the model.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn answer_task(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if matches!(line.trim(), ":quit" | "/quit" | "/exit") {
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        return Ok(TaskPass::Stop);
+    }
+    if line.trim().starts_with('/') || line.trim().is_empty() {
+        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        return slash_command(line, invocation, typing, restoring, stdout, emitter);
+    }
+    run_task(
+        line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
+    )
+}
+
+/// Answer a slash command typed at the task prompt.
+#[cfg(feature = "tui")]
+fn slash_command(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if manages_session(line) {
+        let next = manage_session(line, restoring, typing.sessions, stdout)?;
+        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
+    }
+    if steers_turn(line) {
+        steer_turn(
+            line,
+            typing.workspace,
+            restoring.approval,
+            restoring.state,
+            restoring.queued,
+            stdout,
+        )?;
+        return Ok(TaskPass::Go);
+    }
+    if opens_picker(line) {
+        let next = open_picker(
+            line,
+            invocation,
+            Opening {
+                models: typing.models,
+                providers: typing.providers,
+                chosen: typing.chosen,
+                draft: typing.draft,
+                auth_draft: typing.auth_draft,
+                effort: typing.effort,
+                theme: typing.theme,
+                roles: typing.roles,
+                state: restoring.state,
+            },
+            stdout,
+            emitter,
+        )?;
+        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
+    }
+    // An empty line is not a command and not a task: nothing to answer.
+    if !line.trim().is_empty() {
+        inspect_command(line, invocation, stdout, typing.colour, emitter)?;
+    }
+    Ok(TaskPass::Go)
+}
+
+/// Send the line to the model as the task it is.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn run_task(
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    restoring.transcript.push_user(line);
+    write!(stdout, "{}", composer.commit(line, typing.colour)).map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    if !typing.provider_available {
+        emitter.diagnostic(&Diagnostic::error(
+            ARSY_PRV_1000,
+            "provider unavailable",
+            "configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or \
+             run codex login, then restart ARSY; /mcp and /hooks remain available",
+        ));
+        return Ok(TaskPass::Go);
+    }
+    let resolved = resolve_route(
+        invocation,
+        typing.workspace,
+        &typing.route.provider,
+        typing.resolved_providers,
+        typing.unavailable_providers,
+    );
+    let footer = restoring.state.status_row(
+        tui::terminal_width(),
+        typing.colour,
+        tui::branch(typing.workspace).as_deref(),
+    );
+    let pass = take_turn(
+        invocation,
+        resolved,
+        line,
+        &footer,
+        Running {
+            workspace: typing.workspace,
+            route: typing.route,
+            effort: *typing.effort,
+            colour: typing.colour,
+            state: restoring.state,
+            conversation: restoring.conversation,
+            transcript: restoring.transcript,
+            history: restoring.history,
+            approval: restoring.approval,
+            queued: restoring.queued,
+        },
+        stdout,
+        keys,
+        decoder,
+        composer,
+        emitter,
+    )?;
+    Ok(match pass {
+        Pass::Stop => TaskPass::Stop,
+        Pass::Go => TaskPass::Go,
+    })
 }
 
 /// What a turn runs against, and what it is allowed to change.
