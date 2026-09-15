@@ -2466,7 +2466,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 state: &state,
                 workspace: &workspace,
                 models: &models,
-                route: &route,
+                route: &mut route,
                 effort,
                 theme: &theme,
                 draft: &draft,
@@ -2487,7 +2487,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 state: &state,
                 workspace: &workspace,
                 models: &models,
-                route: &route,
+                route: &mut route,
                 effort,
                 theme: &theme,
                 draft: &draft,
@@ -2498,11 +2498,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             },
             invocation,
         );
-        // A credential is typed, never shown, and never remembered.
-        composer.set_masked(
-            matches!(prompt, Prompt::Provider(step) if step.masked())
-                || matches!(prompt, Prompt::Auth(step) if step.masked()),
-        );
+        composer.set_masked(masked(&prompt));
         // While the theme picker is open, repaint in whichever theme is
         // arrowed onto so it can be seen before Enter takes it.
         let preview_theme = |name: &str| tui::set_palette(name, &theme_config.roles);
@@ -2526,18 +2522,8 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 Some(input) => input,
                 // Ending input at a picker cancels the picker, not the
                 // session: the setting is unchanged and the task prompt
-                // returns. Every picker has to be listed here, or leaving one
-                // exits ARSY instead.
-                None if matches!(
-                    prompt,
-                    Prompt::Model
-                        | Prompt::Effort
-                        | Prompt::Theme
-                        | Prompt::Provider(_)
-                        | Prompt::Auth(_)
-                        | Prompt::Resume
-                ) =>
-                {
+                // returns. Ending it at the task prompt ends the session.
+                None if cancels_to_task(&prompt) => {
                     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
                     let unchanged = leave_picker(
                         &prompt,
@@ -2548,7 +2534,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                             draft: &mut draft,
                             auth_draft: &mut auth_draft,
                             session: state.session_id(),
-                            route: &route,
+                            route: &mut route,
                         },
                     );
                     writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
@@ -2558,150 +2544,53 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 None => break,
             },
         };
-        let line = match input {
-            tui::Action::Submit(line) => line,
-            tui::Action::CycleMode => {
-                let mode = cycle_approval_mode(&approval);
-                state.set_approval_mode(mode.label());
-                continue;
-            }
-            tui::Action::Quit | tui::Action::Redraw | tui::Action::None => continue,
+        // Shift+Tab changes the mode where it stands: it never becomes a line
+        // for the prompt to answer. Every other action redraws and nothing
+        // more.
+        let Some(line) = submitted(input, &approval, &mut state) else {
+            continue;
         };
-        match prompt {
-            Prompt::Provider(step) => {
-                // `clear` rather than `commit`, so no answer — least of all the
-                // credential — is painted into the scrollback.
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                prompt = take_provider(
-                    invocation,
-                    step,
-                    &line,
-                    &mut draft,
-                    &mut providers,
-                    &mut chosen_provider,
-                    &mut stdout,
-                )?;
-            }
-            Prompt::Effort => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                prompt = take_effort(&line, &mut effort, &mut state, &mut stdout, emitter)?;
-            }
-            Prompt::Theme => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // On a rejected answer the list stays open so it can be retyped.
-                if apply_theme(&line, &mut theme, &theme_config.roles, &mut stdout, emitter)
-                    .map_err(terminal_failed)?
-                {
-                    prompt = Prompt::Task;
-                }
-            }
-            Prompt::Model => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                prompt = take_model(&line, &models, &mut route, &mut state, &mut stdout, emitter)?;
-            }
-            Prompt::Auth(step) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                prompt = take_auth(
-                    invocation,
-                    step,
-                    &line,
-                    &mut auth_draft,
-                    &providers,
-                    &mut stdout,
-                    emitter,
-                )?;
-            }
-            Prompt::Resume => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match tui::resolve_session_answer(&line, &sessions, state.session_id()) {
-                    Ok(picked) => {
-                        let loaded = resume_into(
-                            picked,
-                            Restoring {
-                                workspace: &workspace,
-                                state: &mut state,
-                                conversation: &mut conversation,
-                                transcript: &mut transcript,
-                                history: &mut history,
-                                approval: &approval,
-                                queued: &mut queued,
-                            },
-                        );
-                        writeln!(
-                            stdout,
-                            "Resumed session {picked} ({loaded} message(s) loaded)."
-                        )
-                        .map_err(terminal_failed)?;
-                        prompt = Prompt::Task;
-                    }
-                    Err(reason) => {
-                        writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-                    }
-                }
-            }
-            Prompt::Session(dialog) => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                run_session_dialog(
-                    dialog,
-                    Restoring {
-                        workspace: &workspace,
-                        state: &mut state,
-                        conversation: &mut conversation,
-                        transcript: &mut transcript,
-                        history: &mut history,
-                        approval: &approval,
-                        queued: &mut queued,
-                    },
-                    &mut stdout,
-                    colour,
-                    &keys,
-                    &mut decoder,
-                )?;
-                prompt = Prompt::Task;
-            }
-            Prompt::Task => {
-                let pass = answer_task(
-                    &line,
-                    invocation,
-                    Typing {
-                        workspace: &workspace,
-                        colour,
-                        provider_available,
-                        route: &route,
-                        effort: &mut effort,
-                        models: &mut models,
-                        providers: &mut providers,
-                        chosen: &mut chosen_provider,
-                        draft: &mut draft,
-                        auth_draft: &mut auth_draft,
-                        theme: &mut theme,
-                        roles: &theme_config.roles,
-                        sessions: &mut sessions,
-                        resolved_providers: &mut resolved_providers,
-                        unavailable_providers: &mut unavailable_providers,
-                    },
-                    Restoring {
-                        workspace: &workspace,
-                        state: &mut state,
-                        conversation: &mut conversation,
-                        transcript: &mut transcript,
-                        history: &mut history,
-                        approval: &approval,
-                        queued: &mut queued,
-                    },
-                    &mut stdout,
-                    &keys,
-                    &mut decoder,
-                    &mut composer,
-                    emitter,
-                )?;
-                match pass {
-                    TaskPass::Stop => break,
-                    TaskPass::Ask(next) => prompt = next,
-                    TaskPass::Go => {}
-                }
-            }
-        }
+        let pass = answer_prompt(
+            prompt,
+            &line,
+            invocation,
+            Typing {
+                workspace: &workspace,
+                colour,
+                provider_available,
+                route: &mut route,
+                effort: &mut effort,
+                models: &mut models,
+                providers: &mut providers,
+                chosen: &mut chosen_provider,
+                draft: &mut draft,
+                auth_draft: &mut auth_draft,
+                theme: &mut theme,
+                roles: &theme_config.roles,
+                sessions: &mut sessions,
+                resolved_providers: &mut resolved_providers,
+                unavailable_providers: &mut unavailable_providers,
+            },
+            Restoring {
+                workspace: &workspace,
+                state: &mut state,
+                conversation: &mut conversation,
+                transcript: &mut transcript,
+                history: &mut history,
+                approval: &approval,
+                queued: &mut queued,
+            },
+            &mut stdout,
+            &keys,
+            &mut decoder,
+            &mut composer,
+            emitter,
+        )?;
+        prompt = match pass {
+            TaskPass::Stop => break,
+            TaskPass::Ask(next) => next,
+            TaskPass::Go => Prompt::Task,
+        };
     }
     write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
     stdout.flush().map_err(terminal_failed)?;
@@ -4171,6 +4060,145 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     Ok((child, error_output, input, events))
 }
 
+/// The line an action carries, if it carries one.
+#[cfg(feature = "tui")]
+fn submitted(
+    input: tui::Action,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+) -> Option<String> {
+    match input {
+        tui::Action::Submit(line) => Some(line),
+        tui::Action::CycleMode => {
+            let mode = cycle_approval_mode(approval);
+            state.set_approval_mode(mode.label());
+            None
+        }
+        tui::Action::Quit | tui::Action::Redraw | tui::Action::None => None,
+    }
+}
+
+/// Whether the answer being typed is a credential, which is shown as bullets,
+/// never painted into the scrollback, and never remembered.
+#[cfg(feature = "tui")]
+fn masked(prompt: &Prompt) -> bool {
+    matches!(prompt, Prompt::Provider(step) if step.masked())
+        || matches!(prompt, Prompt::Auth(step) if step.masked())
+}
+
+/// Whether ending input here closes a picker rather than the session.
+///
+/// Every picker has to be named, or leaving one exits ARSY instead.
+#[cfg(feature = "tui")]
+fn cancels_to_task(prompt: &Prompt) -> bool {
+    matches!(
+        prompt,
+        Prompt::Model
+            | Prompt::Effort
+            | Prompt::Theme
+            | Prompt::Provider(_)
+            | Prompt::Auth(_)
+            | Prompt::Resume
+    )
+}
+
+/// Answer the line at whichever prompt collected it.
+///
+/// Every picker clears the composer rather than committing it, so no answer —
+/// least of all a credential — is painted into the scrollback.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn answer_prompt(
+    prompt: Prompt,
+    line: &str,
+    invocation: &Invocation,
+    typing: Typing<'_>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<TaskPass, Diagnostic> {
+    if matches!(prompt, Prompt::Task) {
+        return answer_task(
+            line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
+        );
+    }
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    let next = match prompt {
+        Prompt::Provider(step) => take_provider(
+            invocation,
+            step,
+            line,
+            typing.draft,
+            typing.providers,
+            typing.chosen,
+            stdout,
+        )?,
+        Prompt::Effort => take_effort(line, typing.effort, restoring.state, stdout, emitter)?,
+        // On a rejected answer the list stays open so it can be retyped.
+        Prompt::Theme => {
+            if apply_theme(line, typing.theme, typing.roles, stdout, emitter)
+                .map_err(terminal_failed)?
+            {
+                Prompt::Task
+            } else {
+                Prompt::Theme
+            }
+        }
+        Prompt::Model => take_model(
+            line,
+            typing.models,
+            typing.route,
+            restoring.state,
+            stdout,
+            emitter,
+        )?,
+        Prompt::Auth(step) => take_auth(
+            invocation,
+            step,
+            line,
+            typing.auth_draft,
+            typing.providers,
+            stdout,
+            emitter,
+        )?,
+        Prompt::Resume => take_resume(line, typing.sessions, restoring, stdout)?,
+        Prompt::Session(dialog) => {
+            run_session_dialog(dialog, restoring, stdout, typing.colour, keys, decoder)?;
+            Prompt::Task
+        }
+        Prompt::Task => Prompt::Task,
+    };
+    Ok(TaskPass::Ask(next))
+}
+
+/// Open the session the answer names, or leave the list open.
+#[cfg(feature = "tui")]
+fn take_resume(
+    line: &str,
+    sessions: &[tui::SessionChoice],
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<Prompt, Diagnostic> {
+    match tui::resolve_session_answer(line, sessions, restoring.state.session_id()) {
+        Ok(picked) => {
+            let loaded = resume_into(picked, restoring);
+            writeln!(
+                stdout,
+                "Resumed session {picked} ({loaded} message(s) loaded)."
+            )
+            .map_err(terminal_failed)?;
+            Ok(Prompt::Task)
+        }
+        Err(reason) => {
+            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
+            Ok(Prompt::Resume)
+        }
+    }
+}
+
 /// Where the session goes after a line typed at the task prompt.
 #[cfg(feature = "tui")]
 enum TaskPass {
@@ -4188,7 +4216,7 @@ struct Typing<'a> {
     workspace: &'a Path,
     colour: bool,
     provider_available: bool,
-    route: &'a tui::ModelRoute,
+    route: &'a mut tui::ModelRoute,
     effort: &'a mut Option<Effort>,
     models: &'a mut Vec<tui::ModelChoice>,
     providers: &'a mut Vec<String>,
