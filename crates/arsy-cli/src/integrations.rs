@@ -322,6 +322,54 @@ fn summary(entries: &[Value], kind: &str) -> String {
     summary
 }
 
+/// Hide the password in any `scheme://user:password@host` the line carries.
+///
+/// A connection string is an argument like any other, so the listing printed
+/// it whole: an operator who runs `/mcp` with someone watching, or scrolls
+/// back through it later, has published the database's password.
+///
+/// Everything else stays. The host, the port and the database name are what
+/// tell two servers apart, and none of them is the secret.
+///
+/// ponytail: only the userinfo form is covered, and only where the password
+/// is encoded as a URL requires. A password carrying an unencoded `/` ends the
+/// authority early and is left alone; a secret passed as its own flag —
+/// `--token abc` — is not covered either, because which flags carry one
+/// differs per server, and guessing wrong either leaks it or hides something
+/// needed.
+fn masked(line: &str) -> String {
+    line.split(' ')
+        .map(mask_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One whitespace-separated word, with its password hidden if it has one.
+fn mask_token(token: &str) -> String {
+    let Some(scheme) = token.find("://") else {
+        return token.to_owned();
+    };
+    let authority_at = scheme + 3;
+    // The userinfo ends at the last `@` before the path starts; a password may
+    // legitimately contain one, so the last is the separator, not the first.
+    let authority_end = token[authority_at..]
+        .find(['/', '?', '#'])
+        .map_or(token.len(), |end| authority_at + end);
+    let Some(at) = token[authority_at..authority_end].rfind('@') else {
+        return token.to_owned();
+    };
+    let userinfo = &token[authority_at..authority_at + at];
+    let Some(colon) = userinfo.find(':') else {
+        return token.to_owned();
+    };
+    format!(
+        "{}{}:•••{}",
+        &token[..authority_at],
+        &userinfo[..colon],
+        &token[authority_at + at..]
+    )
+}
+
 fn details(kind: &str, entry: &Value) -> Vec<String> {
     let text = |key: &str| entry[key].as_str().unwrap_or("unknown");
     let mut rows = vec![format!(
@@ -341,9 +389,11 @@ fn details(kind: &str, entry: &Value) -> Vec<String> {
                             .join(" ")
                     })
                     .unwrap_or_default();
-                format!("command: {command} {args}").trim_end().to_owned()
+                masked(&format!("command: {command} {args}"))
+                    .trim_end()
+                    .to_owned()
             }
-            None => format!("url: {}", text("url")),
+            None => masked(&format!("url: {}", text("url"))),
         });
         let mut state = format!("trust: {} · level: {}", text("trust"), text("level"));
         if entry["enabled"] == Value::Bool(false) {
@@ -431,6 +481,37 @@ fn nothing_found(kind: &str, source: Option<&str>, event: Option<&str>) -> Strin
 
 #[cfg(test)]
 mod tests {
+    /// A connection string is an argument, and the listing used to print it
+    /// whole. The password is the one part of it nobody watching needs.
+    #[test]
+    fn a_listed_command_keeps_its_target_and_hides_its_password() {
+        assert_eq!(
+            masked("command: npx -y mongodb-mcp-server --connectionString mongodb://root:tYytHtubfP@10.2.238.111:31847/"),
+            "command: npx -y mongodb-mcp-server --connectionString mongodb://root:•••@10.2.238.111:31847/"
+        );
+        // An unencoded `@` in the password is common, so the last one in the
+        // authority is the separator rather than the first.
+        assert_eq!(
+            mask_token("postgresql://po_mulham:b2p@rCX60!@10.2.237.129:5432/oss_rba_test"),
+            "postgresql://po_mulham:•••@10.2.237.129:5432/oss_rba_test"
+        );
+        assert_eq!(
+            mask_token("postgresql://TDB_HM8135:6pqbhkqvpt1a30!@10.2.238.22:5432/oss_rba"),
+            "postgresql://TDB_HM8135:•••@10.2.238.22:5432/oss_rba"
+        );
+        // Nothing to hide, nothing changed.
+        assert_eq!(
+            mask_token("https://stitch.googleapis.com/mcp"),
+            "https://stitch.googleapis.com/mcp"
+        );
+        assert_eq!(
+            mask_token("mongodb://10.2.238.111:31847/"),
+            "mongodb://10.2.238.111:31847/"
+        );
+        assert_eq!(mask_token("--profile"), "--profile");
+        assert_eq!(mask_token(""), "");
+    }
+
     use super::*;
 
     #[test]
