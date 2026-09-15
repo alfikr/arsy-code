@@ -2751,112 +2751,16 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     prompt = next;
                 }
             }
-            Prompt::Task if line.split_whitespace().next() == Some("/plan") => {
+            Prompt::Task if steers_turn(&line) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match plan_command(&line) {
-                    PlanCommand::Revise(note) => {
-                        approval.enter_plan();
-                        state.set_approval_mode(approval.get().label());
-                        queued.push_front(revise_instruction(note.as_deref()));
-                    }
-                    PlanCommand::Approve => {
-                        if approval.get() == approval::ApprovalMode::Plan {
-                            let mode = approval.approve_plan();
-                            state.set_approval_mode(mode.label());
-                            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
-                            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
-                                .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "No plan is awaiting approval.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    PlanCommand::Cancel => {
-                        if approval.get() == approval::ApprovalMode::Plan {
-                            let mode = approval.cancel_plan();
-                            state.set_approval_mode(mode.label());
-                            writeln!(
-                                stdout,
-                                "Planning cancelled. Approval mode: {}.",
-                                mode.label()
-                            )
-                            .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "Plan Mode is not active.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    PlanCommand::Show => {
-                        // The live plan for this session's scope, which is the
-                        // one the turn's `plan_*` tools have been writing to.
-                        let projection =
-                            progress::plan(&workspace, &state.session_id().to_string());
-                        write!(stdout, "{}", progress::human_plan(&projection))
-                            .map_err(terminal_failed)?;
-                    }
-                    PlanCommand::Enter(task) => {
-                        approval.enter_plan();
-                        state.set_approval_mode(approval.get().label());
-                        writeln!(
-                            stdout,
-                            "Plan Mode active — workspace mutations are blocked."
-                        )
-                        .map_err(terminal_failed)?;
-                        if let Some(task) = task {
-                            queued.push_front(task);
-                        }
-                    }
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/todo") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                // Read from the store rather than from the turn's runtime: the
-                // checklist is durable, so what is on disk is the answer even
-                // if this session has not touched it yet.
-                let projection = open_store(&workspace).ok().and_then(|store| {
-                    progress::todos(store as Arc<dyn EventStore>, state.session_id())
-                });
-                match projection {
-                    Some(projection) => {
-                        write!(stdout, "{}", progress::human_todos(&projection))
-                            .map_err(terminal_failed)?;
-                    }
-                    None => writeln!(stdout, "This session's TODOs could not be read.")
-                        .map_err(terminal_failed)?,
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/approval") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|argument| match argument {
-                        // What Shift+Tab sends. Resolved here so the shortcut
-                        // and the typed command take the same path.
-                        "cycle" => Some(approval.get().cycle()),
-                        _ => approval::ApprovalMode::parse(argument),
-                    }) {
-                    Some(mode) => {
-                        set_approval_mode(&approval, &mut state, mode);
-                        writeln!(
-                            stdout,
-                            "Approval mode: {} — {}",
-                            mode.label(),
-                            mode.description()
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                    None => {
-                        let current = approval.get();
-                        writeln!(
-                            stdout,
-                            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
-                            current.label(),
-                            current.description()
-                        )
-                        .map_err(terminal_failed)?;
-                    }
-                }
+                steer_turn(
+                    &line,
+                    &workspace,
+                    &approval,
+                    &mut state,
+                    &mut queued,
+                    &mut stdout,
+                )?;
             }
             Prompt::Task if opens_picker(&line) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -4451,6 +4355,156 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// The slash commands that change how the next turn is allowed to act, or
+/// report what the session has recorded about its work.
+#[cfg(feature = "tui")]
+fn steers_turn(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/plan" | "/todo" | "/approval")
+    )
+}
+
+#[cfg(feature = "tui")]
+fn steer_turn(
+    line: &str,
+    workspace: &Path,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    match line.split_whitespace().next() {
+        Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
+        Some("/todo") => show_todos(workspace, state.session_id(), stdout),
+        Some("/approval") => set_mode(line, approval, state, stdout),
+        _ => Ok(()),
+    }
+}
+
+/// Enter, revise, approve, cancel or show the plan.
+#[cfg(feature = "tui")]
+fn plan_step(
+    line: &str,
+    workspace: &Path,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    queued: &mut std::collections::VecDeque<String>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    match plan_command(line) {
+        PlanCommand::Revise(note) => {
+            approval.enter_plan();
+            state.set_approval_mode(approval.get().label());
+            queued.push_front(revise_instruction(note.as_deref()));
+            Ok(())
+        }
+        PlanCommand::Approve if approval.get() == approval::ApprovalMode::Plan => {
+            let mode = approval.approve_plan();
+            state.set_approval_mode(mode.label());
+            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
+            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
+                .map_err(terminal_failed)
+        }
+        PlanCommand::Approve => {
+            writeln!(stdout, "No plan is awaiting approval.").map_err(terminal_failed)
+        }
+        PlanCommand::Cancel if approval.get() == approval::ApprovalMode::Plan => {
+            let mode = approval.cancel_plan();
+            state.set_approval_mode(mode.label());
+            writeln!(
+                stdout,
+                "Planning cancelled. Approval mode: {}.",
+                mode.label()
+            )
+            .map_err(terminal_failed)
+        }
+        PlanCommand::Cancel => {
+            writeln!(stdout, "Plan Mode is not active.").map_err(terminal_failed)
+        }
+        // The live plan for this session's scope, which is the one the turn's
+        // `plan_*` tools have been writing to.
+        PlanCommand::Show => {
+            let projection = progress::plan(workspace, &state.session_id().to_string());
+            write!(stdout, "{}", progress::human_plan(&projection)).map_err(terminal_failed)
+        }
+        PlanCommand::Enter(task) => {
+            approval.enter_plan();
+            state.set_approval_mode(approval.get().label());
+            writeln!(
+                stdout,
+                "Plan Mode active — workspace mutations are blocked."
+            )
+            .map_err(terminal_failed)?;
+            if let Some(task) = task {
+                queued.push_front(task);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The session's durable checklist.
+///
+/// Read from the store rather than from the turn's runtime: the checklist
+/// outlives a turn, so what is on disk is the answer even if this session has
+/// not touched it yet.
+#[cfg(feature = "tui")]
+fn show_todos(
+    workspace: &Path,
+    session: SessionId,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let projection = open_store(workspace)
+        .ok()
+        .and_then(|store| progress::todos(store as Arc<dyn EventStore>, session));
+    match projection {
+        Some(projection) => {
+            write!(stdout, "{}", progress::human_todos(&projection)).map_err(terminal_failed)
+        }
+        None => {
+            writeln!(stdout, "This session's TODOs could not be read.").map_err(terminal_failed)
+        }
+    }
+}
+
+/// Take the approval mode a command named, or report the one in force.
+#[cfg(feature = "tui")]
+fn set_mode(
+    line: &str,
+    approval: &approval::ApprovalCell,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let named = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|argument| match argument {
+            // What Shift+Tab sends. Resolved here so the shortcut and the
+            // typed command take the same path.
+            "cycle" => Some(approval.get().cycle()),
+            _ => approval::ApprovalMode::parse(argument),
+        });
+    let Some(mode) = named else {
+        let current = approval.get();
+        return writeln!(
+            stdout,
+            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
+            current.label(),
+            current.description()
+        )
+        .map_err(terminal_failed);
+    };
+    set_approval_mode(approval, state, mode);
+    writeln!(
+        stdout,
+        "Approval mode: {} — {}",
+        mode.label(),
+        mode.description()
+    )
+    .map_err(terminal_failed)
 }
 
 /// Drive the session dialog until it is answered or left.
