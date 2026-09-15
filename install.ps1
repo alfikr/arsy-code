@@ -55,6 +55,19 @@ try {
     $BinaryPath = Join-Path $InstallDirectory "arsy.exe"
     Copy-Item -Force (Join-Path $TemporaryDirectory "arsy.exe") $BinaryPath
 
+    # The shared ARSY home. Created here so a first run has settings to read;
+    # an existing file is never touched.
+    $ArsyHome = if ($env:ARSY_CONFIG_HOME) {
+        $env:ARSY_CONFIG_HOME
+    } else {
+        Join-Path $env:USERPROFILE ".arsy"
+    }
+    New-Item -ItemType Directory -Force -Path $ArsyHome | Out-Null
+    $SettingsPath = Join-Path $ArsyHome "arsy.json"
+    if (-not (Test-Path $SettingsPath)) {
+        Set-Content -Path $SettingsPath -Value "{}" -Encoding utf8
+    }
+
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $PathEntries = @($UserPath -split ';' | Where-Object { $_ })
     if ($InstallDirectory -notin $PathEntries) {

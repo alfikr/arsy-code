@@ -93,6 +93,14 @@ default_install_directory="${HOME}/.local/bin"
 install_directory="${ARSY_INSTALL_DIR:-$default_install_directory}"
 mkdir -p "$install_directory"
 install -m 0755 "${temporary_directory}/arsy" "${install_directory}/arsy"
+
+# The shared ARSY home. Created here so a first run has settings to read and a
+# place to keep credentials; an existing file is never touched.
+arsy_home="${ARSY_CONFIG_HOME:-${HOME}/.arsy}"
+mkdir -p "$arsy_home"
+if [ ! -e "${arsy_home}/arsy.json" ]; then
+    printf '{}\n' > "${arsy_home}/arsy.json"
+fi
 PATH="${install_directory}:${PATH}"
 export PATH
 

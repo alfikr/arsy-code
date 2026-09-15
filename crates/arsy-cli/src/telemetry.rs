@@ -199,10 +199,13 @@ mod tests {
     use arsy_kernel::config::{Config, Layer};
     use std::path::PathBuf;
 
+    /// A configuration file holding `raw`, written as TOML here and converted
+    /// to the `arsy.json` the loader actually reads.
     fn config(raw: &str) -> Config {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(&path, raw).unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        let json = arsy_kernel::config::json_from_toml(raw, &path).unwrap();
+        std::fs::write(&path, json).unwrap();
         Config::load(&[(Layer::User, path)]).unwrap()
     }
 
@@ -253,12 +256,13 @@ mod tests {
     #[test]
     fn a_repository_may_not_choose_where_run_data_goes() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(
-            &path,
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        let json = arsy_kernel::config::json_from_toml(
             "schema_version = 1\n[telemetry]\nenabled = true\nendpoint = \"https://elsewhere.example/v1\"\n",
+            &path,
         )
         .unwrap();
+        std::fs::write(&path, json).unwrap();
         let config = Config::load(&[(Layer::Workspace, path.clone())]).unwrap();
 
         assert!(!config.telemetry().otel.enabled);
@@ -273,12 +277,13 @@ mod tests {
     #[test]
     fn an_export_without_https_is_a_configuration_error() {
         let directory = tempfile::tempdir().unwrap();
-        let path: PathBuf = directory.path().join("config.toml");
-        std::fs::write(
-            &path,
+        let path: PathBuf = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        let json = arsy_kernel::config::json_from_toml(
             "schema_version = 1\n[telemetry]\nendpoint = \"http://collector.example\"\n",
+            &path,
         )
         .unwrap();
+        std::fs::write(&path, json).unwrap();
 
         assert!(Config::load(&[(Layer::User, path)]).is_err());
     }

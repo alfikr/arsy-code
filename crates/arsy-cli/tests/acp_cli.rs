@@ -14,6 +14,18 @@ use std::{
     thread,
 };
 
+/// Write a settings file, given as TOML here and converted: the schema reads
+/// more clearly that way than as quoted JSON, and what lands on disk is the
+/// `arsy.json` the binary under test loads.
+fn write_settings(path: &Path, body: &str) {
+    let json = arsy_kernel::config::json_from_toml(body, path).unwrap();
+    std::fs::write(path, json).unwrap();
+}
+
+fn settings_path(home: &Path) -> std::path::PathBuf {
+    home.join(arsy_kernel::config::CONFIG_FILE)
+}
+
 fn sse(chunks: &[Value]) -> String {
     chunks
         .iter()
@@ -132,9 +144,9 @@ fn an_editor_initializes_opens_a_session_prompts_and_sees_the_answer_stream() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let port = provider(vec![answers("the answer ", "is 42.")]);
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!(
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
@@ -144,8 +156,7 @@ fn an_editor_initializes_opens_a_session_prompts_and_sees_the_answer_stream() {
              [policy]\n\
              default_effect = \"allow\"\n"
         ),
-    )
-    .unwrap();
+    );
     let mut editor = Editor::open(workspace.path(), home.path());
 
     let (_, initialized) = editor.call("initialize", json!({"protocolVersion": 1}));
@@ -216,9 +227,9 @@ fn a_credential_the_model_echoes_is_masked_before_it_reaches_the_editor() {
 
     // A credential this workspace has stored. The catalog names the handle;
     // the file beside it holds the value, which is what the redactor learns.
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!(
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
@@ -226,8 +237,7 @@ fn a_credential_the_model_echoes_is_masked_before_it_reaches_the_editor() {
              model = \"test-model\"\n\
              api_key_env = \"ARSY_TEST_KEY\"\n"
         ),
-    )
-    .unwrap();
+    );
     std::fs::write(home.path().join("deploy.key"), secret).unwrap();
     std::fs::write(
         home.path().join("credentials.json"),

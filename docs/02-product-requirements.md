@@ -8,12 +8,15 @@ Individual developers need a trustworthy local agent; teams need shared policy a
 
 | Priority | Requirement |
 |---|---|
-| P0 | Canonical protocol, event store, provider abstraction, prompt compiler, policy evaluation, local execution, read/search/edit, approval, artifacts, recovery |
-| P1 | Git-aware verification, syntax intelligence, LSP, portable sandbox profiles, Claude/Codex/OMP instruction imports, MCP client, CLI/TUI |
-| P2 | DAP, knowledge graph, multi-agent isolation, WASM plugins, ACP/IDE, model routing, structured review |
-| P3 | Remote workers, collaboration, MCP server/apps, advanced overlays, learned offline optimizers |
+| P0 | Preserve the canonical operation/policy/capability path; make task attempts, budgets, validation, and recovery durable; ship asynchronous agents, isolated writers, completion proofs, and isolated regression benchmarks |
+| P1 | Agent Hub, Safe Auto, responsibility-based roles, measured model routing, plan-to-commit compilation, and verified launch readiness |
+| P2 | Benchmark-driven language semantics, structural intelligence, debugger repair loops, and automatic memory curation |
+| P3 | Remote/distributed workers, organization collaboration, daemon scheduling, advanced overlays, marketplace, and learned offline optimizers |
 
-P0 establishes architecture; P1 makes a credible coding agent; P2 creates differentiation; P3 is optional until demand and eval evidence exist.
+The event, capability, provider, tool, and evaluation foundations already have
+implemented slices. These priorities name the remaining delivery order, not the
+historical order in which source files appeared. See the source-backed status
+and gates in [`31-roadmap.md`](31-roadmap.md).
 
 ## Non-functional requirements
 

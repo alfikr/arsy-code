@@ -18,9 +18,9 @@ connecting. A hook declaration says which it is — `loaded` means it runs on th
 workspace's turns.
 
 Native MCP connections are separate from those imported declarations. They are
-defined in `config.toml` as `[mcp.server.<name>]`, written by `arsy mcp add` and
+defined in `arsy.json` under `mcp.server.<name>`, written by `arsy mcp add` and
 `arsy mcp remove` and toggled by `arsy mcp enable`/`disable`, with `--scope
-user|workspace` selecting the configuration layer that owns the table. The layer
+user|workspace` selecting the configuration layer that owns the definition. The layer
 decides the connection's trust label, so a definition that travels with a
 repository is `workspace` rather than `user`. `arsy mcp list` shows those
 connections alongside the imported declarations; `--source arsy` narrows to the
@@ -51,12 +51,15 @@ A repository's own hooks — `<workspace>/.arsy/guard.json` and
 `<workspace>/.claude/settings.json` — are read but not run until the operator
 vouches for that directory:
 
-```toml
-[project."/home/you/src/thing"]
-trust_level = "trusted"
+```json
+{
+  "project": {
+    "/home/you/src/thing": { "trust_level": "trusted" }
+  }
+}
 ```
 
-The table is spelled as Codex spells it, and only the enterprise or user layer
+The key is spelled as Codex spells it, and only the enterprise or user layer
 may write it: a repository that could vouch for itself would be no gate at all.
 Trust is compared on resolved paths, so a symlink beside a vouched-for checkout
 does not inherit its trust. Even vouched for, a repository's hook carries
@@ -112,9 +115,9 @@ written to the scrollback. Each answer is validated as it is given, an empty
 answer leaves the wizard, and nothing reaches the configuration until the last
 answer, so an abandoned wizard changes nothing. Removing is confirmed first and
 leaves the credential in place; `arsy auth list` still shows it. ARSY edits only
-the `[provider.endpoint.*]` tables it owns and the `[provider] default` key, as
-text rather than by reserializing the file, so comments, blank lines, and hand
-alignment survive. A session resolves its provider at startup, so a change asks
+the `provider.endpoint.*` objects it owns and the `provider.default` key; every
+other key in the file comes back exactly as it was. A session resolves its
+provider at startup, so a change asks
 for a restart rather than pretending the running session moved.
 
 A bare `/effort` opens the levels in the composer's own menu, marked at the
@@ -189,9 +192,12 @@ Unknown flags, missing arguments, invalid UTF-8, and invalid enum values are usa
 
 ## Commands
 
-Every command accepts the global flags above and honours the output modes and exit codes below.
-**Availability** names the roadmap phase that first ships the command; a command listed here but not
-yet available exits `2` with an `ARSY-SCH-*` diagnostic naming its phase, never a generic parse error.
+Every command accepts the global flags above and honours the output modes and
+exit codes below. **Availability** retains the original design-slice number
+encoded by current diagnostics; it is not a phase number in the source-backed
+[`31-roadmap.md`](31-roadmap.md). A command listed here but not yet available
+exits `2` with an `ARSY-SCH-*` diagnostic naming that design slice, never a
+generic parse error.
 
 Commands whose name is `list`, `show`, `explain`, `inspect`, or `test`, plus `doctor` and `eval`, are
 read-only: they never mutate the workspace, session history, or stored configuration.
@@ -306,7 +312,7 @@ approved at install. `--dry-run` reports what would change and loads nothing.
 cannot destroy data. `arsy migrate` takes a verified backup before applying and leaves the original
 store openable if it fails.
 
-`arsy mcp add` writes to the user `config.toml` by default and to `.arsy/config.toml` under
+`arsy mcp add` writes to the user `arsy.json` by default and to `.arsy/arsy.json` under
 `--scope workspace`. A definition written at either scope remains untrusted content: it declares a
 connection, and grants no capability.
 

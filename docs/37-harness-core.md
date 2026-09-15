@@ -164,7 +164,9 @@ workspace contains.
 - `apply_patch` is not atomic across files. A hunk that fails in the third file
   leaves the first two written; the error says which, so the model can re-read
   before retrying.
-- `arsy_kernel::{memory, orchestration, observer, telemetry, migrate}` and
-  `arsy-code::{workspace, review, benchmark, acp, remote, extension, graph,
-  intelligence, lsp, syntax}` are built but not reachable from a turn. They are
-  later roadmap phases; see [`31-roadmap.md`](31-roadmap.md).
+- Reachability outside the core path is mixed. Memory recall, orchestration,
+  telemetry, repository mapping, LSP-backed intelligence, DAP, MCP, hooks, and
+  WASM plugin operations have reachable slices; workspace coordination remains
+  test-only, child execution remains synchronous, and several integrations are
+  absent from interactive or child turns. The source-audited status table and
+  dependency order are in [`31-roadmap.md`](31-roadmap.md).

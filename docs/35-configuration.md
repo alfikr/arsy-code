@@ -2,17 +2,25 @@
 
 ## Format and discovery
 
-ARSY native configuration is UTF-8 TOML named `config.toml`. Native files require `schema_version = 1`; unknown keys are errors, and unknown keys under `policy`, `sandbox`, `secrets`, or `telemetry` fail closed.
+ARSY native configuration is UTF-8 JSON named `arsy.json`. `schema_version` is optional and, when written, must be `1`: a settings file someone just created is `{}`. Unknown keys are errors, and unknown keys under `policy`, `sandbox`, `secrets`, or `telemetry` fail closed.
 
-The user layer's directory can be replaced with `ARSY_CONFIG_HOME`, which points a run at a
+The user layer lives in `~/.arsy/`, the directory ARSY and ARSY CODE share for
+settings, credentials, and the rest of the ecosystem's global state. It is one
+path on every platform, because two separate products have to agree on it. The
+directory can be replaced with `ARSY_CONFIG_HOME`, which points a run at a
 throwaway configuration without editing the operator's own file.
+
+`~/.arsy/arsy.json` is created on install and, failing that, on the first run
+that reads configuration. An older ARSY's `config.toml` in the platform
+configuration directory is converted into it once, at that point — never when
+`ARSY_CONFIG_HOME` is set, and never over a file that already exists.
 
 The resolver reads these six layers in authority order, then returns the effective value and a source trace for every key, which [`arsy config explain`](36-cli-tui.md) prints:
 
-1. enterprise `config.toml`: `/etc/arsy/` on Linux, `/Library/Application Support/ARSY/` on macOS, or `%ProgramData%\ARSY\` on Windows;
-2. user `config.toml`: `$XDG_CONFIG_HOME/arsy/` (fallback `~/.config/arsy/`) on Linux, `~/Library/Application Support/ARSY/` on macOS, or `%AppData%\ARSY\` on Windows;
-3. `.arsy/config.toml` at the workspace root;
-4. nested `.arsy/config.toml` files from the workspace root toward the working directory, parent before child;
+1. enterprise `arsy.json`: `/etc/arsy/` on Linux, `/Library/Application Support/ARSY/` on macOS, or `%ProgramData%\ARSY\` on Windows;
+2. user `arsy.json`: `~/.arsy/` on every platform;
+3. `.arsy/arsy.json` at the workspace root;
+4. nested `.arsy/arsy.json` files from the workspace root toward the working directory, parent before child;
 5. enabled Claude, Codex, and OMP compatibility imports in their documented precedence order;
 6. the current session request, including CLI flags. `--config <PATH>` supplies
    one file at this layer. It is the operator speaking for this invocation, so
@@ -34,13 +42,13 @@ Authority classes are:
 - **intent**: repository/nested/compatibility/session intent is accepted within ceilings;
 - **session**: the session may select a value within resolved policy.
 
-`none` below means TOML key absent, not an empty string. Defaults are fallbacks applied only when no layer sets a key; they are not operands in a multi-layer merge.
+`none` below means the key is absent, not an empty string. Defaults are fallbacks applied only when no layer sets a key; they are not operands in a multi-layer merge.
 
 ## Version 1 key schema
 
 | Key | Type | Default | Merge | Authority |
 |---|---|---|---|---|
-| `schema_version` | integer, exactly `1` | required | replace | built-in |
+| `schema_version` | integer, exactly `1` | optional; absent means `1` | replace | built-in |
 | `provider.default` | string or `"auto"` | `"auto"` | replace | intent |
 | `provider.allowed` | array of provider IDs | all configured | intersection | ceiling |
 | `provider.residency` | array of region IDs | none | intersection | ceiling |
@@ -100,25 +108,30 @@ For boolean `intersection`, every authoritative layer must permit `true`; an abs
 An endpoint names a wire dialect and an API root, so one adapter serves the vendor's own API, a
 gateway such as LiteLLM or OpenRouter, and a local runtime such as Ollama or LM Studio:
 
-```toml
-schema_version = 1
-
-[provider]
-default = "gateway"
-
-[provider.endpoint.gateway]
-kind        = "openai"
-base_url    = "https://gateway.internal/v1"
-credential  = "secret://os/gateway"
-model       = "qwen3-coder"
-
-[provider.endpoint.gateway.oauth]           # optional; `arsy auth login` uses it
-authorize_url            = "https://issuer.internal/authorize"
-token_url                = "https://issuer.internal/token"
-device_authorization_url = "https://issuer.internal/device"
-client_id                = "arsy"
-scopes                   = ["offline_access"]
+```json
+{
+  "provider": {
+    "default": "gateway",
+    "endpoint": {
+      "gateway": {
+        "kind": "openai",
+        "base_url": "https://gateway.internal/v1",
+        "credential": "secret://os/gateway",
+        "model": "qwen3-coder",
+        "oauth": {
+          "authorize_url": "https://issuer.internal/authorize",
+          "token_url": "https://issuer.internal/token",
+          "device_authorization_url": "https://issuer.internal/device",
+          "client_id": "arsy",
+          "scopes": ["offline_access"]
+        }
+      }
+    }
+  }
+}
 ```
+
+The `oauth` object is optional; `arsy auth login` uses it when it is there.
 
 `provider.endpoint.*` keys carry **user** authority and are accepted from the enterprise and user
 layers only. A `base_url` decides where prompts and a credential are sent, so a repository file
@@ -191,16 +204,19 @@ other key is a role whose colour it replaces, given as `#rrggbb`. The roles are
 `assistant`, `dim`, `accent`, `ok`, `err`, `run`, `model`, `cwd`, `border`,
 `bullet`, and `input_bg` (a background).
 
-```toml
-[theme]
-base   = "ocean"
-accent = "#1e78b4"
-err    = "#c8283f"
+```json
+{
+  "theme": {
+    "base": "ocean",
+    "accent": "#1e78b4",
+    "err": "#c8283f"
+  }
+}
 ```
 
 The `/theme` command in the TUI opens a picker that repaints in each theme as
 you arrow onto it, so the choice is previewed before Enter takes it; the chosen
-`base` is remembered beside the configuration. An explicit `[theme].base` in the
+`base` is remembered beside the configuration. An explicit `theme.base` in the
 file wins over the remembered one. An unrecognized role or a malformed colour is
 reported and skipped, never applied. `--no-color` and `NO_COLOR` still suppress
 all of it.

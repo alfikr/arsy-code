@@ -21,6 +21,14 @@ fn main() {
         Location::Local
     };
     let mut samples = Vec::new();
+    // One unrecorded pass first. The first search and the first edit in a
+    // process pay for it: a cold page cache, the first allocations, and the
+    // first walk of a directory nothing has opened yet. Measured, that lands
+    // entirely on the first sample — which is why `edit`/small/cold used to
+    // read slower than `edit`/large/cold, an ordering no real cost produces.
+    // `cold` still means a fixture this process has not touched; it no longer
+    // also means a process that has done nothing at all.
+    warm_up(remote_root.as_deref().map(Path::new));
     for size in [
         RepositorySize::Small,
         RepositorySize::Medium,
@@ -36,55 +44,14 @@ fn main() {
             );
         });
         measure_pair(&mut samples, "edit", size, location, || {
-            let path = fixture.path().join("edit.txt");
-            fs::write(&path, "old").unwrap();
-            let transaction = EditTransaction {
-                base: edit::workspace_version(fixture.path()).unwrap(),
-                operations: vec![EditOperation {
-                    path: "edit.txt".into(),
-                    address: EditAddress::TextAnchor {
-                        needle: "old".into(),
-                        occurrence: None,
-                    },
-                    replacement: b"new".to_vec(),
-                }],
-            };
-            black_box(edit::apply(fixture.path(), &transaction).unwrap());
+            black_box(edit_once(fixture.path()));
         });
+        // Built once, outside the closure: the measurement is the selection,
+        // not the construction of what it selects from.
         let fragments = context_fragments(size.files());
-        let candidates = fragments
-            .iter()
-            .map(|fragment| ContextCandidate {
-                fragment,
-                residency: "local",
-                relevance: 8_000,
-                recency: 8_000,
-                novelty: 8_000,
-            })
-            .collect::<Vec<_>>();
+        let candidates = candidates(&fragments);
         measure_pair(&mut samples, "retrieval", size, location, || {
-            black_box(
-                ContextView::select(
-                    ContextViewId::new(),
-                    &candidates,
-                    &SelectionPolicy {
-                        scope: ContextScope::Global,
-                        require_trusted: false,
-                        allowed_residencies: vec!["local".into()],
-                        budget: u32::try_from(size.files()).unwrap(),
-                    },
-                    &RankingWeights {
-                        dependency: 1,
-                        authority: 1,
-                        relevance: 1,
-                        recency: 1,
-                        confidence: 1,
-                        novelty: 1,
-                        token_cost: 1,
-                    },
-                )
-                .unwrap(),
-            );
+            black_box(select_context(&candidates, size.files()));
         });
     }
     println!("{}", serde_json::to_string_pretty(&samples).unwrap());
@@ -127,6 +94,76 @@ fn measure(iterations: usize, run: &mut impl FnMut()) -> u64 {
     }
     elapsed.sort_unstable();
     u64::try_from(elapsed[iterations / 2].as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Run each measured operation once on a fixture of its own, recording
+/// nothing. Its cost is the process's start-up, not any operation's.
+fn warm_up(root: Option<&Path>) {
+    let fixture = fixture(RepositorySize::Small.files(), root);
+    let workspace = Workspace::open(fixture.path()).unwrap();
+    black_box(workspace.search("needle", 32, 8, 4096).unwrap());
+    black_box(edit_once(fixture.path()));
+    let fragments = context_fragments(RepositorySize::Small.files());
+    black_box(select_context(
+        &candidates(&fragments),
+        RepositorySize::Small.files(),
+    ));
+}
+
+/// The candidate list a selection ranks, one per fragment.
+fn candidates(fragments: &[ContextFragment]) -> Vec<ContextCandidate<'_>> {
+    fragments
+        .iter()
+        .map(|fragment| ContextCandidate {
+            fragment,
+            residency: "local",
+            relevance: 8_000,
+            recency: 8_000,
+            novelty: 8_000,
+        })
+        .collect()
+}
+
+/// The selection both the warm-up and the measurement run.
+fn select_context(candidates: &[ContextCandidate<'_>], budget: usize) -> ContextView {
+    ContextView::select(
+        ContextViewId::new(),
+        candidates,
+        &SelectionPolicy {
+            scope: ContextScope::Global,
+            require_trusted: false,
+            allowed_residencies: vec!["local".into()],
+            budget: u32::try_from(budget).unwrap(),
+        },
+        &RankingWeights {
+            dependency: 1,
+            authority: 1,
+            relevance: 1,
+            recency: 1,
+            confidence: 1,
+            novelty: 1,
+            token_cost: 1,
+        },
+    )
+    .unwrap()
+}
+
+/// The edit both the warm-up and the measurement run: write a file, then
+/// replace its contents through a transaction.
+fn edit_once(root: &Path) -> Vec<edit::FileEdit> {
+    fs::write(root.join("edit.txt"), "old").unwrap();
+    let transaction = EditTransaction {
+        base: edit::workspace_version(root).unwrap(),
+        operations: vec![EditOperation {
+            path: "edit.txt".into(),
+            address: EditAddress::TextAnchor {
+                needle: "old".into(),
+                occurrence: None,
+            },
+            replacement: b"new".to_vec(),
+        }],
+    };
+    edit::apply(root, &transaction).unwrap()
 }
 
 fn fixture(files: usize, root: Option<&Path>) -> tempfile::TempDir {

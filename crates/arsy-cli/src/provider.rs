@@ -208,8 +208,8 @@ fn unconfigured(named: Option<&str>) -> Diagnostic {
             Some(id) => format!("no provider endpoint named `{id}` is configured"),
             None => "no provider endpoint is configured".to_owned(),
         },
-        "add a `[provider.endpoint.<name>]` table with `kind` and `base_url` to the user \
-         config.toml, then run `arsy config explain provider`",
+        "add a `provider.endpoint.<name>` object with `kind` and `base_url` to the user \
+         arsy.json, then run `arsy config explain provider`",
     )
 }
 
@@ -702,10 +702,16 @@ mod tests {
     use super::*;
     use arsy_kernel::config::Layer;
 
+    /// A configuration file holding `body`.
+    ///
+    /// The cases are written as TOML and converted, because the schema reads
+    /// more clearly that way than as quoted JSON; what reaches disk, and what
+    /// the loader sees, is the `arsy.json` a real run reads.
     fn config(body: &str) -> Config {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
-        std::fs::write(&path, body).unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        let json = arsy_kernel::config::json_from_toml(body, &path).unwrap();
+        std::fs::write(&path, json).unwrap();
         Config::load(&[(Layer::User, path)]).unwrap()
     }
 

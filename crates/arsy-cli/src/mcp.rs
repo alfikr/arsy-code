@@ -1,8 +1,8 @@
 //! `arsy mcp`: manage MCP connection definitions, and probe one.
 //!
-//! Definitions live in `config.toml` beside everything else ARSY resolves, so
-//! `--scope user|workspace` is the configuration layer that owns the table and
-//! the layer decides the connection's trust label. Writing a definition is not
+//! Definitions live in `arsy.json` beside everything else ARSY resolves, so
+//! `--scope user|workspace` is the configuration layer that owns the definition
+//! and the layer decides the connection's trust label. Writing one is not
 //! connecting: only `test` contacts a server, and it never invokes a tool.
 
 use crate::{load_config, usage, Command, Diagnostic, Emitter, Invocation, Output};
@@ -93,7 +93,7 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
     };
     if !crate::config_edit::is_writable(&name) {
         return Err(usage(format!(
-            "`{name}` cannot be written to a TOML file as a connection name"
+            "`{name}` cannot be used as a connection name"
         )));
     }
     match action.as_str() {
@@ -199,62 +199,40 @@ fn definition(
     })
 }
 
-fn header(name: &str) -> String {
-    format!("[mcp.server.{name}]")
+/// Where one connection lives in the configuration document.
+fn path_of(name: &str) -> [&str; 3] {
+    ["mcp", "server", name]
 }
 
-/// A value written as a TOML basic string.
-///
-/// These tables are written by hand, so every value has to be escaped on the
-/// way in or it will not read back: a Windows path carries backslashes, which
-/// TOML reads as escapes, and a quote anywhere in a command or argument would
-/// end the string and leave the rest to be parsed as TOML.
-fn basic_string(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\u{8}' => quoted.push_str("\\b"),
-            '\t' => quoted.push_str("\\t"),
-            '\n' => quoted.push_str("\\n"),
-            '\u{c}' => quoted.push_str("\\f"),
-            '\r' => quoted.push_str("\\r"),
-            control if control < ' ' || control == '\u{7f}' => {
-                quoted.push_str(&format!("\\u{:04X}", control as u32));
-            }
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('"');
-    quoted
+/// A configuration file that is not JSON stops the edit rather than being
+/// replaced by one holding only this connection.
+fn config_broken(error: String) -> Diagnostic {
+    Diagnostic::error(
+        crate::ARSY_CFG_1000,
+        error,
+        "fix the configuration file, then run the command again",
+    )
 }
 
-fn table(server: &McpServer) -> String {
-    let mut table = format!("{}\n", header(&server.name));
+fn definition_json(server: &McpServer) -> Value {
+    let mut object = serde_json::Map::new();
     match &server.transport {
         McpTransport::Stdio { command, args } => {
-            table.push_str("transport = \"stdio\"\n");
-            table.push_str(&format!("command = {}\n", basic_string(command)));
+            object.insert("transport".to_owned(), json!("stdio"));
+            object.insert("command".to_owned(), json!(command));
             if !args.is_empty() {
-                let listed = args
-                    .iter()
-                    .map(|argument| basic_string(argument))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                table.push_str(&format!("args = [{listed}]\n"));
+                object.insert("args".to_owned(), json!(args));
             }
         }
         McpTransport::Http { url } => {
-            table.push_str("transport = \"http\"\n");
-            table.push_str(&format!("url = {}\n", basic_string(url)));
+            object.insert("transport".to_owned(), json!("http"));
+            object.insert("url".to_owned(), json!(url));
         }
     }
     if server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS {
-        table.push_str(&format!("timeout_ms = {}\n", server.timeout_ms));
+        object.insert("timeout_ms".to_owned(), json!(server.timeout_ms));
     }
-    table
+    Value::Object(object)
 }
 
 pub fn add(
@@ -266,17 +244,20 @@ pub fn add(
     let root = crate::workspace_root(&invocation.workspace)?;
     let path = scope.path(&root)?;
     let current = read(&path)?;
-    if current.contains(&header(&server.name)) {
+    if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)? {
         return Err(usage(format!(
             "`{}` is already defined in {}; remove it first",
             server.name,
             path.display()
         )));
     }
-    let updated = crate::config_edit::append_table(
-        &crate::config_edit::ensure_schema(&current),
-        &table(server),
-    );
+    let updated = crate::config_edit::set(
+        &current,
+        &["mcp", "server"],
+        &server.name,
+        definition_json(server),
+    )
+    .map_err(config_broken)?;
     write(&path, &updated)?;
     emitter.result(json!({
         "connection": server.name,
@@ -299,7 +280,7 @@ pub fn remove(
     let root = crate::workspace_root(&invocation.workspace)?;
     let path = scope.path(&root)?;
     let current = read(&path)?;
-    if !current.contains(&header(name)) {
+    if !crate::config_edit::contains(&current, &path_of(name)).map_err(config_broken)? {
         return Err(usage(format!(
             "no connection named `{name}` is defined in {}",
             path.display()
@@ -307,7 +288,7 @@ pub fn remove(
     }
     write(
         &path,
-        &crate::config_edit::remove_table(&current, &header(name)),
+        &crate::config_edit::remove(&current, &path_of(name)).map_err(config_broken)?,
     )?;
     emitter.result(json!({
         "connection": name,
@@ -329,18 +310,15 @@ pub fn set_enabled(
     let root = crate::workspace_root(&invocation.workspace)?;
     let path = scope.path(&root)?;
     let current = read(&path)?;
-    let updated = crate::config_edit::set_in_table(
-        &current,
-        &header(name),
-        "enabled",
-        if enabled { "true" } else { "false" },
-    )
-    .ok_or_else(|| {
-        usage(format!(
-            "no connection named `{name}` is defined in {}",
-            path.display()
-        ))
-    })?;
+    let updated =
+        crate::config_edit::set_existing(&current, &path_of(name), "enabled", Value::Bool(enabled))
+            .map_err(config_broken)?
+            .ok_or_else(|| {
+                usage(format!(
+                    "no connection named `{name}` is defined in {}",
+                    path.display()
+                ))
+            })?;
     write(&path, &updated)?;
     emitter.result(json!({
         "connection": name,
@@ -720,9 +698,9 @@ mod tests {
     }
 
     #[test]
-    fn a_written_table_round_trips_through_the_configuration_loader() {
+    fn a_written_definition_round_trips_through_the_configuration_loader() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.toml");
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
         let stdio = McpServer {
             name: "docs".to_owned(),
             transport: McpTransport::Stdio {
@@ -734,21 +712,22 @@ mod tests {
             timeout_ms: 5_000,
             max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
         };
-        let body = crate::config_edit::append_table(
-            &crate::config_edit::ensure_schema(""),
-            &table(&stdio),
-        );
+        let body =
+            crate::config_edit::set("", &["mcp", "server"], &stdio.name, definition_json(&stdio))
+                .unwrap();
         std::fs::write(&path, &body).unwrap();
         let config = arsy_kernel::config::Config::load(&[(Layer::User, path.clone())]).unwrap();
-        let loaded = config.mcp_server("docs").expect("the table loads back");
+        let loaded = config
+            .mcp_server("docs")
+            .expect("the definition loads back");
         assert_eq!(loaded.transport, stdio.transport);
         assert_eq!(loaded.timeout_ms, 5_000);
         assert!(loaded.enabled);
         assert_eq!(loaded.trust, arsy_kernel::capability::PolicySource::User);
 
-        // A Windows path and a quoted argument survive the round trip. Written
-        // raw, the backslashes would read back as escapes and the quote would
-        // end the string, leaving the remainder to be parsed as TOML.
+        // A Windows path, a quoted argument, and a tab survive the round trip:
+        // the definition is serialized rather than pasted, so nothing in a
+        // value can end the string it is written into.
         let awkward = McpServer {
             name: "awkward".to_owned(),
             transport: McpTransport::Stdio {
@@ -757,27 +736,36 @@ mod tests {
             },
             ..stdio.clone()
         };
-        let awkward_path = directory.path().join("awkward.toml");
+        let awkward_path = directory.path().join("awkward.json");
         std::fs::write(
             &awkward_path,
-            crate::config_edit::append_table(
-                &crate::config_edit::ensure_schema(""),
-                &table(&awkward),
-            ),
+            crate::config_edit::set(
+                "",
+                &["mcp", "server"],
+                &awkward.name,
+                definition_json(&awkward),
+            )
+            .unwrap(),
         )
         .unwrap();
         let config = arsy_kernel::config::Config::load(&[(Layer::User, awkward_path)]).unwrap();
         assert_eq!(
             config
                 .mcp_server("awkward")
-                .expect("an awkward table loads back")
+                .expect("an awkward definition loads back")
                 .transport,
             awkward.transport
         );
 
-        // Disabling flips one key and leaves the rest of the table alone.
-        let disabled =
-            crate::config_edit::set_in_table(&body, &header("docs"), "enabled", "false").unwrap();
+        // Disabling flips one key and leaves the rest of the definition alone.
+        let disabled = crate::config_edit::set_existing(
+            &body,
+            &path_of("docs"),
+            "enabled",
+            Value::Bool(false),
+        )
+        .unwrap()
+        .unwrap();
         std::fs::write(&path, &disabled).unwrap();
         let config = arsy_kernel::config::Config::load(&[(Layer::User, path.clone())]).unwrap();
         assert!(!config.mcp_server("docs").unwrap().enabled);
@@ -795,8 +783,8 @@ mod tests {
             arsy_kernel::capability::PolicySource::Workspace
         );
 
-        // Removing takes the whole table with it.
-        let removed = crate::config_edit::remove_table(&disabled, &header("docs"));
+        // Removing takes the whole definition with it.
+        let removed = crate::config_edit::remove(&disabled, &path_of("docs")).unwrap();
         std::fs::write(&path, &removed).unwrap();
         let config = arsy_kernel::config::Config::load(&[(Layer::User, path)]).unwrap();
         assert!(config.mcp_server("docs").is_none());

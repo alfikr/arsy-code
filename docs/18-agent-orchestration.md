@@ -1,5 +1,10 @@
 # Agent orchestration
 
+Status: target architecture. For the source-audited implementation boundary and
+delivery sequence, see [`31-roadmap.md`](31-roadmap.md). In particular, the
+current `task.spawn` path is synchronous and does not yet bind children to the
+workspace isolation described below.
+
 ## Problem
 
 Parallel conversations share hidden state, duplicate work, and corrupt files. Orchestration needs durable dependencies, supervision, budgets, and workspace isolation.

@@ -69,9 +69,16 @@ impl Served {
 fn workspace(policy: &str) -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(directory.path().join(".arsy")).unwrap();
+    // Written as TOML here and converted: the schema reads more clearly that
+    // way, and what lands on disk is the `arsy.json` the binary loads.
+    let settings = directory
+        .path()
+        .join(".arsy")
+        .join(arsy_kernel::config::CONFIG_FILE);
+    let body = format!("schema_version = 1\n{policy}");
     std::fs::write(
-        directory.path().join(".arsy/config.toml"),
-        format!("schema_version = 1\n{policy}"),
+        &settings,
+        arsy_kernel::config::json_from_toml(&body, &settings).unwrap(),
     )
     .unwrap();
     directory

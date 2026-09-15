@@ -7,7 +7,7 @@
 //! local: the "provider" is a socket this test owns, and the model's turn is a
 //! script, so there is nothing to be flaky about.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{Ipv4Addr, TcpListener},
@@ -150,10 +150,22 @@ fn answers(text: &str) -> String {
     ])
 }
 
+/// Write a settings file, given as TOML here and converted: the schema reads
+/// more clearly that way than as quoted JSON, and what lands on disk is the
+/// `arsy.json` the binary under test loads.
+fn write_settings(path: &Path, body: &str) {
+    let json = arsy_kernel::config::json_from_toml(body, path).unwrap();
+    std::fs::write(path, json).unwrap();
+}
+
+fn settings_path(home: &Path) -> std::path::PathBuf {
+    home.join(arsy_kernel::config::CONFIG_FILE)
+}
+
 fn configure(home: &Path, port: u16) {
-    std::fs::write(
-        home.join("config.toml"),
-        format!(
+    write_settings(
+        &settings_path(home),
+        &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
@@ -163,8 +175,7 @@ fn configure(home: &Path, port: u16) {
              [policy]\n\
              default_effect = \"allow\"\n"
         ),
-    )
-    .unwrap();
+    );
 }
 
 fn arsy(workspace: &Path, home: &Path, args: &[&str]) -> (i32, Vec<Value>) {
@@ -478,9 +489,9 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
         answers("notes.txt says 42."),
         answers("the subagent found 42."),
     ]);
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!(
+    write_settings(
+        &settings_path(home.path()),
+        &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
@@ -502,8 +513,7 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
              resource = \"file:**\"\n",
             provider.port
         ),
-    )
-    .unwrap();
+    );
 
     let (code, records) = arsy(
         workspace.path(),
@@ -719,12 +729,11 @@ fn a_repositorys_own_hook_does_not_run_until_it_is_vouched_for() {
 /// The same configuration, plus the operator vouching for one directory.
 fn configure_trusting(home: &Path, port: u16, workspace: &Path) {
     configure(home, port);
-    let mut config = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    config.push_str(&format!(
-        // A literal key: a Windows path's backslashes are escapes in a TOML
-        // basic string.
-        "[project.'{}']\ntrust_level = \"trusted\"\n",
-        workspace.display()
-    ));
-    std::fs::write(home.join("config.toml"), config).unwrap();
+    let path = settings_path(home);
+    let mut settings: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+        .expect("the settings file is JSON");
+    settings["project"] = json!({
+        workspace.display().to_string(): { "trust_level": "trusted" }
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
 }

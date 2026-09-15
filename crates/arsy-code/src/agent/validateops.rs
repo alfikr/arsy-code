@@ -3,10 +3,11 @@
 //! A model that runs `pytest` through `process.exec` and reads the output is
 //! validating, but nothing durable says so: the transcript can be trimmed,
 //! and "did this pass before I claimed done" becomes a question only the
-//! model's memory can answer. `validate.record` makes one run of a check a
-//! fact the task carries — recorded against it, not just typed at it — so
-//! `validate.status` can answer "is the last known validation state a pass"
-//! without re-reading the transcript, and a completion claim can cite it.
+//! model's memory can answer. `validate.record` keeps one run in a scope-local
+//! process log, so `validate.status` can answer "is the last known validation
+//! state a pass" without re-reading the transcript. The process result artifact
+//! persists, but this log is not reconstructed after restart and is not yet a
+//! durable completion proof.
 
 use crate::process::ProcessResult;
 use arsy_kernel::{

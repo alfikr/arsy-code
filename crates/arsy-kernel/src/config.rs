@@ -1,4 +1,9 @@
-//! Native configuration: `config.toml` resolved across authority layers.
+//! Native configuration: `arsy.json` resolved across authority layers.
+//!
+//! The file is JSON, and it lives in one place an operator can name on every
+//! platform: `~/.arsy/arsy.json`. ARSY and the wider ARSY ecosystem share that
+//! directory, so the settings a person edits are not somewhere a different
+//! product would have to guess at.
 //!
 //! See `docs/35-configuration.md`. Only the keys the runtime can act on today
 //! are applied; the rest of the documented schema is accepted and ignored, so a
@@ -30,7 +35,10 @@ use std::{
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// Name every configuration layer uses.
-pub const CONFIG_FILE: &str = "config.toml";
+pub const CONFIG_FILE: &str = "arsy.json";
+
+/// Name the pre-JSON configuration used. Still read once, to convert.
+pub const LEGACY_CONFIG_FILE: &str = "config.toml";
 
 /// Documented sections that parse but have no runtime effect yet. Listing them
 /// keeps "unknown keys are errors" true without rejecting a forward-looking
@@ -788,88 +796,124 @@ impl Config {
     }
 
     fn apply(&mut self, layer: Layer, path: &Path, raw: &str) -> Result<(), ConfigError> {
-        let reject = |message: String| ConfigError {
+        // Parsed as JSON into the same tree the rest of this module walks. The
+        // tree type is `toml`'s because that is what the schema was written
+        // against; no configuration file is TOML any more.
+        let table: toml::Table = serde_json::from_str(raw).map_err(|error| ConfigError {
             path: path.to_path_buf(),
-            message,
-        };
-        let table: toml::Table = raw.parse().map_err(|error: toml::de::Error| {
-            reject(format!("is not valid TOML: {}", error.message()))
+            message: format!("is not valid JSON: {error}"),
         })?;
-        match table
-            .get("schema_version")
-            .and_then(toml::Value::as_integer)
-        {
-            Some(SCHEMA_VERSION) => {}
-            Some(other) => return Err(reject(format!("unsupported schema_version {other}"))),
-            None => return Err(reject("requires `schema_version = 1`".to_owned())),
-        }
+        check_schema_version(&table, path)?;
         for (key, value) in &table {
-            match key.as_str() {
-                "schema_version" => {}
-                "provider" => self.apply_provider(layer, path, value)?,
-                "model" => {
-                    let table = as_table(value, "model", path)?;
-                    if let Some(default) = string(table, "default", "model.default", path)? {
-                        self.model_default = Some(default.clone());
-                        self.record(layer, path, "model.default", default);
-                    }
-                    if let Some(value) = table.get("allowed") {
-                        let allowed = name_set(value, "model.allowed", path)?;
-                        self.record(layer, path, "model.allowed", joined(&allowed));
-                        self.model_allowed = Some(intersect(self.model_allowed.take(), allowed));
-                    }
-                }
-                "credentials" => {
-                    let table = as_table(value, "credentials", path)?;
-                    if let Some(store) = string(table, "store", "credentials.store", path)?.cloned()
-                    {
-                        if !CREDENTIAL_STORES.contains(&store.as_str()) {
-                            return Err(reject(format!(
-                                "credentials.store must be one of {}, not `{store}`",
-                                CREDENTIAL_STORES.join(", ")
-                            )));
-                        }
-                        self.credential_store = Some(store.clone());
-                        self.record(layer, path, "credentials.store", store);
-                    }
-                }
-                "execution" => {
-                    // The rest of `[execution]` is still inert, so an unknown
-                    // key here is accepted as it always was; only the one this
-                    // build reads is validated.
-                    let table = as_table(value, "execution", path)?;
-                    if let Some(value) = table.get("max_parallel") {
-                        let key = "execution.max_parallel";
-                        let limit = value
-                            .as_integer()
-                            .and_then(|limit| usize::try_from(limit).ok())
-                            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
-                            .ok_or_else(|| {
-                                reject(format!(
-                                    "`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"
-                                ))
-                            })?;
-                        self.record(layer, path, key, limit.to_string());
-                        // Narrowest wins, like every other ceiling: a layer may
-                        // ask for less concurrency than the one above it and
-                        // never for more.
-                        self.max_parallel_tools = Some(
-                            self.max_parallel_tools
-                                .map_or(limit, |held| held.min(limit)),
-                        );
-                    }
-                }
-                "telemetry" => self.apply_telemetry(layer, path, value)?,
-                "lsp" => self.apply_lsp(layer, path, value)?,
-                "mcp" => self.apply_mcp(layer, path, value)?,
-                "remote" => self.apply_remote(layer, path, value)?,
-                "project" => self.apply_project(layer, path, value)?,
-                "policy" => self.apply_policy(layer, path, value)?,
-                "theme" => self.apply_theme(layer, path, value)?,
-                section if INERT_SECTIONS.contains(&section) => {}
-                other => return Err(reject(format!("unknown key `{other}`"))),
-            }
+            self.apply_section(layer, path, key, value)?;
         }
+        Ok(())
+    }
+
+    /// One top-level section. Every arm either delegates to the function that
+    /// owns that section or, for the three short ones, reads its own keys.
+    fn apply_section(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        key: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        match key {
+            "schema_version" => Ok(()),
+            "provider" => self.apply_provider(layer, path, value),
+            "model" => self.apply_model(layer, path, value),
+            "credentials" => self.apply_credentials(layer, path, value),
+            "execution" => self.apply_execution(layer, path, value),
+            "telemetry" => self.apply_telemetry(layer, path, value),
+            "lsp" => self.apply_lsp(layer, path, value),
+            "mcp" => self.apply_mcp(layer, path, value),
+            "remote" => self.apply_remote(layer, path, value),
+            "project" => self.apply_project(layer, path, value),
+            "policy" => self.apply_policy(layer, path, value),
+            "theme" => self.apply_theme(layer, path, value),
+            section if INERT_SECTIONS.contains(&section) => Ok(()),
+            other => Err(ConfigError {
+                path: path.to_path_buf(),
+                message: format!("unknown key `{other}`"),
+            }),
+        }
+    }
+
+    /// `model.default` and the `model.allowed` ceiling.
+    fn apply_model(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "model", path)?;
+        if let Some(default) = string(table, "default", "model.default", path)? {
+            self.model_default = Some(default.clone());
+            self.record(layer, path, "model.default", default);
+        }
+        if let Some(value) = table.get("allowed") {
+            let allowed = name_set(value, "model.allowed", path)?;
+            self.record(layer, path, "model.allowed", joined(&allowed));
+            self.model_allowed = Some(intersect(self.model_allowed.take(), allowed));
+        }
+        Ok(())
+    }
+
+    /// `credentials.store`: which store the credential catalog is kept in.
+    fn apply_credentials(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "credentials", path)?;
+        let Some(store) = string(table, "store", "credentials.store", path)?.cloned() else {
+            return Ok(());
+        };
+        if !CREDENTIAL_STORES.contains(&store.as_str()) {
+            return Err(ConfigError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "credentials.store must be one of {}, not `{store}`",
+                    CREDENTIAL_STORES.join(", ")
+                ),
+            });
+        }
+        self.credential_store = Some(store.clone());
+        self.record(layer, path, "credentials.store", store);
+        Ok(())
+    }
+
+    /// `execution.max_parallel`. The rest of the section is still inert, so an
+    /// unknown key here is accepted as it always was; only the one this build
+    /// reads is validated.
+    fn apply_execution(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "execution", path)?;
+        let Some(value) = table.get("max_parallel") else {
+            return Ok(());
+        };
+        let key = "execution.max_parallel";
+        let limit = value
+            .as_integer()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| (1..=MAX_PARALLEL_TOOLS).contains(limit))
+            .ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!("`{key}` must be between 1 and {MAX_PARALLEL_TOOLS}"),
+            })?;
+        self.record(layer, path, key, limit.to_string());
+        // Narrowest wins, like every other ceiling: a layer may ask for less
+        // concurrency than the one above it and never for more.
+        self.max_parallel_tools = Some(
+            self.max_parallel_tools
+                .map_or(limit, |held| held.min(limit)),
+        );
         Ok(())
     }
 
@@ -2199,6 +2243,25 @@ fn expect_string<'a>(
     }
 }
 
+/// An absent `schema_version` means this schema: a settings file a person just
+/// created is `{}`, and refusing that would make the first edit a ceremony. A
+/// version that *is* written still has to be one this build understands, so a
+/// future file fails loudly rather than being half-applied.
+fn check_schema_version(table: &toml::Table, path: &Path) -> Result<(), ConfigError> {
+    let reject = |message: String| ConfigError {
+        path: path.to_path_buf(),
+        message,
+    };
+    match table.get("schema_version") {
+        None => Ok(()),
+        Some(value) => match value.as_integer() {
+            Some(SCHEMA_VERSION) => Ok(()),
+            Some(other) => Err(reject(format!("unsupported schema_version {other}"))),
+            None => Err(reject("`schema_version` must be an integer".to_owned())),
+        },
+    }
+}
+
 /// Configuration files in authority order, per `docs/35-configuration.md`.
 ///
 /// Nested files run from the workspace root toward `working`, parent before
@@ -2225,19 +2288,17 @@ pub fn layers(workspace: &Path, working: &Path) -> Vec<(Layer, PathBuf)> {
 
 #[cfg(target_os = "linux")]
 pub fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from("/etc/arsy/config.toml"))
+    Some(Path::new("/etc/arsy").join(CONFIG_FILE))
 }
 
 #[cfg(target_os = "macos")]
 pub fn enterprise_config() -> Option<PathBuf> {
-    Some(PathBuf::from(
-        "/Library/Application Support/ARSY/config.toml",
-    ))
+    Some(Path::new("/Library/Application Support/ARSY").join(CONFIG_FILE))
 }
 
 #[cfg(target_os = "windows")]
 pub fn enterprise_config() -> Option<PathBuf> {
-    std::env::var_os("ProgramData").map(|base| Path::new(&base).join("ARSY/config.toml"))
+    std::env::var_os("ProgramData").map(|base| Path::new(&base).join("ARSY").join(CONFIG_FILE))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2253,34 +2314,80 @@ pub fn enterprise_config() -> Option<PathBuf> {
 pub const CONFIG_HOME_VAR: &str = "ARSY_CONFIG_HOME";
 
 pub fn user_config() -> Option<PathBuf> {
+    Some(config_home()?.join(CONFIG_FILE))
+}
+
+/// The directory the operator's own ARSY state lives in: `~/.arsy`, or whatever
+/// `ARSY_CONFIG_HOME` names.
+///
+/// One directory on every platform, rather than the three platform locations
+/// this used to spread across, because ARSY and ARSY CODE are separate products
+/// that share it: a path a person can type is a path both can agree on.
+pub fn config_home() -> Option<PathBuf> {
     match std::env::var_os(CONFIG_HOME_VAR) {
-        Some(home) if !home.is_empty() => Some(Path::new(&home).join(CONFIG_FILE)),
-        _ => platform_user_config(),
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => home_directory().map(|home| home.join(".arsy")),
     }
 }
 
+#[cfg(windows)]
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(windows))]
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where the user configuration was kept before it moved to `~/.arsy`.
+///
+/// Read once, by the migration in `arsy-cli`, so an operator who already had a
+/// `config.toml` keeps their providers and policy. Nothing else reads it.
 #[cfg(target_os = "linux")]
-fn platform_user_config() -> Option<PathBuf> {
+pub fn legacy_user_config() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".config")))
-        .map(|base| base.join("arsy/config.toml"))
+        .or_else(|| home_directory().map(|home| home.join(".config")))
+        .map(|base| base.join("arsy").join(LEGACY_CONFIG_FILE))
 }
 
 #[cfg(target_os = "macos")]
-fn platform_user_config() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| Path::new(&home).join("Library/Application Support/ARSY/config.toml"))
+pub fn legacy_user_config() -> Option<PathBuf> {
+    home_directory().map(|home| {
+        home.join("Library/Application Support/ARSY")
+            .join(LEGACY_CONFIG_FILE)
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn platform_user_config() -> Option<PathBuf> {
-    std::env::var_os("AppData").map(|base| Path::new(&base).join("ARSY/config.toml"))
+pub fn legacy_user_config() -> Option<PathBuf> {
+    std::env::var_os("AppData").map(|base| Path::new(&base).join("ARSY").join(LEGACY_CONFIG_FILE))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn platform_user_config() -> Option<PathBuf> {
+pub fn legacy_user_config() -> Option<PathBuf> {
     None
+}
+
+/// The JSON a configuration file holds, from the TOML an older one held.
+///
+/// The schema did not change when the format did, so a conversion is a parse
+/// and a re-serialize: this is what the one-time migration writes, and what
+/// `arsy config migrate` reports on.
+pub fn json_from_toml(raw: &str, path: &Path) -> Result<String, ConfigError> {
+    let table: toml::Table = raw.parse().map_err(|error: toml::de::Error| ConfigError {
+        path: path.to_path_buf(),
+        message: format!("is not valid TOML: {}", error.message()),
+    })?;
+    serde_json::to_string_pretty(&table).map_err(|error| ConfigError {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -2289,10 +2396,15 @@ mod project_trust_tests {
 
     fn layered(user: &str, workspace: &str) -> (tempfile::TempDir, Config) {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("user.toml");
-        let second = directory.path().join("workspace.toml");
-        std::fs::write(&first, format!("schema_version = 1\n{user}")).unwrap();
-        std::fs::write(&second, format!("schema_version = 1\n{workspace}")).unwrap();
+        let first = directory.path().join("user.json");
+        let second = directory.path().join("workspace.json");
+        let json = |body: String, path: &Path| json_from_toml(&body, path).unwrap();
+        std::fs::write(&first, json(format!("schema_version = 1\n{user}"), &first)).unwrap();
+        std::fs::write(
+            &second,
+            json(format!("schema_version = 1\n{workspace}"), &second),
+        )
+        .unwrap();
         let config = Config::load(&[(Layer::User, first), (Layer::Workspace, second)]).unwrap();
         (directory, config)
     }
@@ -2348,12 +2460,13 @@ mod project_trust_tests {
         assert!(!config.trusts(Path::new("/repo/mine")));
 
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("one.toml");
-        std::fs::write(
-            &path,
+        let path = directory.path().join(CONFIG_FILE);
+        let body = json_from_toml(
             "schema_version = 1\n[project.\"/repo/mine\"]\ntrust_level = \"sort-of\"\n",
+            &path,
         )
         .unwrap();
+        std::fs::write(&path, body).unwrap();
         let error = Config::load(&[(Layer::User, path)]).unwrap_err();
         assert!(
             format!("{error}").contains("trusted"),
@@ -2368,10 +2481,10 @@ mod policy_identity_tests {
 
     fn layered(enterprise: &str, workspace: &str) -> (tempfile::TempDir, Config) {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("enterprise.toml");
-        let second = directory.path().join("workspace.toml");
-        std::fs::write(&first, enterprise).unwrap();
-        std::fs::write(&second, workspace).unwrap();
+        let first = directory.path().join("enterprise.json");
+        let second = directory.path().join("workspace.json");
+        std::fs::write(&first, json_from_toml(enterprise, &first).unwrap()).unwrap();
+        std::fs::write(&second, json_from_toml(workspace, &second).unwrap()).unwrap();
         let config =
             Config::load(&[(Layer::Enterprise, first), (Layer::Workspace, second)]).unwrap();
         (directory, config)
@@ -2421,18 +2534,19 @@ mod policy_identity_tests {
     #[test]
     fn a_layer_may_refine_a_rule_of_its_own_authority() {
         let directory = tempfile::tempdir().unwrap();
-        let first = directory.path().join("a.toml");
-        let second = directory.path().join("b.toml");
-        std::fs::write(
+        let first = directory.path().join("a.json");
+        let second = directory.path().join("b.json");
+        let written = |path: &Path, body: &str| {
+            std::fs::write(path, json_from_toml(body, path).unwrap()).unwrap();
+        };
+        written(
             &first,
             "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:**\"\n",
-        )
-        .unwrap();
-        std::fs::write(
+        );
+        written(
             &second,
             "schema_version = 1\n[[policy.rules]]\nid = \"reads\"\neffect = \"allow\"\n             action = \"fs.read\"\nresource = \"file:src/**\"\n",
-        )
-        .unwrap();
+        );
         // Both from the user layer: nobody is overruling anybody.
         let config = Config::load(&[(Layer::User, first), (Layer::User, second)]).unwrap();
 
@@ -2449,7 +2563,7 @@ mod tests {
     fn an_endpoint_offers_every_model_it_lists_with_its_default_first() {
         let directory = tempfile::tempdir().unwrap();
         let read = |body: &str| {
-            let path = write(directory.path(), "config.toml", body);
+            let path = write(directory.path(), CONFIG_FILE, body);
             Config::load(&[(Layer::User, path)])
         };
 
@@ -2507,7 +2621,7 @@ mod tests {
     fn theme_carries_a_base_and_well_formed_role_overrides() {
         let directory = tempfile::tempdir().unwrap();
         let read = |body: &str| {
-            let path = write(directory.path(), "config.toml", body);
+            let path = write(directory.path(), CONFIG_FILE, body);
             Config::load(&[(Layer::User, path)])
         };
 
@@ -2615,14 +2729,18 @@ default_effect = \"allow\"\n",
 
     fn single_layer(layer: Layer, body: &str) -> Config {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(CONFIG_FILE);
-        std::fs::write(&path, body).unwrap();
+        let path = write(directory.path(), CONFIG_FILE, body);
         Config::load(&[(layer, path)]).unwrap()
     }
 
+    /// A configuration file holding `body`.
+    ///
+    /// The cases are written as TOML and converted, because the schema is far
+    /// easier to read that way than as quoted JSON; what reaches disk, and what
+    /// the loader parses, is the JSON a real `arsy.json` holds.
     fn write(directory: &Path, name: &str, body: &str) -> PathBuf {
         let path = directory.join(name);
-        std::fs::write(&path, body).unwrap();
+        std::fs::write(&path, json_from_toml(body, &path).unwrap()).unwrap();
         path
     }
 
@@ -2646,17 +2764,17 @@ default_effect = \"allow\"\n",
 
         let enterprise = write(
             directory.path(),
-            "enterprise.toml",
+            "enterprise.json",
             "schema_version = 1\n\n[execution]\nmax_parallel = 8\n",
         );
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             "schema_version = 1\n\n[execution]\nmax_parallel = 2\n",
         );
         let greedy = write(
             directory.path(),
-            "greedy.toml",
+            "greedy.json",
             "schema_version = 1\n\n[execution]\nmax_parallel = 12\n",
         );
 
@@ -2682,7 +2800,7 @@ default_effect = \"allow\"\n",
         for bad in ["0", "1000", "\"four\""] {
             let path = write(
                 directory.path(),
-                "bad.toml",
+                "bad.json",
                 &format!("schema_version = 1\n\n[execution]\nmax_parallel = {bad}\n"),
             );
             assert!(
@@ -2698,7 +2816,7 @@ default_effect = \"allow\"\n",
         let directory = tempfile::tempdir().unwrap();
         let path = write(
             directory.path(),
-            "pricing.toml",
+            "pricing.json",
             r#"
 schema_version = 1
 
@@ -2737,7 +2855,7 @@ output_micros_per_million = 75000000
         ] {
             let path = write(
                 directory.path(),
-                "bad-pricing.toml",
+                "bad-pricing.json",
                 &format!(
                     "schema_version = 1\n\n[provider.endpoint.a]\nkind = \"openai\"\n\n\
                      [provider.endpoint.a.pricing.m]\n{bad}\noutput_micros_per_million = 1\n"
@@ -2755,7 +2873,7 @@ output_micros_per_million = 75000000
         let directory = tempfile::tempdir().unwrap();
         let enterprise = write(
             directory.path(),
-            "enterprise.toml",
+            "enterprise.json",
             r#"
 schema_version = 1
 [provider.endpoint.proxy]
@@ -2766,7 +2884,7 @@ api_key_env = "ENTERPRISE_KEY"
         );
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             r#"
 schema_version = 1
 [provider]
@@ -2812,7 +2930,7 @@ base_url = "https://user.test/v1/"
         let secret = "sk-not-a-handle-0123456789";
         let path = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             &format!(
                 "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\ncredential = \"{secret}\"\n"
             ),
@@ -2833,7 +2951,7 @@ base_url = "https://user.test/v1/"
         let directory = tempfile::tempdir().unwrap();
         let enterprise = write(
             directory.path(),
-            "enterprise.toml",
+            "enterprise.json",
             r#"
 schema_version = 1
 [provider.endpoint.p]
@@ -2843,7 +2961,7 @@ base_url = "https://enterprise.test/v1"
         );
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             r#"
 schema_version = 1
 [provider.endpoint.p]
@@ -2879,12 +2997,12 @@ api_key_env = "K"
         let directory = tempfile::tempdir().unwrap();
         let enterprise = write(
             directory.path(),
-            "enterprise.toml",
+            "enterprise.json",
             "schema_version = 1\n[provider.endpoint.p]\nkind = \"openai\"\n",
         );
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             "schema_version = 1\n[provider.endpoint.p]\nkind = \"anthropic\"\n",
         );
 
@@ -2906,7 +3024,7 @@ api_key_env = "K"
         let directory = tempfile::tempdir().unwrap();
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             r#"
 schema_version = 1
 [provider.endpoint.official]
@@ -2915,7 +3033,7 @@ kind = "anthropic"
         );
         let workspace = write(
             directory.path(),
-            "workspace.toml",
+            "workspace.json",
             r#"
 schema_version = 1
 [provider.endpoint.official]
@@ -2941,7 +3059,10 @@ credential = "secret://os/official"
     fn invalid_input_is_rejected_rather_than_partly_applied() {
         let directory = tempfile::tempdir().unwrap();
         let cases = [
-            ("[provider]\ndefault = \"x\"\n", "requires `schema_version = 1`"),
+            (
+                "schema_version = \"1\"\n",
+                "`schema_version` must be an integer",
+            ),
             ("schema_version = 2\n", "unsupported schema_version 2"),
             ("schema_version = 1\n[nonsense]\na = 1\n", "unknown key `nonsense`"),
             (
@@ -2970,7 +3091,7 @@ credential = "secret://os/official"
             ),
         ];
         for (index, (body, expected)) in cases.into_iter().enumerate() {
-            let path = write(directory.path(), &format!("case{index}.toml"), body);
+            let path = write(directory.path(), &format!("case{index}.json"), body);
             let error = Config::load(&[(Layer::User, path)]).unwrap_err();
             assert!(
                 error.message.contains(expected),
@@ -2980,12 +3101,27 @@ credential = "secret://os/official"
         }
     }
 
+    /// A settings file someone just created is `{}`, and the first thing they
+    /// write into it is a setting, not a version header.
+    #[test]
+    fn a_file_without_a_schema_version_is_this_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, "{}\n").unwrap();
+        let config = Config::load(&[(Layer::User, path.clone())]).unwrap();
+        assert_eq!(config.max_parallel_tools(), DEFAULT_PARALLEL_TOOLS);
+
+        std::fs::write(&path, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        let config = Config::load(&[(Layer::User, path)]).unwrap();
+        assert_eq!(config.model_default(), Some("m1"));
+    }
+
     #[test]
     fn a_missing_file_is_not_an_error_and_a_lone_endpoint_needs_no_default() {
         let directory = tempfile::tempdir().unwrap();
         let user = write(
             directory.path(),
-            "user.toml",
+            "user.json",
             r#"
 schema_version = 1
 [model]
@@ -3006,7 +3142,7 @@ access_type = "offline"
         );
 
         let config = load(&[
-            (Layer::Enterprise, directory.path().join("absent.toml")),
+            (Layer::Enterprise, directory.path().join("absent.json")),
             (Layer::User, user),
         ]);
 
@@ -3045,8 +3181,8 @@ access_type = "offline"
         assert_eq!(
             nested,
             [
-                PathBuf::from("/w/services/.arsy/config.toml"),
-                PathBuf::from("/w/services/payments/.arsy/config.toml"),
+                PathBuf::from("/w/services/.arsy/arsy.json"),
+                PathBuf::from("/w/services/payments/.arsy/arsy.json"),
             ]
         );
         assert!(layers(workspace, Path::new("/elsewhere"))
