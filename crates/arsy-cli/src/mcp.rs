@@ -102,7 +102,22 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
             "`{name}` cannot be used as a connection name"
         )));
     }
-    match action.as_str() {
+    named_action(&action, name, scope, arguments, positional)
+}
+
+/// The subcommands that act on one connection by name.
+///
+/// Split from `parse` so that reading which actions take a name, and what each
+/// does with the rest of the line, is not also reading how a line is taken
+/// apart.
+fn named_action(
+    action: &str,
+    name: String,
+    scope: Scope,
+    arguments: &crate::ParsedArguments,
+    positional: Vec<String>,
+) -> Result<Command, Diagnostic> {
+    match action {
         "add" => Ok(Command::McpAdd {
             server: definition(&name, arguments, positional)?,
             scope,
@@ -111,7 +126,7 @@ pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> 
             if !positional.is_empty() {
                 return Err(usage(format!("mcp {action} takes one connection name")));
             }
-            Ok(match action.as_str() {
+            Ok(match action {
                 "remove" => Command::McpRemove { name, scope },
                 other => Command::McpEnable {
                     name,

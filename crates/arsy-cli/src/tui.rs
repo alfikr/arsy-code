@@ -350,18 +350,16 @@ fn base64(bytes: &[u8]) -> String {
     for group in bytes.chunks(3) {
         let packed = group
             .iter()
-            .enumerate()
-            .fold(0u32, |packed, (index, byte)| {
-                packed | (u32::from(*byte) << (16 - 8 * index))
+            .zip([16, 8, 0])
+            .fold(0u32, |packed, (byte, shift)| {
+                packed | (u32::from(*byte) << shift)
             });
-        for index in 0..=group.len() {
-            out.push(char::from(
-                ALPHABET[(packed >> (18 - 6 * index)) as usize & 0x3f],
-            ));
-        }
-        for _ in group.len()..3 {
-            out.push('=');
-        }
+        let symbol = |shift: u32| char::from(ALPHABET[(packed >> shift) as usize & 0x3f]);
+        // Two symbols always, then one per byte the group actually carried.
+        out.push(symbol(18));
+        out.push(symbol(12));
+        out.push(if group.len() > 1 { symbol(6) } else { '=' });
+        out.push(if group.len() > 2 { symbol(0) } else { '=' });
     }
     out
 }
@@ -487,32 +485,39 @@ fn terminal_size(field: usize, variable: &str, default: usize) -> usize {
 
 /// Strip SGR escapes (`ESC [ ... m`) so padding counts printed columns only.
 fn strip_sgr(text: &str) -> String {
+    /// Where the scan stands. A colour ends at its `m`, but an image is an APC
+    /// string — `_ ... ESC \` — whose base64 payload can hold any letter, so
+    /// that one ends only at its terminator. Either can be the next thing
+    /// seen, so both are tracked in one pass over the text.
+    #[derive(Clone, Copy)]
+    enum Scan {
+        Text,
+        /// An `ESC`, with the character after it still to say which kind.
+        Opened,
+        Colour,
+        Image,
+        /// An `ESC` inside an image, which closes it if a `\` follows.
+        Closing,
+    }
+
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(character) = chars.next() {
-        if character == '\x1b' {
-            // An image is an APC string: `_ ... ESC \`. Its base64 payload can
-            // hold any letter, so it has to be closed on its terminator rather
-            // than on the first `m` the way a colour is.
-            if chars.clone().next() == Some('_') {
-                let mut previous = None;
-                for escaped in chars.by_ref() {
-                    if previous == Some('\x1b') && escaped == '\\' {
-                        break;
-                    }
-                    previous = Some(escaped);
-                }
-                continue;
+    let mut scan = Scan::Text;
+    for character in text.chars() {
+        scan = match (scan, character) {
+            (Scan::Text, '\x1b') => Scan::Opened,
+            (Scan::Text, _) => {
+                out.push(character);
+                Scan::Text
             }
-            // Consume `[ ... m`; an unterminated sequence drops to end of text.
-            for escaped in chars.by_ref() {
-                if escaped == 'm' {
-                    break;
-                }
-            }
-        } else {
-            out.push(character);
-        }
+            (Scan::Opened, '_') => Scan::Image,
+            // An unterminated escape drops the rest of the text, as it did
+            // when this consumed the tail with an inner loop.
+            (Scan::Opened | Scan::Colour, 'm') => Scan::Text,
+            (Scan::Opened | Scan::Colour, _) => Scan::Colour,
+            (Scan::Image | Scan::Closing, '\x1b') => Scan::Closing,
+            (Scan::Closing, '\\') => Scan::Text,
+            (Scan::Image | Scan::Closing, _) => Scan::Image,
+        };
     }
     out
 }
