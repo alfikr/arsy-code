@@ -4483,26 +4483,10 @@ fn native_turn(
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
-        let trimmed =
-            arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history));
-        if trimmed.changed() {
-            let mut terminal = io::stdout();
-            writeln!(
-                terminal,
-                "{}",
-                tui::tool_result_row(
-                    colour,
-                    "context",
-                    true,
-                    &format!(
-                        "elided {} tool result(s) and compacted {} earlier message(s) to stay \
-                         within {} tokens",
-                        trimmed.elided, trimmed.summarized, trimmed.after
-                    )
-                )
-            )?;
-            terminal.flush()?;
-        }
+        report_trim(
+            colour,
+            &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
+        )?;
         let mut outcome = native_status(
             resolved,
             runtime,
@@ -4557,52 +4541,41 @@ fn native_turn(
             // Once the turn is stopped the remaining calls are still answered,
             // because a call the provider sent needs a result; they are simply
             // answered without running anything.
-            let (content, is_error) = if outcome.interrupted {
-                all_repeated = false;
-                ("The operator declined to run this call.".to_owned(), true)
-            } else if let Some(previous) = cached {
-                (
+            let (content, is_error) = match (outcome.interrupted, cached) {
+                // Once the turn is stopped the remaining calls are still
+                // answered, because a call the provider sent needs a result;
+                // they are simply answered without running anything.
+                (true, _) => {
+                    all_repeated = false;
+                    ("The operator declined to run this call.".to_owned(), true)
+                }
+                (false, Some(previous)) => (
                     format!(
                         "This exact tool call already completed successfully; skipped duplicate.\n\
                          {previous}"
                     ),
                     false,
-                )
-            } else {
-                all_repeated = false;
-                // A new effect can invalidate an earlier read or command
-                // result, so only reuse calls until the next effectful call.
-                if !runtime.is_observational(name, arguments) {
-                    completed_calls.clear();
-                }
-                match execute_call(
-                    runtime,
-                    &mut terminal,
-                    colour,
-                    name,
-                    arguments,
-                    &summary,
-                    keys,
-                    decoder,
-                    approval,
-                )? {
-                    Executed::Answered(mut result) => {
-                        if !result.changed_files.is_empty() {
-                            result.output.push_str("\nChanged files:\n");
-                            for path in &result.changed_files {
-                                result.output.push_str(&format!("  • {path}\n"));
-                            }
-                        }
-                        if result.success {
-                            completed_calls.insert(fingerprint, result.output.clone());
-                        }
-                        (result.output, !result.success)
-                    }
-                    Executed::Stopped => {
-                        outcome.interrupted = true;
-                        writeln!(terminal, "{}", tui::interrupted_row(colour))?;
-                        ("The operator stopped the turn.".to_owned(), true)
-                    }
+                ),
+                (false, None) => {
+                    all_repeated = false;
+                    run_call(
+                        runtime,
+                        &mut terminal,
+                        colour,
+                        &summary,
+                        Call {
+                            name,
+                            arguments,
+                            fingerprint,
+                        },
+                        Answering {
+                            keys,
+                            decoder,
+                            approval,
+                            completed: &mut completed_calls,
+                            interrupted: &mut outcome.interrupted,
+                        },
+                    )?
                 }
             };
             if !repeated {
@@ -4665,6 +4638,102 @@ fn native_turn(
         }
     }
     Ok(Turn::default())
+}
+
+/// Say what a context trim removed, when it removed anything.
+///
+/// A transcript that has outgrown the window fails at the provider, so the
+/// operator is told what was elided rather than watching the turn shrink
+/// invisibly.
+#[cfg(feature = "tui")]
+fn report_trim(colour: bool, trimmed: &arsy_code::agent::budget::Trimmed) -> io::Result<()> {
+    if !trimmed.changed() {
+        return Ok(());
+    }
+    let mut terminal = io::stdout();
+    writeln!(
+        terminal,
+        "{}",
+        tui::tool_result_row(
+            colour,
+            "context",
+            true,
+            &format!(
+                "elided {} tool result(s) and compacted {} earlier message(s) to stay \
+                 within {} tokens",
+                trimmed.elided, trimmed.summarized, trimmed.after
+            )
+        )
+    )?;
+    terminal.flush()
+}
+
+/// The call being answered.
+#[cfg(feature = "tui")]
+struct Call<'a> {
+    name: &'a str,
+    arguments: &'a Value,
+    /// Identifies the effect, so an identical later call can be answered from
+    /// this one's result.
+    fingerprint: String,
+}
+
+/// What answering a call is allowed to touch.
+#[cfg(feature = "tui")]
+struct Answering<'a> {
+    keys: &'a std::sync::mpsc::Receiver<u8>,
+    decoder: &'a mut tui::Keys,
+    approval: &'a approval::ApprovalCell,
+    completed: &'a mut std::collections::HashMap<String, String>,
+    interrupted: &'a mut bool,
+}
+
+/// Run one call and turn what happened into the result the provider is sent.
+#[cfg(feature = "tui")]
+fn run_call(
+    runtime: &arsy_code::agent::ToolRuntime,
+    terminal: &mut io::Stdout,
+    colour: bool,
+    summary: &str,
+    call: Call<'_>,
+    answering: Answering<'_>,
+) -> io::Result<(String, bool)> {
+    // A new effect can invalidate an earlier read or command result, so only
+    // reuse calls until the next effectful call.
+    if !runtime.is_observational(call.name, call.arguments) {
+        answering.completed.clear();
+    }
+    match execute_call(
+        runtime,
+        terminal,
+        colour,
+        call.name,
+        call.arguments,
+        summary,
+        answering.keys,
+        answering.decoder,
+        answering.approval,
+    )? {
+        Executed::Answered(mut result) => {
+            if !result.changed_files.is_empty() {
+                result.output.push_str("\nChanged files:\n");
+                for path in &result.changed_files {
+                    result.output.push_str(&format!("  • {path}\n"));
+                }
+            }
+            if result.success {
+                answering
+                    .completed
+                    .insert(call.fingerprint, result.output.clone());
+            }
+            Ok((result.output, !result.success))
+        }
+        Executed::Stopped => {
+            *answering.interrupted = true;
+            writeln!(terminal, "{}", tui::interrupted_row(colour))?;
+            Ok(("The operator stopped the turn.".to_owned(), true))
+        }
+    }
 }
 
 /// What happened to one tool call.
