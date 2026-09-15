@@ -2712,98 +2712,25 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
-            Prompt::Session(mut dialog) => {
+            Prompt::Session(dialog) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let width = tui::terminal_width();
-                writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
-                stdout.flush().map_err(terminal_failed)?;
-                loop {
-                    match keys.recv() {
-                        Ok(byte) => {
-                            if let Some(key) = decoder.feed(byte) {
-                                if let Some(action) = dialog.handle_key(key) {
-                                    match action {
-                                        tui::SessionAction::Resume(id) => {
-                                            let loaded = resume_into(
-                                                id,
-                                                Restoring {
-                                                    workspace: &workspace,
-                                                    state: &mut state,
-                                                    conversation: &mut conversation,
-                                                    transcript: &mut transcript,
-                                                    history: &mut history,
-                                                    approval: &approval,
-                                                    queued: &mut queued,
-                                                },
-                                            );
-                                            writeln!(
-                                                stdout,
-                                                "Resumed session {id} ({loaded} message(s) loaded)."
-                                            )
-                                            .map_err(terminal_failed)?;
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Rename(id, title) => {
-                                            if let Ok(store) = open_store(&workspace) {
-                                                let _ = store.set_session_title(id, &title);
-                                            }
-                                            writeln!(
-                                                stdout,
-                                                "Renamed session {id} to \"{title}\"."
-                                            )
-                                            .map_err(terminal_failed)?;
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Delete(id) => {
-                                            let is_current = id == state.session_id();
-                                            if let Ok(store) = open_store(&workspace) {
-                                                let _ = store.delete_session(id);
-                                            }
-                                            if is_current {
-                                                let new_session = SessionId::new();
-                                                state.set_session_id(new_session);
-                                                conversation.clear();
-                                                transcript.clear();
-                                                history =
-                                                    arsy_code::agent::budget::History::default();
-                                                set_approval_mode(
-                                                    &approval,
-                                                    &mut state,
-                                                    approval::ApprovalMode::Default,
-                                                );
-                                                queued.clear();
-                                                writeln!(
-                                                    stdout,
-                                                    "Deleted current session. Started fresh session {new_session}."
-                                                )
-                                                .map_err(terminal_failed)?;
-                                            } else {
-                                                writeln!(stdout, "Deleted session {id}.")
-                                                    .map_err(terminal_failed)?;
-                                            }
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                        tui::SessionAction::Cancel => {
-                                            prompt = Prompt::Task;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
-                                        .map_err(terminal_failed)?;
-                                    stdout.flush().map_err(terminal_failed)?;
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            prompt = Prompt::Task;
-                            break;
-                        }
-                    }
-                }
+                run_session_dialog(
+                    dialog,
+                    Restoring {
+                        workspace: &workspace,
+                        state: &mut state,
+                        conversation: &mut conversation,
+                        transcript: &mut transcript,
+                        history: &mut history,
+                        approval: &approval,
+                        queued: &mut queued,
+                    },
+                    &mut stdout,
+                    colour,
+                    &keys,
+                    &mut decoder,
+                )?;
+                prompt = Prompt::Task;
             }
             Prompt::Task if manages_session(&line) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -4524,6 +4451,65 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// Drive the session dialog until it is answered or left.
+///
+/// The dialog owns the keyboard while it is open: it is a list in front of the
+/// reader, and every key belongs to it until it closes.
+#[cfg(feature = "tui")]
+fn run_session_dialog(
+    mut dialog: tui::SessionDialogState,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let width = tui::terminal_width();
+    writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    loop {
+        // A keyboard that hung up leaves the dialog, rather than holding the
+        // session on a list nothing can answer.
+        let Ok(byte) = keys.recv() else {
+            return Ok(());
+        };
+        let Some(action) = decoder.feed(byte).and_then(|key| dialog.handle_key(key)) else {
+            write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
+                .map_err(terminal_failed)?;
+            stdout.flush().map_err(terminal_failed)?;
+            continue;
+        };
+        let borrowed = Restoring {
+            workspace: restoring.workspace,
+            state: restoring.state,
+            conversation: restoring.conversation,
+            transcript: restoring.transcript,
+            history: restoring.history,
+            approval: restoring.approval,
+            queued: restoring.queued,
+        };
+        match action {
+            tui::SessionAction::Resume(id) => {
+                let loaded = resume_into(id, borrowed);
+                writeln!(stdout, "Resumed session {id} ({loaded} message(s) loaded).")
+                    .map_err(terminal_failed)?;
+            }
+            tui::SessionAction::Rename(id, title) => {
+                if let Ok(store) = open_store(borrowed.workspace) {
+                    let _ = store.set_session_title(id, &title);
+                }
+                writeln!(stdout, "Renamed session {id} to \"{title}\".")
+                    .map_err(terminal_failed)?;
+            }
+            tui::SessionAction::Delete(id) => {
+                delete_session(Some(&id.to_string()), borrowed, stdout)?;
+            }
+            tui::SessionAction::Cancel => {}
+        }
+        return Ok(());
+    }
 }
 
 /// The slash commands that act on the recorded session rather than on the
