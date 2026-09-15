@@ -1434,6 +1434,44 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
     json!({"configuration": listing})
 }
 
+/// Replace a file's contents in one step.
+///
+/// A `write` truncates before it writes, so anything reading the file in
+/// between sees it empty — and an empty `arsy.json` is a fatal parse error
+/// rather than a missing layer. Staging beside the destination and renaming
+/// over it means a reader sees either the old contents or the new ones.
+fn replace_file(path: &Path, body: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("a settings file needs a directory"))?;
+    std::fs::create_dir_all(parent)?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("settings"),
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(body)?;
+        file.sync_all()
+    })();
+    if written.is_ok() {
+        // Rename replaces on every target ARSY ships for, so nothing is left
+        // half written even when the destination is already there.
+        if let Err(error) = std::fs::rename(&staged, path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&staged);
+    written
+}
+
 /// Create `~/.arsy/arsy.json` when it is not there yet, carrying over the
 /// `config.toml` an older ARSY kept in the platform configuration directory.
 ///
@@ -1470,13 +1508,14 @@ fn bootstrap_user_config() {
         return;
     }
     let body = carried.unwrap_or_else(|| "{}".to_owned());
-    // Written beside the destination and linked into place, so a second ARSY
+    // Staged beside the destination and linked into place, so a second ARSY
     // starting at the same time reads either nothing or the whole file. A
     // created-then-written file is visible while it is still empty, and an
     // empty `arsy.json` is a fatal parse error rather than a missing layer.
     //
-    // `hard_link` is the create-if-absent half: it fails when the destination
-    // exists, so neither process truncates what the other carried over.
+    // `hard_link` rather than the rename `replace_file` uses: it fails when
+    // the destination exists, so neither process truncates what the other
+    // carried over.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let staged = parent.join(format!(
         ".{}.{}.{}.tmp",
@@ -3323,10 +3362,7 @@ fn saved_route() -> Option<tui::ModelRoute> {
 fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
     let path = model_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{route}\n"))
+    replace_file(&path, format!("{route}\n").as_bytes())
 }
 
 /// The remembered reasoning effort, beside the remembered model.
@@ -3350,11 +3386,8 @@ fn saved_effort() -> Option<Effort> {
 fn save_effort(effort: Option<Effort>) -> io::Result<()> {
     let path = effort_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     match effort {
-        Some(effort) => std::fs::write(path, format!("{effort}\n")),
+        Some(effort) => replace_file(&path, format!("{effort}\n").as_bytes()),
         None => match std::fs::remove_file(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             result => result,
@@ -3382,10 +3415,7 @@ fn saved_theme() -> Option<String> {
 fn save_theme(name: &str) -> io::Result<()> {
     let path = theme_store()
         .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{name}\n"))
+    replace_file(&path, format!("{name}\n").as_bytes())
 }
 
 #[cfg(feature = "tui")]
@@ -4040,10 +4070,7 @@ fn write_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(),
         Err(error) => return Err(format!("the configuration could not be read: {error}")),
     };
     let updated = edit(&original)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    std::fs::write(&path, updated)
+    replace_file(&path, updated.as_bytes())
         .map_err(|error| format!("the configuration could not be written: {error}"))
 }
 

@@ -64,8 +64,8 @@ impl Scope {
 }
 
 const HELP: &str = "mcp requires `list`, `show <NAME>`, `add <NAME> --transport <stdio|http> \
-                    (--command <CMD> [ARGS...] | --url <URL>)`, `remove <NAME>`, `enable <NAME>`, \
-                    `disable <NAME>`, or `test <NAME>`";
+                    (--command <CMD> [ARGS...] | --url <URL>)`, `import`, `remove <NAME>`, \
+                    `enable <NAME>`, `disable <NAME>`, or `test <NAME>`";
 
 pub fn parse(arguments: &crate::ParsedArguments) -> Result<Command, Diagnostic> {
     let mut positional = arguments.positional.clone();
@@ -494,16 +494,7 @@ fn read(path: &Path) -> Result<String, Diagnostic> {
 }
 
 fn write(path: &Path, body: &str) -> Result<(), Diagnostic> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            Diagnostic::error(
-                crate::ARSY_CFG_1000,
-                format!("cannot create {}: {error}", parent.display()),
-                "check the directory's permissions",
-            )
-        })?;
-    }
-    std::fs::write(path, body).map_err(|error| {
+    crate::replace_file(path, body.as_bytes()).map_err(|error| {
         Diagnostic::error(
             crate::ARSY_CFG_1000,
             format!("cannot write {}: {error}", path.display()),
