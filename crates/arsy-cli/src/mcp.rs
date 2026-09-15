@@ -300,7 +300,9 @@ pub fn import(
     let mut skipped = Vec::new();
     for declaration in declared_for_import(&root)? {
         let server = server_from_declaration(&declaration)?;
-        if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)? {
+        if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)?
+            || imported.contains(&server.name)
+        {
             skipped.push(server.name);
             continue;
         }
@@ -335,15 +337,10 @@ fn declared_for_import(root: &Path) -> Result<Vec<Value>, Diagnostic> {
     } else {
         root.to_path_buf()
     };
-    let mut declarations = importer
-        .mcp_declarations(arsy_code::compat::Ecosystem::Claude, &working)
-        .map_err(|error| {
-            Diagnostic::error(
-                "ARSY-CMP-1001",
-                format!("claude import failed: {error}"),
-                "fix the source configuration; no connection was written",
-            )
-        })?;
+    // The operator's own file comes first. A name is imported once and a
+    // repeat is skipped, so whichever is read first wins — and a definition
+    // the operator wrote must not be displaced by one a checkout carries.
+    let mut declarations = Vec::new();
     if let Some(home) = arsy_kernel::config::home_config_file(".claude.json") {
         declarations.extend(
             arsy_code::compat::user_mcp_declarations(&home).map_err(|error| {
@@ -355,6 +352,17 @@ fn declared_for_import(root: &Path) -> Result<Vec<Value>, Diagnostic> {
             })?,
         );
     }
+    declarations.extend(
+        importer
+            .mcp_declarations(arsy_code::compat::Ecosystem::Claude, &working)
+            .map_err(|error| {
+                Diagnostic::error(
+                    "ARSY-CMP-1001",
+                    format!("claude import failed: {error}"),
+                    "fix the source configuration; no connection was written",
+                )
+            })?,
+    );
     Ok(declarations)
 }
 
