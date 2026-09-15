@@ -2716,25 +2716,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Task if matches!(line.trim(), ":quit" | "/quit" | "/exit") => break,
             Prompt::Task if line.trim().starts_with('/') => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                if line.split_whitespace().next() == Some("/help") {
-                    write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed)?;
-                } else if let Some(args) = inspection_args(&line) {
-                    match parse(args) {
-                        Ok(parsed) => {
-                            let inspection = Invocation {
-                                command: parsed.command,
-                                ..invocation.clone()
-                            };
-                            if let Err(diagnostic) = execute(&inspection, false, emitter) {
-                                emitter.diagnostic(&diagnostic);
-                            }
-                        }
-                        Err(diagnostic) => emitter.diagnostic(&diagnostic),
-                    }
-                } else {
-                    writeln!(stdout, "Unknown command. Use /help for available actions.")
-                        .map_err(terminal_failed)?;
-                }
+                inspect_command(&line, invocation, &mut stdout, colour, emitter)?;
             }
             Prompt::Task if line.trim().is_empty() => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
@@ -2753,11 +2735,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     ));
                     continue;
                 }
-                let footer = state.status_row(
-                    tui::terminal_width(),
-                    colour,
-                    tui::branch(&workspace).as_deref(),
-                );
                 let selected_provider = resolve_route(
                     invocation,
                     &workspace,
@@ -2765,53 +2742,36 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     &mut resolved_providers,
                     &mut unavailable_providers,
                 );
-                match run_turn(
+                let footer = state.status_row(
+                    tui::terminal_width(),
+                    colour,
+                    tui::branch(&workspace).as_deref(),
+                );
+                let pass = take_turn(
                     invocation,
-                    state.session_id(),
                     selected_provider,
                     &line,
-                    &history,
-                    &route,
-                    effort,
-                    colour,
                     &footer,
-                    &mut conversation,
-                    &mut transcript,
+                    Running {
+                        workspace: &workspace,
+                        route: &route,
+                        effort,
+                        colour,
+                        state: &mut state,
+                        conversation: &mut conversation,
+                        transcript: &mut transcript,
+                        history: &history,
+                        approval: &approval,
+                        queued: &mut queued,
+                    },
+                    &mut stdout,
                     &keys,
                     &mut decoder,
                     &mut composer,
-                    &approval,
                     emitter,
-                ) {
-                    Ok(turn) if turn.quit => break,
-                    Ok(turn) => {
-                        if turn.interrupted {
-                            queued.clear();
-                        }
-                        queued.extend(turn.queued);
-                        // Mode changes made while the provider was streaming
-                        // happen through the shared cell; refresh the visible
-                        // projection before deciding whether a plan dialog is
-                        // still appropriate.
-                        state.set_approval_mode(approval.get().label());
-                        if approval.get() == approval::ApprovalMode::Plan
-                            && !turn.interrupted
-                            && turn.failure.is_none()
-                        {
-                            settle_plan(
-                                &workspace,
-                                &turn.response,
-                                &approval,
-                                &mut state,
-                                &mut queued,
-                                &mut stdout,
-                                colour,
-                                &keys,
-                                &mut decoder,
-                            )?;
-                        }
-                    }
-                    Err(diagnostic) => emitter.diagnostic(&diagnostic),
+                )?;
+                if pass == Pass::Stop {
+                    break;
                 }
             }
         }
@@ -4284,6 +4244,130 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     Ok((child, error_output, input, events))
 }
 
+/// What a turn runs against, and what it is allowed to change.
+#[cfg(feature = "tui")]
+struct Running<'a> {
+    workspace: &'a Path,
+    route: &'a tui::ModelRoute,
+    effort: Option<Effort>,
+    colour: bool,
+    state: &'a mut tui::TuiState,
+    conversation: &'a mut Vec<ModelMessage>,
+    transcript: &'a mut tui::Transcript,
+    history: &'a arsy_code::agent::budget::History,
+    approval: &'a approval::ApprovalCell,
+    queued: &'a mut std::collections::VecDeque<String>,
+}
+
+/// Run one turn and settle what it left behind.
+///
+/// Answers whether the session carries on: a turn can end it, and nothing
+/// after that should run.
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn take_turn(
+    invocation: &Invocation,
+    resolved: Option<&provider::Resolved>,
+    line: &str,
+    footer: &str,
+    running: Running<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    emitter: &mut Emitter,
+) -> Result<Pass, Diagnostic> {
+    let turn = match run_turn(
+        invocation,
+        running.state.session_id(),
+        resolved,
+        line,
+        running.history,
+        running.route,
+        running.effort,
+        running.colour,
+        footer,
+        running.conversation,
+        running.transcript,
+        keys,
+        decoder,
+        composer,
+        running.approval,
+        emitter,
+    ) {
+        Ok(turn) if turn.quit => return Ok(Pass::Stop),
+        Ok(turn) => turn,
+        Err(diagnostic) => {
+            emitter.diagnostic(&diagnostic);
+            return Ok(Pass::Go);
+        }
+    };
+    // A stopped turn takes the queue with it: a follow-up was queued to run
+    // after this one, not instead of the stop.
+    if turn.interrupted {
+        running.queued.clear();
+    }
+    running.queued.extend(turn.queued);
+    // Mode changes made while the provider was streaming happen through the
+    // shared cell; refresh the visible projection before deciding whether a
+    // plan dialog is still appropriate.
+    running
+        .state
+        .set_approval_mode(running.approval.get().label());
+    if running.approval.get() == approval::ApprovalMode::Plan
+        && !turn.interrupted
+        && turn.failure.is_none()
+    {
+        settle_plan(
+            running.workspace,
+            &turn.response,
+            running.approval,
+            running.state,
+            running.queued,
+            stdout,
+            running.colour,
+            keys,
+            decoder,
+        )?;
+    }
+    Ok(Pass::Go)
+}
+
+/// Answer a slash command that only reads: help, or one of the inspections
+/// the CLI already answers.
+///
+/// The inspection runs through the same parser and the same dispatch a typed
+/// `arsy` command does, so the two can never drift apart.
+#[cfg(feature = "tui")]
+fn inspect_command(
+    line: &str,
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    if line.split_whitespace().next() == Some("/help") {
+        return write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed);
+    }
+    let Some(args) = inspection_args(line) else {
+        return writeln!(stdout, "Unknown command. Use /help for available actions.")
+            .map_err(terminal_failed);
+    };
+    match parse(args) {
+        Ok(parsed) => {
+            let inspection = Invocation {
+                command: parsed.command,
+                ..invocation.clone()
+            };
+            if let Err(diagnostic) = execute(&inspection, false, emitter) {
+                emitter.diagnostic(&diagnostic);
+            }
+        }
+        Err(diagnostic) => emitter.diagnostic(&diagnostic),
+    }
+    Ok(())
+}
+
 /// Fix the palette before the first frame.
 ///
 /// A rejected `[theme]` override is reported and dropped, never left to blank
@@ -5364,6 +5448,7 @@ fn absorb_event(event: &Value, outcome: &mut Turn, finished: &mut Option<std::ti
 
 /// Whether the turn's loop carries on.
 #[cfg(feature = "tui")]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum Pass {
     Go,
     Stop,
