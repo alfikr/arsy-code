@@ -6133,6 +6133,9 @@ fn drive_provider(
                 // turn ends, rather than being dropped or blocking.
                 tui::Action::Submit(line) if !line.trim().is_empty() => {
                     if outcome.queued.len() < 16 {
+                        // Queued, not dropped: the row below says it was
+                        // taken, and the turn that follows this one runs it.
+                        outcome.queued.push_back(line);
                         draw(
                             &mut terminal,
                             composer,
@@ -9274,6 +9277,61 @@ mod tests {
         assert_eq!(
             approval::decide(approval.get(), "fs.write"),
             approval::Decision::Approve
+        );
+    }
+
+    #[cfg(all(feature = "tui", unix))]
+    #[test]
+    fn a_follow_up_typed_during_a_provider_turn_is_carried_to_the_next_one() {
+        use std::time::Duration;
+        let route = tui::ModelRoute {
+            provider: tui::CODEX_PROVIDER.to_owned(),
+            model: "default".to_owned(),
+        };
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (sender, keys) = std::sync::mpsc::channel();
+        let typist = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            for byte in b"next thing\r" {
+                let _ = sender.send(*byte);
+            }
+            // The keyboard outlives the turn, so the loop never reads the
+            // follow-up as the operator hanging up.
+            std::thread::sleep(Duration::from_secs(1));
+        });
+        // Streams for a moment, so there is a turn to type into, then ends.
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' '{\"type\":\"turn.started\"}'; sleep 0.4; \
+             printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+        ]);
+        let result = drive_provider(
+            command,
+            "task\n",
+            &route,
+            &approval,
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &Redactor::new(),
+        )
+        .unwrap();
+        typist.join().unwrap();
+
+        // Reported as queued and actually queued: a row that says a follow-up
+        // was taken, over a queue that dropped it, is worse than refusing it.
+        assert_eq!(
+            result.queued.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["next thing"],
+            "the follow-up runs after this turn"
+        );
+        assert!(
+            !result.interrupted,
+            "typing a follow-up does not stop the turn"
         );
     }
 
