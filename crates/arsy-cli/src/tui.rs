@@ -242,19 +242,132 @@ fn logo(colour: bool) -> &'static [String] {
     }
 }
 
-fn render_logo(colour: bool) -> Vec<String> {
+/// Rasterise the mark into a canvas `scale` times the cell grid it occupies.
+///
+/// The canvas keeps the grid's own aspect — one cell is two rows of pixels —
+/// so the same geometry serves the half-block rows and the image a terminal
+/// with a graphics protocol draws, and neither comes out stretched.
+fn logo_pixmap(scale: u32) -> resvg::tiny_skia::Pixmap {
     let tree = resvg::usvg::Tree::from_data(LOGO_SVG, &resvg::usvg::Options::default())
         .expect("embedded ARSY logo must be valid SVG");
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(LOGO_WIDTH as u32, (LOGO_HEIGHT * 2) as u32)
-        .expect("fixed logo canvas must be valid");
-    let scale = (LOGO_WIDTH as f32 / tree.size().width())
-        .min((LOGO_HEIGHT * 2) as f32 / tree.size().height());
+    let width = LOGO_WIDTH as u32 * scale;
+    let height = (LOGO_HEIGHT * 2) as u32 * scale;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(width, height).expect("fixed logo canvas must be valid");
+    let fit = (width as f32 / tree.size().width()).min(height as f32 / tree.size().height());
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        resvg::tiny_skia::Transform::from_scale(fit, fit),
         &mut pixmap.as_mut(),
     );
+    pixmap
+}
 
+/// Whether the terminal draws images through the Kitty graphics protocol.
+///
+/// ponytail: environment sniffing rather than the `a=q` handshake, which would
+/// have to read a reply back before the key reader owns the terminal. A
+/// terminal this misses draws the half-block mark, which is the old behaviour;
+/// add the handshake if one worth naming turns up.
+fn logo_graphics() -> bool {
+    std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var("TERM").as_deref() == Ok("xterm-kitty")
+        || matches!(
+            std::env::var("TERM_PROGRAM").as_deref(),
+            Ok("ghostty" | "WezTerm")
+        )
+}
+
+/// The mark drawn into `LOGO_WIDTH` by `LOGO_HEIGHT` cells from wherever the
+/// cursor stands, as Kitty graphics escapes.
+///
+/// The pixels travel once and every later card places the stored image, so
+/// repainting the card on a resize or a mode change costs one short escape
+/// rather than the whole picture again.
+///
+/// `C=1` leaves the cursor where it was, so the caller lays the card out in
+/// text as though the mark were blank space and the image lands on top of it.
+/// `q=2` silences the terminal's acknowledgement, which would otherwise reach
+/// the key reader as input.
+///
+/// ponytail: a terminal that evicts the stored image leaves the mark blank
+/// until the next run, because `q=2` also hides the error that would say so.
+/// Re-transmit on a timer if that ever shows up in practice.
+fn logo_graphic() -> String {
+    /// Identifies the stored image. Any number does; this one is unlikely to
+    /// collide with an image another program left behind.
+    const IMAGE_ID: u32 = 0x4152_5359;
+
+    static SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let placement = format!("\x1b_Ga=p,i={IMAGE_ID},c={LOGO_WIDTH},r={LOGO_HEIGHT},C=1,q=2\x1b\\");
+    if SENT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return placement;
+    }
+    format!("{}{placement}", logo_transmission(IMAGE_ID))
+}
+
+/// The pixels themselves, chunked as the protocol requires.
+fn logo_transmission(id: u32) -> &'static str {
+    /// Pixels per cell in the rasterised canvas. Large enough that the mark is
+    /// drawn from real curves rather than from the cell grid.
+    const SCALE: u32 = 24;
+    /// The protocol's limit on one chunk of base64 payload.
+    const CHUNK: usize = 4096;
+
+    static GRAPHIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    GRAPHIC.get_or_init(|| {
+        let pixmap = logo_pixmap(SCALE);
+        let (width, height) = (pixmap.width(), pixmap.height());
+        let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
+        for pixel in pixmap.pixels() {
+            // The protocol wants straight alpha; a pixmap holds premultiplied.
+            let (red, green, blue) = logo_pixel(*pixel).unwrap_or((0, 0, 0));
+            rgba.extend_from_slice(&[red, green, blue, pixel.alpha()]);
+        }
+        let payload = base64(&rgba);
+        let mut escape = String::with_capacity(payload.len() + 256);
+        let mut rest = payload.as_str();
+        let mut first = true;
+        while !rest.is_empty() {
+            let take = rest.len().min(CHUNK);
+            let (chunk, tail) = rest.split_at(take);
+            let more = u8::from(!tail.is_empty());
+            escape.push_str("\x1b_G");
+            if first {
+                escape.push_str(&format!("a=t,i={id},f=32,s={width},v={height},q=2,"));
+                first = false;
+            }
+            escape.push_str(&format!("m={more};{chunk}\x1b\\"));
+            rest = tail;
+        }
+        escape
+    })
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let packed = group
+            .iter()
+            .enumerate()
+            .fold(0u32, |packed, (index, byte)| {
+                packed | (u32::from(*byte) << (16 - 8 * index))
+            });
+        for index in 0..=group.len() {
+            out.push(char::from(
+                ALPHABET[(packed >> (18 - 6 * index)) as usize & 0x3f],
+            ));
+        }
+        for _ in group.len()..3 {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn render_logo(colour: bool) -> Vec<String> {
+    let pixmap = logo_pixmap(1);
     let pixels = pixmap.pixels();
     (0..LOGO_HEIGHT)
         .map(|row| {
@@ -378,6 +491,19 @@ fn strip_sgr(text: &str) -> String {
     let mut chars = text.chars();
     while let Some(character) = chars.next() {
         if character == '\x1b' {
+            // An image is an APC string: `_ ... ESC \`. Its base64 payload can
+            // hold any letter, so it has to be closed on its terminator rather
+            // than on the first `m` the way a colour is.
+            if chars.clone().next() == Some('_') {
+                let mut previous = None;
+                for escaped in chars.by_ref() {
+                    if previous == Some('\x1b') && escaped == '\\' {
+                        break;
+                    }
+                    previous = Some(escaped);
+                }
+                continue;
+            }
             // Consume `[ ... m`; an unterminated sequence drops to end of text.
             for escaped in chars.by_ref() {
                 if escaped == 'm' {
@@ -866,6 +992,51 @@ mod tests {
         let narrow = state.render(32, true);
         assert!(!strip_sgr(&narrow).contains(&first_mark));
         assert!(strip_sgr(&narrow).contains(">_ ARSY CODE"));
+    }
+
+    #[test]
+    fn an_image_mark_is_measured_as_blank_and_travels_once() {
+        // The payload is base64, so the terminator has to close the escape;
+        // stopping at the first `m` would leave part of it counted as text.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"ARSY"), "QVJTWQ==");
+
+        let image = "\x1b_Ga=p,i=1,c=2,r=1,C=1,q=2;bWFtbWFt\x1b\\";
+        assert_eq!(visible_len(&format!("{image}  ")), 2);
+        assert_eq!(strip_sgr(&format!("{image}ok")), "ok");
+
+        // The pixels travel with the first card and no other, so repainting
+        // the card on a mode change costs one short placement.
+        let first = logo_graphic();
+        let second = logo_graphic();
+        assert!(first.contains("a=t,i="), "the first card carries the image");
+        assert!(second.starts_with("\x1b_Ga=p,i="), "{second}");
+        assert!(second.len() < first.len() / 100, "{}", second.len());
+    }
+
+    #[test]
+    fn the_launch_card_goes_stale_when_the_model_or_the_mode_changes() {
+        let mut state = TuiState::new("/w".into(), SessionId::new());
+        assert!(state.card_is_stale(), "the card has never been drawn");
+        assert!(!state.card_is_stale(), "nothing changed since");
+
+        state.set_approval_mode("plan");
+        assert!(state.card_is_stale(), "the mode the card names changed");
+        assert!(!state.card_is_stale());
+
+        state.set_model_route(ModelRoute {
+            provider: CODEX_PROVIDER.into(),
+            model: "gpt-5.6-luna".into(),
+        });
+        assert!(state.card_is_stale(), "the model the card names changed");
+        assert!(!state.card_is_stale());
+
+        // The effort is a status-row field, not a card field.
+        state.set_effort(Some(Effort::High));
+        assert!(!state.card_is_stale());
     }
 
     #[test]

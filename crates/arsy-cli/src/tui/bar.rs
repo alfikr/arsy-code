@@ -17,6 +17,9 @@ pub struct TuiState {
     model_route: Option<ModelRoute>,
     effort: Option<Effort>,
     approval_mode: String,
+    /// The model and mode the launch card was last drawn with, so a change to
+    /// either can be noticed without every caller reporting it.
+    shown: Option<(Option<ModelRoute>, String)>,
 }
 
 impl TuiState {
@@ -31,7 +34,22 @@ impl TuiState {
             model_route: None,
             effort: None,
             approval_mode: "default".to_owned(),
+            shown: None,
         }
+    }
+
+    /// Whether the launch card on screen still says what the session is doing.
+    ///
+    /// The card names the model and the approval mode, and both can change
+    /// without restarting, so a card left as it was printed describes a
+    /// session that no longer exists. Taking the answer marks it drawn.
+    pub fn card_is_stale(&mut self) -> bool {
+        let current = (self.model_route.clone(), self.approval_mode.clone());
+        if self.shown.as_ref() == Some(&current) {
+            return false;
+        }
+        self.shown = Some(current);
+        true
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -292,7 +310,19 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     // Whichever column is shorter is centred against the other, so the mark
     // sits beside the middle of the label rows rather than being pinned to
     // their first line.
-    let logo = logo(colour);
+    //
+    // A terminal that draws images gets the mark as one, laid out as though it
+    // were blank space: the escape leaves the cursor where it stands and the
+    // image covers the cells the half-blocks would have filled.
+    let drawn = colour && logo_graphics();
+    let blank = " ".repeat(LOGO_WIDTH);
+    let logo: Vec<String> = if drawn {
+        std::iter::once(format!("{}{blank}", logo_graphic()))
+            .chain(std::iter::repeat_n(blank.clone(), LOGO_HEIGHT - 1))
+            .collect()
+    } else {
+        logo(colour).to_vec()
+    };
     let mark_offset = text.len().saturating_sub(logo.len()) / 2;
     let text_offset = logo.len().saturating_sub(text.len()) / 2;
     (0..(logo.len() + mark_offset).max(text.len() + text_offset))
