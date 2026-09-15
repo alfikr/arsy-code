@@ -70,48 +70,79 @@ impl Transcript {
             "Use /help for commands, /mcp and /hooks to inspect integrations."
         )?;
         for entry in &self.entries {
-            match entry {
-                TranscriptEntry::User(text) => {
-                    for (index, line) in text.lines().enumerate() {
-                        let prompt = if index == 0 { "› You" } else { "·" };
-                        writeln!(
-                            terminal,
-                            "{} {}",
-                            paint(colour, BOLD, prompt),
-                            paint(colour, sgr_assistant(), &fit(line, width.saturating_sub(6)))
-                        )?;
-                    }
-                }
-                TranscriptEntry::Assistant(text) => {
-                    writeln!(terminal, "{}", assistant_header(colour))?;
-                    for line in text.lines() {
-                        writeln!(terminal, "{}", assistant_row(colour, &fit(line, width)))?;
-                    }
-                }
-                TranscriptEntry::Tool {
-                    name,
-                    summary,
-                    output,
-                    success,
-                    duration_ms,
-                } => {
-                    let card = tool_card(
-                        width,
-                        colour,
-                        name,
-                        summary,
-                        output,
-                        *success,
-                        std::time::Duration::from_millis(*duration_ms),
-                    );
-                    write!(terminal, "{DISABLE_AUTOWRAP}")?;
-                    writeln!(terminal, "{card}")?;
-                    write!(terminal, "{ENABLE_AUTOWRAP}")?;
-                }
-            }
+            write_entry(terminal, width, colour, entry)?;
         }
         terminal.flush()
     }
+}
+
+/// One transcript entry, as the rows it occupies.
+///
+/// Split from the repaint so that walking the transcript and drawing one of
+/// its entries are separate readings, and neither has to carry the other.
+fn write_entry(
+    terminal: &mut dyn Write,
+    width: usize,
+    colour: bool,
+    entry: &TranscriptEntry,
+) -> std::io::Result<()> {
+    match entry {
+        TranscriptEntry::User(text) => write_user(terminal, width, colour, text),
+        TranscriptEntry::Assistant(text) => write_assistant(terminal, width, colour, text),
+        TranscriptEntry::Tool {
+            name,
+            summary,
+            output,
+            success,
+            duration_ms,
+        } => {
+            let card = tool_card(
+                width,
+                colour,
+                name,
+                summary,
+                output,
+                *success,
+                std::time::Duration::from_millis(*duration_ms),
+            );
+            write!(terminal, "{DISABLE_AUTOWRAP}")?;
+            writeln!(terminal, "{card}")?;
+            write!(terminal, "{ENABLE_AUTOWRAP}")
+        }
+    }
+}
+
+/// What the operator typed: the first row carries the marker, the rest are
+/// continuations of the same message.
+fn write_user(
+    terminal: &mut dyn Write,
+    width: usize,
+    colour: bool,
+    text: &str,
+) -> std::io::Result<()> {
+    for (index, line) in text.lines().enumerate() {
+        let prompt = if index == 0 { "› You" } else { "·" };
+        writeln!(
+            terminal,
+            "{} {}",
+            paint(colour, BOLD, prompt),
+            paint(colour, sgr_assistant(), &fit(line, width.saturating_sub(6)))
+        )?;
+    }
+    Ok(())
+}
+
+fn write_assistant(
+    terminal: &mut dyn Write,
+    width: usize,
+    colour: bool,
+    text: &str,
+) -> std::io::Result<()> {
+    writeln!(terminal, "{}", assistant_header(colour))?;
+    for line in text.lines() {
+        writeln!(terminal, "{}", assistant_row(colour, &fit(line, width)))?;
+    }
+    Ok(())
 }
 
 /// Status dot colours from the brainless `CodexExec` component.
