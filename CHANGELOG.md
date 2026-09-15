@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+* **tui:** keep mode changes, plan previews, tool execution, and provider
+  authentication stable during interactive turns
+
+
 ## [0.1.2](https://github.com/suiflex/arsy-code/compare/v0.1.1...v0.1.2) (2026-09-14)
 
 

@@ -134,14 +134,19 @@ def main():
             terminal.send(b"/plan cancel\r")
             terminal.expect("Planning cancelled. Approval mode: default.")
 
-            # Shift+Tab steps the same modes `/approval` sets, without Enter.
+            # Shift+Tab updates the footer directly and does not print a
+            # synthetic approval command for every key repeat.
             terminal.send(b"\x1b[Z")
-            terminal.expect("Approval mode: acceptEdits")
+            terminal.expect("acceptEdits")
             terminal.send(b"\x1b[Z")
-            terminal.expect("Approval mode: plan")
-            terminal.expect("PLAN")
+            terminal.expect("⏸ PLAN")
             terminal.send(b"/approval default\r")
             terminal.expect("Approval mode: default")
+            with terminal.lock:
+                approval_announcements = terminal.received.count(b"Approval mode:")
+                assert approval_announcements <= 2, (
+                    f"Shift+Tab printed {approval_announcements} approval announcements"
+                )
 
             # `/` opens the command menu, typing filters it, Down moves the
             # marker, and Enter takes the highlighted command, which a second
