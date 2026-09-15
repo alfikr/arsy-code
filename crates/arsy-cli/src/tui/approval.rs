@@ -157,9 +157,37 @@ impl AskDialogState {
             lines.push(Self::box_line(&row, inner, colour, sgr_dim()));
         }
 
-        if let Some(diff) = &self.diff_preview {
+        if self.diff_preview.is_some() {
+            lines.extend(self.preview_rows(inner, colour));
+        }
+
+        lines.push(Self::box_line("", inner, colour, ""));
+        lines.extend(self.option_rows(inner, colour));
+        if self.editing_note || !self.custom_note.is_empty() {
             lines.push(Self::box_line("", inner, colour, ""));
             lines.push(Self::box_line(
+                &self.note_row(),
+                inner,
+                colour,
+                sgr_assistant(),
+            ));
+        }
+
+        lines.push(Self::box_line("", inner, colour, ""));
+        lines.push(Self::box_line(self.hint(), inner, colour, sgr_dim()));
+        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
+        lines.join("\n")
+    }
+
+    /// The scrolled window onto the diff or the plan, with the line that says
+    /// how much of it is not on screen.
+    fn preview_rows(&self, inner: usize, colour: bool) -> Vec<String> {
+        let Some(diff) = &self.diff_preview else {
+            return Vec::new();
+        };
+        let mut rows = vec![
+            Self::box_line("", inner, colour, ""),
+            Self::box_line(
                 if self.plan_decision {
                     "Plan preview:"
                 } else {
@@ -168,76 +196,78 @@ impl AskDialogState {
                 inner,
                 colour,
                 sgr_accent(),
-            ));
-            let preview_lines: Vec<&str> = diff.lines().collect();
-            let max_preview = self.preview_height.max(1);
-            let start = self
-                .preview_offset
-                .min(preview_lines.len().saturating_sub(max_preview));
-            for line in preview_lines.iter().skip(start).take(max_preview) {
-                lines.push(Self::render_diff_line(line, inner, colour));
-            }
-            if preview_lines.len() > max_preview {
-                let end = (start + max_preview).min(preview_lines.len());
-                let more = if self.plan_decision {
-                    format!(
-                        "… lines {}-{} of {} · PgUp/PgDn scroll",
-                        start + 1,
-                        end,
-                        preview_lines.len()
-                    )
-                } else {
-                    format!("… ({} more lines omitted)", preview_lines.len() - end)
-                };
-                lines.push(Self::box_line(&more, inner, colour, sgr_dim()));
-            }
-        }
-
-        lines.push(Self::box_line("", inner, colour, ""));
-
-        for (idx, opt) in self.options.iter().enumerate() {
-            let is_sel = idx == self.selected;
-            let radio = if is_sel { "(•)" } else { "( )" };
-            let opt_num = idx + 1;
-            let label_part = format!("{radio} {opt_num}. {}", opt.label);
-            let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
-            lines.push(Self::box_line(&label_part, inner, colour, sgr));
-            if let Some(desc) = &opt.description {
-                let desc_part = format!("     {desc}");
-                lines.push(Self::box_line(&desc_part, inner, colour, sgr_dim()));
-            }
-        }
-
-        if self.editing_note || !self.custom_note.is_empty() {
-            lines.push(Self::box_line("", inner, colour, ""));
-            let note_display = if self.editing_note {
-                format!("Note: {}█", self.custom_note)
+            ),
+        ];
+        let preview_lines: Vec<&str> = diff.lines().collect();
+        let max_preview = self.preview_height.max(1);
+        let start = self
+            .preview_offset
+            .min(preview_lines.len().saturating_sub(max_preview));
+        rows.extend(
+            preview_lines
+                .iter()
+                .skip(start)
+                .take(max_preview)
+                .map(|line| Self::render_diff_line(line, inner, colour)),
+        );
+        if preview_lines.len() > max_preview {
+            let end = (start + max_preview).min(preview_lines.len());
+            let more = if self.plan_decision {
+                format!(
+                    "… lines {}-{} of {} · PgUp/PgDn scroll",
+                    start + 1,
+                    end,
+                    preview_lines.len()
+                )
             } else {
-                format!("Note: {}", self.custom_note)
+                format!("… ({} more lines omitted)", preview_lines.len() - end)
             };
-            lines.push(Self::box_line(
-                &note_display,
-                inner,
-                colour,
-                sgr_assistant(),
-            ));
+            rows.push(Self::box_line(&more, inner, colour, sgr_dim()));
         }
+        rows
+    }
 
-        lines.push(Self::box_line("", inner, colour, ""));
-        let hint = if self.editing_note {
-            "[Enter] Done Note  [Esc] Clear Note"
-        } else if self.plan_decision && self.custom_note.is_empty() {
-            "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Add Note  [i] Implement  [r] Revise  [c] Cancel"
-        } else if self.plan_decision {
-            "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Edit Note  [i] Implement  [r] Revise  [c] Cancel"
-        } else if self.custom_note.is_empty() {
-            "[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm"
+    /// The answers, each marked with whether it is the one arrowed onto.
+    fn option_rows(&self, inner: usize, colour: bool) -> Vec<String> {
+        let mut rows = Vec::new();
+        for (index, option) in self.options.iter().enumerate() {
+            let selected = index == self.selected;
+            let radio = if selected { "(•)" } else { "( )" };
+            let sgr = if selected { sgr_accent() } else { sgr_dim() };
+            let label = format!("{radio} {}. {}", index + 1, option.label);
+            rows.push(Self::box_line(&label, inner, colour, sgr));
+            if let Some(description) = &option.description {
+                let row = format!("     {description}");
+                rows.push(Self::box_line(&row, inner, colour, sgr_dim()));
+            }
+        }
+        rows
+    }
+
+    fn note_row(&self) -> String {
+        if self.editing_note {
+            format!("Note: {}█", self.custom_note)
         } else {
-            "[↑/↓] Navigate  [1-3] Choose  [n] Edit Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm"
+            format!("Note: {}", self.custom_note)
+        }
+    }
+
+    /// The keys this dialog answers to, in the state it is in.
+    fn hint(&self) -> &'static str {
+        if self.editing_note {
+            return "[Enter] Done Note  [Esc] Clear Note";
+        }
+        let note = if self.custom_note.is_empty() {
+            "Add"
+        } else {
+            "Edit"
         };
-        lines.push(Self::box_line(hint, inner, colour, sgr_dim()));
-        lines.push(paint(colour, sgr_border(), &format!("╰{rule}╯")));
-        lines.join("\n")
+        match (self.plan_decision, note) {
+            (true, "Add") => "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Add Note  [i] Implement  [r] Revise  [c] Cancel",
+            (true, _) => "[↑/↓] Navigate  [PgUp/PgDn] Scroll plan  [1-3] Choose  [e] Edit Note  [i] Implement  [r] Revise  [c] Cancel",
+            (false, "Add") => "[↑/↓] Navigate  [1-3] Choose  [n] Add Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm",
+            (false, _) => "[↑/↓] Navigate  [1-3] Choose  [n] Edit Note  [y] Yes  [a] Auto  [d] Deny  [Enter] Confirm",
+        }
     }
 
     fn render_diff_line(line: &str, inner: usize, colour: bool) -> String {
@@ -297,111 +327,136 @@ impl AskDialogState {
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<AskDialogResult> {
+        // A note takes every key while it is being typed, and a plan preview
+        // takes the keys that scroll it. Only what is left decides the answer.
         if self.editing_note {
-            match key {
-                Key::Enter | Key::Newline => {
-                    self.editing_note = false;
-                    return None;
-                }
-                Key::Char(c) => {
-                    self.custom_note.push(c);
-                    return None;
-                }
-                Key::Backspace => {
-                    self.custom_note.pop();
-                    return None;
-                }
-                Key::Interrupt => {
-                    self.editing_note = false;
-                    self.custom_note.clear();
-                    return None;
-                }
-                _ => return None,
-            }
+            self.edit_note(key);
+            return None;
         }
         if self.plan_decision {
-            match key {
-                Key::PageUp => {
-                    self.scroll_preview(false);
-                    return None;
-                }
-                Key::PageDown => {
-                    self.scroll_preview(true);
-                    return None;
-                }
-                Key::Home => {
-                    self.preview_offset = 0;
-                    return None;
-                }
-                Key::End => {
-                    self.preview_offset = usize::MAX;
-                    self.clamp_preview();
-                    return None;
-                }
-                Key::CycleMode => return Some(AskDialogResult::CycleMode),
-                _ => {}
+            if let Some(handled) = self.scroll_plan(key) {
+                return handled;
             }
         }
+        self.answer(key)
+    }
 
+    /// A key typed into the note. Every key is consumed: a note is being
+    /// written, so nothing here answers the dialog.
+    fn edit_note(&mut self, key: Key) {
+        match key {
+            Key::Enter | Key::Newline => self.editing_note = false,
+            Key::Char(character) => self.custom_note.push(character),
+            Key::Backspace => {
+                self.custom_note.pop();
+            }
+            Key::Interrupt => {
+                self.editing_note = false;
+                self.custom_note.clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// The keys that move the plan preview.
+    ///
+    /// `None` when the key was not one of them and the dialog should go on to
+    /// read it as an answer; `Some` when it was, carrying whatever that key
+    /// resolved to.
+    fn scroll_plan(&mut self, key: Key) -> Option<Option<AskDialogResult>> {
+        match key {
+            Key::PageUp => self.scroll_preview(false),
+            Key::PageDown => self.scroll_preview(true),
+            Key::Home => self.preview_offset = 0,
+            Key::End => {
+                self.preview_offset = usize::MAX;
+                self.clamp_preview();
+            }
+            Key::CycleMode => return Some(Some(AskDialogResult::CycleMode)),
+            _ => return None,
+        }
+        Some(None)
+    }
+
+    /// The keys that choose an answer, or move the marker between them.
+    fn answer(&mut self, key: Key) -> Option<AskDialogResult> {
         match key {
             Key::Up => {
-                if self.selected == 0 {
-                    self.selected = self.options.len().saturating_sub(1);
-                } else {
-                    self.selected -= 1;
-                }
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or_else(|| self.options.len().saturating_sub(1));
                 None
             }
             Key::Down => {
-                if self.selected + 1 >= self.options.len() {
-                    self.selected = 0;
+                self.selected = if self.selected + 1 >= self.options.len() {
+                    0
                 } else {
-                    self.selected += 1;
-                }
+                    self.selected + 1
+                };
                 None
             }
-            Key::Char('e' | 'E') if self.plan_decision => {
-                self.editing_note = true;
-                None
-            }
-            Key::Char('n' | 'N') if !self.plan_decision => {
-                self.editing_note = true;
-                None
-            }
-            Key::Char('i' | 'I') if self.plan_decision => Some(AskDialogResult::Approve {
-                note: self.current_note(),
-            }),
-            Key::Char('r' | 'R') if self.plan_decision => Some(AskDialogResult::AlwaysApprove {
-                note: self.current_note(),
-            }),
-            Key::Char('c' | 'C') if self.plan_decision => Some(AskDialogResult::Deny {
-                note: self.current_note(),
-            }),
-            Key::Char('1' | 'y' | 'Y') => Some(AskDialogResult::Approve {
-                note: self.current_note(),
-            }),
-            Key::Char('2' | 'a' | 'A') => Some(AskDialogResult::AlwaysApprove {
-                note: self.current_note(),
-            }),
-            Key::Char('3' | 'd' | 'D') => Some(AskDialogResult::Deny {
-                note: self.current_note(),
-            }),
-            Key::Enter | Key::Newline | Key::Char(' ') => match self.selected {
-                0 => Some(AskDialogResult::Approve {
-                    note: self.current_note(),
-                }),
-                1 => Some(AskDialogResult::AlwaysApprove {
-                    note: self.current_note(),
-                }),
-                2 => Some(AskDialogResult::Deny {
-                    note: self.current_note(),
-                }),
-                _ => Some(AskDialogResult::Approve {
-                    note: self.current_note(),
-                }),
-            },
+            Key::Enter | Key::Newline | Key::Char(' ') => Some(self.marked()),
+            Key::Char(character) => self.shortcut(character),
             Key::Interrupt => Some(AskDialogResult::Cancel),
             _ => None,
+        }
+    }
+
+    /// Taking the answer the marker stands on. An index past the answers
+    /// cannot happen, and approving is the reading that asks again.
+    fn marked(&self) -> AskDialogResult {
+        match self.selected {
+            1 => self.always(),
+            2 => self.deny(),
+            _ => self.approve(),
+        }
+    }
+
+    /// The letters and numbers that answer without moving the marker.
+    ///
+    /// The plan dialog spells its answers with the words it offers — implement,
+    /// revise, cancel — and every other dialog spells them yes, auto, deny. The
+    /// numbers mean the same thing in both.
+    fn shortcut(&mut self, character: char) -> Option<AskDialogResult> {
+        if self.plan_decision {
+            match character {
+                'e' | 'E' => {
+                    self.editing_note = true;
+                    return None;
+                }
+                'i' | 'I' => return Some(self.approve()),
+                'r' | 'R' => return Some(self.always()),
+                'c' | 'C' => return Some(self.deny()),
+                _ => {}
+            }
+        } else if matches!(character, 'n' | 'N') {
+            self.editing_note = true;
+            return None;
+        }
+        match character {
+            '1' | 'y' | 'Y' => Some(self.approve()),
+            '2' | 'a' | 'A' => Some(self.always()),
+            '3' | 'd' | 'D' => Some(self.deny()),
+            _ => None,
+        }
+    }
+
+    fn approve(&self) -> AskDialogResult {
+        AskDialogResult::Approve {
+            note: self.current_note(),
+        }
+    }
+
+    fn always(&self) -> AskDialogResult {
+        AskDialogResult::AlwaysApprove {
+            note: self.current_note(),
+        }
+    }
+
+    fn deny(&self) -> AskDialogResult {
+        AskDialogResult::Deny {
+            note: self.current_note(),
         }
     }
 }
