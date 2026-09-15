@@ -2805,156 +2805,23 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                     }
                 }
             }
-            Prompt::Task if line.trim() == "/new" => {
+            Prompt::Task if manages_session(&line) => {
                 write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let new_session = SessionId::new();
-                state.set_session_id(new_session);
-                conversation.clear();
-                transcript.clear();
-                history = arsy_code::agent::budget::History::default();
-                set_approval_mode(&approval, &mut state, approval::ApprovalMode::Default);
-                queued.clear();
-                writeln!(stdout, "Started new session {new_session}.").map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.trim() == "/clear" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                conversation.clear();
-                history = arsy_code::agent::budget::History::default();
-                queued.clear();
-                writeln!(
-                    stdout,
-                    "Cleared conversation context for session {}.",
-                    state.session_id()
-                )
-                .map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/resume") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                match line.split_whitespace().nth(1) {
-                    None => {
-                        sessions = load_workspace_sessions(&workspace);
-                        prompt = Prompt::Resume;
-                    }
-                    Some(id_str) => match id_str.parse::<SessionId>() {
-                        Ok(id) => {
-                            (conversation, history) =
-                                reconstruct_session_conversation(&workspace, id);
-                            transcript.clear();
-                            state.set_session_id(id);
-                            set_approval_mode(
-                                &approval,
-                                &mut state,
-                                approval::ApprovalMode::Default,
-                            );
-                            queued.clear();
-                            writeln!(
-                                stdout,
-                                "Resumed session {id} ({} message(s) loaded).",
-                                conversation.len()
-                            )
-                            .map_err(terminal_failed)?;
-                        }
-                        Err(_) => {
-                            writeln!(stdout, "Invalid session ID `{id_str}`.")
-                                .map_err(terminal_failed)?;
-                        }
+                if let Some(next) = manage_session(
+                    &line,
+                    Restoring {
+                        workspace: &workspace,
+                        state: &mut state,
+                        conversation: &mut conversation,
+                        transcript: &mut transcript,
+                        history: &mut history,
+                        approval: &approval,
+                        queued: &mut queued,
                     },
-                }
-            }
-            Prompt::Task if line.trim() == "/update" => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                writeln!(
-                    stdout,
-                    "arsy-code v{} is up to date.",
-                    env!("CARGO_PKG_VERSION")
-                )
-                .map_err(terminal_failed)?;
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/rename") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let title = line.trim_start_matches("/rename").trim();
-                if title.is_empty() {
-                    writeln!(stdout, "Usage: /rename <TITLE>").map_err(terminal_failed)?;
-                } else {
-                    if let Ok(store) = open_store(&workspace) {
-                        let _ = store.set_session_title(state.session_id(), title);
-                    }
-                    writeln!(
-                        stdout,
-                        "Renamed session {} to \"{title}\".",
-                        state.session_id()
-                    )
-                    .map_err(terminal_failed)?;
-                }
-            }
-            Prompt::Task if line.split_whitespace().next() == Some("/session") => {
-                write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                let mut parts = line.split_whitespace().skip(1);
-                match parts.next() {
-                    None => {
-                        let sess = load_workspace_sessions(&workspace);
-                        let dialog = tui::SessionDialogState::new(sess, state.session_id());
-                        prompt = Prompt::Session(dialog);
-                    }
-                    Some("list") => {
-                        sessions = load_workspace_sessions(&workspace);
-                        prompt = Prompt::Resume;
-                    }
-                    Some("rename") => {
-                        let title = parts.collect::<Vec<_>>().join(" ");
-                        if title.is_empty() {
-                            writeln!(stdout, "Usage: /session rename <TITLE>")
-                                .map_err(terminal_failed)?;
-                        } else {
-                            if let Ok(store) = open_store(&workspace) {
-                                let _ = store.set_session_title(state.session_id(), &title);
-                            }
-                            writeln!(
-                                stdout,
-                                "Renamed session {} to \"{title}\".",
-                                state.session_id()
-                            )
-                            .map_err(terminal_failed)?;
-                        }
-                    }
-                    Some("delete" | "rm" | "remove") => {
-                        let target_id = parts
-                            .next()
-                            .and_then(|id_str| id_str.parse::<SessionId>().ok())
-                            .unwrap_or_else(|| state.session_id());
-                        let is_current = target_id == state.session_id();
-                        if let Ok(store) = open_store(&workspace) {
-                            let _ = store.delete_session(target_id);
-                        }
-                        if is_current {
-                            let new_session = SessionId::new();
-                            state.set_session_id(new_session);
-                            conversation.clear();
-                            transcript.clear();
-                            history = arsy_code::agent::budget::History::default();
-                            set_approval_mode(
-                                &approval,
-                                &mut state,
-                                approval::ApprovalMode::Default,
-                            );
-                            queued.clear();
-                            writeln!(
-                                stdout,
-                                "Deleted current session. Started fresh session {new_session}."
-                            )
-                            .map_err(terminal_failed)?;
-                        } else {
-                            writeln!(stdout, "Deleted session {target_id}.")
-                                .map_err(terminal_failed)?;
-                        }
-                    }
-                    _ => {
-                        writeln!(
-                            stdout,
-                            "Usage: /session [list | rename <TITLE> | delete [ID]]"
-                        )
-                        .map_err(terminal_failed)?;
-                    }
+                    &mut sessions,
+                    &mut stdout,
+                )? {
+                    prompt = next;
                 }
             }
             Prompt::Task if line.split_whitespace().next() == Some("/plan") => {
@@ -4657,6 +4524,190 @@ fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<
     let stdout = child.0.stdout.take().expect("piped stdout is available");
     let events = tui::provider_lines(stdout);
     Ok((child, error_output, input, events))
+}
+
+/// The slash commands that act on the recorded session rather than on the
+/// conversation with the model.
+#[cfg(feature = "tui")]
+fn manages_session(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session")
+    )
+}
+
+/// Start, clear, open, rename or delete a session.
+///
+/// `Some` is the dialog or picker the command opened; `None` means it was
+/// answered on the line and the task prompt stays.
+#[cfg(feature = "tui")]
+fn manage_session(
+    line: &str,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let mut words = line.split_whitespace();
+    match words.next() {
+        Some("/new") => {
+            let started = start_session(restoring);
+            writeln!(stdout, "Started new session {started}.").map_err(terminal_failed)?;
+            Ok(None)
+        }
+        // The session is kept; only what the model is told about it is
+        // dropped, so the recording stays whole.
+        Some("/clear") => {
+            let session = restoring.state.session_id();
+            restoring.conversation.clear();
+            *restoring.history = arsy_code::agent::budget::History::default();
+            restoring.queued.clear();
+            writeln!(
+                stdout,
+                "Cleared conversation context for session {session}."
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+        Some("/resume") => resume_command(words.next(), restoring, sessions, stdout),
+        Some("/update") => {
+            writeln!(
+                stdout,
+                "arsy-code v{} is up to date.",
+                env!("CARGO_PKG_VERSION")
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+        Some("/rename") => {
+            let title = line.trim_start_matches("/rename").trim();
+            rename_session(title, "/rename <TITLE>", restoring, stdout)?;
+            Ok(None)
+        }
+        Some("/session") => session_command(words, restoring, sessions, stdout),
+        _ => Ok(None),
+    }
+}
+
+/// Open a session by id, or the list of them when none was named.
+#[cfg(feature = "tui")]
+fn resume_command(
+    id: Option<&str>,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    let Some(id) = id else {
+        *sessions = load_workspace_sessions(restoring.workspace);
+        return Ok(Some(Prompt::Resume));
+    };
+    let Ok(parsed) = id.parse::<SessionId>() else {
+        writeln!(stdout, "Invalid session ID `{id}`.").map_err(terminal_failed)?;
+        return Ok(None);
+    };
+    let loaded = resume_into(parsed, restoring);
+    writeln!(
+        stdout,
+        "Resumed session {parsed} ({loaded} message(s) loaded)."
+    )
+    .map_err(terminal_failed)?;
+    Ok(None)
+}
+
+/// `/session`, with or without a word after it.
+#[cfg(feature = "tui")]
+fn session_command<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    restoring: Restoring<'_>,
+    sessions: &mut Vec<tui::SessionChoice>,
+    stdout: &mut io::Stdout,
+) -> Result<Option<Prompt>, Diagnostic> {
+    match words.next() {
+        None => Ok(Some(Prompt::Session(tui::SessionDialogState::new(
+            load_workspace_sessions(restoring.workspace),
+            restoring.state.session_id(),
+        )))),
+        Some("list") => {
+            *sessions = load_workspace_sessions(restoring.workspace);
+            Ok(Some(Prompt::Resume))
+        }
+        Some("rename") => {
+            let title = words.collect::<Vec<_>>().join(" ");
+            rename_session(&title, "/session rename <TITLE>", restoring, stdout)?;
+            Ok(None)
+        }
+        Some("delete" | "rm" | "remove") => {
+            delete_session(words.next(), restoring, stdout)?;
+            Ok(None)
+        }
+        _ => {
+            writeln!(
+                stdout,
+                "Usage: /session [list | rename <TITLE> | delete [ID]]"
+            )
+            .map_err(terminal_failed)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Give the current session a title, or say how to.
+#[cfg(feature = "tui")]
+fn rename_session(
+    title: &str,
+    usage: &str,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    if title.is_empty() {
+        return writeln!(stdout, "Usage: {usage}").map_err(terminal_failed);
+    }
+    let session = restoring.state.session_id();
+    if let Ok(store) = open_store(restoring.workspace) {
+        let _ = store.set_session_title(session, title);
+    }
+    writeln!(stdout, "Renamed session {session} to \"{title}\".").map_err(terminal_failed)
+}
+
+/// Delete a session, starting a fresh one when it was the open one.
+#[cfg(feature = "tui")]
+fn delete_session(
+    id: Option<&str>,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+) -> Result<(), Diagnostic> {
+    let current = restoring.state.session_id();
+    let target = id
+        .and_then(|id| id.parse::<SessionId>().ok())
+        .unwrap_or(current);
+    if let Ok(store) = open_store(restoring.workspace) {
+        let _ = store.delete_session(target);
+    }
+    if target != current {
+        return writeln!(stdout, "Deleted session {target}.").map_err(terminal_failed);
+    }
+    let started = start_session(restoring);
+    writeln!(
+        stdout,
+        "Deleted current session. Started fresh session {started}."
+    )
+    .map_err(terminal_failed)
+}
+
+/// Begin a session with nothing carried over from the one before it.
+#[cfg(feature = "tui")]
+fn start_session(restoring: Restoring<'_>) -> SessionId {
+    let started = SessionId::new();
+    restoring.state.set_session_id(started);
+    restoring.conversation.clear();
+    restoring.transcript.clear();
+    *restoring.history = arsy_code::agent::budget::History::default();
+    set_approval_mode(
+        restoring.approval,
+        restoring.state,
+        approval::ApprovalMode::Default,
+    );
+    restoring.queued.clear();
+    started
 }
 
 /// The slash commands that choose a setting, by opening its list or by naming
