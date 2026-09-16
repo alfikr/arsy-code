@@ -545,6 +545,19 @@ pub struct Provenance {
     pub path: PathBuf,
 }
 
+/// A model another tool's configuration names.
+///
+/// Only a fallback: it is used for an endpoint that names no model, when no
+/// layer set `model.default`, and only where the endpoint speaks one of
+/// `dialects` — a Claude model is never sent to an OpenAI endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelHint {
+    pub model: String,
+    pub dialects: Vec<Dialect>,
+    /// The endpoint id it must be, when the other tool named its provider.
+    pub provider: Option<String>,
+}
+
 /// What another tool's configuration contributes, already translated into
 /// ARSY's own types at the edge that read it. The kernel never parses another
 /// tool's format; it only places the result below every `arsy.json` layer.
@@ -559,6 +572,8 @@ pub struct CompatSeed {
     /// Each rule's `source` is the scope it was declared in, so a repository's
     /// `allow` is downgraded when the rules are compiled like any other.
     pub policy_rules: Vec<(String, PolicyRule)>,
+    /// In precedence order; the first that fits an endpoint is used.
+    pub models: Vec<ModelHint>,
     /// Whatever was understood but could not be applied, for `config explain`.
     pub notes: Vec<String>,
 }
@@ -714,6 +729,8 @@ pub struct Config {
     mcp_provenance: BTreeMap<String, Provenance>,
     /// `compat.<source>.enabled = false` from any layer.
     compat_disabled: BTreeSet<String>,
+    /// Models other tools name, in seed order.
+    compat_models: Vec<ModelHint>,
     /// `[remote.target.<name>]`, from a trusted layer only.
     remote_targets: BTreeMap<String, RemoteTarget>,
     /// `[lsp.server.<name>]`, from a trusted layer only.
@@ -809,6 +826,15 @@ impl Config {
             self.mcp_servers.insert(server.name.clone(), server.clone());
         }
         self.seed_rules(seed);
+        for hint in &seed.models {
+            self.record(
+                Layer::User,
+                &seed.path,
+                &format!("compat.{}.model", seed.label),
+                hint.model.clone(),
+            );
+        }
+        self.compat_models.extend(seed.models.iter().cloned());
         self.diagnostics
             .extend(seed.notes.iter().map(|message| Diagnostic {
                 key: format!("compat.{}", seed.label),
@@ -846,6 +872,18 @@ impl Config {
     /// re-enable a source the operator turned off.
     pub fn compat_enabled(&self, source: &str) -> bool {
         !self.compat_disabled.contains(source)
+    }
+
+    /// The model another tool names for this endpoint, when `arsy.json` names
+    /// none: the first whose dialect and provider fit and that `model.allowed`
+    /// admits.
+    pub fn compat_model(&self, endpoint: &Endpoint) -> Option<&str> {
+        self.compat_models
+            .iter()
+            .filter(|hint| hint.dialects.contains(&endpoint.kind))
+            .filter(|hint| hint.provider.as_deref().is_none_or(|id| id == endpoint.id))
+            .map(|hint| hint.model.as_str())
+            .find(|model| self.model_is_allowed(model))
     }
 
     /// The tool that declared this MCP connection, when no `arsy.json` did.
@@ -3721,6 +3759,7 @@ access_type = "offline"
                     minimum_assurance: SandboxAssurance::None,
                 },
             )],
+            models: Vec::new(),
             notes: vec!["`permissions.defaultMode` is not mapped".to_owned()],
         }
     }
@@ -3778,6 +3817,48 @@ access_type = "offline"
         .unwrap();
         assert!(config.mcp_provenance(BUNDLED_MCP_SERVER).is_none());
         assert_eq!(config.mcp_server("docs").unwrap().trust, PolicySource::User);
+    }
+
+    #[test]
+    fn another_tools_model_is_only_a_fallback_for_an_endpoint_that_fits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(
+            directory.path(),
+            CONFIG_FILE,
+            "schema_version = 1\n[provider.endpoint.claude]\nkind = \"anthropic\"\nbase_url = \
+             \"https://api.anthropic.com\"\n[provider.endpoint.openai]\nkind = \"openai\"\nbase_url = \
+             \"https://api.openai.com\"\n[model]\nallowed = [\"claude-opus-4-1\", \"gpt-5-codex\"]\n",
+        );
+        let seed = CompatSeed {
+            label: "claude".to_owned(),
+            models: vec![
+                ModelHint {
+                    model: "claude-sonnet-5".to_owned(),
+                    dialects: vec![Dialect::Anthropic],
+                    provider: None,
+                },
+                ModelHint {
+                    model: "claude-opus-4-1".to_owned(),
+                    dialects: vec![Dialect::Anthropic],
+                    provider: None,
+                },
+                ModelHint {
+                    model: "gpt-5-codex".to_owned(),
+                    dialects: vec![Dialect::Openai],
+                    provider: Some("elsewhere".to_owned()),
+                },
+            ],
+            ..CompatSeed::default()
+        };
+        let config = Config::load_with(&[(Layer::User, path)], &[seed]).unwrap();
+        let endpoint = |id: &str| config.endpoint(Some(id)).unwrap().clone();
+        // The first hint is not allowed, so the next that fits is used.
+        assert_eq!(
+            config.compat_model(&endpoint("claude")),
+            Some("claude-opus-4-1")
+        );
+        // A hint for another provider never reaches this one.
+        assert_eq!(config.compat_model(&endpoint("openai")), None);
     }
 
     #[test]
