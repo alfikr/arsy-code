@@ -555,6 +555,10 @@ pub struct CompatSeed {
     /// Each carries the trust of the scope it was declared in: a file in the
     /// operator's home is theirs, one in the checkout is the repository's.
     pub mcp_servers: Vec<McpServer>,
+    /// Keyed by an id under `compat/`, which no `arsy.json` rule can take.
+    /// Each rule's `source` is the scope it was declared in, so a repository's
+    /// `allow` is downgraded when the rules are compiled like any other.
+    pub policy_rules: Vec<(String, PolicyRule)>,
     /// Whatever was understood but could not be applied, for `config explain`.
     pub notes: Vec<String>,
 }
@@ -804,6 +808,7 @@ impl Config {
             );
             self.mcp_servers.insert(server.name.clone(), server.clone());
         }
+        self.seed_rules(seed);
         self.diagnostics
             .extend(seed.notes.iter().map(|message| Diagnostic {
                 key: format!("compat.{}", seed.label),
@@ -811,6 +816,29 @@ impl Config {
                 path: seed.path.clone(),
                 message: message.clone(),
             }));
+    }
+
+    /// Place one tool's policy rules under ids no `arsy.json` rule can take.
+    fn seed_rules(&mut self, seed: &CompatSeed) {
+        for (id, rule) in &seed.policy_rules {
+            let id = format!("compat/{}", id.trim_start_matches("compat/"));
+            let layer = match rule.source {
+                PolicySource::Workspace => Layer::Workspace,
+                _ => Layer::User,
+            };
+            self.record(
+                layer,
+                &seed.path,
+                &format!("policy.rules.{id}"),
+                format!(
+                    "{} {} {}",
+                    effect_name(rule.effect),
+                    rule.action,
+                    rule.pattern
+                ),
+            );
+            self.policy_rules.entry(id).or_insert_with(|| rule.clone());
+        }
     }
 
     /// Whether no layer switched this tool's configuration off. A `false`
@@ -3680,6 +3708,19 @@ access_type = "offline"
                 timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
                 max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
             }],
+            policy_rules: vec![(
+                "claude/user/deny/Bash(rm:*)".to_owned(),
+                PolicyRule {
+                    source: PolicySource::User,
+                    effect: RuleEffect::Deny,
+                    actor: ActorMatch::Any,
+                    action: CapabilityAction::ProcessExec,
+                    pattern: ResourcePattern::new("process", "rm").unwrap(),
+                    expires_at_ms: None,
+                    delegation_depth: 0,
+                    minimum_assurance: SandboxAssurance::None,
+                },
+            )],
             notes: vec!["`permissions.defaultMode` is not mapped".to_owned()],
         }
     }
@@ -3696,6 +3737,17 @@ access_type = "offline"
         let untouched = with("schema_version = 1\n");
         let docs = untouched.mcp_server("docs").unwrap();
         assert!(docs.enabled);
+        let rules = untouched.policy_rules();
+        assert!(
+            rules.iter().any(|rule| rule.effect == RuleEffect::Deny
+                && rule.pattern.to_string() == "process:rm"
+                && rule.source == PolicySource::User),
+            "{rules:?}"
+        );
+        assert!(untouched
+            .explain(Some("policy.rules.compat/claude/user/deny/Bash(rm:*)"))
+            .to_string()
+            .contains(".claude.json"));
         assert_eq!(untouched.mcp_provenance("docs").unwrap().label, "claude");
         assert!(untouched
             .diagnostics()
