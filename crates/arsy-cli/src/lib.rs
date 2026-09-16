@@ -3566,6 +3566,26 @@ fn run_turn(
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    // Loaded once per turn, as `arsy run` loads them: a turn finishes with the
+    // hooks it began with.
+    let loaded = hook_engine(&root, &config);
+    let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
+    let task = turn_boundary(
+        hooks,
+        arsy_code::hook::LifecycleEvent::BeforeTurn,
+        &task,
+        emitter,
+    )
+    .map_err(|reason| {
+        Diagnostic::error(
+            "ARSY-HOK-1001",
+            reason,
+            "the hook that refused it is listed by `/hooks`",
+        )
+    })?;
     let RecordedTurn {
         service,
         mut graph,
@@ -3582,8 +3602,6 @@ fn run_turn(
         role: ModelRole::User,
         content: vec![ModelContent::Text { text: task.clone() }],
     });
-    let root = workspace_root(&invocation.workspace)?;
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     emitter.trace(
         "turn.started",
         json!({
@@ -3600,7 +3618,7 @@ fn run_turn(
             resolved,
             &agent_runtime(
                 &root,
-                &load_config(&root, &working, invocation.config.as_deref())?,
+                &config,
                 true,
                 &session_id.to_string(),
                 Some(session_id),
@@ -3619,6 +3637,7 @@ fn run_turn(
             composer,
             transcript,
             approval,
+            hooks,
         ),
         None => external_status(
             &root,
@@ -3662,6 +3681,19 @@ fn run_turn(
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
+    // Whatever the turn ended as, which is what Codex's `notify` is for.
+    // Nothing it returns can change what already happened.
+    let stop = match (turn.interrupted, &turn.failure) {
+        (true, _) => "interrupted",
+        (false, Some(_)) => "failed",
+        (false, None) => "answered",
+    };
+    let _ = turn_boundary(
+        hooks,
+        arsy_code::hook::LifecycleEvent::AfterTurn,
+        stop,
+        emitter,
+    );
     emitter.trace(
         "turn.finished",
         json!({
@@ -3843,6 +3875,7 @@ fn native_turn(
     composer: &mut tui::Composer,
     transcript: &mut tui::Transcript,
     approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
 ) -> io::Result<Turn> {
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
@@ -3953,6 +3986,7 @@ fn native_turn(
                             approval,
                             completed: &mut completed_calls,
                             interrupted: &mut outcome.interrupted,
+                            hooks,
                         },
                     )?
                 }
@@ -6608,6 +6642,7 @@ struct Answering<'a> {
     approval: &'a approval::ApprovalCell,
     completed: &'a mut std::collections::HashMap<String, String>,
     interrupted: &'a mut bool,
+    hooks: Option<&'a arsy_code::hook::HookEngine>,
 }
 
 /// Run one call and turn what happened into the result the provider is sent.
@@ -6635,6 +6670,7 @@ fn run_call(
         answering.keys,
         answering.decoder,
         answering.approval,
+        answering.hooks,
     )? {
         Executed::Answered(mut result) => {
             if !result.changed_files.is_empty() {
@@ -6684,8 +6720,29 @@ fn execute_call(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
 ) -> io::Result<Executed> {
     let started = std::time::Instant::now();
+    let mut notes = Vec::new();
+    let (arguments, injected) =
+        match hooks.map(|hooks| hook_before_call(hooks, name, arguments, &mut notes)) {
+            None => (arguments.clone(), Vec::new()),
+            Some(hooked) => {
+                let asking = Asking {
+                    name,
+                    arguments,
+                    summary,
+                    keys,
+                    decoder: &mut *decoder,
+                    approval,
+                };
+                match hooked_arguments(terminal, colour, hooked, asking, &notes)? {
+                    Ok(run) => run,
+                    Err(executed) => return Ok(executed),
+                }
+            }
+        };
+    let arguments = &arguments;
     let request = match runtime.prepare(name, arguments) {
         Ok(request) => request,
         Err(failure) => return Ok(Executed::Answered(*failure)),
@@ -6717,7 +6774,71 @@ fn execute_call(
     if let Some(note) = approval_note {
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
+    if let Some(hooks) = hooks {
+        notes.clear();
+        hook_after_call(hooks, name, &injected, &mut result, &mut notes);
+        hook_notes(terminal, colour, &notes)?;
+    }
     Ok(Executed::Answered(result))
+}
+
+/// The arguments a call runs with and what hooks injected for the model.
+#[cfg(feature = "tui")]
+type HookedRun = (Value, Vec<(String, String)>);
+
+/// What `before_operation` leaves the interactive turn to run.
+///
+/// Unlike a scripted run, this surface has an operator, so a hook that wants
+/// one asked gets the approval dialog rather than a refusal.
+#[cfg(feature = "tui")]
+fn hooked_arguments(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    hooked: HookedCall,
+    asking: Asking<'_>,
+    notes: &[String],
+) -> io::Result<Result<HookedRun, Executed>> {
+    hook_notes(terminal, colour, notes)?;
+    let (arguments, injected, reason) = match hooked {
+        HookedCall::Refused(reason) => {
+            return Ok(Err(Executed::Answered(hook_refused(asking.name, reason))))
+        }
+        HookedCall::Run {
+            arguments,
+            injected,
+            approval,
+        } => (arguments, injected, approval),
+    };
+    let Some(reason) = reason else {
+        return Ok(Ok((arguments, injected)));
+    };
+    let answer = confirm_tool(
+        terminal,
+        colour,
+        asking.name,
+        asking.summary,
+        &format!("a hook asks for approval: {reason}"),
+        format_tool_preview(asking.name, &arguments),
+        asking.keys,
+        asking.decoder,
+        asking.approval,
+    )?;
+    Ok(match answer {
+        Answer::Yes { .. } => Ok((arguments, injected)),
+        Answer::No { .. } => Err(Executed::Answered(hook_refused(
+            asking.name,
+            "The operator declined the call a hook asked about.".to_owned(),
+        ))),
+        Answer::Stop => Err(Executed::Stopped),
+    })
+}
+
+/// What the hooks said about a call, as dim rows above it.
+#[cfg(feature = "tui")]
+fn hook_notes(terminal: &mut io::Stdout, colour: bool, notes: &[String]) -> io::Result<()> {
+    notes
+        .iter()
+        .try_for_each(|note| writeln!(terminal, "{}", tui::hook_note_row(colour, note)))
 }
 
 /// What deciding a call needs in order to ask about it.
@@ -9457,6 +9578,107 @@ mod tests {
         (typist, keys, done)
     }
 
+    /// A hook that denies every call.
+    struct DenyAll;
+
+    impl arsy_code::hook::HookHandler for DenyAll {
+        fn run(
+            &self,
+            _rule: &arsy_code::hook::HookRule,
+            _payload: &Value,
+        ) -> Result<arsy_code::hook::HandlerResult, arsy_code::hook::HookError> {
+            Ok(arsy_code::hook::HandlerResult {
+                outcome: Some(arsy_code::hook::Outcome::Deny("no patches here".to_owned())),
+                payload: None,
+                inject: None,
+                schedule: None,
+            })
+        }
+    }
+
+    /// The interactive turn dispatches `before_operation`, so a Claude hook
+    /// that blocks a call blocks it here too, before anyone is asked.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_hook_that_denies_a_call_stops_it_in_the_interactive_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let patch = "*** Begin Patch\n*** Add File: note.txt\n+blocked\n*** End Patch\n";
+        let (resolved, _) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: json!({ "patch": patch }),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "understood\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut hooks = arsy_code::hook::HookEngine::new(1);
+        hooks.register(
+            arsy_code::hook::HookRule {
+                id: "deny".to_owned(),
+                event: arsy_code::hook::LifecycleEvent::BeforeOperation,
+                matcher: "*".to_owned(),
+                effect: arsy_code::hook::EffectClass::Gate,
+                origin: arsy_kernel::capability::PolicySource::User,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            Box::new(DenyAll),
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"", std::sync::Arc::clone(&approval));
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "write a note".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &resolved,
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            Some(&hooks),
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        assert_eq!(turn.response.trim(), "understood");
+        assert!(
+            !workspace.path().join("note.txt").exists(),
+            "the call never ran"
+        );
+        assert_eq!(approval.opened(), 0, "nobody was asked about a denied call");
+        assert!(matches!(
+            conversation[2].content.first(),
+            Some(ModelContent::ToolResult { is_error: true, content, .. })
+                if content.contains("no patches here")
+        ));
+    }
+
     #[cfg(feature = "tui")]
     #[test]
     fn a_confirmed_tool_call_runs_and_its_result_goes_back_to_the_model() {
@@ -9516,6 +9738,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9651,6 +9874,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
 
@@ -9716,6 +9940,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9784,6 +10009,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         // The typist outlives the turn on purpose, so an unanswered prompt
