@@ -4894,7 +4894,10 @@ fn mcp_choices(
         if rows.iter().any(|(_, choice)| choice.name == name) {
             continue;
         }
-        let native = entry["ecosystem"] == "arsy";
+        // A row the resolved configuration holds carries its real trust; a
+        // declaration nothing reads live is labelled untrusted and starts
+        // nothing until adopted.
+        let native = entry["trust"] != "untrusted";
         let detail = match entry["url"].as_str() {
             Some(url) => url.to_owned(),
             None => std::iter::once(text("command"))
@@ -5011,7 +5014,11 @@ fn apply_mcp_action(
         tui::McpAction::Toggle(index) => {
             let choice = &dialog.choices[index];
             let enabled = !choice.enabled.unwrap_or(false);
+            // Claude Code's and Codex's own files are never written: the
+            // choice is kept in the operator's arsy.json, which outranks them.
+            let declared_elsewhere = choice.source != "arsy";
             let scope = match choice.trust.as_str() {
+                _ if declared_elsewhere => mcp::Scope::User,
                 "user" => mcp::Scope::User,
                 "workspace" => mcp::Scope::Workspace,
                 other => {
@@ -5021,7 +5028,7 @@ fn apply_mcp_action(
                     )))
                 }
             };
-            mcp::set_enabled_in(root, &choice.name, enabled, scope)?;
+            mcp::set_enabled_in(root, &choice.name, enabled, scope, declared_elsewhere)?;
             let state = if enabled { "enabled" } else { "disabled" };
             Ok(format!("MCP `{}` {state}.", choice.name))
         }

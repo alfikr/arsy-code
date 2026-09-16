@@ -473,17 +473,24 @@ pub fn set_enabled(
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    emitter.result(set_enabled_in(&root, name, enabled, scope)?);
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let declared = config.mcp_provenance(name).is_some();
+    emitter.result(set_enabled_in(&root, name, enabled, scope, declared)?);
     Ok(0)
 }
 
 /// Flip the key and describe the result, for a caller that reports it its own
 /// way.
+///
+/// `declared_elsewhere` says Claude Code or Codex declares the connection, so
+/// this file may hold only the toggle for it.
 pub(crate) fn set_enabled_in(
     root: &Path,
     name: &str,
     enabled: bool,
     scope: Scope,
+    declared_elsewhere: bool,
 ) -> Result<Value, Diagnostic> {
     let path = scope.path(root)?;
     let current = read(&path)?;
@@ -496,19 +503,20 @@ pub(crate) fn set_enabled_in(
     .map_err(config_broken)?
     {
         Some(updated) => updated,
-        // The bundled connection is declared before any file is read, so there
-        // is nothing in this one to amend yet. Writing the toggle alone is
-        // what the loader expects: it amends the declaration rather than
-        // restating a command the operator never wrote. Any other name really
-        // is undefined, and a transport-less entry for one would only produce
-        // a file the loader refuses.
-        None if name == arsy_kernel::config::BUNDLED_MCP_SERVER => crate::config_edit::set(
-            &current,
-            &["mcp", "server"],
-            name,
-            json!({ "enabled": enabled }),
-        )
-        .map_err(config_broken)?,
+        // The bundled connection, and one Claude Code or Codex declares, exist
+        // before this file is read, so there is nothing in it to amend yet.
+        // Writing the toggle alone is what the loader expects: it amends the
+        // declaration rather than restating a command the operator never
+        // wrote. Any other name really is undefined.
+        None if declared_elsewhere || name == arsy_kernel::config::BUNDLED_MCP_SERVER => {
+            crate::config_edit::set(
+                &current,
+                &["mcp", "server"],
+                name,
+                json!({ "enabled": enabled }),
+            )
+            .map_err(config_broken)?
+        }
         None => {
             return Err(usage(format!(
                 "no connection named `{name}` is defined in {}",

@@ -207,6 +207,43 @@ fn a_server_claude_code_declares_is_probed_without_adopting_it() {
         explained.to_string().contains(".claude.json"),
         "the listing names the file it came from: {explained}"
     );
+
+    // Listed once, as Claude's, with its env named but not shown.
+    let (_, listed) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "list", "--source", "claude"],
+    );
+    let rows: Vec<&Value> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["name"] == "from-claude")
+        .collect();
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_eq!(rows[0]["ecosystem"], "claude");
+    assert_eq!(rows[0]["enabled"], true);
+    assert_eq!(rows[0]["env_keys"], serde_json::json!(["ARSY_PROBE_TOKEN"]));
+
+    // Switching it off writes only the toggle to arsy.json; Claude's file is
+    // untouched and the connection stops.
+    let before = std::fs::read(claude.path().join(".claude.json")).unwrap();
+    let (code, disabled) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "disable", "from-claude", "--scope", "workspace"],
+    );
+    assert_eq!(code, 0, "{disabled}");
+    assert_eq!(
+        std::fs::read(claude.path().join(".claude.json")).unwrap(),
+        before
+    );
+    let (code, _) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "test", "from-claude"],
+    );
+    assert_eq!(code, 3, "a disabled connection is a policy refusal");
 }
 
 /// Unix-gated: it needs a program that reads nothing and answers nothing, and
