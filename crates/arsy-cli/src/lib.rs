@@ -2449,8 +2449,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
-        // `/model`, `/approval` and Shift+Tab change what the launch card
-        // says, and the card is the first thing a reader checks. A fresh card
+        // `/model` changes what the launch card says, and the card is the
+        // first thing a reader checks. The approval mode lives in the status
+        // row, so Shift+Tab never lands here. A fresh card
         // is printed rather than the screen being repainted around the old
         // one, because a repaint also erases the notices printed between the
         // cards — including the line that just reported the change.

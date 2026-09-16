@@ -1017,18 +1017,18 @@ mod tests {
         );
         assert_eq!(
             rows.len(),
-            // model, directory, sandbox, session, mode, the blank under the
-            // title, and the title — or the taller half-block mark — inside a
-            // blank line and a border each side.
-            BLOCK_LOGO_HEIGHT.max(7) + 2 + 2,
+            // model, directory, sandbox, session, the blank under the title,
+            // and the title — or the taller half-block mark — inside a blank
+            // line and a border each side.
+            BLOCK_LOGO_HEIGHT.max(6) + 2 + 2,
             "the taller column sets the card height"
         );
         let marked = rows
             .iter()
             .position(|row| strip_sgr(row).contains(&first_mark))
             .expect("the mark is on the card");
-        // Six mark rows against seven label rows leave no room to centre, so
-        // the mark starts level with the title, inside the blank line.
+        // Six mark rows against six label rows: the mark starts level with
+        // the title, inside the blank line.
         assert_eq!(marked, 2, "the mark sits beside the labels");
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
@@ -1071,14 +1071,15 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_card_goes_stale_when_the_model_or_the_mode_changes() {
+    fn the_launch_card_goes_stale_when_the_model_changes() {
         let mut state = TuiState::new("/w".into(), SessionId::new());
         assert!(state.card_is_stale(), "the card has never been drawn");
         assert!(!state.card_is_stale(), "nothing changed since");
 
+        // Shift+Tab cycles the mode; the status row names it, so the card
+        // is not reprinted for it.
         state.set_approval_mode("plan");
-        assert!(state.card_is_stale(), "the mode the card names changed");
-        assert!(!state.card_is_stale());
+        assert!(!state.card_is_stale(), "the mode is not a card field");
 
         state.set_model_route(ModelRoute {
             provider: CODEX_PROVIDER.into(),
@@ -1432,13 +1433,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_visible_in_the_launch_card_and_status_row() {
+    fn plan_mode_is_visible_in_the_status_row_not_the_card() {
         let mut state = TuiState::new("/workspace".into(), SessionId::new());
         state.set_approval_mode("plan");
 
         let launch = state.render(80, false);
-        assert!(launch.contains("mode:"), "{launch}");
-        assert!(launch.contains("PLAN"), "{launch}");
+        assert!(!launch.contains("mode:"), "{launch}");
         assert!(state.status_row(80, false, None).contains("⏸ PLAN"));
     }
 
