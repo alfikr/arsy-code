@@ -29,7 +29,7 @@ permissions:
 jobs:
   report:
     if: github.repository_owner == 'suiflex'
-    uses: suiflex/Guardener/.github/workflows/report.yml@main
+    uses: suiflex/Guardener/.github/workflows/report.yml@aa428c8a9c802f8ac1fc6226e6319471aae7a698 # main
     secrets:
       app_id: ${{ secrets.GUARDENER_BOT_APP_ID }}
       private_key: ${{ secrets.GUARDENER_BOT_PRIVATE_KEY }}
