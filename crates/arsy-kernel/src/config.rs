@@ -68,7 +68,16 @@ pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
 /// describing a fork bomb.
 pub const MAX_PARALLEL_TOOLS: usize = 16;
 
-const INERT_SECTIONS: &[&str] = &["context", "git", "sandbox", "storage", "ui"];
+/// Top-level keys this loader accepts and applies nothing from. `schema_version`
+/// is here because `check_schema_version` has already read it.
+const INERT_SECTIONS: &[&str] = &[
+    "schema_version",
+    "context",
+    "git",
+    "sandbox",
+    "storage",
+    "ui",
+];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
@@ -1055,7 +1064,6 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         match key {
-            "schema_version" => Ok(()),
             "provider" => self.apply_provider(layer, path, value),
             "model" => self.apply_model(layer, path, value),
             "credentials" => self.apply_credentials(layer, path, value),
@@ -1232,25 +1240,40 @@ impl Config {
             if !COMPAT_SOURCES.contains(&source.as_str()) {
                 return Err(reject(format!("unknown key `compat.{source}`")));
             }
-            let prefix = format!("compat.{source}");
-            for (key, value) in as_table(value, &prefix, path)? {
-                let enabled = match (key.as_str(), value.as_bool()) {
-                    ("enabled", Some(enabled)) => enabled,
-                    ("enabled", None) => {
-                        return Err(reject(format!("`{prefix}.enabled` must be a boolean")))
-                    }
-                    _ => return Err(reject(format!("unknown key `{prefix}.{key}`"))),
-                };
-                if !enabled {
-                    self.compat_disabled.insert(source.clone());
+            self.apply_compat_source(layer, path, source, value)?;
+        }
+        Ok(())
+    }
+
+    fn apply_compat_source(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        source: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let prefix = format!("compat.{source}");
+        for (key, value) in as_table(value, &prefix, path)? {
+            let enabled = match (key.as_str(), value.as_bool()) {
+                ("enabled", Some(enabled)) => enabled,
+                ("enabled", None) => {
+                    return Err(reject(format!("`{prefix}.enabled` must be a boolean")))
                 }
-                self.record(
-                    layer,
-                    path,
-                    &format!("{prefix}.enabled"),
-                    self.compat_enabled(source).to_string(),
-                );
+                _ => return Err(reject(format!("unknown key `{prefix}.{key}`"))),
+            };
+            if !enabled {
+                self.compat_disabled.insert(source.to_owned());
             }
+            self.record(
+                layer,
+                path,
+                &format!("{prefix}.enabled"),
+                self.compat_enabled(source).to_string(),
+            );
         }
         Ok(())
     }
