@@ -19,6 +19,13 @@ on:
 permissions:
   contents: read
 
+# FluxGuard rides in the same archive as `arsy`, so an install has resource
+# awareness without a second install step. The tag is pinned rather than
+# tracking `latest`: a release has to build the same way tomorrow as it did
+# today, and a bundled dependency that moves on its own is not a release.
+env:
+  FLUXGUARD_TAG: v0.2.0
+
 jobs:
   verify-installers:
     runs-on: ubuntu-latest
@@ -52,31 +59,37 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: arsy-linux-x86_64.tar.gz
+            platform: linux-x86_64
             exe: ""
             archive: tar
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset: arsy-linux-aarch64.tar.gz
+            platform: linux-aarch64
             exe: ""
             archive: tar
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             asset: arsy-macos-x86_64.tar.gz
+            platform: macos-x86_64
             exe: ""
             archive: tar
           - runner: macos-latest
             target: aarch64-apple-darwin
             asset: arsy-macos-aarch64.tar.gz
+            platform: macos-aarch64
             exe: ""
             archive: tar
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             asset: arsy-windows-x86_64.zip
+            platform: windows-x86_64
             exe: .exe
             archive: zip
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset: arsy-windows-aarch64.zip
+            platform: windows-aarch64
             exe: .exe
             archive: zip
     runs-on: ${{ matrix.runner }}
@@ -94,6 +107,50 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 build --workspace --all-features --locked --release
+      # Downloaded rather than built here: FluxGuard releases the same six
+      # targets under the same names, already checksummed, and rebuilding it
+      # from source would ship a binary nobody else can verify against. A
+      # bundled binary is one more thing an install trusts, so the checksum is
+      # checked before the archive is ever unpacked.
+      - name: Fetch the bundled FluxGuard binary
+        if: matrix.archive == 'tar'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: fluxguard-${{ matrix.platform }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p dist/fluxguard
+          gh release download "$FLUXGUARD_TAG" --repo suiflex/FluxGuard \
+            --pattern "$ASSET" --pattern SHA256SUMS --dir dist/fluxguard
+          expected="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name {print $1}' dist/fluxguard/SHA256SUMS)"
+          test -n "$expected"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "dist/fluxguard/$ASSET" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "dist/fluxguard/$ASSET" | awk '{print $1}')"
+          fi
+          test "$expected" = "$actual"
+          tar -xzf "dist/fluxguard/$ASSET" -C dist/fluxguard
+          test -f dist/fluxguard/fluxguard
+      - name: Fetch the bundled FluxGuard binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: fluxguard-${{ matrix.platform }}.zip
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/fluxguard | Out-Null
+          gh release download $env:FLUXGUARD_TAG --repo suiflex/FluxGuard `
+            --pattern $env:ASSET --pattern SHA256SUMS --dir dist/fluxguard
+          $line = Select-String -Path dist/fluxguard/SHA256SUMS `
+            -Pattern "\s\*?$([regex]::Escape($env:ASSET))$"
+          if ($null -eq $line) { throw "no checksum for $env:ASSET" }
+          $expected = $line.Line.Split(' ')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 "dist/fluxguard/$env:ASSET").Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "checksum mismatch for $env:ASSET" }
+          Expand-Archive -Path "dist/fluxguard/$env:ASSET" -DestinationPath dist/fluxguard -Force
+          if (-not (Test-Path dist/fluxguard/fluxguard.exe)) { throw "fluxguard.exe missing" }
       - name: Package Unix archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -101,7 +158,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist/package
           cp "target/release/arsy${{ matrix.exe }}" dist/package/arsy
-          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy
+          cp dist/fluxguard/fluxguard dist/package/fluxguard
+          chmod 0755 dist/package/arsy dist/package/fluxguard
+          tar -C dist/package -czf "dist/${{ matrix.asset }}" arsy fluxguard
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "dist/${{ matrix.asset }}" | awk '{print $1}' > "dist/${{ matrix.asset }}.sha256"
           else
@@ -113,7 +172,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item "target/release/arsy${{ matrix.exe }}" dist/package/arsy.exe
-          Compress-Archive -Path dist/package/arsy.exe -DestinationPath "dist/${{ matrix.asset }}"
+          Copy-Item dist/fluxguard/fluxguard.exe dist/package/fluxguard.exe
+          Compress-Archive -Path dist/package/arsy.exe, dist/package/fluxguard.exe -DestinationPath "dist/${{ matrix.asset }}"
           (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLowerInvariant() |
             Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

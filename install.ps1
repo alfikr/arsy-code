@@ -54,6 +54,10 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
     $BinaryPath = Join-Path $InstallDirectory "arsy.exe"
     Copy-Item -Force (Join-Path $TemporaryDirectory "arsy.exe") $BinaryPath
+    # FluxGuard travels in the same archive and has to land beside arsy.exe:
+    # that is where ARSY looks for it when it declares the bundled MCP server.
+    Copy-Item -Force (Join-Path $TemporaryDirectory "fluxguard.exe") `
+        (Join-Path $InstallDirectory "fluxguard.exe")
 
     # The shared ARSY home. Created here so a first run has settings to read;
     # an existing file is never touched.

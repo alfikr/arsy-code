@@ -35,6 +35,9 @@ class ArsyCode < Formula
 
   def install
     bin.install "arsy"
+    # Installed together so FluxGuard lands beside arsy, where ARSY looks for
+    # it when it declares the bundled MCP server.
+    bin.install "fluxguard"
   end
 
   test do
