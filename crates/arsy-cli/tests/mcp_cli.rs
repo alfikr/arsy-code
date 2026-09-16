@@ -223,4 +223,11 @@ fn the_bundled_connection_can_be_turned_off_without_restating_it() {
     // amendment path and the writer agree on the shape.
     let (code, listed) = arsy(workspace.path(), &["mcp", "list"]);
     assert_eq!(code, 0, "{listed}");
+    let fluxguard = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "fluxguard")
+        .expect("fluxguard is listed");
+    assert_eq!(fluxguard["enabled"], false);
 }
