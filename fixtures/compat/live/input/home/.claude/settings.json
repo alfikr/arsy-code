@@ -1,0 +1,7 @@
+{
+  "model": "opus",
+  "permissions": {
+    "allow": ["Read(src/**)", "mcp__docs__search"],
+    "deny": ["Bash(rm:*)", "Bash(git push:*)"]
+  }
+}
