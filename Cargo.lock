@@ -117,6 +117,9 @@ name = "arsy-compat"
 version = "0.1.2"
 dependencies = [
  "arsy-kernel",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

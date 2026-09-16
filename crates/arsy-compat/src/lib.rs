@@ -5,6 +5,9 @@
 //! (invariant 5). Everything this crate returns sits below every `arsy.json`
 //! layer, and nothing it reads from a repository can grant authority.
 
+mod expand;
 mod homes;
+pub mod mcp;
+mod read;
 
 pub use homes::CompatHomes;

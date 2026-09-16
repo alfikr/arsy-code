@@ -9,6 +9,11 @@ repository.workspace = true
 
 [dependencies]
 arsy-kernel = { path = "../arsy-kernel" }
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
