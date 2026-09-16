@@ -320,15 +320,28 @@ pub const BUNDLED_MCP_SERVER: &str = "fluxguard";
 /// matching build, while a `fluxguard` further along `PATH` is some other
 /// install's, offered but left off until the operator says otherwise.
 fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
-    let bundled = binary
-        .parent()
-        .map(|directory| {
-            directory.join(format!(
-                "{BUNDLED_MCP_SERVER}{}",
-                std::env::consts::EXE_SUFFIX
-            ))
-        })
-        .filter(|command| command.is_file());
+    // Only an absolute directory counts: a bare name's parent is empty and
+    // would resolve against the working directory, which a repository controls.
+    let beside = |binary: &Path| {
+        binary
+            .parent()
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| {
+                directory.join(format!(
+                    "{BUNDLED_MCP_SERVER}{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
+            })
+            .filter(|command| command.is_file())
+    };
+    // `current_exe` reports the symlink on macOS, so an `arsy` linked onto
+    // `PATH` alone still finds the copy installed beside its target.
+    let bundled = beside(binary).or_else(|| {
+        Some(binary)
+            .filter(|binary| binary.is_absolute())
+            .and_then(|binary| std::fs::canonicalize(binary).ok())
+            .and_then(|target| beside(&target))
+    });
     McpServer {
         name: BUNDLED_MCP_SERVER.to_owned(),
         transport: McpTransport::Stdio {
@@ -3409,5 +3422,23 @@ access_type = "offline"
                 args: vec!["serve".to_owned()],
             }
         );
+
+        // A relative path has no directory of its own to look in, so nothing
+        // the working directory holds is ever claimed as bundled.
+        assert!(!bundled_mcp_server_beside(Path::new("arsy")).enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_arsy_still_finds_the_server_beside_its_target() {
+        let installed = tempfile::tempdir().unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        let binary = installed.path().join("arsy");
+        std::fs::write(&binary, b"").unwrap();
+        std::fs::write(installed.path().join(BUNDLED_MCP_SERVER), b"").unwrap();
+        let link = linked.path().join("arsy");
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+
+        assert!(bundled_mcp_server_beside(&link).enabled);
     }
 }
