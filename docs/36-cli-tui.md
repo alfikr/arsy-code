@@ -210,6 +210,19 @@ an inert declaration it asks — showing the full command — before adopting it
 `arsy mcp enable|disable` accepts Claude and Codex names the same way.
 `/mcp list` and `/mcp show NAME` remain read-only.
 
+An interactive session holds its MCP connections for as long as it runs. Every
+enabled server starts connecting when the session opens, each on its own thread,
+and every turn reuses it. At each turn boundary the session is brought in line
+with configuration: a server switched off or redefined is disconnected, a
+connection that broke under a call is reopened, and a server that failed to
+start is reported once and not retried until its definition changes. While a
+server connects, the model is offered the tools it published the last time it
+connected under the same definition — cached in `~/.arsy/mcp-tools.json`, keyed
+by a SHA-256 of the definition including its launch values — and a call to one
+waits up to a minute for the connection. A server's stderr is shown with the
+values it was launched with replaced by `[redacted]`. `arsy run` connects for its
+single turn.
+
 The launch card is reprinted whenever the model or the approval mode changes,
 so the card above the transcript describes the session that is running. On a
 terminal that speaks the Kitty graphics protocol the mark is drawn as an image
