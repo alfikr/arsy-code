@@ -45,13 +45,14 @@ authority: the tools, resources, and prompts adopted on the first connection are
 the ceiling, and anything appearing later outside it is reported and rejected.
 Authentication failure and a disabled connection are excluded from automatic
 retry. Executable hooks are dispatched by the lifecycle engine around each tool call
-and at both turn boundaries of a scripted turn — `arsy run` and everything built
-on it. The interactive TUI loop and a subagent's own calls do not dispatch them
-yet; a hook that gates `before_operation` therefore gates a pipeline and not a
-keyboard session. `arsy hook list` reports the effect class, the failure policy,
+and at both turn boundaries, in `arsy run` and in the interactive TUI. In the TUI
+a hook runs before the operator is asked: it may rewrite or deny a call, and one
+that asks for approval opens the approval dialog. A subagent's own calls do not
+dispatch them yet. `arsy hook list` reports the effect class, the failure policy,
 and whether each declaration is loaded, alongside every file the engine read.
 
-Hooks come from whichever ecosystem the operator already uses. `~/.claude/settings.json`
+Hooks come from whichever ecosystem the operator already uses, found where
+`CLAUDE_CONFIG_DIR` and `CODEX_HOME` put them. `~/.claude/settings.json`
 supplies Claude-shaped command hooks; `~/.codex/config.toml` supplies Codex's one
 lifecycle callback, `notify`, as `after_turn`; and `~/.arsy/guard.json` is the
 same Claude shape under ARSY's own name, for an operator using neither. Only
@@ -59,7 +60,7 @@ same Claude shape under ARSY's own name, for an operator using neither. Only
 against its file and skipped.
 
 A repository's own hooks — `<workspace>/.arsy/guard.json` and
-`<workspace>/.claude/settings.json` — are read but not run until the operator
+`<workspace>/.claude/settings.json` and `settings.local.json` — are read but not run until the operator
 vouches for that directory:
 
 ```json
@@ -93,8 +94,9 @@ for `config explain`, `/doctor`, `/auth` for the credential listing, and
 and is parsed by the same grammar, so an unsupported argument is refused with the
 CLI's diagnostic. Every command on this route is read-only — `auth set`,
 `auth login`, and `auth remove` are not reachable from the TUI — so `/model`,
-which writes the accepted answer to the user configuration, remains the only
-slash command that changes state. These work even without provider
+which writes the accepted answer to the user configuration, and the `/mcp`
+dialog, which writes only `enabled` toggles and adoptions, are the slash
+commands that change state. These work even without provider
 authentication. Repeat an inspection to reload its source files. Unknown slash
 commands report an error instead of becoming model prompts.
 
@@ -191,17 +193,21 @@ File reads show one-based line numbers. Newly created files and text edits show
 unified `-`/`+` rows with the anchor line, so the visible cards identify the
 exact content that changed instead of only reporting byte counts.
 
-`/mcp` lists the connections defined in `arsy.json` alongside the declarations
-mapped from other ecosystems. For Claude that is the workspace `.mcp.json` and
-the operator's own `~/.claude.json`, whose user-scope `mcpServers` are read by
-absolute path rather than through the workspace importer, which resolves only
-inside the checkout. A declaration is inert: `arsy mcp import [--scope
-user|workspace]` writes them into `arsy.json`, which is the step that makes
-them connectable, and it never repoints a name that is already defined.
-In the TUI, `/mcp` with no argument opens a dialog over the same rows: Space or
-Enter flips `enabled` on a definition in the user or workspace `arsy.json`, and
-on a declaration asks — showing the full command — before adopting that one
-into the user `arsy.json`. Environment variables and headers are not copied.
+`/mcp` lists every connection the resolved configuration holds: those defined
+in `arsy.json` and those Claude Code and Codex declare, which are read live and
+connect without being adopted. Each row names the tool and file it came from,
+and env and header names without their values. OMP declarations, and those of a
+tool switched off with `compat.<tool>.enabled = false`, are listed as inert:
+`arsy mcp import [--scope user|workspace]` writes Claude's into `arsy.json`, and
+it never repoints a name that is already defined.
+
+In the TUI, `/mcp` with no argument opens a dialog over the same rows. Space or
+Enter flips `enabled`: for an `arsy.json` definition in its own file, and for a
+Claude or Codex connection as an `enabled` amendment in the user `arsy.json`,
+leaving the other tool's files untouched. Turning on a server a repository's
+file declares asks first, since it then acts with the operator's authority. On
+an inert declaration it asks — showing the full command — before adopting it.
+`arsy mcp enable|disable` accepts Claude and Codex names the same way.
 `/mcp list` and `/mcp show NAME` remain read-only.
 
 The launch card is reprinted whenever the model or the approval mode changes,

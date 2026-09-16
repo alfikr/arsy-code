@@ -19,6 +19,28 @@ Discover user and repository `AGENTS.md`/`AGENTS.override.md`, `.codex/config.to
 | tool | model-facing operation view |
 | app-server event | protocol adapter event |
 
+## Live resolution
+
+`$CODEX_HOME/config.toml` and the repository's `.codex/config.toml` are read on
+every launch by `arsy-compat` (`crates/arsy-compat/src/codex/`) and placed below
+every `arsy.json` layer:
+
+- `[mcp_servers]` become MCP connections, with `env`, `env_vars` (forwarded
+  when set), `http_headers`, `env_http_headers`, `bearer_token_env_var`, and the
+  longer of `startup_timeout_sec` and `tool_timeout_sec`. A repository file may
+  not read the operator's variables into a header, and its servers start only
+  in a trusted project.
+- `sandbox_mode = "read-only"` asks before `fs.write` and `fs.delete`, or
+  refuses them under `approval_policy = "never"`. `workspace-write` adds nothing
+  and `danger-full-access` grants nothing. `approval_policy = "never"` itself is
+  noted, not applied. `profiles` are not read.
+- `model` is a fallback for an OpenAI endpoint that names none, narrowed to the
+  endpoint whose id matches a non-default `model_provider`.
+- `AGENTS.override.md` replaces `AGENTS.md` in a directory and in `$CODEX_HOME`.
+- `notify` runs as `after_turn`, in `arsy run` and the TUI.
+
+`[compat.codex] enabled = false` removes all of it.
+
 ## RPC strategy
 
 Implement a strategically useful app-server façade after schema fixtures prove demand. Preserve initialization, thread/start/resume, turn/start, item lifecycle, approvals, and event ordering. Codex wire quirks stay inside the adapter. Unsupported experimental methods return explicit capability absence.
