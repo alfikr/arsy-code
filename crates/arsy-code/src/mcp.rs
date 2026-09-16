@@ -251,8 +251,14 @@ impl StdioChannel {
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
+        let secrets = scrubbed_values(env);
         thread::spawn(move || {
-            let _ = io::copy(&mut BufReader::new(stderr), &mut io::stderr());
+            // A server that logs its own connection string or token must not
+            // put it on the operator's terminal, so each line is scrubbed of
+            // the values this definition handed it.
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = writeln!(io::stderr(), "{}", scrub(&line, &secrets));
+            }
         });
         let (sender, lines) = mpsc::channel();
         // A reader thread is what makes a deadline possible: a blocking read on
@@ -376,6 +382,25 @@ impl Drop for StdioChannel {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The launch values worth hiding. Very short ones are left alone: replacing
+/// every `1` or `on` in a log would hide the log, not a secret.
+fn scrubbed_values(env: &LaunchEnv) -> Vec<String> {
+    let mut values: Vec<String> = env
+        .iter()
+        .map(|(_, value)| value.to_owned())
+        .filter(|value| value.len() >= 6)
+        .collect();
+    // Longest first, so a value containing another is replaced whole.
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+fn scrub(line: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(line.to_owned(), |line, secret| {
+        line.replace(secret.as_str(), "[redacted]")
+    })
 }
 
 /// Streamable HTTP: one POST per request, answering with JSON or SSE.
@@ -1040,6 +1065,25 @@ mod tests {
             .collect();
         assert_eq!(content_types.len(), 1);
         assert_eq!(content_types[0].1, "application/json");
+    }
+
+    #[test]
+    fn a_servers_log_never_shows_the_values_it_was_launched_with() {
+        let env = LaunchEnv::from(std::collections::BTreeMap::from([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:hunter22@db/prod".to_owned(),
+            ),
+            ("DEBUG".to_owned(), "on".to_owned()),
+        ]));
+        let secrets = scrubbed_values(&env);
+        assert_eq!(
+            scrub(
+                "connecting to postgres://user:hunter22@db/prod (debug on)",
+                &secrets
+            ),
+            "connecting to [redacted] (debug on)"
+        );
     }
 
     #[cfg(unix)]
