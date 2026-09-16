@@ -1719,7 +1719,10 @@ fn load_config(
     let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
     let seeds = compat_seeds(workspace, &config);
     let contributes = |seed: &arsy_kernel::config::CompatSeed| {
-        !(seed.mcp_servers.is_empty() && seed.policy_rules.is_empty() && seed.notes.is_empty())
+        !(seed.mcp_servers.is_empty()
+            && seed.policy_rules.is_empty()
+            && seed.models.is_empty()
+            && seed.notes.is_empty())
     };
     if !seeds.iter().any(contributes) {
         return Ok(config);
@@ -1769,6 +1772,8 @@ fn selected_model(
         .model
         .clone()
         .or_else(|| config.model_default().map(str::to_owned))
+        // What Claude Code or Codex is set to use, only when arsy.json is silent.
+        .or_else(|| config.compat_model(endpoint).map(str::to_owned))
         .ok_or_else(|| {
             Diagnostic::error(
                 ARSY_PRV_1000,
@@ -11133,6 +11138,47 @@ mod tests {
         let mut traced = Emitter::new(Output::Json).with_debug(true);
         traced.trace("request", json!({"round": 0}));
         assert_eq!(traced.sequence, 1);
+    }
+
+    /// A model Claude Code or Codex is set to use fills in only for an endpoint
+    /// arsy.json leaves without one, and never outranks one it names.
+    #[test]
+    fn another_tools_model_is_used_only_where_arsy_names_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.claude]\nkind = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com\"\n",
+        );
+        let seed = arsy_kernel::config::CompatSeed {
+            label: "claude".to_owned(),
+            models: vec![arsy_kernel::config::ModelHint {
+                model: "claude-opus-4-1".to_owned(),
+                dialects: vec![arsy_kernel::config::Dialect::Anthropic],
+                provider: None,
+            }],
+            ..Default::default()
+        };
+        let layers = [(arsy_kernel::config::Layer::User, path.clone())];
+        let config = Config::load_with(&layers, std::slice::from_ref(&seed)).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "claude-opus-4-1"
+        );
+
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.claude]\nkind = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com\"\nmodel = \"claude-sonnet-5\"\n",
+        );
+        let config = Config::load_with(&layers, &[seed]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "claude-sonnet-5"
+        );
     }
 
     /// `--model` chooses between what policy permits; it cannot reach past it.
