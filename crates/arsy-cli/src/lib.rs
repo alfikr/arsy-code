@@ -23,6 +23,7 @@ mod acp;
 mod approval;
 mod code;
 mod config_edit;
+mod connector;
 mod eval;
 mod evidence;
 mod extensions;
@@ -2446,6 +2447,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
     let approval =
         std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+    // MCP servers start connecting now, in the background, so the first turn
+    // finds them up or on their way instead of starting them itself.
+    let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    if let Ok(config) = load_config(&workspace, &working, invocation.config.as_deref()) {
+        session_connector().sync(&config);
+    }
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
@@ -3627,6 +3634,7 @@ fn run_turn(
                 true,
                 &session_id.to_string(),
                 Some(session_id),
+                Some(session_connector()),
                 emitter,
             )?
             .with_execution_mode(approval.get().execution_mode()),
@@ -7913,6 +7921,7 @@ impl<'a> TaskRun<'a> {
             false,
             &task.to_string(),
             Some(self.session),
+            None,
             emitter,
         )?;
         // A supervisor exists only when policy actually delegates something,
@@ -9116,12 +9125,14 @@ fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStor
 /// `session` is the stream durable state belongs to. Without one — a dry run,
 /// or a build with no store open — the runtime offers no `todo.*` tool rather
 /// than a checklist that would vanish when the process ends.
+#[allow(clippy::too_many_arguments)]
 fn agent_runtime(
     root: &Path,
     config: &arsy_kernel::config::Config,
     interactive: bool,
     scope: &str,
     session: Option<SessionId>,
+    connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
@@ -9134,9 +9145,16 @@ fn agent_runtime(
     // Only for a turn that has a session. A dry run or a one-shot inspection
     // has no conversation to offer tools to, and starting somebody's MCP
     // server as a side effect of `arsy code symbol` would be a surprise.
-    let (connections, discovered) = match session {
-        Some(_) => mcp::connect_enabled(config, emitter),
-        None => (None, Vec::new()),
+    //
+    // An interactive session holds its connections across turns instead, and
+    // only brings them in line with configuration here.
+    let (connections, pending, discovered) = match (connector, session) {
+        (Some(connector), _) => session_mcp(connector, config, emitter),
+        (None, Some(_)) => {
+            let (connections, discovered) = mcp::connect_enabled(config, emitter);
+            (connections, Default::default(), discovered)
+        }
+        (None, None) => (None, Default::default(), Vec::new()),
     };
     arsy_code::agent::runtime(
         &workspace,
@@ -9163,11 +9181,47 @@ fn agent_runtime(
                 })
                 .transpose()?,
             mcp: connections,
-            mcp_pending: Default::default(),
+            mcp_pending: pending,
         },
     )
     .map(|runtime| runtime.with_dynamic_tools(discovered))
     .map_err(|error| storage_failed(error.to_string()))
+}
+
+/// The session's MCP connections for this turn, and what failed since the last.
+fn session_mcp(
+    connector: &connector::McpConnector,
+    config: &arsy_kernel::config::Config,
+    emitter: &mut Emitter,
+) -> (
+    Option<arsy_code::agent::mcpops::Connections>,
+    arsy_code::agent::mcpops::Pending,
+    Vec<arsy_code::agent::DynamicTool>,
+) {
+    let discovered = connector.sync(config);
+    for failure in connector.failures() {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-MCP-1000",
+            failure,
+            "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
+        ));
+    }
+    let (connections, pending) = connector.session();
+    (Some(connections), pending, discovered)
+}
+
+/// The MCP connections of this interactive session, held until it ends.
+///
+/// One per process, because an interactive session is one process: every turn
+/// and every resumed session in it reuses the same servers.
+#[cfg(feature = "tui")]
+fn session_connector() -> &'static connector::McpConnector {
+    static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
+    CONNECTOR.get_or_init(|| {
+        connector::McpConnector::new(
+            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
+        )
+    })
 }
 
 /// The system prompt for one turn: the harness's own instructions, then the
@@ -9528,6 +9582,7 @@ mod tests {
             &load_config(root, root, None).unwrap(),
             true,
             "test",
+            None,
             None,
             &mut Emitter::new(Output::Json),
         )
