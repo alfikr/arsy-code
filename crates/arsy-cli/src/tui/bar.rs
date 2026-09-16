@@ -303,8 +303,9 @@ impl TuiState {
 /// The mark is dropped when the card is too narrow to hold both, so a small
 /// terminal keeps the text it needs instead of a cropped picture.
 fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
-    let gutter = LOGO_WIDTH + LOGO_GAP;
-    if inner < gutter + LABEL_WIDTH + 12 {
+    let drawn = colour && logo_graphics();
+    let mark_width = if drawn { LOGO_WIDTH } else { BLOCK_LOGO_WIDTH };
+    if inner < mark_width + LOGO_GAP + LABEL_WIDTH + 12 {
         return text;
     }
     // Whichever column is shorter is centred against the other, so the mark
@@ -314,8 +315,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     // A terminal that draws images gets the mark as one, laid out as though it
     // were blank space: the escape leaves the cursor where it stands and the
     // image covers the cells the half-blocks would have filled.
-    let drawn = colour && logo_graphics();
-    let blank = " ".repeat(LOGO_WIDTH);
+    let blank = " ".repeat(mark_width);
     let logo: Vec<String> = if drawn {
         std::iter::once(format!("{}{blank}", logo_graphic()))
             .chain(std::iter::repeat_n(blank.clone(), LOGO_HEIGHT - 1))
@@ -331,7 +331,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
                 .checked_sub(mark_offset)
                 .and_then(|index| logo.get(index))
                 .cloned()
-                .unwrap_or_else(|| " ".repeat(LOGO_WIDTH));
+                .unwrap_or_else(|| " ".repeat(mark_width));
             let line = row
                 .checked_sub(text_offset)
                 .and_then(|index| text.get(index))

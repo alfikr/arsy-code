@@ -229,6 +229,10 @@ const LABEL_WIDTH: usize = 10;
 
 const LOGO_WIDTH: usize = 10;
 const LOGO_HEIGHT: usize = 5;
+/// The half-block mark gets more cells than the image, because at 10 by 5
+/// it has only a hundred pixels to hold the shape and reads as noise.
+const BLOCK_LOGO_WIDTH: usize = 16;
+const BLOCK_LOGO_HEIGHT: usize = 8;
 const LOGO_GAP: usize = 3;
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 
@@ -242,16 +246,17 @@ fn logo(colour: bool) -> &'static [String] {
     }
 }
 
-/// Rasterise the mark into a canvas `scale` times the cell grid it occupies.
+/// Rasterise the mark into a canvas `scale` times the `columns` by `rows`
+/// cell grid it occupies.
 ///
 /// The canvas keeps the grid's own aspect — one cell is two rows of pixels —
 /// so the same geometry serves the half-block rows and the image a terminal
 /// with a graphics protocol draws, and neither comes out stretched.
-fn logo_pixmap(scale: u32) -> resvg::tiny_skia::Pixmap {
+fn logo_pixmap(columns: usize, rows: usize, scale: u32) -> resvg::tiny_skia::Pixmap {
     let tree = resvg::usvg::Tree::from_data(LOGO_SVG, &resvg::usvg::Options::default())
         .expect("embedded ARSY logo must be valid SVG");
-    let width = LOGO_WIDTH as u32 * scale;
-    let height = (LOGO_HEIGHT * 2) as u32 * scale;
+    let width = columns as u32 * scale;
+    let height = (rows * 2) as u32 * scale;
     let mut pixmap =
         resvg::tiny_skia::Pixmap::new(width, height).expect("fixed logo canvas must be valid");
     let fit = (width as f32 / tree.size().width()).min(height as f32 / tree.size().height());
@@ -316,7 +321,7 @@ fn logo_transmission(id: u32) -> &'static str {
 
     static GRAPHIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GRAPHIC.get_or_init(|| {
-        let pixmap = logo_pixmap(SCALE);
+        let pixmap = logo_pixmap(LOGO_WIDTH, LOGO_HEIGHT, SCALE);
         let (width, height) = (pixmap.width(), pixmap.height());
         let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
         for pixel in pixmap.pixels() {
@@ -365,14 +370,14 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn render_logo(colour: bool) -> Vec<String> {
-    let pixmap = logo_pixmap(1);
+    let pixmap = logo_pixmap(BLOCK_LOGO_WIDTH, BLOCK_LOGO_HEIGHT, 1);
     let pixels = pixmap.pixels();
-    (0..LOGO_HEIGHT)
+    (0..BLOCK_LOGO_HEIGHT)
         .map(|row| {
             let mut line = String::new();
-            for column in 0..LOGO_WIDTH {
-                let upper = logo_pixel(pixels[row * 2 * LOGO_WIDTH + column]);
-                let lower = logo_pixel(pixels[(row * 2 + 1) * LOGO_WIDTH + column]);
+            for column in 0..BLOCK_LOGO_WIDTH {
+                let upper = logo_pixel(pixels[row * 2 * BLOCK_LOGO_WIDTH + column]);
+                let lower = logo_pixel(pixels[(row * 2 + 1) * BLOCK_LOGO_WIDTH + column]);
                 line.push_str(&half_block(upper, lower, colour));
             }
             line
@@ -964,8 +969,8 @@ mod tests {
             rows.iter().any(|row| strip_sgr(row).contains(&first_mark)),
             "card contains the rendered mark"
         );
-        // Border, a blank line, then the title: the labels set the height and
-        // the mark is centred against them, not the other way round.
+        // Border, a blank line, then the title: whichever column is taller sets
+        // the height and the other is centred against it.
         assert!(
             strip_sgr(rows[2]).contains(">_ ARSY CODE"),
             "the title leads the card"
@@ -973,9 +978,10 @@ mod tests {
         assert_eq!(
             rows.len(),
             // model, directory, sandbox, session, mode, the blank under the
-            // title, and the title, inside a blank line and a border each side.
-            7 + 2 + 2,
-            "the labels set the card height"
+            // title, and the title — or the taller half-block mark — inside a
+            // blank line and a border each side.
+            BLOCK_LOGO_HEIGHT.max(7) + 2 + 2,
+            "the taller column sets the card height"
         );
         let marked = rows
             .iter()
