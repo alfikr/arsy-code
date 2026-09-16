@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "docs": {
+      "type": "http",
+      "url": "https://docs.example.test/mcp",
+      "headers": { "Authorization": "Bearer ${DOCS_TOKEN}" }
+    },
+    "tickets": { "command": "tickets-mcp", "env": { "TICKETS_URL": "${TICKETS_URL}" } }
+  }
+}

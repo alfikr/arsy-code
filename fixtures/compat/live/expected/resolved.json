@@ -1,0 +1,206 @@
+{
+  "fixture": "live",
+  "schema_version": 1,
+  "seeds": [
+    {
+      "label": "claude",
+      "mcp_servers": [
+        {
+          "enabled": false,
+          "launch_keys": [],
+          "name": "docs",
+          "target": "shadowed-docs",
+          "timeout_ms": 30000,
+          "trust": "workspace"
+        },
+        {
+          "enabled": false,
+          "launch_keys": [],
+          "name": "repo-tool",
+          "target": "./scripts/repo-mcp",
+          "timeout_ms": 30000,
+          "trust": "workspace"
+        }
+      ],
+      "models": [],
+      "notes": [
+        "`docs` is off until `<fixture>/workspace` is a trusted project",
+        "`repo-tool` is off until `<fixture>/workspace` is a trusted project"
+      ],
+      "policy_rules": [],
+      "source": "<fixture>/workspace/.mcp.json"
+    },
+    {
+      "label": "claude",
+      "mcp_servers": [
+        {
+          "enabled": true,
+          "launch_keys": [
+            "Authorization"
+          ],
+          "name": "docs",
+          "target": "https://docs.example.test/mcp",
+          "timeout_ms": 30000,
+          "trust": "user"
+        },
+        {
+          "enabled": false,
+          "launch_keys": [
+            "TICKETS_URL"
+          ],
+          "name": "tickets",
+          "target": "tickets-mcp",
+          "timeout_ms": 30000,
+          "trust": "user"
+        }
+      ],
+      "models": [],
+      "notes": [
+        "`tickets` is off: `TICKETS_URL` is not set"
+      ],
+      "policy_rules": [],
+      "source": "<fixture>/home/.claude.json"
+    },
+    {
+      "label": "codex",
+      "mcp_servers": [
+        {
+          "enabled": false,
+          "launch_keys": [],
+          "name": "steal",
+          "target": "https://evil.example.test/mcp",
+          "timeout_ms": 30000,
+          "trust": "workspace"
+        }
+      ],
+      "models": [],
+      "notes": [
+        "`steal` is off until `<fixture>/workspace` is a trusted project",
+        "`steal` is off: a repository file may not put the operator's variables into a header"
+      ],
+      "policy_rules": [],
+      "source": "<fixture>/workspace/.codex/config.toml"
+    },
+    {
+      "label": "codex",
+      "mcp_servers": [
+        {
+          "enabled": true,
+          "launch_keys": [
+            "DOCS_TOKEN"
+          ],
+          "name": "tags",
+          "target": "git-tag-mcp",
+          "timeout_ms": 30000,
+          "trust": "user"
+        }
+      ],
+      "models": [],
+      "notes": [],
+      "policy_rules": [],
+      "source": "<fixture>/home/.codex/config.toml"
+    },
+    {
+      "label": "claude",
+      "mcp_servers": [],
+      "models": [],
+      "notes": [
+        "`Bash(git push:*)` names more than ARSY matches on, so it asks before every `git` instead"
+      ],
+      "policy_rules": [
+        {
+          "id": "claude/user/deny/Bash(rm:*)",
+          "rule": "Deny process.exec process:rm (user)"
+        },
+        {
+          "id": "claude/user/deny/Bash(git push:*)",
+          "rule": "RequireApproval process.exec process:git (user)"
+        },
+        {
+          "id": "claude/user/allow/Read(src/**)",
+          "rule": "Allow fs.read file:src/** (user)"
+        },
+        {
+          "id": "claude/user/allow/mcp__docs__search",
+          "rule": "Allow mcp.invoke mcp:docs/search (user)"
+        }
+      ],
+      "source": "<fixture>/home/.claude/settings.json"
+    },
+    {
+      "label": "claude",
+      "mcp_servers": [],
+      "models": [],
+      "notes": [],
+      "policy_rules": [
+        {
+          "id": "claude/workspace/deny/WebFetch",
+          "rule": "Deny network.connect host:** (workspace)"
+        },
+        {
+          "id": "claude/workspace/allow/Bash",
+          "rule": "Allow process.exec process:** (workspace)"
+        }
+      ],
+      "source": "<fixture>/workspace/.claude/settings.json"
+    },
+    {
+      "label": "codex",
+      "mcp_servers": [],
+      "models": [],
+      "notes": [],
+      "policy_rules": [
+        {
+          "id": "codex/user/sandbox/read-only/fs.write",
+          "rule": "RequireApproval fs.write file:** (user)"
+        },
+        {
+          "id": "codex/user/sandbox/read-only/fs.delete",
+          "rule": "RequireApproval fs.delete file:** (user)"
+        }
+      ],
+      "source": "<fixture>/home/.codex/config.toml"
+    },
+    {
+      "label": "claude",
+      "mcp_servers": [],
+      "models": [
+        {
+          "dialects": "[Anthropic]",
+          "model": "claude-sonnet-4-5",
+          "provider": null
+        }
+      ],
+      "notes": [],
+      "policy_rules": [],
+      "source": "<fixture>/workspace/.claude/settings.json"
+    },
+    {
+      "label": "claude",
+      "mcp_servers": [],
+      "models": [],
+      "notes": [
+        "`model = \"opus\"` is a Claude alias; set a full model id in arsy.json to use it"
+      ],
+      "policy_rules": [],
+      "source": "<fixture>/home/.claude/settings.json"
+    },
+    {
+      "label": "codex",
+      "mcp_servers": [],
+      "models": [
+        {
+          "dialects": "[Openai, OpenaiResponses]",
+          "model": "gpt-5-codex",
+          "provider": null
+        }
+      ],
+      "notes": [],
+      "policy_rules": [],
+      "source": "<fixture>/home/.codex/config.toml"
+    }
+  ],
+  "user_instructions": [
+    "<fixture>/home/.claude/CLAUDE.md"
+  ]
+}
