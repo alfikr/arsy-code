@@ -34,6 +34,9 @@ fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
 fn arsy_in(workspace: &Path, home: &Path, args: &[&str]) -> (i32, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.to_str().unwrap()])
+        // Never the Claude Code or Codex setup of the machine running the test.
+        .env("CLAUDE_CONFIG_DIR", workspace.join("no-claude-home"))
+        .env("CODEX_HOME", workspace.join("no-codex-home"))
         .args(["--output", "json"])
         .args(args)
         .env("ARSY_CONFIG_HOME", home)
@@ -306,6 +309,9 @@ fn an_approved_plugin_runs_through_the_same_policy_a_tool_call_does() {
     let approved = |args: &[&str]| -> (i32, Value) {
         let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
             .args(["--workspace", workspace.path().to_str().unwrap()])
+            // Never the Claude Code or Codex setup of the machine running the test.
+            .env("CLAUDE_CONFIG_DIR", workspace.path().join("no-claude-home"))
+            .env("CODEX_HOME", workspace.path().join("no-codex-home"))
             .args(["--output", "json"])
             .args(args)
             .env("ARSY_CONFIG_HOME", home.path())

@@ -88,6 +88,9 @@ impl Editor {
     fn open(workspace: &Path, home: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_arsy"))
             .args(["--workspace", workspace.to_str().unwrap()])
+            // Never the Claude Code or Codex setup of the machine running the test.
+            .env("CLAUDE_CONFIG_DIR", workspace.join("no-claude-home"))
+            .env("CODEX_HOME", workspace.join("no-codex-home"))
             .args(["serve", "--protocol", "acp"])
             .env("ARSY_CONFIG_HOME", home)
             .env("ARSY_TEST_KEY", "test-key-0123456789abcdef")

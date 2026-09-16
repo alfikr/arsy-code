@@ -23,6 +23,9 @@ impl Served {
     fn start(workspace: &Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_arsy"))
             .args(["--workspace", workspace.to_str().unwrap()])
+            // Never the Claude Code or Codex setup of the machine running the test.
+            .env("CLAUDE_CONFIG_DIR", workspace.join("no-claude-home"))
+            .env("CODEX_HOME", workspace.join("no-codex-home"))
             .arg("serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -206,6 +209,9 @@ resource = "file:**"
 
     let explained = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", directory.path().to_str().unwrap()])
+        // Never the Claude Code or Codex setup of the machine running the test.
+        .env("CLAUDE_CONFIG_DIR", directory.path().join("no-claude-home"))
+        .env("CODEX_HOME", directory.path().join("no-codex-home"))
         .args(["--output", "json"])
         .args(["policy", "explain", "git.status"])
         .output()

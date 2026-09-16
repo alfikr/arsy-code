@@ -81,6 +81,9 @@ fn the_thin_client_drives_a_turn_through_the_protocol_and_nothing_else() {
 
     let mut agent = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.path().to_str().unwrap()])
+        // Never the Claude Code or Codex setup of the machine running the test.
+        .env("CLAUDE_CONFIG_DIR", workspace.path().join("no-claude-home"))
+        .env("CODEX_HOME", workspace.path().join("no-codex-home"))
         .args(["serve", "--protocol", "acp"])
         .env("ARSY_CONFIG_HOME", home.path())
         .env("ARSY_TEST_KEY", "test-key-0123456789abcdef")

@@ -1706,12 +1706,40 @@ fn load_config(
         }
         layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
     }
-    arsy_kernel::config::Config::load(&layers).map_err(|error| {
+    let unusable = |error: arsy_kernel::config::ConfigError| {
         Diagnostic::error(
             ARSY_CFG_1000,
             format!("configuration is unusable: {error}"),
             "fix the reported file, then run `arsy config explain`",
         )
+    };
+    // Read twice: the first pass says which tools are switched on and whether
+    // this checkout is trusted, and the second places what those tools declare
+    // below every layer.
+    let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
+    let seeds = compat_seeds(workspace, &config);
+    if seeds
+        .iter()
+        .all(|seed| seed.mcp_servers.is_empty() && seed.notes.is_empty())
+    {
+        return Ok(config);
+    }
+    arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
+}
+
+/// What Claude Code and Codex declare for this workspace, read live.
+fn compat_seeds(
+    workspace: &Path,
+    config: &arsy_kernel::config::Config,
+) -> Vec<arsy_kernel::config::CompatSeed> {
+    let homes = compat_homes();
+    arsy_compat::mcp::mcp_seeds(&arsy_compat::mcp::Context {
+        homes: &homes,
+        root: workspace,
+        trusted: config.trusts(workspace),
+        claude: config.compat_enabled("claude"),
+        codex: config.compat_enabled("codex"),
+        env: &|name| std::env::var(name).ok(),
     })
 }
 
