@@ -68,7 +68,39 @@ pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
 /// describing a fork bomb.
 pub const MAX_PARALLEL_TOOLS: usize = 16;
 
-const INERT_SECTIONS: &[&str] = &["compat", "context", "git", "sandbox", "storage", "ui"];
+const INERT_SECTIONS: &[&str] = &["context", "git", "sandbox", "storage", "ui"];
+
+/// Other tools whose configuration can be read as a lower layer.
+pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
+
+/// How `config explain` shows one connection. The target never includes the
+/// launch env or headers, which may be credentials.
+fn describe_mcp_server(server: &McpServer) -> String {
+    format!(
+        "{} · {} · {}",
+        server.transport.kind(),
+        server.transport.target(),
+        if server.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )
+}
+
+/// The keys that tune a connection without redefining where it points.
+const MCP_AMENDABLE: &[&str] = &["enabled", "timeout_ms", "max_body_bytes"];
+
+/// Whether a `[mcp.server.<name>]` table only switches or tunes a connection,
+/// rather than defining one.
+fn is_amendment(value: &toml::Value) -> bool {
+    value.as_table().is_some_and(|table| {
+        !table.is_empty()
+            && table
+                .keys()
+                .all(|key| MCP_AMENDABLE.contains(&key.as_str()))
+    })
+}
 
 /// Where a value came from, in ascending authority order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -496,6 +528,28 @@ impl McpTransport {
     }
 }
 
+/// Where a declaration that no `arsy.json` wrote came from.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Provenance {
+    /// The tool that declared it, as `compat.<label>` names it.
+    pub label: String,
+    pub path: PathBuf,
+}
+
+/// What another tool's configuration contributes, already translated into
+/// ARSY's own types at the edge that read it. The kernel never parses another
+/// tool's format; it only places the result below every `arsy.json` layer.
+#[derive(Clone, Debug, Default)]
+pub struct CompatSeed {
+    pub label: String,
+    pub path: PathBuf,
+    /// Each carries the trust of the scope it was declared in: a file in the
+    /// operator's home is theirs, one in the checkout is the repository's.
+    pub mcp_servers: Vec<McpServer>,
+    /// Whatever was understood but could not be applied, for `config explain`.
+    pub notes: Vec<String>,
+}
+
 /// One configured MCP connection. Holding the definition is not connecting:
 /// nothing here has contacted the server.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -642,6 +696,11 @@ pub struct Config {
     /// `[mcp.server.<name>]` keyed by name, so a higher layer replaces a
     /// definition rather than adding a second connection with the same name.
     mcp_servers: BTreeMap<String, McpServer>,
+    /// Which of `mcp_servers` another tool declared. Dropped when an
+    /// `arsy.json` layer replaces the definition, kept when one only amends it.
+    mcp_provenance: BTreeMap<String, Provenance>,
+    /// `compat.<source>.enabled = false` from any layer.
+    compat_disabled: BTreeSet<String>,
     /// `[remote.target.<name>]`, from a trusted layer only.
     remote_targets: BTreeMap<String, RemoteTarget>,
     /// `[lsp.server.<name>]`, from a trusted layer only.
@@ -674,6 +733,18 @@ impl Config {
     /// Read every layer in authority order. A missing file is not an error;
     /// an unreadable or invalid one is.
     pub fn load(layers: &[(Layer, PathBuf)]) -> Result<Self, ConfigError> {
+        Self::load_with(layers, &[])
+    }
+
+    /// Read every layer on top of what other tools declared.
+    ///
+    /// The seeds go in before the first file, exactly like the bundled server,
+    /// so every `arsy.json` layer outranks them: a layer naming the same server
+    /// replaces it, and one that only sets `enabled` switches it.
+    pub fn load_with(
+        layers: &[(Layer, PathBuf)],
+        seeds: &[CompatSeed],
+    ) -> Result<Self, ConfigError> {
         let mut config = Self::default();
         // Declared before the first layer is read, so any layer that names
         // `mcp.server.fluxguard` replaces it outright -- which is also how an
@@ -681,6 +752,7 @@ impl Config {
         config
             .mcp_servers
             .insert(BUNDLED_MCP_SERVER.to_owned(), bundled_mcp_server());
+        seeds.iter().for_each(|seed| config.seed(seed));
         for (layer, path) in layers {
             let raw = match std::fs::read_to_string(path) {
                 Ok(raw) => raw,
@@ -695,6 +767,53 @@ impl Config {
             config.apply(*layer, path, &raw)?;
         }
         Ok(config)
+    }
+
+    /// Place one tool's declarations. A name the bundled server or an earlier
+    /// seed already holds is kept: the caller orders seeds by precedence.
+    fn seed(&mut self, seed: &CompatSeed) {
+        let layer = |server: &McpServer| match server.trust {
+            PolicySource::Workspace => Layer::Workspace,
+            _ => Layer::User,
+        };
+        for server in &seed.mcp_servers {
+            if self.mcp_servers.contains_key(&server.name) {
+                continue;
+            }
+            self.record(
+                layer(server),
+                &seed.path,
+                &format!("mcp.server.{}", server.name),
+                describe_mcp_server(server),
+            );
+            self.mcp_provenance.insert(
+                server.name.clone(),
+                Provenance {
+                    label: seed.label.clone(),
+                    path: seed.path.clone(),
+                },
+            );
+            self.mcp_servers.insert(server.name.clone(), server.clone());
+        }
+        self.diagnostics
+            .extend(seed.notes.iter().map(|message| Diagnostic {
+                key: format!("compat.{}", seed.label),
+                layer: Layer::User,
+                path: seed.path.clone(),
+                message: message.clone(),
+            }));
+    }
+
+    /// Whether no layer switched this tool's configuration off. A `false`
+    /// sticks: a later layer cannot switch it back on, so a repository cannot
+    /// re-enable a source the operator turned off.
+    pub fn compat_enabled(&self, source: &str) -> bool {
+        !self.compat_disabled.contains(source)
+    }
+
+    /// The tool that declared this MCP connection, when no `arsy.json` did.
+    pub fn mcp_provenance(&self, name: &str) -> Option<&Provenance> {
+        self.mcp_provenance.get(name)
     }
 
     pub fn provider_default(&self) -> Option<&str> {
@@ -948,6 +1067,7 @@ impl Config {
             "project" => self.apply_project(layer, path, value),
             "policy" => self.apply_policy(layer, path, value),
             "theme" => self.apply_theme(layer, path, value),
+            "compat" => self.apply_compat(layer, path, value),
             section if INERT_SECTIONS.contains(&section) => Ok(()),
             other => Err(ConfigError {
                 path: path.to_path_buf(),
@@ -1057,22 +1177,28 @@ impl Config {
             for (name, value) in as_table(value, "mcp.server", path)? {
                 let server = match self.amend_mcp_server(layer, path, name, value)? {
                     Some(server) => server,
-                    None => self.parse_mcp_server(layer, path, name, value)?,
+                    None if is_amendment(value) => {
+                        // Names a connection nothing declares any more -- most
+                        // often one another tool's file stopped declaring.
+                        // Refusing the whole file for it would stop every run.
+                        self.diagnostics.push(Diagnostic {
+                            key: format!("mcp.server.{name}"),
+                            layer,
+                            path: path.to_path_buf(),
+                            message: "sets `enabled` or a limit on a connection nothing declares; ignored".to_owned(),
+                        });
+                        continue;
+                    }
+                    None => {
+                        self.mcp_provenance.remove(name);
+                        self.parse_mcp_server(layer, path, name, value)?
+                    }
                 };
                 self.record(
                     layer,
                     path,
                     &format!("mcp.server.{name}"),
-                    format!(
-                        "{} · {} · {}",
-                        server.transport.kind(),
-                        server.transport.target(),
-                        if server.enabled {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
-                    ),
+                    describe_mcp_server(&server),
                 );
                 self.mcp_servers.insert(name.clone(), server);
             }
@@ -1091,6 +1217,44 @@ impl Config {
     /// Anything that names a `transport` still replaces the definition
     /// outright, so a layer can never quietly repoint a connection while
     /// looking like it only toggled one.
+    /// `compat.<source>.enabled`, the only key each source has.
+    fn apply_compat(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        for (source, value) in as_table(value, "compat", path)? {
+            if !COMPAT_SOURCES.contains(&source.as_str()) {
+                return Err(reject(format!("unknown key `compat.{source}`")));
+            }
+            let prefix = format!("compat.{source}");
+            for (key, value) in as_table(value, &prefix, path)? {
+                let enabled = match (key.as_str(), value.as_bool()) {
+                    ("enabled", Some(enabled)) => enabled,
+                    ("enabled", None) => {
+                        return Err(reject(format!("`{prefix}.enabled` must be a boolean")))
+                    }
+                    _ => return Err(reject(format!("unknown key `{prefix}.{key}`"))),
+                };
+                if !enabled {
+                    self.compat_disabled.insert(source.clone());
+                }
+                self.record(
+                    layer,
+                    path,
+                    &format!("{prefix}.enabled"),
+                    self.compat_enabled(source).to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn amend_mcp_server(
         &self,
         layer: Layer,
@@ -1098,14 +1262,17 @@ impl Config {
         name: &str,
         value: &toml::Value,
     ) -> Result<Option<McpServer>, ConfigError> {
-        const AMENDABLE: &[&str] = &["enabled", "timeout_ms", "max_body_bytes"];
         let prefix = format!("mcp.server.{name}");
         let reject = |message: String| ConfigError {
             path: path.to_path_buf(),
             message,
         };
         let table = as_table(value, &prefix, path)?;
-        if table.is_empty() || !table.keys().all(|key| AMENDABLE.contains(&key.as_str())) {
+        if table.is_empty()
+            || !table
+                .keys()
+                .all(|key| MCP_AMENDABLE.contains(&key.as_str()))
+        {
             return Ok(None);
         }
         let Some(existing) = self.mcp_servers.get(name) else {
@@ -3472,6 +3639,113 @@ access_type = "offline"
                 env: LaunchEnv::default(),
             }
         );
+    }
+
+    fn seeded(name: &str, trust: PolicySource) -> CompatSeed {
+        CompatSeed {
+            label: "claude".to_owned(),
+            path: PathBuf::from("/home/operator/.claude.json"),
+            mcp_servers: vec![McpServer {
+                name: name.to_owned(),
+                transport: McpTransport::Stdio {
+                    command: "docs-server".to_owned(),
+                    args: Vec::new(),
+                    env: LaunchEnv::default(),
+                },
+                enabled: true,
+                trust,
+                timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+                max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+            }],
+            notes: vec!["`permissions.defaultMode` is not mapped".to_owned()],
+        }
+    }
+
+    #[test]
+    fn another_tools_declarations_sit_below_every_arsy_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let seeds = [seeded("docs", PolicySource::User)];
+        let with = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load_with(&[(Layer::User, path)], &seeds).unwrap()
+        };
+
+        let untouched = with("schema_version = 1\n");
+        let docs = untouched.mcp_server("docs").unwrap();
+        assert!(docs.enabled);
+        assert_eq!(untouched.mcp_provenance("docs").unwrap().label, "claude");
+        assert!(untouched
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.key == "compat.claude"));
+
+        // Switching it off in arsy.json amends it and it is still Claude's.
+        let off = with("schema_version = 1\n[mcp.server.docs]\nenabled = false\n");
+        assert!(!off.mcp_server("docs").unwrap().enabled);
+        assert!(off.mcp_provenance("docs").is_some());
+
+        // Defining it in arsy.json replaces it, and it is no longer Claude's.
+        let mine = with(
+            "schema_version = 1\n[mcp.server.docs]\ntransport = \"stdio\"\ncommand = \"mine\"\n",
+        );
+        assert_eq!(mine.mcp_server("docs").unwrap().transport.target(), "mine");
+        assert!(mine.mcp_provenance("docs").is_none());
+
+        // The bundled server and an earlier seed keep their names.
+        let config = Config::load_with(
+            &[],
+            &[
+                seeded(BUNDLED_MCP_SERVER, PolicySource::Workspace),
+                seeded("docs", PolicySource::User),
+                seeded("docs", PolicySource::Workspace),
+            ],
+        )
+        .unwrap();
+        assert!(config.mcp_provenance(BUNDLED_MCP_SERVER).is_none());
+        assert_eq!(config.mcp_server("docs").unwrap().trust, PolicySource::User);
+    }
+
+    #[test]
+    fn a_toggle_for_a_connection_nothing_declares_is_ignored_not_fatal() {
+        let config = single_layer(
+            Layer::User,
+            "schema_version = 1\n[mcp.server.gone]\nenabled = false\n",
+        );
+        assert!(config.mcp_server("gone").is_none());
+        assert!(config
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.key == "mcp.server.gone"));
+    }
+
+    #[test]
+    fn a_compat_source_switched_off_stays_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let user = write(
+            directory.path(),
+            "user.json",
+            "schema_version = 1\n[compat.claude]\nenabled = false\n",
+        );
+        let workspace = write(
+            directory.path(),
+            "workspace.json",
+            "schema_version = 1\n[compat.claude]\nenabled = true\n",
+        );
+        let config = load(&[(Layer::User, user), (Layer::Workspace, workspace)]);
+        assert!(
+            !config.compat_enabled("claude"),
+            "a repository cannot switch it back on"
+        );
+        assert!(config.compat_enabled("codex"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let unknown = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+        assert!(unknown("schema_version = 1\n[compat.cursor]\nenabled = false\n").is_err());
+        assert!(unknown("schema_version = 1\n[compat.claude]\nimport = true\n").is_err());
+        assert!(unknown("schema_version = 1\n[compat.claude]\nenabled = \"no\"\n").is_err());
     }
 
     #[test]
