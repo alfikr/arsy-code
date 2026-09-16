@@ -29,7 +29,7 @@ jobs:
   triage:
     # Forks of this repository should not try to run the organization's bot.
     if: github.repository_owner == 'suiflex'
-    uses: suiflex/.github/.github/workflows/pr-triage.yml@main
+    uses: suiflex/.github/.github/workflows/pr-triage.yml@83f3614394082f3f5d271b041562005429cf6ef4 # main
     secrets:
       app_id: ${{ secrets.SUIFLEX_BOT_APP_ID }}
       private_key: ${{ secrets.SUIFLEX_BOT_PRIVATE_KEY }}
@@ -44,12 +44,12 @@ jobs:
     steps:
       # Same app credentials the triage job passes upstream, so both jobs'
       # labels arrive from suiflex-bot rather than github-actions.
-      - uses: actions/create-github-app-token@v3
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
         with:
           app-id: ${{ secrets.SUIFLEX_BOT_APP_ID }}
           private-key: ${{ secrets.SUIFLEX_BOT_PRIVATE_KEY }}
-      - uses: actions/labeler@v7
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7
         with:
           repo-token: ${{ steps.app-token.outputs.token }}
           configuration-path: .github/labeler.yml

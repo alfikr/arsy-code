@@ -82,11 +82,16 @@ async function main() {
     ]);
   }
 
-  const binary = path.join(vendorDirectory, platform === "win32" ? "arsy.exe" : "arsy");
-  if (!fs.existsSync(binary)) {
-    throw new Error(`Release archive did not contain ${path.basename(binary)}`);
+  // FluxGuard ships in the same archive and stays beside `arsy` in vendor/,
+  // which is where ARSY looks for it when it declares the bundled MCP server.
+  const suffix = platform === "win32" ? ".exe" : "";
+  for (const name of ["arsy", "fluxguard"]) {
+    const binary = path.join(vendorDirectory, `${name}${suffix}`);
+    if (!fs.existsSync(binary)) {
+      throw new Error(`Release archive did not contain ${path.basename(binary)}`);
+    }
+    if (platform !== "win32") fs.chmodSync(binary, 0o755);
   }
-  if (platform !== "win32") fs.chmodSync(binary, 0o755);
   fs.rmSync(archivePath, { force: true });
   fs.rmSync(checksumPath, { force: true });
 }

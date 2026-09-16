@@ -81,10 +81,15 @@ fn a_connection_is_defined_listed_probed_disabled_and_removed() {
     let (code, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
     assert_eq!(code, 0);
     let entries = listed["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["name"], "fixture");
-    assert_eq!(entries[0]["enabled"], true);
-    assert_eq!(entries[0]["runtime_status"], "not_loaded");
+    // The bundled connection is always declared, so the listing carries it
+    // beside whatever the operator defined.
+    let fixture = entries
+        .iter()
+        .find(|entry| entry["name"] == "fixture")
+        .unwrap_or_else(|| panic!("the definition is missing from {listed}"));
+    assert_eq!(fixture["enabled"], true);
+    assert_eq!(fixture["runtime_status"], "not_loaded");
+    assert!(entries.iter().any(|entry| entry["name"] == "fluxguard"));
 
     // Adding the same name twice is refused rather than silently duplicated.
     let (code, _) = arsy(
@@ -142,7 +147,11 @@ fn a_connection_is_defined_listed_probed_disabled_and_removed() {
     assert_eq!(code, 0);
     assert_eq!(removed["removed"], true);
     let (_, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
-    assert!(listed["entries"].as_array().unwrap().is_empty());
+    assert!(listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["name"] != "fixture"));
 
     // Removing what is not there is an error, not a silent success.
     let (code, _) = arsy(
@@ -187,4 +196,38 @@ fn a_server_that_never_answers_fails_on_the_deadline() {
         started.elapsed() < std::time::Duration::from_secs(20),
         "the deadline must bound the probe, not the server's own lifetime"
     );
+}
+
+/// The bundled connection is declared before any file is read, so an operator
+/// who wants it off has nothing in their config to edit. Disabling has to work
+/// anyway, and has to leave behind a file the loader still accepts.
+#[test]
+fn the_bundled_connection_can_be_turned_off_without_restating_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (code, disabled) = arsy(
+        workspace.path(),
+        &["mcp", "disable", "fluxguard", "--scope", "workspace"],
+    );
+    assert_eq!(code, 0, "{disabled}");
+    assert_eq!(disabled["enabled"], false);
+
+    // A name that is genuinely undefined is still refused: writing a
+    // transport-less entry for one would only produce a file nothing can load.
+    let (code, _) = arsy(
+        workspace.path(),
+        &["mcp", "disable", "absent", "--scope", "workspace"],
+    );
+    assert_ne!(code, 0);
+
+    // The toggle alone has to survive a reload, which is what proves the
+    // amendment path and the writer agree on the shape.
+    let (code, listed) = arsy(workspace.path(), &["mcp", "list"]);
+    assert_eq!(code, 0, "{listed}");
+    let fluxguard = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "fluxguard")
+        .expect("fluxguard is listed");
+    assert_eq!(fluxguard["enabled"], false);
 }

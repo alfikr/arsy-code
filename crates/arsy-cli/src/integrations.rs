@@ -805,10 +805,18 @@ mod tests {
         let mcp = fixtures(&root, "mcp", None, Some("claude"), None, None).unwrap();
         assert!(!mcp["entries"].as_array().unwrap().is_empty());
         assert!(fixtures(&root, "mcp", Some("missing"), Some("claude"), None, None).is_err());
-        assert_eq!(
-            fixtures(&root, "mcp", None, None, None, None).unwrap()["entries"],
-            mcp["entries"]
-        );
+        // Naming no ecosystem keeps every declaration the `claude` filter
+        // found, unchanged. It is a superset rather than an equal set because
+        // ARSY's own bundled connection is always declared, so the unfiltered
+        // listing carries it too.
+        let unfiltered = fixtures(&root, "mcp", None, None, None, None).unwrap();
+        let unfiltered = unfiltered["entries"].as_array().unwrap();
+        for entry in mcp["entries"].as_array().unwrap() {
+            assert!(unfiltered.contains(entry), "{entry} was dropped or altered");
+        }
+        assert!(unfiltered
+            .iter()
+            .any(|entry| entry["name"] == arsy_kernel::config::BUNDLED_MCP_SERVER));
         let listing = human_report(&mcp, "mcp", Some("claude"), None)["declarations"]
             .as_str()
             .unwrap()
