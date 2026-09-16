@@ -1,0 +1,42 @@
+name: Compatibility
+
+on:
+  pull_request:
+    paths:
+      - "crates/arsy-compat/**"
+      - "crates/arsy-kernel/**"
+      - "fixtures/compat/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "crates/arsy-compat/**"
+      - "crates/arsy-kernel/**"
+      - "fixtures/compat/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: arsy-compat / Rust 1.98
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Rust with lint components
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy
+      - name: Formatting
+        run: cargo +1.98.0 fmt --all -- --check
+      - name: Clippy
+        run: cargo +1.98.0 clippy -p arsy-compat --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        run: cargo +1.98.0 test -p arsy-compat --all-targets --all-features --locked
+      - name: Compatibility fixtures
+        run: python3 fixtures/compat/check.py
