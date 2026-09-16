@@ -100,9 +100,11 @@ fn the_live_view_of_a_claude_and_codex_setup_is_pinned() {
     if std::env::var_os("ARSY_UPDATE_GOLDEN").is_some() {
         std::fs::write(&expected, &rendered).unwrap();
     }
+    let expected = std::fs::read_to_string(&expected)
+        .unwrap()
+        .replace("\r\n", "\n");
     assert_eq!(
-        rendered,
-        std::fs::read_to_string(&expected).unwrap(),
+        rendered, expected,
         "the live view changed; rerun with ARSY_UPDATE_GOLDEN=1 and review the diff"
     );
 }

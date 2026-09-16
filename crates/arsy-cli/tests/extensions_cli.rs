@@ -211,7 +211,7 @@ fn skills_are_listed_as_data_and_hooks_carry_their_engine_semantics() {
             .iter()
             .any(|source| source["path"]
                 .as_str()
-                .is_some_and(|path| path.ends_with(".claude/settings.json"))),
+                .is_some_and(|path| path.replace('\\', "/").ends_with(".claude/settings.json"))),
         "{hooks:#?}"
     );
 }

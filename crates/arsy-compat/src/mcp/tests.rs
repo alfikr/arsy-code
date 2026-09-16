@@ -185,13 +185,24 @@ fn a_repositorys_servers_wait_for_trust_and_never_read_the_operators_variables()
 fn the_first_declaration_of_a_name_owns_it() {
     let machine = Machine::new();
     let root = machine.root.path().to_string_lossy().into_owned();
+    let mut projects = serde_json::Map::new();
+    projects.insert(
+        root,
+        serde_json::json!({
+            "mcpServers": {"docs": {"command": "local-docs"}}
+        }),
+    );
     machine
         .home_file(
             ".claude.json",
-            &format!(
-                r#"{{"projects": {{"{root}": {{"mcpServers": {{"docs": {{"command": "local-docs"}}}}}}}},
-                    "mcpServers": {{"docs": {{"command": "user-docs"}}, "db": {{"command": "user-db"}}}}}}"#
-            ),
+            &serde_json::json!({
+                "projects": projects,
+                "mcpServers": {
+                    "docs": {"command": "user-docs"},
+                    "db": {"command": "user-db"}
+                }
+            })
+            .to_string(),
         )
         .root_file(
             ".mcp.json",
