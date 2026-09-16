@@ -16,6 +16,7 @@ fn fixture() -> PathBuf {
 /// where the checkout lives.
 fn relative(text: &str, input: &Path) -> String {
     text.replace(&input.display().to_string(), "<fixture>")
+        .replace('\\', "/")
 }
 
 /// A seed as data a reader can check.
