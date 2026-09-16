@@ -395,19 +395,16 @@ fn render_logo(colour: bool) -> Vec<String> {
     // The average of one pixel's samples, lit only when the shape covers at
     // least half of it.
     let pixel = |column: usize, row: usize| {
-        let mut sum = [0usize; 4];
-        for y in row * samples..(row + 1) * samples {
-            for sample in &pixels[y * stride + column * samples..][..samples] {
-                for (total, value) in sum.iter_mut().zip([
-                    sample.red(),
-                    sample.green(),
-                    sample.blue(),
-                    sample.alpha(),
-                ]) {
-                    *total += usize::from(value);
-                }
-            }
-        }
+        let sum = (row * samples..(row + 1) * samples)
+            .flat_map(|y| &pixels[y * stride + column * samples..][..samples])
+            .fold([0usize; 4], |[red, green, blue, alpha], sample| {
+                [
+                    red + usize::from(sample.red()),
+                    green + usize::from(sample.green()),
+                    blue + usize::from(sample.blue()),
+                    alpha + usize::from(sample.alpha()),
+                ]
+            });
         let [red, green, blue, alpha] = sum.map(|total| (total / (samples * samples)) as u8);
         (alpha >= 128)
             .then(|| resvg::tiny_skia::PremultipliedColorU8::from_rgba(red, green, blue, alpha))

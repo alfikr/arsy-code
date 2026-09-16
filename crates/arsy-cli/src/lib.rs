@@ -4923,64 +4923,20 @@ fn run_mcp_dialog(
         stdout.flush().map_err(terminal_failed)?;
         drawn = frame.lines().count();
 
-        let action = loop {
-            // A lone Escape is only known once nothing follows it.
-            let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
-                Ok(byte) => decoder.feed(byte),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    break Some(tui::McpAction::Close)
-                }
-            };
-            if let Some(key) = key {
-                break dialog.handle_key(key);
-            }
-        };
-        let outcome = match action {
+        let action = match next_mcp_action(&mut dialog, keys, decoder) {
             None => continue,
             Some(tui::McpAction::Close) => {
                 write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
-                for change in &changes {
-                    writeln!(stdout, "{}", tui::safe_text(change)).map_err(terminal_failed)?;
-                }
                 if !changes.is_empty() {
-                    writeln!(stdout, "MCP changes take effect from the next turn.")
+                    changes.push("MCP changes take effect from the next turn.".to_owned());
+                    writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
                         .map_err(terminal_failed)?;
                 }
                 return Ok(());
             }
-            Some(tui::McpAction::Toggle(index)) => {
-                let choice = &dialog.choices[index];
-                let enabled = !choice.enabled.unwrap_or(false);
-                match choice.trust.as_str() {
-                    "user" => mcp::set_enabled_in(&root, &choice.name, enabled, mcp::Scope::User),
-                    "workspace" => {
-                        mcp::set_enabled_in(&root, &choice.name, enabled, mcp::Scope::Workspace)
-                    }
-                    other => Err(usage(format!(
-                        "`{}` is defined by the {other} configuration; change it there",
-                        choice.name
-                    ))),
-                }
-                .map(|_| {
-                    format!(
-                        "MCP `{}` {}.",
-                        choice.name,
-                        if enabled { "enabled" } else { "disabled" }
-                    )
-                })
-            }
-            Some(tui::McpAction::Adopt(index)) => mcp::server_from_declaration(&rows[index].0)
-                .and_then(|server| mcp::add_in(&root, &server, mcp::Scope::User))
-                .map(|written| {
-                    format!(
-                        "MCP `{}` adopted into {}, enabled.",
-                        dialog.choices[index].name,
-                        written["path"].as_str().unwrap_or("arsy.json")
-                    )
-                }),
+            Some(action) => action,
         };
-        dialog.notice = Some(match outcome {
+        dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
             Ok(change) => {
                 changes.push(change.clone());
                 change
@@ -4989,6 +4945,68 @@ fn run_mcp_dialog(
         });
         rows = mcp_choices(&root, invocation)?;
         dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
+    }
+}
+
+/// Wait for the next key and let the dialog answer it. A keyboard that hung up
+/// closes the dialog rather than holding the session on it.
+#[cfg(feature = "tui")]
+fn next_mcp_action(
+    dialog: &mut tui::McpDialogState,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Option<tui::McpAction> {
+    loop {
+        // A lone Escape is only known once nothing follows it.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(tui::McpAction::Close)
+            }
+        };
+        if let Some(key) = key {
+            return dialog.handle_key(key);
+        }
+    }
+}
+
+/// Write the change a toggle or an adoption asks for, and say what it did.
+#[cfg(feature = "tui")]
+fn apply_mcp_action(
+    root: &Path,
+    rows: &[(Value, tui::McpChoice)],
+    dialog: &tui::McpDialogState,
+    action: tui::McpAction,
+) -> Result<String, Diagnostic> {
+    match action {
+        tui::McpAction::Toggle(index) => {
+            let choice = &dialog.choices[index];
+            let enabled = !choice.enabled.unwrap_or(false);
+            let scope = match choice.trust.as_str() {
+                "user" => mcp::Scope::User,
+                "workspace" => mcp::Scope::Workspace,
+                other => {
+                    return Err(usage(format!(
+                        "`{}` is defined by the {other} configuration; change it there",
+                        choice.name
+                    )))
+                }
+            };
+            mcp::set_enabled_in(root, &choice.name, enabled, scope)?;
+            let state = if enabled { "enabled" } else { "disabled" };
+            Ok(format!("MCP `{}` {state}.", choice.name))
+        }
+        tui::McpAction::Adopt(index) => {
+            let server = mcp::server_from_declaration(&rows[index].0)?;
+            let written = mcp::add_in(root, &server, mcp::Scope::User)?;
+            Ok(format!(
+                "MCP `{}` adopted into {}, enabled.",
+                server.name,
+                written["path"].as_str().unwrap_or("arsy.json")
+            ))
+        }
+        tui::McpAction::Close => Ok(String::new()),
     }
 }
 
