@@ -52,6 +52,29 @@ pub fn session_prompt(sessions: &[SessionChoice], colour: bool) -> String {
     paint(colour, sgr_dim(), &format!("  resume · {choices}"))
 }
 
+/// The top border of a dialog, with its title set into the rule.
+pub(super) fn dialog_top(title: &str, width: usize, colour: bool) -> String {
+    let top_right = "─".repeat(width.saturating_sub(2 + 2 + visible_len(title)));
+    format!(
+        "{}{}{}",
+        paint(colour, sgr_border(), "╭──"),
+        paint(colour, BOLD, title),
+        paint(colour, sgr_border(), &format!("{top_right}╮")),
+    )
+}
+
+/// One row inside a dialog's border, cut to fit and padded to reach it.
+pub(super) fn dialog_line(content: &str, inner: usize, colour: bool, sgr: &str) -> String {
+    let fitted = fit(content, inner);
+    let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+    format!(
+        "{} {}{pad} {}",
+        paint(colour, sgr_border(), "│"),
+        paint(colour, sgr, &fitted),
+        paint(colour, sgr_border(), "│"),
+    )
+}
+
 /// Actions resulting from the interactive session dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionAction {
@@ -102,19 +125,10 @@ impl SessionDialogState {
         match self.mode {
             SessionDialogMode::Select => {
                 let title = " SESSIONS ";
-                let title_len = visible_len(title);
-                let top_left = "─".repeat(2);
-                let top_right = "─".repeat(width.saturating_sub(2 + 2 + title_len));
-                let mut lines = vec![format!(
-                    "{}{}{}{}",
-                    paint(colour, sgr_border(), "╭"),
-                    paint(colour, sgr_border(), &top_left),
-                    paint(colour, BOLD, title),
-                    paint(colour, sgr_border(), &format!("{top_right}╮")),
-                )];
+                let mut lines = vec![dialog_top(title, width, colour)];
 
                 if self.sessions.is_empty() {
-                    lines.push(Self::box_line(
+                    lines.push(dialog_line(
                         "  no recorded sessions found",
                         inner,
                         colour,
@@ -133,14 +147,14 @@ impl SessionDialogState {
                         let row_label =
                             format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
                         let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
-                        lines.push(Self::box_line(&row_label, inner, colour, sgr));
+                        lines.push(dialog_line(&row_label, inner, colour, sgr));
                         let detail = format!("     {} events · {}", s.events, s.last_seen);
-                        lines.push(Self::box_line(&detail, inner, colour, sgr_dim()));
+                        lines.push(dialog_line(&detail, inner, colour, sgr_dim()));
                     }
                 }
 
-                lines.push(Self::box_line("", inner, colour, ""));
-                lines.push(Self::box_line(
+                lines.push(dialog_line("", inner, colour, ""));
+                lines.push(dialog_line(
                     "[↑/↓] Navigate  [Enter] Resume  [r] Rename  [d] Delete  [Esc] Cancel",
                     inner,
                     colour,
@@ -151,30 +165,21 @@ impl SessionDialogState {
             }
             SessionDialogMode::Rename => {
                 let title = " RENAME SESSION ";
-                let title_len = visible_len(title);
-                let top_left = "─".repeat(2);
-                let top_right = "─".repeat(width.saturating_sub(2 + 2 + title_len));
-                let mut lines = vec![format!(
-                    "{}{}{}{}",
-                    paint(colour, sgr_border(), "╭"),
-                    paint(colour, sgr_border(), &top_left),
-                    paint(colour, BOLD, title),
-                    paint(colour, sgr_border(), &format!("{top_right}╮")),
-                )];
+                let mut lines = vec![dialog_top(title, width, colour)];
 
                 if let Some(target) = self.sessions.get(self.selected) {
                     let sess_row = format!("Session: {}", target.id);
-                    lines.push(Self::box_line(&sess_row, inner, colour, sgr_dim()));
+                    lines.push(dialog_line(&sess_row, inner, colour, sgr_dim()));
                     if let Some(cur) = &target.title {
                         let cur_row = format!("Current: {cur}");
-                        lines.push(Self::box_line(&cur_row, inner, colour, sgr_dim()));
+                        lines.push(dialog_line(&cur_row, inner, colour, sgr_dim()));
                     }
                 }
-                lines.push(Self::box_line("", inner, colour, ""));
+                lines.push(dialog_line("", inner, colour, ""));
                 let input_row = format!("New title: {}█", self.rename_buffer);
-                lines.push(Self::box_line(&input_row, inner, colour, sgr_accent()));
-                lines.push(Self::box_line("", inner, colour, ""));
-                lines.push(Self::box_line(
+                lines.push(dialog_line(&input_row, inner, colour, sgr_accent()));
+                lines.push(dialog_line("", inner, colour, ""));
+                lines.push(dialog_line(
                     "[Enter] Save Title  [Esc] Back to Session List",
                     inner,
                     colour,
@@ -185,33 +190,24 @@ impl SessionDialogState {
             }
             SessionDialogMode::ConfirmDelete => {
                 let title = " DELETE SESSION ";
-                let title_len = visible_len(title);
-                let top_left = "─".repeat(2);
-                let top_right = "─".repeat(width.saturating_sub(2 + 2 + title_len));
-                let mut lines = vec![format!(
-                    "{}{}{}{}",
-                    paint(colour, sgr_border(), "╭"),
-                    paint(colour, sgr_border(), &top_left),
-                    paint(colour, BOLD, title),
-                    paint(colour, sgr_border(), &format!("{top_right}╮")),
-                )];
+                let mut lines = vec![dialog_top(title, width, colour)];
 
                 if let Some(target) = self.sessions.get(self.selected) {
                     let msg = format!("Are you sure you want to delete session {}?", target.id);
-                    lines.push(Self::box_line(&msg, inner, colour, sgr_err()));
+                    lines.push(dialog_line(&msg, inner, colour, sgr_err()));
                     if let Some(t) = &target.title {
                         let t_row = format!("Title: \"{t}\"");
-                        lines.push(Self::box_line(&t_row, inner, colour, sgr_dim()));
+                        lines.push(dialog_line(&t_row, inner, colour, sgr_dim()));
                     }
-                    lines.push(Self::box_line(
+                    lines.push(dialog_line(
                         "This will permanently remove its recorded history and events.",
                         inner,
                         colour,
                         sgr_dim(),
                     ));
                 }
-                lines.push(Self::box_line("", inner, colour, ""));
-                lines.push(Self::box_line(
+                lines.push(dialog_line("", inner, colour, ""));
+                lines.push(dialog_line(
                     "[y/Enter] Confirm Delete  [n/Esc] Cancel",
                     inner,
                     colour,
@@ -221,17 +217,6 @@ impl SessionDialogState {
                 lines.join("\n")
             }
         }
-    }
-
-    fn box_line(content: &str, inner: usize, colour: bool, sgr: &str) -> String {
-        let fitted = fit(content, inner);
-        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
-        format!(
-            "{} {}{pad} {}",
-            paint(colour, sgr_border(), "│"),
-            paint(colour, sgr, &fitted),
-            paint(colour, sgr_border(), "│"),
-        )
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<SessionAction> {
