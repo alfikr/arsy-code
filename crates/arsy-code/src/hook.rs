@@ -592,8 +592,14 @@ pub const MAX_HOOK_OUTPUT_BYTES: usize = 64 * 1024;
 /// Where hooks are read from, and whether this directory's own files may run.
 #[derive(Clone, Debug)]
 pub struct Discovery {
-    /// The operator's home. Their own files carry their own authority.
-    pub home: Option<PathBuf>,
+    /// Where Claude Code and Codex keep the operator's files. Those files
+    /// carry the operator's own authority.
+    pub homes: crate::compat::CompatHomes,
+    /// The operator's home, for `~/.arsy/guard.json`.
+    pub arsy_home: Option<PathBuf>,
+    /// `compat.claude.enabled` and `compat.codex.enabled`.
+    pub claude: bool,
+    pub codex: bool,
     pub root: PathBuf,
     /// Whether the operator vouched for `root`. Nothing under it executes
     /// until they have.
@@ -629,13 +635,17 @@ impl Loaded {
 
 /// Build the engine from every source this operator and workspace offer.
 ///
-/// Four places, in authority order:
+/// These places, in authority order:
 ///
 /// * `~/.claude/settings.json` — the operator's own Claude hooks.
 /// * `~/.codex/config.toml` — Codex's one lifecycle callback, `notify`.
 /// * `~/.arsy/guard.json` — ARSY's own, for an operator using neither.
-/// * `<root>/.arsy/guard.json` and `<root>/.claude/settings.json` — the
-///   repository's, which run only where the operator vouched for it.
+/// * `<root>/.arsy/guard.json`, `<root>/.claude/settings.json`, and
+///   `<root>/.claude/settings.local.json` — the repository's, which run only
+///   where the operator vouched for it. Claude merges hooks from both of its
+///   files, so both are read.
+///
+/// A Claude or Codex file is skipped entirely when its `compat` switch is off.
 ///
 /// A source that is missing is not an error: most machines have one of these
 /// and not the others. A source that is present and unusable is reported
@@ -651,29 +661,17 @@ pub fn load(discovery: &Discovery) -> Loaded {
         )]
     };
 
-    if let Some(home) = &discovery.home {
-        for (path, kind) in [
-            (home.join(".claude/settings.json"), Kind::ClaudeSettings),
-            (home.join(".codex/config.toml"), Kind::CodexNotify),
-            (home.join(".arsy/guard.json"), Kind::ArsyGuard),
-        ] {
-            sources.push(read_source(
-                &mut engine,
-                &path,
-                kind,
-                PolicySource::User,
-                true,
-                discovery,
-            ));
-        }
+    for (path, kind) in user_sources(discovery) {
+        sources.push(read_source(
+            &mut engine,
+            &path,
+            kind,
+            PolicySource::User,
+            true,
+            discovery,
+        ));
     }
-    for (path, kind) in [
-        (discovery.root.join(".arsy/guard.json"), Kind::ArsyGuard),
-        (
-            discovery.root.join(".claude/settings.json"),
-            Kind::ClaudeSettings,
-        ),
-    ] {
+    for (path, kind) in workspace_sources(discovery) {
         let mut report = read_source(
             &mut engine,
             &path,
@@ -688,6 +686,44 @@ pub fn load(discovery: &Discovery) -> Loaded {
         sources.push(report);
     }
     Loaded { engine, sources }
+}
+
+/// The operator's own files, each only where its tool is switched on.
+fn user_sources(discovery: &Discovery) -> Vec<(PathBuf, Kind)> {
+    let homes = &discovery.homes;
+    [
+        homes
+            .claude_dir
+            .as_ref()
+            .filter(|_| discovery.claude)
+            .map(|directory| (directory.join("settings.json"), Kind::ClaudeSettings)),
+        homes
+            .codex_dir
+            .as_ref()
+            .filter(|_| discovery.codex)
+            .map(|directory| (directory.join("config.toml"), Kind::CodexNotify)),
+        discovery
+            .arsy_home
+            .as_ref()
+            .map(|home| (home.join(".arsy/guard.json"), Kind::ArsyGuard)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The repository's files. Whether they run is decided by the caller's trust.
+fn workspace_sources(discovery: &Discovery) -> Vec<(PathBuf, Kind)> {
+    let root = &discovery.root;
+    let mut sources = vec![(root.join(".arsy/guard.json"), Kind::ArsyGuard)];
+    if discovery.claude {
+        sources.push((root.join(".claude/settings.json"), Kind::ClaudeSettings));
+        sources.push((
+            root.join(".claude/settings.local.json"),
+            Kind::ClaudeSettings,
+        ));
+    }
+    sources
 }
 
 #[derive(Clone, Copy)]
@@ -1008,7 +1044,14 @@ mod tests {
 
     fn discovery(home: &Path, root: &Path, trusted: bool) -> Discovery {
         Discovery {
-            home: Some(home.to_path_buf()),
+            homes: crate::compat::CompatHomes {
+                claude_dir: Some(home.join(".claude")),
+                claude_json: None,
+                codex_dir: Some(home.join(".codex")),
+            },
+            arsy_home: Some(home.to_path_buf()),
+            claude: true,
+            codex: true,
             root: root.to_path_buf(),
             trusted,
             max_depth: 4,
@@ -1198,6 +1241,45 @@ mod tests {
         // A machine with none of these files is not an error either.
         let empty = tempfile::tempdir().unwrap();
         assert!(load(&discovery(empty.path(), workspace.path(), true)).is_empty());
+    }
+
+    #[test]
+    fn a_local_settings_file_adds_hooks_and_a_switched_off_tool_adds_none() {
+        const STOP: &str =
+            r#"{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "done"}]}]}}"#;
+        let home = home_with(&[
+            (".claude/settings.json", STOP),
+            (".codex/config.toml", "notify = [\"ping\"]\n"),
+        ]);
+        let workspace = home_with(&[
+            (".claude/settings.json", STOP),
+            (".claude/settings.local.json", STOP),
+        ]);
+
+        let trusted = load(&discovery(home.path(), workspace.path(), true));
+        let from_workspace = trusted
+            .engine
+            .rules()
+            .filter(|rule| rule.origin == PolicySource::Workspace)
+            .count();
+        assert_eq!(
+            from_workspace, 2,
+            "both Claude files contribute, as Claude merges them"
+        );
+
+        let mut off = discovery(home.path(), workspace.path(), true);
+        off.claude = false;
+        off.codex = false;
+        let off = load(&off);
+        assert!(
+            off.is_empty(),
+            "no Claude or Codex file is read when switched off"
+        );
+        assert!(off
+            .sources
+            .iter()
+            .all(|source| !source.path.to_string_lossy().contains("claude")
+                && !source.path.to_string_lossy().contains("codex")));
     }
 
     /// A handler that returns a scripted result, and records that it ran.

@@ -8239,13 +8239,28 @@ fn dispatch(
     )))
 }
 
+/// Where Claude Code and Codex keep the operator's files.
+///
+/// A unit test gets none at all, so what it asserts cannot depend on the
+/// Claude or Codex setup of the machine it happens to run on.
+fn compat_homes() -> arsy_code::compat::CompatHomes {
+    if cfg!(test) {
+        arsy_code::compat::CompatHomes::none()
+    } else {
+        arsy_code::compat::CompatHomes::from_env()
+    }
+}
+
 /// The engine for this workspace, built from the operator's files and the
 /// repository's — the latter only where the operator vouched for it.
 fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
     arsy_code::hook::load(&arsy_code::hook::Discovery {
-        home: std::env::var_os("HOME")
+        homes: compat_homes(),
+        arsy_home: std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from),
+        claude: config.compat_enabled("claude"),
+        codex: config.compat_enabled("codex"),
         root: root.to_path_buf(),
         trusted: config.trusts(root),
         // One means hooks run and nothing they do dispatches again.
