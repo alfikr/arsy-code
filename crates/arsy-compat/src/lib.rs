@@ -14,6 +14,7 @@
 mod claude;
 mod codex;
 mod homes;
+pub mod instructions;
 pub mod mcp;
 mod read;
 
