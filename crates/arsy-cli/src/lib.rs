@@ -8243,11 +8243,11 @@ fn dispatch(
 ///
 /// A unit test gets none at all, so what it asserts cannot depend on the
 /// Claude or Codex setup of the machine it happens to run on.
-fn compat_homes() -> arsy_code::compat::CompatHomes {
+fn compat_homes() -> arsy_compat::CompatHomes {
     if cfg!(test) {
-        arsy_code::compat::CompatHomes::none()
+        arsy_compat::CompatHomes::none()
     } else {
-        arsy_code::compat::CompatHomes::from_env()
+        arsy_compat::CompatHomes::from_env()
     }
 }
 

@@ -14,6 +14,7 @@ wasm = ["dep:wasmtime"]
 remote-transports = []
 
 [dependencies]
+arsy-compat = { path = "../arsy-compat" }
 arsy-kernel = { path = "../arsy-kernel" }
 arsy-pty = { path = "../arsy-pty" }
 cap-std.workspace = true

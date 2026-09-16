@@ -78,6 +78,7 @@ name = "arsy-cli"
 version = "0.1.2"
 dependencies = [
  "arsy-code",
+ "arsy-compat",
  "arsy-ide",
  "arsy-kernel",
  "resvg",
@@ -92,6 +93,7 @@ dependencies = [
 name = "arsy-code"
 version = "0.1.2"
 dependencies = [
+ "arsy-compat",
  "arsy-kernel",
  "arsy-pty",
  "cap-std",
@@ -108,6 +110,13 @@ dependencies = [
  "ureq",
  "wasmtime",
  "yaml_serde",
+]
+
+[[package]]
+name = "arsy-compat"
+version = "0.1.2"
+dependencies = [
+ "arsy-kernel",
 ]
 
 [[package]]

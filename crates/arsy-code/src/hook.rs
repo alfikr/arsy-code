@@ -594,7 +594,7 @@ pub const MAX_HOOK_OUTPUT_BYTES: usize = 64 * 1024;
 pub struct Discovery {
     /// Where Claude Code and Codex keep the operator's files. Those files
     /// carry the operator's own authority.
-    pub homes: crate::compat::CompatHomes,
+    pub homes: arsy_compat::CompatHomes,
     /// The operator's home, for `~/.arsy/guard.json`.
     pub arsy_home: Option<PathBuf>,
     /// `compat.claude.enabled` and `compat.codex.enabled`.
@@ -1044,7 +1044,7 @@ mod tests {
 
     fn discovery(home: &Path, root: &Path, trusted: bool) -> Discovery {
         Discovery {
-            homes: crate::compat::CompatHomes {
+            homes: arsy_compat::CompatHomes {
                 claude_dir: Some(home.join(".claude")),
                 claude_json: None,
                 codex_dir: Some(home.join(".codex")),
