@@ -198,6 +198,11 @@ absolute path rather than through the workspace importer, which resolves only
 inside the checkout. A declaration is inert: `arsy mcp import [--scope
 user|workspace]` writes them into `arsy.json`, which is the step that makes
 them connectable, and it never repoints a name that is already defined.
+In the TUI, `/mcp` with no argument opens a dialog over the same rows: Space or
+Enter flips `enabled` on a definition in the user or workspace `arsy.json`, and
+on a declaration asks — showing the full command — before adopting that one
+into the user `arsy.json`. Environment variables and headers are not copied.
+`/mcp list` and `/mcp show NAME` remain read-only.
 
 The launch card is reprinted whenever the model or the approval mode changes,
 so the card above the transcript describes the session that is running. On a

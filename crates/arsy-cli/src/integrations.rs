@@ -395,7 +395,7 @@ fn headline(entries: &[Value]) -> String {
 
 /// What a row says about where the server is, in as few characters as carry
 /// the answer: the program that runs it, or the host it is reached at.
-fn target(entry: &Value) -> String {
+pub(crate) fn target(entry: &Value) -> String {
     if let Some(url) = entry["url"].as_str() {
         return mask_token(url);
     }

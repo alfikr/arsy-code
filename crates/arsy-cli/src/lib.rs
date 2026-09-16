@@ -2449,8 +2449,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
 
     loop {
-        // `/model`, `/approval` and Shift+Tab change what the launch card
-        // says, and the card is the first thing a reader checks. A fresh card
+        // `/model` changes what the launch card says, and the card is the
+        // first thing a reader checks. The approval mode lives in the status
+        // row, so Shift+Tab never lands here. A fresh card
         // is printed rather than the screen being repainted around the old
         // one, because a repaint also erases the notices printed between the
         // cards — including the line that just reported the change.
@@ -4253,6 +4254,12 @@ fn answer_task(
     }
     if line.trim().starts_with('/') || line.trim().is_empty() {
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        // `/mcp` alone opens the dialog, which writes the configuration; with
+        // any argument it is the read-only inspection it always was.
+        if line.trim() == "/mcp" {
+            run_mcp_dialog(invocation, stdout, typing.colour, keys, decoder)?;
+            return Ok(TaskPass::Go);
+        }
         return slash_command(line, invocation, typing, restoring, stdout, emitter);
     }
     run_task(
@@ -4838,6 +4845,168 @@ fn run_session_dialog(
             tui::SessionAction::Cancel => {}
         }
         return Ok(());
+    }
+}
+
+/// Every MCP connection ARSY defines, then every one another tool declares
+/// under a name ARSY does not already use, with the entries they came from.
+#[cfg(feature = "tui")]
+fn mcp_choices(
+    root: &Path,
+    invocation: &Invocation,
+) -> Result<Vec<(Value, tui::McpChoice)>, Diagnostic> {
+    let report =
+        integrations::inspect(root, "mcp", None, None, None, invocation.config.as_deref())?;
+    let mut rows: Vec<(Value, tui::McpChoice)> = Vec::new();
+    for entry in report["entries"].as_array().into_iter().flatten() {
+        let text = |key: &str| entry[key].as_str().unwrap_or_default().to_owned();
+        let name = text("name");
+        // The first row under a name is the one a toggle acts on: ARSY's own
+        // definition is listed first, and it is the one that runs.
+        if rows.iter().any(|(_, choice)| choice.name == name) {
+            continue;
+        }
+        let native = entry["ecosystem"] == "arsy";
+        let detail = match entry["url"].as_str() {
+            Some(url) => url.to_owned(),
+            None => std::iter::once(text("command"))
+                .chain(
+                    entry["args"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                )
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let choice = tui::McpChoice {
+            name,
+            source: text("ecosystem"),
+            trust: if native { text("trust") } else { String::new() },
+            target: integrations::target(entry),
+            detail,
+            enabled: native.then(|| entry["enabled"].as_bool().unwrap_or(false)),
+        };
+        rows.push((entry.clone(), choice));
+    }
+    Ok(rows)
+}
+
+/// Drive the `/mcp` dialog until it is closed.
+///
+/// Each key redraws the frame over the last one rather than under it, and the
+/// frame is erased on close, so moving through the list leaves nothing behind;
+/// only a line per change made stays in the scrollback.
+#[cfg(feature = "tui")]
+fn run_mcp_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = mcp_choices(&root, invocation)?;
+    let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        let frame = dialog.render(tui::terminal_width(), colour);
+        let up = if drawn > 0 {
+            format!("\x1b[{drawn}A")
+        } else {
+            String::new()
+        };
+        write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+        drawn = frame.lines().count();
+
+        let action = match next_mcp_action(&mut dialog, keys, decoder) {
+            None => continue,
+            Some(tui::McpAction::Close) => {
+                write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+                if !changes.is_empty() {
+                    changes.push("MCP changes take effect from the next turn.".to_owned());
+                    writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
+                        .map_err(terminal_failed)?;
+                }
+                return Ok(());
+            }
+            Some(action) => action,
+        };
+        dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
+            Ok(change) => {
+                changes.push(change.clone());
+                change
+            }
+            Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
+        });
+        rows = mcp_choices(&root, invocation)?;
+        dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
+    }
+}
+
+/// Wait for the next key and let the dialog answer it. A keyboard that hung up
+/// closes the dialog rather than holding the session on it.
+#[cfg(feature = "tui")]
+fn next_mcp_action(
+    dialog: &mut tui::McpDialogState,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Option<tui::McpAction> {
+    loop {
+        // A lone Escape is only known once nothing follows it.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(tui::McpAction::Close)
+            }
+        };
+        if let Some(key) = key {
+            return dialog.handle_key(key);
+        }
+    }
+}
+
+/// Write the change a toggle or an adoption asks for, and say what it did.
+#[cfg(feature = "tui")]
+fn apply_mcp_action(
+    root: &Path,
+    rows: &[(Value, tui::McpChoice)],
+    dialog: &tui::McpDialogState,
+    action: tui::McpAction,
+) -> Result<String, Diagnostic> {
+    match action {
+        tui::McpAction::Toggle(index) => {
+            let choice = &dialog.choices[index];
+            let enabled = !choice.enabled.unwrap_or(false);
+            let scope = match choice.trust.as_str() {
+                "user" => mcp::Scope::User,
+                "workspace" => mcp::Scope::Workspace,
+                other => {
+                    return Err(usage(format!(
+                        "`{}` is defined by the {other} configuration; change it there",
+                        choice.name
+                    )))
+                }
+            };
+            mcp::set_enabled_in(root, &choice.name, enabled, scope)?;
+            let state = if enabled { "enabled" } else { "disabled" };
+            Ok(format!("MCP `{}` {state}.", choice.name))
+        }
+        tui::McpAction::Adopt(index) => {
+            let server = mcp::server_from_declaration(&rows[index].0)?;
+            let written = mcp::add_in(root, &server, mcp::Scope::User)?;
+            Ok(format!(
+                "MCP `{}` adopted into {}, enabled.",
+                server.name,
+                written["path"].as_str().unwrap_or("arsy.json")
+            ))
+        }
+        tui::McpAction::Close => Ok(String::new()),
     }
 }
 

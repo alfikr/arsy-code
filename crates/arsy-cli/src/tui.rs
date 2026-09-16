@@ -29,6 +29,7 @@ mod bar;
 mod chat;
 mod keys;
 mod layout;
+mod mcp_dialog;
 mod model;
 mod progress;
 mod provider;
@@ -42,6 +43,7 @@ pub use keys::*;
 pub(super) use layout::stty;
 pub use layout::RawTerminal;
 pub use layout::{builtin_palette, Palette, DEFAULT_THEME, THEMES, THEME_ROLES};
+pub use mcp_dialog::*;
 pub use model::*;
 pub use progress::*;
 pub use provider::*;
@@ -229,6 +231,14 @@ const LABEL_WIDTH: usize = 10;
 
 const LOGO_WIDTH: usize = 10;
 const LOGO_HEIGHT: usize = 5;
+/// The half-block mark gets more cells than the image, because at 10 by 5
+/// it has only a hundred pixels to hold the shape and reads as noise. Six rows
+/// keep the card no taller than its labels.
+const BLOCK_LOGO_WIDTH: usize = 20;
+const BLOCK_LOGO_HEIGHT: usize = 6;
+/// Samples per side of each half-block pixel, so a pixel is lit by how much
+/// of it the shape covers rather than by whether a faint edge touched it.
+const BLOCK_LOGO_SAMPLES: usize = 4;
 const LOGO_GAP: usize = 3;
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 
@@ -242,22 +252,35 @@ fn logo(colour: bool) -> &'static [String] {
     }
 }
 
-/// Rasterise the mark into a canvas `scale` times the cell grid it occupies.
+/// Rasterise the mark into a canvas `scale` times the `columns` by `rows`
+/// cell grid it occupies.
+///
+/// `crop` fits the drawn shape rather than the SVG's padded view box, which
+/// the half-block mark needs because it has no pixels to spend on margin.
 ///
 /// The canvas keeps the grid's own aspect — one cell is two rows of pixels —
 /// so the same geometry serves the half-block rows and the image a terminal
 /// with a graphics protocol draws, and neither comes out stretched.
-fn logo_pixmap(scale: u32) -> resvg::tiny_skia::Pixmap {
+fn logo_pixmap(columns: usize, rows: usize, scale: u32, crop: bool) -> resvg::tiny_skia::Pixmap {
     let tree = resvg::usvg::Tree::from_data(LOGO_SVG, &resvg::usvg::Options::default())
         .expect("embedded ARSY logo must be valid SVG");
-    let width = LOGO_WIDTH as u32 * scale;
-    let height = (LOGO_HEIGHT * 2) as u32 * scale;
+    let width = columns as u32 * scale;
+    let height = (rows * 2) as u32 * scale;
     let mut pixmap =
         resvg::tiny_skia::Pixmap::new(width, height).expect("fixed logo canvas must be valid");
-    let fit = (width as f32 / tree.size().width()).min(height as f32 / tree.size().height());
+    let bounds = if crop {
+        tree.root().abs_bounding_box()
+    } else {
+        tree.size()
+            .to_rect(0.0, 0.0)
+            .expect("logo view box must be valid")
+    };
+    let fit = (width as f32 / bounds.width()).min(height as f32 / bounds.height());
+    let left = (width as f32 - bounds.width() * fit) / 2.0 - bounds.x() * fit;
+    let top = (height as f32 - bounds.height() * fit) / 2.0 - bounds.y() * fit;
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::from_scale(fit, fit),
+        resvg::tiny_skia::Transform::from_row(fit, 0.0, 0.0, fit, left, top),
         &mut pixmap.as_mut(),
     );
     pixmap
@@ -316,7 +339,7 @@ fn logo_transmission(id: u32) -> &'static str {
 
     static GRAPHIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GRAPHIC.get_or_init(|| {
-        let pixmap = logo_pixmap(SCALE);
+        let pixmap = logo_pixmap(LOGO_WIDTH, LOGO_HEIGHT, SCALE, false);
         let (width, height) = (pixmap.width(), pixmap.height());
         let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
         for pixel in pixmap.pixels() {
@@ -365,14 +388,35 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 fn render_logo(colour: bool) -> Vec<String> {
-    let pixmap = logo_pixmap(1);
+    let samples = BLOCK_LOGO_SAMPLES;
+    let pixmap = logo_pixmap(BLOCK_LOGO_WIDTH, BLOCK_LOGO_HEIGHT, samples as u32, true);
     let pixels = pixmap.pixels();
-    (0..LOGO_HEIGHT)
+    let stride = BLOCK_LOGO_WIDTH * samples;
+    // The average of one pixel's samples, lit only when the shape covers at
+    // least half of it.
+    let pixel = |column: usize, row: usize| {
+        let sum = (row * samples..(row + 1) * samples)
+            .flat_map(|y| &pixels[y * stride + column * samples..][..samples])
+            .fold([0usize; 4], |[red, green, blue, alpha], sample| {
+                [
+                    red + usize::from(sample.red()),
+                    green + usize::from(sample.green()),
+                    blue + usize::from(sample.blue()),
+                    alpha + usize::from(sample.alpha()),
+                ]
+            });
+        let [red, green, blue, alpha] = sum.map(|total| (total / (samples * samples)) as u8);
+        (alpha >= 128)
+            .then(|| resvg::tiny_skia::PremultipliedColorU8::from_rgba(red, green, blue, alpha))
+            .flatten()
+            .and_then(logo_pixel)
+    };
+    (0..BLOCK_LOGO_HEIGHT)
         .map(|row| {
             let mut line = String::new();
-            for column in 0..LOGO_WIDTH {
-                let upper = logo_pixel(pixels[row * 2 * LOGO_WIDTH + column]);
-                let lower = logo_pixel(pixels[(row * 2 + 1) * LOGO_WIDTH + column]);
+            for column in 0..BLOCK_LOGO_WIDTH {
+                let upper = pixel(column, row * 2);
+                let lower = pixel(column, row * 2 + 1);
                 line.push_str(&half_block(upper, lower, colour));
             }
             line
@@ -964,24 +1008,27 @@ mod tests {
             rows.iter().any(|row| strip_sgr(row).contains(&first_mark)),
             "card contains the rendered mark"
         );
-        // Border, a blank line, then the title: the labels set the height and
-        // the mark is centred against them, not the other way round.
+        // Border, a blank line, then the title: whichever column is taller sets
+        // the height and the other is centred against it.
         assert!(
             strip_sgr(rows[2]).contains(">_ ARSY CODE"),
             "the title leads the card"
         );
         assert_eq!(
             rows.len(),
-            // model, directory, sandbox, session, mode, the blank under the
-            // title, and the title, inside a blank line and a border each side.
-            7 + 2 + 2,
-            "the labels set the card height"
+            // model, directory, sandbox, session, the blank under the title,
+            // and the title — or the taller half-block mark — inside a blank
+            // line and a border each side.
+            BLOCK_LOGO_HEIGHT.max(6) + 2 + 2,
+            "the taller column sets the card height"
         );
         let marked = rows
             .iter()
             .position(|row| strip_sgr(row).contains(&first_mark))
             .expect("the mark is on the card");
-        assert!(marked > 2, "the mark is centred against the labels");
+        // Six mark rows against six label rows: the mark starts level with
+        // the title, inside the blank line.
+        assert_eq!(marked, 2, "the mark sits beside the labels");
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
         }
@@ -1023,14 +1070,15 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_card_goes_stale_when_the_model_or_the_mode_changes() {
+    fn the_launch_card_goes_stale_when_the_model_changes() {
         let mut state = TuiState::new("/w".into(), SessionId::new());
         assert!(state.card_is_stale(), "the card has never been drawn");
         assert!(!state.card_is_stale(), "nothing changed since");
 
+        // Shift+Tab cycles the mode; the status row names it, so the card
+        // is not reprinted for it.
         state.set_approval_mode("plan");
-        assert!(state.card_is_stale(), "the mode the card names changed");
-        assert!(!state.card_is_stale());
+        assert!(!state.card_is_stale(), "the mode is not a card field");
 
         state.set_model_route(ModelRoute {
             provider: CODEX_PROVIDER.into(),
@@ -1384,13 +1432,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_visible_in_the_launch_card_and_status_row() {
+    fn plan_mode_is_visible_in_the_status_row_not_the_card() {
         let mut state = TuiState::new("/workspace".into(), SessionId::new());
         state.set_approval_mode("plan");
 
         let launch = state.render(80, false);
-        assert!(launch.contains("mode:"), "{launch}");
-        assert!(launch.contains("PLAN"), "{launch}");
+        assert!(!launch.contains("mode:"), "{launch}");
         assert!(state.status_row(80, false, None).contains("⏸ PLAN"));
     }
 

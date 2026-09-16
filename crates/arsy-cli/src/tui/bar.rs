@@ -17,9 +17,9 @@ pub struct TuiState {
     model_route: Option<ModelRoute>,
     effort: Option<Effort>,
     approval_mode: String,
-    /// The model and mode the launch card was last drawn with, so a change to
-    /// either can be noticed without every caller reporting it.
-    shown: Option<(Option<ModelRoute>, String)>,
+    /// The model the launch card was last drawn with, so a change to it can be
+    /// noticed without every caller reporting it.
+    shown: Option<Option<ModelRoute>>,
 }
 
 impl TuiState {
@@ -40,11 +40,15 @@ impl TuiState {
 
     /// Whether the launch card on screen still says what the session is doing.
     ///
-    /// The card names the model and the approval mode, and both can change
-    /// without restarting, so a card left as it was printed describes a
-    /// session that no longer exists. Taking the answer marks it drawn.
+    /// The card names the model, which can change without restarting, so a
+    /// card left as it was printed describes a session that no longer exists.
+    /// Taking the answer marks it drawn.
+    ///
+    /// The approval mode is not a card field: Shift+Tab cycles it often, and a
+    /// card reprinted on every press fills the scrollback. The status row
+    /// under the composer names the mode instead, and it is always on screen.
     pub fn card_is_stale(&mut self) -> bool {
-        let current = (self.model_route.clone(), self.approval_mode.clone());
+        let current = self.model_route.clone();
         if self.shown.as_ref() == Some(&current) {
             return false;
         }
@@ -144,15 +148,6 @@ impl TuiState {
             &self.session.to_string(),
             sgr_dim(),
         ));
-        // Named on every launch, not only when it is Plan Mode: an operator
-        // opening a session should be told what runs without asking before
-        // they type, rather than after a call they expected to be prompted for.
-        let (mode, style) = match self.approval_mode.as_str() {
-            "default" => ("manual", sgr_dim()),
-            "plan" => ("PLAN", sgr_accent()),
-            other => (other, sgr_accent()),
-        };
-        rows.push(label_row(colour, "mode:", mode, style));
         if let Some(entry) = self.timeline.last() {
             rows.push(label_row(
                 colour,
@@ -303,8 +298,9 @@ impl TuiState {
 /// The mark is dropped when the card is too narrow to hold both, so a small
 /// terminal keeps the text it needs instead of a cropped picture.
 fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
-    let gutter = LOGO_WIDTH + LOGO_GAP;
-    if inner < gutter + LABEL_WIDTH + 12 {
+    let drawn = colour && logo_graphics();
+    let mark_width = if drawn { LOGO_WIDTH } else { BLOCK_LOGO_WIDTH };
+    if inner < mark_width + LOGO_GAP + LABEL_WIDTH + 12 {
         return text;
     }
     // Whichever column is shorter is centred against the other, so the mark
@@ -314,8 +310,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     // A terminal that draws images gets the mark as one, laid out as though it
     // were blank space: the escape leaves the cursor where it stands and the
     // image covers the cells the half-blocks would have filled.
-    let drawn = colour && logo_graphics();
-    let blank = " ".repeat(LOGO_WIDTH);
+    let blank = " ".repeat(mark_width);
     let logo: Vec<String> = if drawn {
         std::iter::once(format!("{}{blank}", logo_graphic()))
             .chain(std::iter::repeat_n(blank.clone(), LOGO_HEIGHT - 1))
@@ -331,7 +326,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
                 .checked_sub(mark_offset)
                 .and_then(|index| logo.get(index))
                 .cloned()
-                .unwrap_or_else(|| " ".repeat(LOGO_WIDTH));
+                .unwrap_or_else(|| " ".repeat(mark_width));
             let line = row
                 .checked_sub(text_offset)
                 .and_then(|index| text.get(index))
