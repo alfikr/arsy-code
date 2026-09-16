@@ -146,7 +146,7 @@ jobs:
           $line = Select-String -Path dist/fluxguard/SHA256SUMS `
             -Pattern "\s\*?$([regex]::Escape($env:ASSET))$"
           if ($null -eq $line) { throw "no checksum for $env:ASSET" }
-          $expected = $line.Line.Split(' ')[0]
+          $expected = (($line | Select-Object -First 1).Line.Trim() -split '\s+')[0].ToLowerInvariant()
           $actual = (Get-FileHash -Algorithm SHA256 "dist/fluxguard/$env:ASSET").Hash.ToLowerInvariant()
           if ($expected -ne $actual) { throw "checksum mismatch for $env:ASSET" }
           Expand-Archive -Path "dist/fluxguard/$env:ASSET" -DestinationPath dist/fluxguard -Force
@@ -173,7 +173,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/package | Out-Null
           Copy-Item "target/release/arsy${{ matrix.exe }}" dist/package/arsy.exe
           Copy-Item dist/fluxguard/fluxguard.exe dist/package/fluxguard.exe
-          Compress-Archive -Path dist/package/arsy.exe, dist/package/fluxguard.exe -DestinationPath "dist/${{ matrix.asset }}"
+          Compress-Archive -Path "dist/package/*" -DestinationPath "dist/${{ matrix.asset }}"
           (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.asset }}").Hash.ToLowerInvariant() |
             Set-Content -NoNewline "dist/${{ matrix.asset }}.sha256"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
