@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Install Linux credential-store dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
       - name: Install Rust with lint components
         run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy
       - name: Formatting
