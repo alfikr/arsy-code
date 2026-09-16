@@ -8358,73 +8358,73 @@ fn turn_boundary(
     Ok(prompt)
 }
 
-/// Run one tool call with the lifecycle events around it.
-///
-/// The scripted turn only. The interactive loop reaches the runtime through
-/// `execute_call`, which asks the operator rather than a hook, and a subagent's
-/// calls go through `child_turn`; neither dispatches these events yet.
-///
-/// `before_operation` sees the call before it happens and may rewrite its
-/// arguments, deny it, or ask for an approval nobody is here to give — which,
-/// on a surface with no operator, is a refusal reported to the model rather
-/// than a wait. `after_operation` and `operation_failed` see what it did.
-///
-/// A refused call is a failed result, not an error: the model asked for
-/// something it may not have, and telling it so is how it tries something else.
-fn invoke_hooked(
-    hooks: Option<&arsy_code::hook::HookEngine>,
-    runtime: &arsy_code::agent::ToolRuntime,
+/// What `before_operation` decided about one tool call.
+enum HookedCall {
+    /// Run it with these arguments, which a hook may have rewritten.
+    Run {
+        arguments: Value,
+        /// Context a hook asked the model to see, by the rule that asked.
+        injected: Vec<(String, String)>,
+        /// A hook's reason for wanting the operator asked first.
+        approval: Option<String>,
+    },
+    /// Do not run it; tell the model why.
+    Refused(String),
+}
+
+/// Dispatch `before_operation` for one call. What the hooks said along the way
+/// is added to `notes` for the caller to report its own way.
+fn hook_before_call(
+    hooks: &arsy_code::hook::HookEngine,
     name: &str,
     arguments: &Value,
-    emitter: &mut Emitter,
-) -> arsy_code::agent::ToolResult {
+    notes: &mut Vec<String>,
+) -> HookedCall {
     use arsy_code::hook::{LifecycleEvent, Outcome};
-
-    let Some(hooks) = hooks else {
-        return runtime.invoke(name, arguments);
-    };
-    let refused = |output: String| arsy_code::agent::ToolResult {
-        tool: name.to_owned(),
-        success: false,
-        output,
-        changed_files: Vec::new(),
-        duration: std::time::Duration::ZERO,
-        metadata: json!({"refused_by": "hook"}),
-        artifact: None,
-    };
 
     let before = match hooks.dispatch(LifecycleEvent::BeforeOperation, name, arguments.clone()) {
         Ok(before) => before,
         // The engine's own guards — depth, reentrancy — failing is the harness
         // misbehaving, and `before_operation` fails closed.
-        Err(error) => return refused(format!("the lifecycle engine refused the call: {error}")),
-    };
-    for note in &before.diagnostics {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-HOK-1000",
-            note.clone(),
-            String::new(),
-        ));
-    }
-    let arguments = match before.outcome {
-        Outcome::Deny(reason) => return refused(format!("a hook denied this call: {reason}")),
-        Outcome::RequireApproval(reason) => {
-            return refused(format!(
-                "a hook asked for the operator's approval, and this surface cannot ask for one:                  {reason}"
-            ))
+        Err(error) => {
+            return HookedCall::Refused(format!("the lifecycle engine refused the call: {error}"))
         }
+    };
+    notes.extend(before.diagnostics);
+    match before.outcome {
+        Outcome::Deny(reason) => HookedCall::Refused(format!("a hook denied this call: {reason}")),
         // A rewritten payload is what actually runs, which is the whole point
         // of letting a hook transform one.
-        Outcome::Continue | Outcome::Allow => before.payload,
-    };
+        outcome => HookedCall::Run {
+            arguments: before.payload,
+            injected: before.injected,
+            approval: match outcome {
+                Outcome::RequireApproval(reason) => Some(reason),
+                _ => None,
+            },
+        },
+    }
+}
 
-    let mut result = runtime.invoke(name, &arguments);
+/// Dispatch `after_operation` or `operation_failed` for a call that ran, and
+/// attach what `before_operation` injected to its result.
+///
+/// Both events report what already happened, so a failure here is said and the
+/// result stands.
+fn hook_after_call(
+    hooks: &arsy_code::hook::HookEngine,
+    name: &str,
+    injected: &[(String, String)],
+    result: &mut arsy_code::agent::ToolResult,
+    notes: &mut Vec<String>,
+) {
+    use arsy_code::hook::LifecycleEvent;
+
     // What a hook injected is context the model was meant to see, attributed to
     // the rule that asked for it.
-    for (rule, text) in &before.injected {
+    for (rule, text) in injected {
         result.output.push_str(&format!("\n[hook {rule}] {text}"));
     }
-
     let after = if result.success {
         LifecycleEvent::AfterOperation
     } else {
@@ -8436,20 +8436,71 @@ fn invoke_hooked(
         "output": result.output,
     });
     match hooks.dispatch(after, name, observed) {
-        Ok(dispatch) => {
-            for note in dispatch.diagnostics {
-                emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
-            }
+        Ok(dispatch) => notes.extend(dispatch.diagnostics),
+        Err(error) => notes.push(format!("a hook on `{}` failed: {error}", after.as_str())),
+    }
+}
+
+/// Run one tool call with the lifecycle events around it, on a surface with no
+/// operator to ask.
+///
+/// `before_operation` sees the call before it happens and may rewrite its
+/// arguments, deny it, or ask for an approval nobody is here to give — which,
+/// here, is a refusal reported to the model rather than a wait.
+/// `after_operation` and `operation_failed` see what it did.
+///
+/// A refused call is a failed result, not an error: the model asked for
+/// something it may not have, and telling it so is how it tries something else.
+fn invoke_hooked(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    arguments: &Value,
+    emitter: &mut Emitter,
+) -> arsy_code::agent::ToolResult {
+    let Some(hooks) = hooks else {
+        return runtime.invoke(name, arguments);
+    };
+    let mut notes = Vec::new();
+    let result = match hook_before_call(hooks, name, arguments, &mut notes) {
+        HookedCall::Refused(reason) => hook_refused(name, reason),
+        HookedCall::Run {
+            approval: Some(reason),
+            ..
+        } => hook_refused(
+            name,
+            format!(
+                "a hook asked for the operator's approval, and this surface cannot ask for one: \
+                 {reason}"
+            ),
+        ),
+        HookedCall::Run {
+            arguments,
+            injected,
+            approval: None,
+        } => {
+            let mut result = runtime.invoke(name, &arguments);
+            hook_after_call(hooks, name, &injected, &mut result, &mut notes);
+            result
         }
-        // Both of these report what already happened, so a failure here is
-        // said and the result stands.
-        Err(error) => emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-HOK-1000",
-            format!("a hook on `{}` failed: {error}", after.as_str()),
-            String::new(),
-        )),
+    };
+    for note in notes {
+        emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
     }
     result
+}
+
+/// The result a call a hook stopped sends back to the model.
+fn hook_refused(name: &str, output: String) -> arsy_code::agent::ToolResult {
+    arsy_code::agent::ToolResult {
+        tool: name.to_owned(),
+        success: false,
+        output,
+        changed_files: Vec::new(),
+        duration: std::time::Duration::ZERO,
+        metadata: json!({"refused_by": "hook"}),
+        artifact: None,
+    }
 }
 
 /// One counter out of the telemetry summary the run just printed.
