@@ -17,6 +17,7 @@ mod context;
 mod homes;
 pub mod instructions;
 pub mod mcp;
+mod model;
 mod permissions;
 mod read;
 
@@ -31,5 +32,6 @@ use arsy_kernel::config::CompatSeed;
 pub fn seeds(context: &Context) -> Vec<CompatSeed> {
     let mut seeds = mcp::mcp_seeds(context);
     seeds.extend(permissions::seeds(context));
+    seeds.extend(model::seeds(context));
     seeds
 }
