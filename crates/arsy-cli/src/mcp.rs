@@ -492,6 +492,13 @@ pub(crate) fn set_enabled_in(
     scope: Scope,
     declared_elsewhere: bool,
 ) -> Result<Value, Diagnostic> {
+    // Checked here rather than only where a command line is parsed: the /mcp
+    // dialog passes names straight from another tool's file.
+    if !crate::config_edit::is_writable(name) {
+        return Err(usage(format!(
+            "`{name}` cannot be written to arsy.json; switch it off in the file that declares it"
+        )));
+    }
     let path = scope.path(root)?;
     let current = read(&path)?;
     let updated = match crate::config_edit::set_existing(
@@ -713,6 +720,19 @@ mod tests {
 
     fn command(args: &[&str]) -> Result<Command, Diagnostic> {
         crate::parse(args.iter().map(|argument| (*argument).to_owned())).map(|it| it.command)
+    }
+
+    #[test]
+    fn a_toggle_refuses_a_name_arsy_json_cannot_hold() {
+        let root = tempfile::tempdir().unwrap();
+        let refused =
+            set_enabled_in(root.path(), "bad\"name", false, Scope::Workspace, true).unwrap_err();
+        assert!(
+            refused.message.contains("cannot be written"),
+            "{}",
+            refused.message
+        );
+        assert!(!root.path().join(".arsy").exists(), "nothing was written");
     }
 
     #[test]
