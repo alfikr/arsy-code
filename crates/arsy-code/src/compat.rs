@@ -1,3 +1,7 @@
+mod homes;
+
+pub use homes::CompatHomes;
+
 use crate::edit::EditAddress;
 use arsy_kernel::{
     domain::StateVersion,
