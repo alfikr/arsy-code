@@ -1033,16 +1033,17 @@ impl Config {
         Ok(())
     }
 
-    /// A table that sets `enabled` on a connection that already exists,
-    /// without restating where it points.
+    /// A table that sets `enabled` or the request limits on a connection that
+    /// already exists, without restating where it points.
     ///
     /// The bundled server is the reason this is here: it is declared before
     /// any file is read, so an operator has nothing to copy and would
-    /// otherwise have to reproduce its command to switch it off. Amending is
-    /// deliberately the narrow case -- only `enabled`, only for a name already
-    /// declared. Anything that names a `transport` still replaces the
-    /// definition outright, so a layer can never quietly repoint a connection
-    /// while looking like it only toggled one.
+    /// otherwise have to reproduce its command to switch it off or tune it.
+    /// Amending is deliberately the narrow case -- only `enabled`,
+    /// `timeout_ms`, and `max_body_bytes`, only for a name already declared.
+    /// Anything that names a `transport` still replaces the definition
+    /// outright, so a layer can never quietly repoint a connection while
+    /// looking like it only toggled one.
     fn amend_mcp_server(
         &self,
         layer: Layer,
@@ -1050,33 +1051,51 @@ impl Config {
         name: &str,
         value: &toml::Value,
     ) -> Result<Option<McpServer>, ConfigError> {
+        const AMENDABLE: &[&str] = &["enabled", "timeout_ms", "max_body_bytes"];
         let prefix = format!("mcp.server.{name}");
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
         let table = as_table(value, &prefix, path)?;
-        if table.len() != 1 {
+        if table.is_empty() || !table.keys().all(|key| AMENDABLE.contains(&key.as_str())) {
             return Ok(None);
         }
-        let Some(enabled) = table.get("enabled") else {
-            return Ok(None);
-        };
         let Some(existing) = self.mcp_servers.get(name) else {
             return Ok(None);
         };
-        let enabled = enabled.as_bool().ok_or_else(|| ConfigError {
-            path: path.to_path_buf(),
-            message: format!("`{prefix}.enabled` must be a boolean"),
-        })?;
+        let enabled = table
+            .get("enabled")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| reject(format!("`{prefix}.enabled` must be a boolean")))
+            })
+            .transpose()?;
+        let positive = |key: &str, current: u64| -> Result<u64, ConfigError> {
+            match table.get(key) {
+                None => Ok(current),
+                Some(value) => value
+                    .as_integer()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| reject(format!("`{prefix}.{key}` must be a positive integer"))),
+            }
+        };
         Ok(Some(McpServer {
-            enabled,
+            enabled: enabled.unwrap_or(existing.enabled),
             // Switching a connection off never increases authority, so the
             // label it was given survives. Switching one back on does, so it
             // is the amending layer that answers for it -- which is what stops
             // a repository re-enabling a connection an operator turned off and
             // having it act with the operator's trust.
-            trust: if enabled {
+            trust: if enabled == Some(true) {
                 policy_source(layer)
             } else {
                 existing.trust
             },
+            timeout_ms: positive("timeout_ms", existing.timeout_ms)?,
+            max_body_bytes: positive("max_body_bytes", existing.max_body_bytes)?,
             ..existing.clone()
         }))
     }
@@ -3373,6 +3392,16 @@ access_type = "offline"
         );
         assert!(on.enabled);
         assert_eq!(on.trust, PolicySource::Workspace);
+
+        // Limits can be tuned alongside the toggle, still without a transport.
+        let tuned = declared(
+            "schema_version = 1\n[mcp.server.fluxguard]\nenabled = false\ntimeout_ms = 60000\n",
+            Layer::User,
+        );
+        assert!(!tuned.enabled);
+        assert_eq!(tuned.timeout_ms, 60_000);
+        assert_eq!(tuned.max_body_bytes, DEFAULT_MCP_MAX_BODY_BYTES);
+        assert_eq!(tuned.trust, PolicySource::User);
 
         // A table that names a transport still replaces the definition, so an
         // amendment can never be a repoint wearing a toggle's clothes.
