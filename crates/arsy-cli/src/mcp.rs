@@ -465,15 +465,35 @@ pub fn set_enabled(
     let root = crate::workspace_root(&invocation.workspace)?;
     let path = scope.path(&root)?;
     let current = read(&path)?;
-    let updated =
-        crate::config_edit::set_existing(&current, &path_of(name), "enabled", Value::Bool(enabled))
-            .map_err(config_broken)?
-            .ok_or_else(|| {
-                usage(format!(
-                    "no connection named `{name}` is defined in {}",
-                    path.display()
-                ))
-            })?;
+    let updated = match crate::config_edit::set_existing(
+        &current,
+        &path_of(name),
+        "enabled",
+        Value::Bool(enabled),
+    )
+    .map_err(config_broken)?
+    {
+        Some(updated) => updated,
+        // The bundled connection is declared before any file is read, so there
+        // is nothing in this one to amend yet. Writing the toggle alone is
+        // what the loader expects: it amends the declaration rather than
+        // restating a command the operator never wrote. Any other name really
+        // is undefined, and a transport-less entry for one would only produce
+        // a file the loader refuses.
+        None if name == arsy_kernel::config::BUNDLED_MCP_SERVER => crate::config_edit::set(
+            &current,
+            &["mcp", "server"],
+            name,
+            json!({ "enabled": enabled }),
+        )
+        .map_err(config_broken)?,
+        None => {
+            return Err(usage(format!(
+                "no connection named `{name}` is defined in {}",
+                path.display()
+            )))
+        }
+    };
     write(&path, &updated)?;
     emitter.result(json!({
         "connection": name,

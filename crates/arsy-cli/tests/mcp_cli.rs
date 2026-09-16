@@ -197,3 +197,30 @@ fn a_server_that_never_answers_fails_on_the_deadline() {
         "the deadline must bound the probe, not the server's own lifetime"
     );
 }
+
+/// The bundled connection is declared before any file is read, so an operator
+/// who wants it off has nothing in their config to edit. Disabling has to work
+/// anyway, and has to leave behind a file the loader still accepts.
+#[test]
+fn the_bundled_connection_can_be_turned_off_without_restating_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let (code, disabled) = arsy(
+        workspace.path(),
+        &["mcp", "disable", "fluxguard", "--scope", "workspace"],
+    );
+    assert_eq!(code, 0, "{disabled}");
+    assert_eq!(disabled["enabled"], false);
+
+    // A name that is genuinely undefined is still refused: writing a
+    // transport-less entry for one would only produce a file nothing can load.
+    let (code, _) = arsy(
+        workspace.path(),
+        &["mcp", "disable", "absent", "--scope", "workspace"],
+    );
+    assert_ne!(code, 0);
+
+    // The toggle alone has to survive a reload, which is what proves the
+    // amendment path and the writer agree on the shape.
+    let (code, listed) = arsy(workspace.path(), &["mcp", "list"]);
+    assert_eq!(code, 0, "{listed}");
+}
