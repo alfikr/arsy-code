@@ -9050,7 +9050,7 @@ fn system_prompt(
 ) -> Option<String> {
     let workspace = arsy_code::resource::Workspace::open(root).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
-    let instructions = arsy_code::agent::instructions::discover(&workspace, &working);
+    let instructions = instructions_for(&workspace, root, &working);
     let family = arsy_code::agent::instructions::family_for(provider, model);
     let compiled = arsy_code::agent::instructions::system_prompt(
         family,
@@ -9063,6 +9063,45 @@ fn system_prompt(
     )
     .ok()?;
     Some(arsy_code::agent::instructions::render(&compiled))
+}
+
+/// The operator's own Claude Code and Codex instructions, then the
+/// repository's, root first.
+///
+/// Only the compat switches are needed, so the layers are read without the
+/// Claude and Codex MCP declarations a full resolution would also place.
+fn instructions_for(
+    workspace: &arsy_code::resource::Workspace,
+    root: &Path,
+    working: &Path,
+) -> Vec<arsy_code::agent::instructions::Instruction> {
+    use arsy_code::agent::instructions::{self, Instruction, MAX_INSTRUCTION_BYTES};
+    let config =
+        arsy_kernel::config::Config::load(&arsy_kernel::config::layers(root, working)).ok();
+    let enabled = |source: &str| {
+        config
+            .as_ref()
+            .is_none_or(|config| config.compat_enabled(source))
+    };
+    arsy_compat::instructions::user_instructions(
+        &compat_homes(),
+        enabled("claude"),
+        enabled("codex"),
+        MAX_INSTRUCTION_BYTES,
+    )
+    .into_iter()
+    .map(|found| Instruction {
+        path: found.path.display().to_string(),
+        text: found.text,
+        truncated: found.truncated,
+        operator: true,
+    })
+    .chain(instructions::discover_with(
+        workspace,
+        working,
+        enabled("claude"),
+    ))
+    .collect()
 }
 
 fn platform() -> String {

@@ -838,8 +838,17 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("crates/inner")).unwrap();
     std::fs::write(root.path().join("AGENTS.md"), "root rule").unwrap();
-    // Two names in one directory contribute once, not twice.
-    std::fs::write(root.path().join("CLAUDE.md"), "duplicate").unwrap();
+    // Claude Code reads CLAUDE.md beside AGENTS.md, so both contribute.
+    std::fs::write(root.path().join("CLAUDE.md"), "claude rule").unwrap();
+    // An override replaces AGENTS.md, and a copy of it is not read twice.
+    std::fs::create_dir_all(root.path().join("crates")).unwrap();
+    std::fs::write(root.path().join("crates/AGENTS.md"), "replaced").unwrap();
+    std::fs::write(
+        root.path().join("crates/AGENTS.override.md"),
+        "override rule",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("crates/CLAUDE.md"), "override rule").unwrap();
     std::fs::write(root.path().join("crates/inner/CLAUDE.md"), "nested rule").unwrap();
     // Ordinary documentation is not an instruction.
     std::fs::write(root.path().join("README.md"), "not an instruction").unwrap();
@@ -855,11 +864,29 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
             .collect::<Vec<_>>(),
         [
             ("AGENTS.md", "root rule"),
+            ("CLAUDE.md", "claude rule"),
+            ("crates/AGENTS.override.md", "override rule"),
             ("crates/inner/CLAUDE.md", "nested rule"),
         ],
-        "root first, one per directory, and nothing that is merely Markdown"
+        "root first, agents file then CLAUDE.md, and nothing that is merely Markdown"
     );
+    let without_claude =
+        agent::instructions::discover_with(&workspace, &root.path().join("crates/inner"), false);
+    assert!(without_claude
+        .iter()
+        .all(|instruction| !instruction.path.ends_with("CLAUDE.md")));
 
+    // The operator's own file is labelled as theirs, not the project's.
+    let mut found = found;
+    found.insert(
+        0,
+        agent::instructions::Instruction {
+            path: "/home/op/.claude/CLAUDE.md".to_owned(),
+            text: "operator rule".to_owned(),
+            truncated: false,
+            operator: true,
+        },
+    );
     let prompt = agent::instructions::system_prompt(
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
@@ -872,6 +899,10 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
     .unwrap();
     let rendered = agent::instructions::render(&prompt);
     assert!(rendered.contains("root rule"), "{rendered}");
+    assert!(
+        rendered.contains("<user-instructions path=\"/home/op/.claude/CLAUDE.md\">\noperator rule"),
+        "{rendered}"
+    );
     assert!(rendered.contains("nested rule"), "{rendered}");
     assert!(rendered.contains(agent::instructions::HARNESS_INSTRUCTIONS.trim_end()));
     assert!(

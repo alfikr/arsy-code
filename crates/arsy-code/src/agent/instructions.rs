@@ -5,7 +5,8 @@
 //! injecting none, which is what this harness did before, means a project's own
 //! conventions never reach the model at all.
 //!
-//! So discovery is deliberate and narrow: only files at [`INSTRUCTION_NAMES`],
+//! So discovery is deliberate and narrow: only [`AGENTS_NAMES`], [`CLAUDE_NAME`],
+//! and [`FALLBACK_NAME`],
 //! only on the path from the workspace root down to the working directory, root
 //! first — the same ancestor walk `arsy integrations import` reports, so what
 //! the model is told and what `arsy integrations explain` prints cannot drift.
@@ -23,10 +24,17 @@ use arsy_kernel::{
 };
 use std::path::{Path, PathBuf};
 
-/// Instruction files, in the order they are looked for in one directory. The
-/// first that exists wins, so a project that keeps both does not get two copies
-/// of the same guidance.
-pub const INSTRUCTION_NAMES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".arsy/AGENTS.md"];
+/// The agents file of one directory: the first of these that exists. Codex
+/// reads `AGENTS.override.md` in place of `AGENTS.md`, so ARSY does too.
+pub const AGENTS_NAMES: [&str; 3] = ["AGENTS.override.md", "AGENTS.md", ".arsy/AGENTS.md"];
+
+/// Read beside the agents file, as Claude Code reads it, when the Claude
+/// source is switched on. A copy of the agents file — the common symlink — is
+/// not read twice.
+pub const CLAUDE_NAME: &str = "CLAUDE.md";
+
+/// Read only in a directory with neither of the above.
+pub const FALLBACK_NAME: &str = "GEMINI.md";
 
 /// The most one instruction file may contribute. A file past this is truncated
 /// rather than dropped: a long CONTRIBUTING-style AGENTS.md still carries its
@@ -40,43 +48,71 @@ pub struct Instruction {
     pub path: String,
     pub text: String,
     pub truncated: bool,
+    /// The operator's own file, outside any repository.
+    pub operator: bool,
 }
 
 /// Walk from the workspace root down to `working_directory`, collecting the
-/// instruction file in each directory that has one.
+/// instruction files in each directory that has any.
 ///
 /// Root first, so a nested `AGENTS.md` is read after — and therefore overrides —
 /// the one above it, which is the precedence every harness in this family uses.
 pub fn discover(workspace: &Workspace, working_directory: &Path) -> Vec<Instruction> {
-    let mut found = Vec::new();
-    for directory in ancestors(workspace.path(), working_directory) {
-        for name in INSTRUCTION_NAMES {
-            let relative = directory.join(name);
-            let Ok(content) = workspace.read(&relative, MAX_INSTRUCTION_BYTES + 1) else {
-                continue;
-            };
-            let truncated = content.bytes.len() as u64 > MAX_INSTRUCTION_BYTES;
-            let mut bytes = content.bytes;
-            if truncated {
-                bytes.truncate(usize::try_from(MAX_INSTRUCTION_BYTES).unwrap_or(usize::MAX));
-                // Cut back to a character boundary rather than emitting a
-                // replacement character mid-word.
-                while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
-                    bytes.pop();
-                }
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
-                continue;
-            };
-            found.push(Instruction {
-                path: relative.to_string_lossy().replace('\\', "/"),
-                text,
-                truncated,
-            });
-            break;
+    discover_with(workspace, working_directory, true)
+}
+
+/// [`discover`], with `CLAUDE.md` read only when `claude` is on.
+pub fn discover_with(
+    workspace: &Workspace,
+    working_directory: &Path,
+    claude: bool,
+) -> Vec<Instruction> {
+    ancestors(workspace.path(), working_directory)
+        .into_iter()
+        .flat_map(|directory| in_directory(workspace, &directory, claude))
+        .collect()
+}
+
+/// The agents file and `CLAUDE.md` of one directory, or its fallback.
+fn in_directory(workspace: &Workspace, directory: &Path, claude: bool) -> Vec<Instruction> {
+    let agents = AGENTS_NAMES
+        .iter()
+        .find_map(|name| read(workspace, &directory.join(name)));
+    let claude_file = claude
+        .then(|| read(workspace, &directory.join(CLAUDE_NAME)))
+        .flatten()
+        .filter(|found| {
+            agents
+                .as_ref()
+                .is_none_or(|agents| agents.text != found.text)
+        });
+    let found: Vec<Instruction> = agents.into_iter().chain(claude_file).collect();
+    if !found.is_empty() {
+        return found;
+    }
+    read(workspace, &directory.join(FALLBACK_NAME))
+        .into_iter()
+        .collect()
+}
+
+fn read(workspace: &Workspace, relative: &Path) -> Option<Instruction> {
+    let content = workspace.read(relative, MAX_INSTRUCTION_BYTES + 1).ok()?;
+    let truncated = content.bytes.len() as u64 > MAX_INSTRUCTION_BYTES;
+    let mut bytes = content.bytes;
+    if truncated {
+        bytes.truncate(usize::try_from(MAX_INSTRUCTION_BYTES).unwrap_or(usize::MAX));
+        // Cut back to a character boundary rather than emitting a
+        // replacement character mid-word.
+        while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+            bytes.pop();
         }
     }
-    found
+    Some(Instruction {
+        path: relative.to_string_lossy().replace('\\', "/"),
+        text: String::from_utf8(bytes).ok()?,
+        truncated,
+        operator: false,
+    })
 }
 
 /// Directories from `root` down to `working_directory`, inclusive.
@@ -197,11 +233,16 @@ pub fn system_prompt(
         });
     }
     for instruction in instructions {
+        let tag = if instruction.operator {
+            "user-instructions"
+        } else {
+            "project-instructions"
+        };
         fragments.push(PromptFragment {
             id: FragmentId::new(),
             kind: PromptFragmentKind::Context,
             content: format!(
-                "<project-instructions path=\"{}\"{}>\n{}\n</project-instructions>",
+                "<{tag} path=\"{}\"{}>\n{}\n</{tag}>",
                 instruction.path,
                 if instruction.truncated {
                     " truncated=\"true\""
