@@ -1718,10 +1718,10 @@ fn load_config(
     // below every layer.
     let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
     let seeds = compat_seeds(workspace, &config);
-    if seeds
-        .iter()
-        .all(|seed| seed.mcp_servers.is_empty() && seed.notes.is_empty())
-    {
+    let contributes = |seed: &arsy_kernel::config::CompatSeed| {
+        !(seed.mcp_servers.is_empty() && seed.policy_rules.is_empty() && seed.notes.is_empty())
+    };
+    if !seeds.iter().any(contributes) {
         return Ok(config);
     }
     arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
@@ -1733,7 +1733,7 @@ fn compat_seeds(
     config: &arsy_kernel::config::Config,
 ) -> Vec<arsy_kernel::config::CompatSeed> {
     let homes = compat_homes();
-    arsy_compat::mcp::mcp_seeds(&arsy_compat::mcp::Context {
+    arsy_compat::seeds(&arsy_compat::Context {
         homes: &homes,
         root: workspace,
         trusted: config.trusts(workspace),
