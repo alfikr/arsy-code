@@ -263,7 +263,14 @@ pub fn add(
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    let path = scope.path(&root)?;
+    emitter.result(add_in(&root, server, scope)?);
+    Ok(0)
+}
+
+/// Write one definition and describe what was written, for a caller that
+/// reports it its own way.
+pub(crate) fn add_in(root: &Path, server: &McpServer, scope: Scope) -> Result<Value, Diagnostic> {
+    let path = scope.path(root)?;
     let current = read(&path)?;
     if crate::config_edit::contains(&current, &path_of(&server.name)).map_err(config_broken)? {
         return Err(usage(format!(
@@ -280,7 +287,7 @@ pub fn add(
     )
     .map_err(config_broken)?;
     write(&path, &updated)?;
-    emitter.result(json!({
+    Ok(json!({
         "connection": server.name,
         "scope": scope.as_str(),
         "path": path.display().to_string(),
@@ -288,8 +295,7 @@ pub fn add(
         "target": server.transport.target(),
         "trust": arsy_kernel::config::policy_source(scope.layer()).to_string(),
         "connected": false,
-    }));
-    Ok(0)
+    }))
 }
 
 /// `arsy mcp import`: adopt the operator's Claude connections as ARSY ones.
@@ -382,7 +388,7 @@ fn declared_for_import(root: &Path) -> Result<Vec<Value>, Diagnostic> {
 }
 
 /// The ARSY definition a mapped declaration describes.
-fn server_from_declaration(declaration: &Value) -> Result<McpServer, Diagnostic> {
+pub(crate) fn server_from_declaration(declaration: &Value) -> Result<McpServer, Diagnostic> {
     let text = |key: &str| declaration.get(key).and_then(Value::as_str).unwrap_or("");
     let name = text("name").to_owned();
     if !crate::config_edit::is_writable(&name) {
@@ -463,7 +469,19 @@ pub fn set_enabled(
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    let path = scope.path(&root)?;
+    emitter.result(set_enabled_in(&root, name, enabled, scope)?);
+    Ok(0)
+}
+
+/// Flip the key and describe the result, for a caller that reports it its own
+/// way.
+pub(crate) fn set_enabled_in(
+    root: &Path,
+    name: &str,
+    enabled: bool,
+    scope: Scope,
+) -> Result<Value, Diagnostic> {
+    let path = scope.path(root)?;
     let current = read(&path)?;
     let updated = match crate::config_edit::set_existing(
         &current,
@@ -495,13 +513,12 @@ pub fn set_enabled(
         }
     };
     write(&path, &updated)?;
-    emitter.result(json!({
+    Ok(json!({
         "connection": name,
         "scope": scope.as_str(),
         "path": path.display().to_string(),
         "enabled": enabled,
-    }));
-    Ok(0)
+    }))
 }
 
 /// Connect every enabled server and collect the tools they offer.
