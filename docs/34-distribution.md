@@ -14,6 +14,37 @@ verifies the digest against the published `.sha256`, and unpacks it into the
 package. An unsupported platform fails the install with an explicit diagnostic
 rather than installing a launcher that cannot run.
 
+## Bundled FluxGuard
+
+Every archive carries two binaries: `arsy` and `fluxguard`. The release build
+downloads FluxGuard's own release asset for the same target, checks it against
+FluxGuard's published `SHA256SUMS`, and packs it beside `arsy`; the tag it
+pulls is pinned in `release.yml` rather than tracking `latest`, so a release
+builds the same way twice. Every channel installs both into the same
+directory — `bin.install` for the tap, a two-entry `bin` array for the bucket,
+`vendor/` for npm, the install directory for the scripts.
+
+Adjacency is what turns it on, not `PATH`: ARSY declares `mcp.server.fluxguard`
+before it reads any configuration file and enables it when `fluxguard` sits
+beside its own executable, so an install has resource awareness on the first
+run without a second install step. An install that did not ship one — a `cargo
+build`, a distribution that packages `arsy` alone — still declares the
+connection but leaves it off, pointing at `fluxguard` on `PATH`: a copy found
+there belongs to some other install, so it is offered rather than started.
+
+The declaration is always present, so the name is always something to toggle:
+
+```sh
+arsy mcp disable fluxguard    # or `enable`, for a separately installed one
+```
+
+That writes `{"mcp": {"server": {"fluxguard": {"enabled": false}}}}`. A table
+that sets `enabled` alone amends the declaration rather than replacing it,
+which is why no command has to be restated; a table that names a `transport`
+replaces it outright, as any other connection does. Re-enabling takes the
+amending layer's own trust, so a repository file cannot switch a connection
+back on and have it act with the operator's authority.
+
 ## Supported targets
 
 | Operating system | Architecture | Rust target | Support |

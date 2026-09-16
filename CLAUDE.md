@@ -76,6 +76,11 @@ Sigstore-signed `SHA256SUMS`, the SuiFlex Homebrew tap, the SuiFlex Scoop
 bucket, the npm package `@suiflex/arsy-code` (a launcher that downloads and
 verifies the matching archive in a postinstall step), and `install.sh` /
 `install.ps1` (checksum-only — they do not check the signature).
+Every archive carries two binaries: `arsy` and `fluxguard`, whose release asset
+is downloaded from `suiflex/FluxGuard` at the tag pinned in `release.yml` and
+checked against its published `SHA256SUMS`. ARSY declares `mcp.server.fluxguard`
+before reading any config file and enables it when the binary sits beside its
+own, so every channel has to install both into the same directory.
 `.github/workflows/release.yml` publishes the release, the tap, and the bucket;
 npm is published separately by `npm-publish.yml` once that build succeeds. See
 [docs/34-distribution.md](docs/34-distribution.md).
