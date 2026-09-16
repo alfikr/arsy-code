@@ -7,8 +7,8 @@
 
 use super::expand;
 use crate::{
-    mcp::{empty_seed, place, required, string_map, strings, Context, Declared, Scope},
-    read,
+    mcp::{empty_seed, place, required, string_map, strings, Declared},
+    read, Context, Scope,
 };
 use arsy_kernel::config::{CompatSeed, LaunchEnv, McpTransport};
 use serde_json::Value;

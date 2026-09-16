@@ -3,3 +3,4 @@
 pub(crate) mod expand;
 pub(crate) mod instructions;
 pub(crate) mod mcp;
+pub(crate) mod permissions;

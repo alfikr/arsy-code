@@ -13,43 +13,12 @@
 //! checkout, and a repository file can never put the operator's variables into
 //! a URL or a header, which would send them to a host the repository chose.
 
-use crate::CompatHomes;
-use arsy_kernel::{
-    capability::PolicySource,
-    config::{
-        CompatSeed, McpServer, McpTransport, DEFAULT_MCP_MAX_BODY_BYTES, DEFAULT_MCP_TIMEOUT_MS,
-    },
+use crate::{Context, Scope};
+use arsy_kernel::config::{
+    CompatSeed, McpServer, McpTransport, DEFAULT_MCP_MAX_BODY_BYTES, DEFAULT_MCP_TIMEOUT_MS,
 };
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
-
-/// What a live read needs to know about where it runs.
-pub struct Context<'a> {
-    pub homes: &'a CompatHomes,
-    pub root: &'a Path,
-    /// Whether the operator vouched for `root`.
-    pub trusted: bool,
-    /// `compat.claude.enabled` and `compat.codex.enabled`.
-    pub claude: bool,
-    pub codex: bool,
-    /// The process environment, injected so a test never reads the real one.
-    pub env: &'a dyn Fn(&str) -> Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Scope {
-    User,
-    Workspace,
-}
-
-impl Scope {
-    pub(crate) const fn trust(self) -> PolicySource {
-        match self {
-            Self::User => PolicySource::User,
-            Self::Workspace => PolicySource::Workspace,
-        }
-    }
-}
 
 /// A declaration read and translated, before trust decides whether it starts.
 pub(crate) struct Declared {

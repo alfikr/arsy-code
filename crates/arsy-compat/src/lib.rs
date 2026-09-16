@@ -13,9 +13,23 @@
 
 mod claude;
 mod codex;
+mod context;
 mod homes;
 pub mod instructions;
 pub mod mcp;
+mod permissions;
 mod read;
 
+pub use context::Context;
+pub(crate) use context::Scope;
 pub use homes::CompatHomes;
+
+use arsy_kernel::config::CompatSeed;
+
+/// Everything Claude Code and Codex contribute to configuration, one seed per
+/// file, in the order the kernel places them.
+pub fn seeds(context: &Context) -> Vec<CompatSeed> {
+    let mut seeds = mcp::mcp_seeds(context);
+    seeds.extend(permissions::seeds(context));
+    seeds
+}

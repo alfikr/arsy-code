@@ -1,5 +1,8 @@
 use super::*;
+use crate::CompatHomes;
+use arsy_kernel::capability::PolicySource;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 struct Machine {
     home: tempfile::TempDir,
