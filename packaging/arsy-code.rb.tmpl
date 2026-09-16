@@ -42,5 +42,6 @@ class ArsyCode < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/arsy --version")
+    assert_predicate bin/"fluxguard", :exist?
   end
 end
