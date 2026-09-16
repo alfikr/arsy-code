@@ -86,7 +86,14 @@ pub fn inspect_with(
     let mut entries = Vec::new();
     // What the engine actually built, so a listing can say which declarations
     // run rather than repeating that none do.
-    let config = crate::load_config(root, working, extra_config)?;
+    // Only what reads it loads it: an OMP-only listing never did, and a
+    // broken arsy.json should not start failing it.
+    let needs_config = kind == "hook" || source.is_none_or(|source| source != "omp");
+    let config = if needs_config {
+        crate::load_config(root, working, extra_config)?
+    } else {
+        arsy_kernel::config::Config::default()
+    };
     let loaded = (kind == "hook").then(|| crate::hook_engine(root, &config));
     if kind == "mcp" {
         entries.extend(configured(&config, name, source));
@@ -684,6 +691,15 @@ mod tests {
         extra: Option<&Path>,
     ) -> Result<Value, Diagnostic> {
         inspect_with(root, kind, name, source, event, extra, &[])
+    }
+
+    #[test]
+    fn an_omp_listing_does_not_depend_on_arsy_json() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".arsy")).unwrap();
+        std::fs::write(root.path().join(".arsy/arsy.json"), "{not json").unwrap();
+        assert!(fixtures(root.path(), "mcp", None, Some("claude"), None, None).is_err());
+        assert!(fixtures(root.path(), "mcp", None, Some("omp"), None, None).is_ok());
     }
 
     fn declared(name: &str, command: &str, args: &[&str], source: &str) -> Value {
