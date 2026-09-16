@@ -416,6 +416,7 @@ mod tests {
             transport: arsy_kernel::config::McpTransport::Stdio {
                 command: "unused".to_owned(),
                 args: Vec::new(),
+                env: Default::default(),
             },
             enabled: true,
             trust: arsy_kernel::capability::PolicySource::User,

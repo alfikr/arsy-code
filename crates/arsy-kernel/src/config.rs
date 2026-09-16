@@ -350,6 +350,7 @@ fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
                 |path| path.display().to_string(),
             ),
             args: vec!["serve".to_owned()],
+            env: LaunchEnv::default(),
         },
         enabled: bundled.is_some(),
         // Shipped with the binary, but authority stops where the operator's
@@ -422,12 +423,58 @@ impl RemoteTarget {
 /// Container engines this build knows how to drive.
 pub const CONTAINER_ENGINES: &[&str] = &["docker", "podman"];
 
+/// Values a server is handed when it is reached: the environment of a stdio
+/// process, or the headers of an HTTP request.
+///
+/// They are usually credentials — a connection string, a bearer token — so
+/// they are never serialized, and `Debug` names the keys without the values.
+/// Only the connection that launches the server reads them.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct LaunchEnv(BTreeMap<String, String>);
+
+impl LaunchEnv {
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<BTreeMap<String, String>> for LaunchEnv {
+    fn from(values: BTreeMap<String, String>) -> Self {
+        Self(values)
+    }
+}
+
+impl fmt::Debug for LaunchEnv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
 /// How ARSY reaches one MCP server.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
-    Stdio { command: String, args: Vec<String> },
-    Http { url: String },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        #[serde(skip)]
+        env: LaunchEnv,
+    },
+    Http {
+        url: String,
+        #[serde(skip)]
+        headers: LaunchEnv,
+    },
 }
 
 impl McpTransport {
@@ -442,9 +489,9 @@ impl McpTransport {
     /// to let an operator recognize the server they meant.
     pub fn target(&self) -> String {
         match self {
-            Self::Stdio { command, args } if args.is_empty() => command.clone(),
-            Self::Stdio { command, args } => format!("{command} {}", args.join(" ")),
-            Self::Http { url } => url.clone(),
+            Self::Stdio { command, args, .. } if args.is_empty() => command.clone(),
+            Self::Stdio { command, args, .. } => format!("{command} {}", args.join(" ")),
+            Self::Http { url, .. } => url.clone(),
         }
     }
 }
@@ -1146,7 +1193,11 @@ impl Config {
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 };
-                McpTransport::Stdio { command, args }
+                McpTransport::Stdio {
+                    command,
+                    args,
+                    env: LaunchEnv::default(),
+                }
             }
             "http" => McpTransport::Http {
                 url: expect_string(
@@ -1157,6 +1208,7 @@ impl Config {
                     path,
                 )?
                 .clone(),
+                headers: LaunchEnv::default(),
             },
             other => {
                 return Err(reject(format!(
@@ -3350,6 +3402,7 @@ access_type = "offline"
                     transport: McpTransport::Stdio {
                         command: "/opt/arsy/fluxguard".to_owned(),
                         args: vec!["serve".to_owned()],
+                        env: LaunchEnv::default(),
                     },
                     enabled: true,
                     trust: PolicySource::User,
@@ -3380,6 +3433,7 @@ access_type = "offline"
             McpTransport::Stdio {
                 command: "/opt/arsy/fluxguard".to_owned(),
                 args: vec!["serve".to_owned()],
+                env: LaunchEnv::default(),
             }
         );
 
@@ -3415,6 +3469,7 @@ access_type = "offline"
             McpTransport::Stdio {
                 command: "other".to_owned(),
                 args: Vec::new(),
+                env: LaunchEnv::default(),
             }
         );
     }
@@ -3434,6 +3489,7 @@ access_type = "offline"
             McpTransport::Stdio {
                 command: BUNDLED_MCP_SERVER.to_owned(),
                 args: vec!["serve".to_owned()],
+                env: LaunchEnv::default(),
             }
         );
 
@@ -3449,6 +3505,7 @@ access_type = "offline"
             McpTransport::Stdio {
                 command: command.display().to_string(),
                 args: vec!["serve".to_owned()],
+                env: LaunchEnv::default(),
             }
         );
 
@@ -3469,5 +3526,32 @@ access_type = "offline"
         std::os::unix::fs::symlink(&binary, &link).unwrap();
 
         assert!(bundled_mcp_server_beside(&link).enabled);
+    }
+
+    #[test]
+    fn launch_values_never_leave_the_transport() {
+        let secret =
+            |key: &str| LaunchEnv::from(BTreeMap::from([(key.to_owned(), "hunter2".to_owned())]));
+        let stdio = McpTransport::Stdio {
+            command: "db-server".to_owned(),
+            args: Vec::new(),
+            env: secret("DATABASE_URL"),
+        };
+        let http = McpTransport::Http {
+            url: "https://mcp.example.test".to_owned(),
+            headers: secret("authorization"),
+        };
+        for transport in [&stdio, &http] {
+            let shown = format!(
+                "{} {transport:?} {}",
+                serde_json::to_string(transport).unwrap(),
+                transport.target()
+            );
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+        assert!(
+            format!("{stdio:?}").contains("DATABASE_URL"),
+            "the key is still named"
+        );
     }
 }

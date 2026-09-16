@@ -170,6 +170,7 @@ fn definition(
         (Some("stdio") | None, Some(command), None) => McpTransport::Stdio {
             command: command.to_owned(),
             args,
+            env: Default::default(),
         },
         (Some("http"), None, Some(url)) => {
             if !args.is_empty() {
@@ -177,6 +178,7 @@ fn definition(
             }
             McpTransport::Http {
                 url: url.to_owned(),
+                headers: Default::default(),
             }
         }
         (Some("stdio"), None, _) => Err(usage("a stdio connection needs --command <CMD>"))?,
@@ -238,14 +240,14 @@ fn config_broken(error: String) -> Diagnostic {
 fn definition_json(server: &McpServer) -> Value {
     let mut object = serde_json::Map::new();
     match &server.transport {
-        McpTransport::Stdio { command, args } => {
+        McpTransport::Stdio { command, args, .. } => {
             object.insert("transport".to_owned(), json!("stdio"));
             object.insert("command".to_owned(), json!(command));
             if !args.is_empty() {
                 object.insert("args".to_owned(), json!(args));
             }
         }
-        McpTransport::Http { url } => {
+        McpTransport::Http { url, .. } => {
             object.insert("transport".to_owned(), json!("http"));
             object.insert("url".to_owned(), json!(url));
         }
@@ -409,9 +411,11 @@ pub(crate) fn server_from_declaration(declaration: &Value) -> Result<McpServer, 
                         .collect()
                 })
                 .unwrap_or_default(),
+            env: Default::default(),
         },
         "http" => McpTransport::Http {
             url: text("url").to_owned(),
+            headers: Default::default(),
         },
         other => {
             return Err(usage(format!(
@@ -730,6 +734,7 @@ mod tests {
             McpTransport::Stdio {
                 command: "docs-server".to_owned(),
                 args: vec!["--serve".to_owned()],
+                env: Default::default(),
             }
         );
         // Adopted into a layer the operator owns, not left at the authority of
@@ -749,6 +754,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "mine".to_owned(),
                     args: Vec::new(),
+                    env: Default::default(),
                 },
                 enabled: true,
                 trust: arsy_kernel::config::policy_source(Layer::User),
@@ -782,6 +788,7 @@ mod tests {
             McpTransport::Stdio {
                 command: "mcp-docs".to_owned(),
                 args: vec!["--root".to_owned(), ".".to_owned()],
+                env: Default::default(),
             },
             "arguments after `--` belong to the command, flags of ARSY's do not"
         );
@@ -805,7 +812,8 @@ mod tests {
         assert_eq!(
             server.transport,
             McpTransport::Http {
-                url: "https://mcp.example.test/mcp".to_owned()
+                url: "https://mcp.example.test/mcp".to_owned(),
+                headers: Default::default(),
             }
         );
 
@@ -890,6 +898,7 @@ mod tests {
             McpTransport::Stdio {
                 command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
                 args: vec![r#"--note="a" b"#.to_owned()],
+                env: Default::default(),
             }
         );
 
@@ -948,6 +957,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "mcp-docs".to_owned(),
                 args: vec!["--root".to_owned(), ".".to_owned()],
+                env: Default::default(),
             },
             enabled: true,
             trust: arsy_kernel::capability::PolicySource::User,
@@ -975,6 +985,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
                 args: vec![r#"--note="a" b"#.to_owned(), "\ttabbed".to_owned()],
+                env: Default::default(),
             },
             ..stdio.clone()
         };

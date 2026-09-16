@@ -671,13 +671,13 @@ where
 {
     fn connect(&self, definition: &McpServer) -> Result<Box<dyn Channel>, McpError> {
         match &definition.transport {
-            McpTransport::Stdio { command, args } => Ok(Box::new(StdioChannel::spawn(
+            McpTransport::Stdio { command, args, .. } => Ok(Box::new(StdioChannel::spawn(
                 command,
                 args,
                 Duration::from_millis(definition.timeout_ms),
                 definition.max_body_bytes,
             )?)),
-            McpTransport::Http { url } => Ok(Box::new(HttpChannel::new(
+            McpTransport::Http { url, .. } => Ok(Box::new(HttpChannel::new(
                 url,
                 (self.http)(),
                 definition.max_body_bytes,
@@ -850,6 +850,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "unused".to_owned(),
                 args: Vec::new(),
+                env: Default::default(),
             },
             enabled,
             trust: arsy_kernel::capability::PolicySource::User,

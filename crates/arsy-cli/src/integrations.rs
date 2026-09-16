@@ -241,11 +241,11 @@ fn configured(
             "max_body_bytes": server.max_body_bytes,
         });
         match &server.transport {
-            arsy_kernel::config::McpTransport::Stdio { command, args } => {
+            arsy_kernel::config::McpTransport::Stdio { command, args, .. } => {
                 entry["command"] = json!(command);
                 entry["args"] = json!(args);
             }
-            arsy_kernel::config::McpTransport::Http { url } => entry["url"] = json!(url),
+            arsy_kernel::config::McpTransport::Http { url, .. } => entry["url"] = json!(url),
         }
         entries.push(entry);
     }
