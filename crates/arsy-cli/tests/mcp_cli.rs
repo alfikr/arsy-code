@@ -81,10 +81,15 @@ fn a_connection_is_defined_listed_probed_disabled_and_removed() {
     let (code, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
     assert_eq!(code, 0);
     let entries = listed["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["name"], "fixture");
-    assert_eq!(entries[0]["enabled"], true);
-    assert_eq!(entries[0]["runtime_status"], "not_loaded");
+    // The bundled connection is always declared, so the listing carries it
+    // beside whatever the operator defined.
+    let fixture = entries
+        .iter()
+        .find(|entry| entry["name"] == "fixture")
+        .unwrap_or_else(|| panic!("the definition is missing from {listed}"));
+    assert_eq!(fixture["enabled"], true);
+    assert_eq!(fixture["runtime_status"], "not_loaded");
+    assert!(entries.iter().any(|entry| entry["name"] == "fluxguard"));
 
     // Adding the same name twice is refused rather than silently duplicated.
     let (code, _) = arsy(
@@ -142,7 +147,11 @@ fn a_connection_is_defined_listed_probed_disabled_and_removed() {
     assert_eq!(code, 0);
     assert_eq!(removed["removed"], true);
     let (_, listed) = arsy(workspace.path(), &["mcp", "list", "--source", "arsy"]);
-    assert!(listed["entries"].as_array().unwrap().is_empty());
+    assert!(listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["name"] != "fixture"));
 
     // Removing what is not there is an error, not a silent success.
     let (code, _) = arsy(

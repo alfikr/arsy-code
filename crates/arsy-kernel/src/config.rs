@@ -306,6 +306,56 @@ pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 /// operator-configured and may be anything, so the cap is not optional.
 pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
 
+/// The one MCP server an ARSY install brings with it. FluxGuard ships in the
+/// same archive as `arsy`, so resource awareness is there on the first run
+/// rather than after a second install.
+pub const BUNDLED_MCP_SERVER: &str = "fluxguard";
+
+/// The bundled server as ARSY would run it.
+///
+/// Always declared, so the name is always something an operator can toggle and
+/// a config file that toggles it stays loadable on an install that packages
+/// `arsy` alone. Only the archive decides whether it starts out on: a copy
+/// beside `arsy` is one this install shipped and can be trusted to be the
+/// matching build, while a `fluxguard` further along `PATH` is some other
+/// install's, offered but left off until the operator says otherwise.
+fn bundled_mcp_server_beside(binary: &Path) -> McpServer {
+    let bundled = binary
+        .parent()
+        .map(|directory| {
+            directory.join(format!(
+                "{BUNDLED_MCP_SERVER}{}",
+                std::env::consts::EXE_SUFFIX
+            ))
+        })
+        .filter(|command| command.is_file());
+    McpServer {
+        name: BUNDLED_MCP_SERVER.to_owned(),
+        transport: McpTransport::Stdio {
+            command: bundled.as_ref().map_or_else(
+                || BUNDLED_MCP_SERVER.to_owned(),
+                |path| path.display().to_string(),
+            ),
+            args: vec!["serve".to_owned()],
+        },
+        enabled: bundled.is_some(),
+        // Shipped with the binary, but authority stops where the operator's
+        // does: bundling decides what is declared, never what it may do.
+        trust: PolicySource::User,
+        timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+        max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+    }
+}
+
+/// The bundled server for the running `arsy`.
+fn bundled_mcp_server() -> McpServer {
+    match std::env::current_exe() {
+        Ok(binary) => bundled_mcp_server_beside(&binary),
+        // Nothing to look beside, so nothing is claimed as bundled.
+        Err(_) => bundled_mcp_server_beside(Path::new(BUNDLED_MCP_SERVER)),
+    }
+}
+
 /// Where a command may be run other than on this machine.
 ///
 /// A target is a *named* place, never a host a caller supplies: an operation
@@ -565,6 +615,12 @@ impl Config {
     /// an unreadable or invalid one is.
     pub fn load(layers: &[(Layer, PathBuf)]) -> Result<Self, ConfigError> {
         let mut config = Self::default();
+        // Declared before the first layer is read, so any layer that names
+        // `mcp.server.fluxguard` replaces it outright -- which is also how an
+        // operator turns it off, with `enabled = false`.
+        config
+            .mcp_servers
+            .insert(BUNDLED_MCP_SERVER.to_owned(), bundled_mcp_server());
         for (layer, path) in layers {
             let raw = match std::fs::read_to_string(path) {
                 Ok(raw) => raw,
@@ -939,7 +995,10 @@ impl Config {
                 return Err(reject(format!("unknown key `mcp.{key}`")));
             }
             for (name, value) in as_table(value, "mcp.server", path)? {
-                let server = self.parse_mcp_server(layer, path, name, value)?;
+                let server = match self.amend_mcp_server(layer, path, name, value)? {
+                    Some(server) => server,
+                    None => self.parse_mcp_server(layer, path, name, value)?,
+                };
                 self.record(
                     layer,
                     path,
@@ -959,6 +1018,54 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// A table that sets `enabled` on a connection that already exists,
+    /// without restating where it points.
+    ///
+    /// The bundled server is the reason this is here: it is declared before
+    /// any file is read, so an operator has nothing to copy and would
+    /// otherwise have to reproduce its command to switch it off. Amending is
+    /// deliberately the narrow case -- only `enabled`, only for a name already
+    /// declared. Anything that names a `transport` still replaces the
+    /// definition outright, so a layer can never quietly repoint a connection
+    /// while looking like it only toggled one.
+    fn amend_mcp_server(
+        &self,
+        layer: Layer,
+        path: &Path,
+        name: &str,
+        value: &toml::Value,
+    ) -> Result<Option<McpServer>, ConfigError> {
+        let prefix = format!("mcp.server.{name}");
+        let table = as_table(value, &prefix, path)?;
+        if table.len() != 1 {
+            return Ok(None);
+        }
+        let Some(enabled) = table.get("enabled") else {
+            return Ok(None);
+        };
+        let Some(existing) = self.mcp_servers.get(name) else {
+            return Ok(None);
+        };
+        let enabled = enabled.as_bool().ok_or_else(|| ConfigError {
+            path: path.to_path_buf(),
+            message: format!("`{prefix}.enabled` must be a boolean"),
+        })?;
+        Ok(Some(McpServer {
+            enabled,
+            // Switching a connection off never increases authority, so the
+            // label it was given survives. Switching one back on does, so it
+            // is the amending layer that answers for it -- which is what stops
+            // a repository re-enabling a connection an operator turned off and
+            // having it act with the operator's trust.
+            trust: if enabled {
+                policy_source(layer)
+            } else {
+                existing.trust
+            },
+            ..existing.clone()
+        }))
     }
 
     fn parse_mcp_server(
@@ -3197,5 +3304,110 @@ access_type = "offline"
         assert!(layers(workspace, Path::new("/elsewhere"))
             .iter()
             .all(|(layer, _)| *layer != Layer::Nested));
+    }
+
+    #[test]
+    fn enabled_alone_amends_a_declared_server_instead_of_replacing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let declared = |body: &str, layer: Layer| {
+            let mut config = Config::default();
+            config.mcp_servers.insert(
+                "fluxguard".to_owned(),
+                McpServer {
+                    name: "fluxguard".to_owned(),
+                    transport: McpTransport::Stdio {
+                        command: "/opt/arsy/fluxguard".to_owned(),
+                        args: vec!["serve".to_owned()],
+                    },
+                    enabled: true,
+                    trust: PolicySource::User,
+                    timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+                    max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+                },
+            );
+            // `apply` takes the body and uses the path only to name the file in
+            // a diagnostic, so the fixture never has to touch the filesystem.
+            // The body is written as TOML, as the rest of this suite does, and
+            // converted the same way `write` would.
+            let path = directory.path().join(CONFIG_FILE);
+            let raw = json_from_toml(body, &path).unwrap();
+            config.apply(layer, &path, &raw).unwrap();
+            config.mcp_server("fluxguard").unwrap().clone()
+        };
+
+        // Switching it off keeps where it points and the label it carries, so
+        // an operator never has to restate a command they never wrote.
+        let off = declared(
+            "schema_version = 1\n[mcp.server.fluxguard]\nenabled = false\n",
+            Layer::User,
+        );
+        assert!(!off.enabled);
+        assert_eq!(off.trust, PolicySource::User);
+        assert_eq!(
+            off.transport,
+            McpTransport::Stdio {
+                command: "/opt/arsy/fluxguard".to_owned(),
+                args: vec!["serve".to_owned()],
+            }
+        );
+
+        // Switching one back on is the amending layer's call to answer for: a
+        // repository cannot re-enable a connection and have it act with the
+        // operator's authority.
+        let on = declared(
+            "schema_version = 1\n[mcp.server.fluxguard]\nenabled = true\n",
+            Layer::Workspace,
+        );
+        assert!(on.enabled);
+        assert_eq!(on.trust, PolicySource::Workspace);
+
+        // A table that names a transport still replaces the definition, so an
+        // amendment can never be a repoint wearing a toggle's clothes.
+        let replaced = declared(
+            "schema_version = 1\n[mcp.server.fluxguard]\ntransport = \"stdio\"\ncommand = \
+             \"other\"\n",
+            Layer::User,
+        );
+        assert_eq!(
+            replaced.transport,
+            McpTransport::Stdio {
+                command: "other".to_owned(),
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_bundled_server_starts_out_on_only_when_the_archive_shipped_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("arsy");
+
+        // Nothing beside `arsy`: still declared, so the name stays togglable
+        // and a file that toggles it stays loadable, but off.
+        let absent = bundled_mcp_server_beside(&binary);
+        assert_eq!(absent.name, BUNDLED_MCP_SERVER);
+        assert!(!absent.enabled);
+        assert_eq!(
+            absent.transport,
+            McpTransport::Stdio {
+                command: BUNDLED_MCP_SERVER.to_owned(),
+                args: vec!["serve".to_owned()],
+            }
+        );
+
+        let command = directory
+            .path()
+            .join(format!("fluxguard{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&command, b"").unwrap();
+        let shipped = bundled_mcp_server_beside(&binary);
+        assert!(shipped.enabled);
+        assert_eq!(shipped.trust, PolicySource::User);
+        assert_eq!(
+            shipped.transport,
+            McpTransport::Stdio {
+                command: command.display().to_string(),
+                args: vec!["serve".to_owned()],
+            }
+        );
     }
 }
