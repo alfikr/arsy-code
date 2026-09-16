@@ -9163,6 +9163,7 @@ fn agent_runtime(
                 })
                 .transpose()?,
             mcp: connections,
+            mcp_pending: Default::default(),
         },
     )
     .map(|runtime| runtime.with_dynamic_tools(discovered))

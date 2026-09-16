@@ -34,8 +34,9 @@ use arsy_kernel::{
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
 };
 
 /// The most text one MCP tool result may contribute before it is cut.
@@ -46,6 +47,52 @@ const MAX_RESULT_BYTES: usize = 256 * 1024;
 
 /// Live connections, shared by the executor and by whoever opened them.
 pub type Connections = Arc<Mutex<BTreeMap<String, Connection>>>;
+
+/// The longest a call waits for its server to finish connecting.
+const CONNECT_WAIT: Duration = Duration::from_secs(60);
+
+/// Servers still connecting in the background.
+///
+/// A session offers a server's tools before its connection is up, from what
+/// the server published last time, so a slow server never holds a turn back.
+/// A call to one of those tools waits here for the connection rather than
+/// failing because it asked too early.
+#[derive(Clone, Default)]
+pub struct Pending(Arc<(Mutex<BTreeSet<String>>, Condvar)>);
+
+impl Pending {
+    pub fn start(&self, server: &str) {
+        if let Ok(mut connecting) = self.0 .0.lock() {
+            connecting.insert(server.to_owned());
+        }
+    }
+
+    /// The connection attempt is over, whichever way it went.
+    pub fn finish(&self, server: &str) {
+        if let Ok(mut connecting) = self.0 .0.lock() {
+            connecting.remove(server);
+        }
+        self.0 .1.notify_all();
+    }
+
+    pub fn contains(&self, server: &str) -> bool {
+        self.0
+             .0
+            .lock()
+            .is_ok_and(|connecting| connecting.contains(server))
+    }
+
+    /// Wait until `server` is no longer connecting, or `limit` has passed.
+    pub fn wait(&self, server: &str, limit: Duration) {
+        let Ok(connecting) = self.0 .0.lock() else {
+            return;
+        };
+        let _ = self
+            .0
+             .1
+            .wait_timeout_while(connecting, limit, |connecting| connecting.contains(server));
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct CallResult {
@@ -63,6 +110,7 @@ struct CallResult {
 pub struct McpExecutor {
     contract: OperationContract,
     connections: Connections,
+    pending: Pending,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
 }
@@ -70,6 +118,7 @@ pub struct McpExecutor {
 impl McpExecutor {
     pub fn new(
         connections: Connections,
+        pending: Pending,
         artifacts: Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
     ) -> Arc<Self> {
@@ -96,8 +145,30 @@ impl McpExecutor {
                 concurrency: ConcurrencyRule::ExclusivePerResource,
             },
             connections,
+            pending,
             artifacts,
             retain_until_ms,
+        })
+    }
+
+    /// Call one tool, waiting for a server still connecting.
+    ///
+    /// A connection that broke under the call is dropped, so whoever holds the
+    /// session reconnects it at the next turn instead of this call retrying.
+    fn call(&self, server: &str, tool: &str, arguments: Value) -> Result<Value, OperationError> {
+        self.pending.wait(server, CONNECT_WAIT);
+        let mut connections = self
+            .connections
+            .lock()
+            .map_err(|_| OperationError::Execution("the MCP connections are poisoned".into()))?;
+        let connection = connections.get_mut(server).ok_or_else(|| {
+            OperationError::Execution(format!("the MCP server `{server}` is not connected"))
+        })?;
+        connection.call_tool(tool, arguments).map_err(|error| {
+            if error.is_retryable() {
+                connections.remove(server);
+            }
+            failed(error)
         })
     }
 }
@@ -128,17 +199,7 @@ impl OperationExecutor for McpExecutor {
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
 
-        let reply = {
-            let mut connections = self.connections.lock().map_err(|_| {
-                OperationError::Execution("the MCP connections are poisoned".into())
-            })?;
-            let connection = connections.get_mut(&server).ok_or_else(|| {
-                OperationError::Execution(format!(
-                    "no MCP server named `{server}` is connected in this turn"
-                ))
-            })?;
-            connection.call_tool(&tool, arguments).map_err(failed)?
-        };
+        let reply = self.call(&server, &tool, arguments)?;
 
         let result = CallResult {
             is_error: reply
@@ -423,6 +484,41 @@ mod tests {
             timeout_ms: 5_000,
             max_body_bytes: 1024 * 1024,
         }
+    }
+
+    /// A tool offered before its server finished connecting still works: the
+    /// call waits for the connection, and a server nobody is connecting fails
+    /// straight away rather than waiting.
+    #[test]
+    fn a_call_waits_for_a_server_that_is_still_connecting() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts: Arc<dyn ArtifactStore> = Arc::new(
+            arsy_kernel::artifact::FileArtifactStore::open(directory.path().join("art"), 0)
+                .unwrap(),
+        );
+        let connections: Connections = Arc::default();
+        let pending = Pending::default();
+        pending.start("calc");
+        let executor = McpExecutor::new(Arc::clone(&connections), pending.clone(), artifacts, 0);
+
+        let (opened, finished) = (Arc::clone(&connections), pending.clone());
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let connection =
+                crate::mcp::Connection::open(&definition(), None, &FakeChannels).unwrap();
+            opened.lock().unwrap().insert("calc".to_owned(), connection);
+            finished.finish("calc");
+        });
+        let reply = executor
+            .call("calc", "add", serde_json::json!({"a": 2, "b": 3}))
+            .unwrap();
+        opener.join().unwrap();
+        assert_eq!(content_text(&reply), "5");
+        assert!(!pending.contains("calc"));
+
+        let started = std::time::Instant::now();
+        assert!(executor.call("gone", "add", serde_json::json!({})).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// The whole path a turn takes: connect, discover, offer the tool under a
