@@ -3714,6 +3714,7 @@ fn run_turn(
     let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
+            &config,
             &mcp_reported(
                 agent_runtime(
                     &root,
@@ -3964,6 +3965,7 @@ enum Answer {
 #[allow(clippy::too_many_arguments)]
 fn native_turn(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
     history: &arsy_code::agent::budget::History,
@@ -4003,6 +4005,7 @@ fn native_turn(
         )?;
         let mut outcome = native_status(
             resolved,
+            config,
             runtime,
             conversation,
             route,
@@ -6637,6 +6640,7 @@ fn drain_keys(
 #[allow(clippy::too_many_arguments)]
 fn round_request(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &[ModelMessage],
     route: &tui::ModelRoute,
@@ -6651,6 +6655,7 @@ fn round_request(
         },
         system: system_prompt(
             runtime.workspace(),
+            config,
             &route.provider,
             &route.model,
             runtime.execution_mode(),
@@ -7375,6 +7380,7 @@ fn erase_live_response(
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &[ModelMessage],
     route: &tui::ModelRoute,
@@ -7388,7 +7394,16 @@ fn native_status(
     composer: &mut tui::Composer,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
-    let request = round_request(resolved, runtime, conversation, route, effort, turn, round)?;
+    let request = round_request(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+    )?;
     let events = spawn_stream(Arc::clone(&resolved.provider), request);
 
     let mut outcome = Turn::default();
@@ -8088,6 +8103,7 @@ impl<'a> TaskRun<'a> {
             },
             system: system_prompt(
                 &self.root,
+                &self.config,
                 &self.resolved.endpoint.id,
                 &self.model,
                 arsy_code::agent::ExecutionMode::Normal,
@@ -9413,13 +9429,14 @@ fn installed_extensions(_root: &Path) -> Vec<arsy_code::agent::instructions::Ext
 
 fn system_prompt(
     root: &Path,
+    config: &arsy_kernel::config::Config,
     provider: &str,
     model: &str,
     mode: arsy_code::agent::ExecutionMode,
 ) -> Option<String> {
     let workspace = arsy_code::resource::Workspace::open(root).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
-    let instructions = instructions_for(&workspace, root, &working);
+    let instructions = instructions_for(&workspace, config, &working);
     let family = arsy_code::agent::instructions::family_for(provider, model);
     let compiled = arsy_code::agent::instructions::system_prompt(
         family,
@@ -9437,21 +9454,15 @@ fn system_prompt(
 /// The operator's own Claude Code and Codex instructions, then the
 /// repository's, root first.
 ///
-/// Only the compat switches are needed, so the layers are read without the
-/// Claude and Codex MCP declarations a full resolution would also place.
+/// The switches come from the invocation's resolved config, `--config`
+/// included, so the prompt follows the same compat policy as everything else.
 fn instructions_for(
     workspace: &arsy_code::resource::Workspace,
-    root: &Path,
+    config: &arsy_kernel::config::Config,
     working: &Path,
 ) -> Vec<arsy_code::agent::instructions::Instruction> {
     use arsy_code::agent::instructions::{self, Instruction, MAX_INSTRUCTION_BYTES};
-    let config =
-        arsy_kernel::config::Config::load(&arsy_kernel::config::layers(root, working)).ok();
-    let enabled = |source: &str| {
-        config
-            .as_ref()
-            .is_none_or(|config| config.compat_enabled(source))
-    };
+    let enabled = |source: &str| config.compat_enabled(source);
     arsy_compat::instructions::user_instructions(
         &compat_homes(),
         enabled("claude"),
@@ -9845,6 +9856,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -9923,6 +9935,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -10059,6 +10072,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -10125,6 +10139,7 @@ mod tests {
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -10194,6 +10209,7 @@ mod tests {
         // hang up: the calls after it are refused without asking.
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),

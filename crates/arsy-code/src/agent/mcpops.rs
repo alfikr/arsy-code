@@ -34,7 +34,7 @@ use arsy_kernel::{
 use serde::Serialize;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Condvar, Mutex},
     time::Duration,
 };
@@ -58,19 +58,27 @@ const CONNECT_WAIT: Duration = Duration::from_secs(60);
 /// A call to one of those tools waits here for the connection rather than
 /// failing because it asked too early.
 #[derive(Clone, Default)]
-pub struct Pending(Arc<(Mutex<BTreeSet<String>>, Condvar)>);
+pub struct Pending(Arc<(Mutex<BTreeMap<String, usize>>, Condvar)>);
 
+// Counted per server: a changed definition can start a second attempt while
+// the first is still open, and the first finishing must not end the wait for
+// the second.
 impl Pending {
     pub fn start(&self, server: &str) {
         if let Ok(mut connecting) = self.0 .0.lock() {
-            connecting.insert(server.to_owned());
+            *connecting.entry(server.to_owned()).or_default() += 1;
         }
     }
 
     /// The connection attempt is over, whichever way it went.
     pub fn finish(&self, server: &str) {
         if let Ok(mut connecting) = self.0 .0.lock() {
-            connecting.remove(server);
+            if let Some(count) = connecting.get_mut(server) {
+                *count -= 1;
+                if *count == 0 {
+                    connecting.remove(server);
+                }
+            }
         }
         self.0 .1.notify_all();
     }
@@ -79,7 +87,7 @@ impl Pending {
         self.0
              .0
             .lock()
-            .is_ok_and(|connecting| connecting.contains(server))
+            .is_ok_and(|connecting| connecting.contains_key(server))
     }
 
     /// Wait until `server` is no longer connecting, or `limit` has passed.
@@ -90,7 +98,9 @@ impl Pending {
         let _ = self
             .0
              .1
-            .wait_timeout_while(connecting, limit, |connecting| connecting.contains(server));
+            .wait_timeout_while(connecting, limit, |connecting| {
+                connecting.contains_key(server)
+            });
     }
 }
 
@@ -356,6 +366,17 @@ pub fn tools_of(connection: &Connection) -> Vec<super::DynamicTool> {
 mod tests {
     use super::*;
     use arsy_kernel::domain::Principal;
+
+    #[test]
+    fn an_older_attempt_finishing_does_not_end_a_newer_one() {
+        let pending = Pending::default();
+        pending.start("docs");
+        pending.start("docs");
+        pending.finish("docs");
+        assert!(pending.contains("docs"));
+        pending.finish("docs");
+        assert!(!pending.contains("docs"));
+    }
 
     /// Run a call the way an operator at a keyboard would. `mcp.call` is
     /// irreversible by contract, so policy asks — and the unattended path
