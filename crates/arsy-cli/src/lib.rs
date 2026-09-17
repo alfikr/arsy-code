@@ -5051,7 +5051,7 @@ fn run_mcp_dialog(
     let root = workspace_root(&invocation.workspace)?;
     let mut rows = mcp_choices(&root, invocation)?;
     let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
-    let mut changes: Vec<String> = Vec::new();
+    let opened = dialog.choices.clone();
     let mut drawn = 0;
     loop {
         let frame = dialog.render(tui::terminal_width(), colour);
@@ -5068,6 +5068,7 @@ fn run_mcp_dialog(
             None => continue,
             Some(tui::McpAction::Close) => {
                 write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+                let mut changes = net_mcp_changes(&opened, &dialog.choices);
                 if !changes.is_empty() {
                     changes.push("MCP changes take effect from the next turn.".to_owned());
                     writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
@@ -5078,15 +5079,37 @@ fn run_mcp_dialog(
             Some(action) => action,
         };
         dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
-            Ok(change) => {
-                changes.push(change.clone());
-                change
-            }
+            Ok(change) => change,
             Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
         });
         rows = mcp_choices(&root, invocation)?;
         dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
     }
+}
+
+/// What the dialog changed, comparing where each connection ended with where it
+/// started: a server switched off and on again changed nothing and is not
+/// reported, however many times it was toggled.
+#[cfg(feature = "tui")]
+fn net_mcp_changes(opened: &[tui::McpChoice], closed: &[tui::McpChoice]) -> Vec<String> {
+    closed
+        .iter()
+        .filter_map(|after| {
+            let before = opened
+                .iter()
+                .find(|choice| choice.name == after.name)
+                .and_then(|choice| choice.enabled);
+            match (before, after.enabled) {
+                (None, Some(true)) => Some(format!("MCP `{}` adopted, enabled.", after.name)),
+                (Some(before), Some(now)) if before != now => Some(format!(
+                    "MCP `{}` {}.",
+                    after.name,
+                    if now { "enabled" } else { "disabled" }
+                )),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Wait for the next key and let the dialog answer it. A keyboard that hung up
@@ -11346,6 +11369,35 @@ mod tests {
             served_route(&route("codex-oauth", "gpt-5"), &served[..1]),
             None
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn closing_mcp_reports_only_what_ended_different() {
+        let choice = |name: &str, enabled: Option<bool>| tui::McpChoice {
+            name: name.to_owned(),
+            source: "arsy".to_owned(),
+            trust: "user".to_owned(),
+            target: "x".to_owned(),
+            detail: "x".to_owned(),
+            enabled,
+        };
+        let opened = [
+            choice("git-tag", Some(true)),
+            choice("stitch", Some(true)),
+            choice("jira", None),
+        ];
+        // git-tag toggled off, on, off; stitch off and on again; jira adopted.
+        let closed = [
+            choice("git-tag", Some(false)),
+            choice("stitch", Some(true)),
+            choice("jira", Some(true)),
+        ];
+        assert_eq!(
+            net_mcp_changes(&opened, &closed),
+            ["MCP `git-tag` disabled.", "MCP `jira` adopted, enabled."]
+        );
+        assert!(net_mcp_changes(&opened, &opened).is_empty());
     }
 
     /// `--model` chooses between what policy permits; it cannot reach past it.
