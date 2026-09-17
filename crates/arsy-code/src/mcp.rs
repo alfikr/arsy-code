@@ -761,19 +761,21 @@ pub struct RealChannels<F> {
     pub logs: Option<std::path::PathBuf>,
 }
 
-/// A server's log file name, with anything a path could misread replaced.
+/// A server's log file name, with anything a path could misread escaped as
+/// `%XX`. `%` is escaped too, so distinct names never share a file.
 pub fn log_file_name(server: &str) -> String {
-    let safe: String = server
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{}.log", safe.trim_start_matches('.'))
+    let mut safe = String::with_capacity(server.len() + 4);
+    for (index, byte) in server.bytes().enumerate() {
+        let plain = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_')
+            || (byte == b'.' && index > 0);
+        if plain {
+            safe.push(char::from(byte));
+        } else {
+            safe.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("{safe}.log")
 }
 
 impl<F> ChannelFactory for RealChannels<F>
@@ -1158,6 +1160,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn distinct_server_names_get_distinct_log_files() {
+        assert_eq!(log_file_name("mongo_prod"), "mongo_prod.log");
+        assert_ne!(log_file_name("mongo/prod"), log_file_name("mongo_prod"));
+        assert_ne!(log_file_name("a%2Fb"), log_file_name("a/b"));
+        assert_eq!(log_file_name("../x"), "%2E.%2Fx.log");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_logged_server_writes_its_scrubbed_stderr_to_its_file() {
@@ -1196,7 +1206,7 @@ mod tests {
             })
             .expect("the server's log reached its file");
         assert_eq!(written.trim(), "starting with [redacted]");
-        assert!(log.ends_with("mongo_prod.log"));
+        assert!(log.ends_with("mongo%2Fprod.log"));
     }
 
     #[cfg(unix)]
