@@ -4354,7 +4354,7 @@ fn slash_command(
     emitter: &mut Emitter,
 ) -> Result<TaskPass, Diagnostic> {
     if manages_session(line) {
-        let next = manage_session(line, restoring, typing.sessions, stdout)?;
+        let next = manage_session(line, restoring, typing.sessions, stdout, typing.colour)?;
         return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
     }
     if steers_turn(line) {
@@ -5110,14 +5110,28 @@ fn manages_session(line: &str) -> bool {
 #[cfg(feature = "tui")]
 fn manage_session(
     line: &str,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     sessions: &mut Vec<tui::SessionChoice>,
     stdout: &mut io::Stdout,
+    colour: bool,
 ) -> Result<Option<Prompt>, Diagnostic> {
     let mut words = line.split_whitespace();
     match words.next() {
+        // A new session starts on a clean terminal: screen and scrollback are
+        // cleared and the launch card drawn again, so nothing of the old
+        // conversation reads as part of the new one.
         Some("/new") => {
-            let started = start_session(restoring);
+            let started = start_session(&mut restoring);
+            restoring
+                .transcript
+                .repaint(
+                    stdout,
+                    tui::terminal_width(),
+                    tui::terminal_rows(),
+                    colour,
+                    restoring.state,
+                )
+                .map_err(terminal_failed)?;
             writeln!(stdout, "Started new session {started}.").map_err(terminal_failed)?;
             Ok(None)
         }
@@ -5239,7 +5253,7 @@ fn rename_session(
 #[cfg(feature = "tui")]
 fn delete_session(
     id: Option<&str>,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
 ) -> Result<(), Diagnostic> {
     let current = restoring.state.session_id();
@@ -5252,7 +5266,7 @@ fn delete_session(
     if target != current {
         return writeln!(stdout, "Deleted session {target}.").map_err(terminal_failed);
     }
-    let started = start_session(restoring);
+    let started = start_session(&mut restoring);
     writeln!(
         stdout,
         "Deleted current session. Started fresh session {started}."
@@ -5262,7 +5276,7 @@ fn delete_session(
 
 /// Begin a session with nothing carried over from the one before it.
 #[cfg(feature = "tui")]
-fn start_session(restoring: Restoring<'_>) -> SessionId {
+fn start_session(restoring: &mut Restoring<'_>) -> SessionId {
     let started = SessionId::new();
     restoring.state.set_session_id(started);
     restoring.conversation.clear();
