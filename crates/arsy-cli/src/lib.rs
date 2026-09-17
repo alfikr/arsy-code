@@ -2429,20 +2429,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
-    // A codex-oauth model the backend stopped serving would fail every turn
-    // and be chosen again at every start, so it is replaced before the first.
-    let replaced = served_route(&route, &models);
-    if let Some(served) = &replaced {
-        let _ = save_route(served);
-    }
-    let replaced_notice = replaced.map(|served| {
-        let notice = format!(
-            "`{}` is no longer offered by ChatGPT; using `{}`. Choose another with /model.",
-            route.model, served.model
-        );
-        route = served;
-        notice
-    });
+    let replaced_notice = replace_dropped_route(&mut route, &models);
     let (mut resolved_providers, mut unavailable_providers) =
         seed_providers(native, native_requested.as_deref(), &route.provider);
     let mut effort = saved_effort();
@@ -2482,9 +2469,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         "Use /help for commands, /mcp and /hooks to inspect integrations."
     )
     .map_err(terminal_failed)?;
-    if let Some(notice) = &replaced_notice {
-        writeln!(stdout, "{notice}").map_err(terminal_failed)?;
-    }
+    write!(stdout, "{replaced_notice}").map_err(terminal_failed)?;
     if !provider_available {
         writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
@@ -2778,6 +2763,23 @@ fn saved_route() -> Option<tui::ModelRoute> {
     let route = (!raw.is_empty()).then(|| tui::ModelRoute::parse(raw))?;
     tui::validate_slug(&route.model).ok()?;
     Some(route)
+}
+
+/// Swap a codex-oauth model the backend stopped serving — which would fail
+/// every turn and be chosen again at every start — for one it serves, save the
+/// choice, and return the line that says so, or nothing when it is served.
+#[cfg(feature = "tui")]
+fn replace_dropped_route(route: &mut tui::ModelRoute, models: &[tui::ModelChoice]) -> String {
+    let Some(served) = served_route(route, models) else {
+        return String::new();
+    };
+    let _ = save_route(&served);
+    let notice = format!(
+        "`{}` is no longer offered by ChatGPT; using `{}`. Choose another with /model.\n",
+        route.model, served.model
+    );
+    *route = served;
+    notice
 }
 
 /// The route to use instead of `route` when it names a codex-oauth model the
