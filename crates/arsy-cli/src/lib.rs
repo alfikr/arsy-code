@@ -2429,6 +2429,20 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     };
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
+    // A codex-oauth model the backend stopped serving would fail every turn
+    // and be chosen again at every start, so it is replaced before the first.
+    let replaced = served_route(&route, &models);
+    if let Some(served) = &replaced {
+        let _ = save_route(served);
+    }
+    let replaced_notice = replaced.map(|served| {
+        let notice = format!(
+            "`{}` is no longer offered by ChatGPT; using `{}`. Choose another with /model.",
+            route.model, served.model
+        );
+        route = served;
+        notice
+    });
     let (mut resolved_providers, mut unavailable_providers) =
         seed_providers(native, native_requested.as_deref(), &route.provider);
     let mut effort = saved_effort();
@@ -2468,6 +2482,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         "Use /help for commands, /mcp and /hooks to inspect integrations."
     )
     .map_err(terminal_failed)?;
+    if let Some(notice) = &replaced_notice {
+        writeln!(stdout, "{notice}").map_err(terminal_failed)?;
+    }
     if !provider_available {
         writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
@@ -2761,6 +2778,28 @@ fn saved_route() -> Option<tui::ModelRoute> {
     let route = (!raw.is_empty()).then(|| tui::ModelRoute::parse(raw))?;
     tui::validate_slug(&route.model).ok()?;
     Some(route)
+}
+
+/// The route to use instead of `route` when it names a codex-oauth model the
+/// ChatGPT backend no longer serves: the first model it does serve. `None`
+/// keeps `route`, including when nothing says what the backend serves.
+#[cfg(feature = "tui")]
+fn served_route(route: &tui::ModelRoute, models: &[tui::ModelChoice]) -> Option<tui::ModelRoute> {
+    if route.provider != CODEX_OAUTH_ENDPOINT {
+        return None;
+    }
+    let mut served = models
+        .iter()
+        .filter(|choice| choice.provider == CODEX_OAUTH_ENDPOINT)
+        .peekable();
+    let first = served.peek().map(|choice| choice.slug.clone())?;
+    if served.any(|choice| choice.slug == route.model) {
+        return None;
+    }
+    Some(tui::ModelRoute {
+        provider: route.provider.clone(),
+        model: first,
+    })
 }
 
 #[cfg(feature = "tui")]
@@ -11272,6 +11311,40 @@ mod tests {
         assert_eq!(
             selected_model(&config, &endpoint, None).unwrap(),
             "claude-sonnet-5"
+        );
+    }
+
+    /// A codex-oauth model the backend dropped is replaced by one it serves;
+    /// a served one, another provider's, or no knowledge at all keeps it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_dropped_codex_oauth_model_is_replaced_by_a_served_one() {
+        let choice = |provider: &str, slug: &str| tui::ModelChoice {
+            provider: provider.to_owned(),
+            slug: slug.to_owned(),
+            name: String::new(),
+        };
+        let route = |provider: &str, model: &str| tui::ModelRoute {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+        };
+        let served = [
+            choice("codex", "gpt-5.6-sol"),
+            choice("codex-oauth", "gpt-5.6-sol"),
+            choice("codex-oauth", "gpt-5.5"),
+        ];
+        assert_eq!(
+            served_route(&route("codex-oauth", "gpt-5"), &served),
+            Some(route("codex-oauth", "gpt-5.6-sol"))
+        );
+        assert_eq!(
+            served_route(&route("codex-oauth", "gpt-5.5"), &served),
+            None
+        );
+        assert_eq!(served_route(&route("codex", "gpt-5"), &served), None);
+        assert_eq!(
+            served_route(&route("codex-oauth", "gpt-5"), &served[..1]),
+            None
         );
     }
 
