@@ -57,14 +57,16 @@ pub struct McpConnector {
 }
 
 impl McpConnector {
-    /// Real servers, with tools cached at `cache` when there is one.
-    pub fn new(cache: Option<PathBuf>) -> Self {
+    /// Real servers, with tools cached at `cache` and each stdio server's own
+    /// log written under `logs` rather than onto the terminal the session draws.
+    pub fn new(cache: Option<PathBuf>, logs: Option<PathBuf>) -> Self {
         Self::with_channels(
             cache,
             Arc::new(arsy_code::mcp::RealChannels {
                 http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
                     Box::new(arsy_kernel::provider::http::HttpTransport::default())
                 },
+                logs,
             }),
         )
     }

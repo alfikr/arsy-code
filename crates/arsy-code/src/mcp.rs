@@ -234,6 +234,24 @@ impl StdioChannel {
         timeout: Duration,
         max_body_bytes: u64,
     ) -> Result<Self, McpError> {
+        Self::spawn_logged(command, args, env, timeout, max_body_bytes, None)
+    }
+
+    /// [`spawn`](Self::spawn), with the server's own log written to `log`
+    /// instead of the terminal.
+    ///
+    /// An interactive session draws its input block on the terminal, and a
+    /// server printing its startup chatter there from another thread lands in
+    /// the middle of it. `None` keeps the terminal, which is what a one-shot
+    /// command wants.
+    pub fn spawn_logged(
+        command: &str,
+        args: &[String],
+        env: &LaunchEnv,
+        timeout: Duration,
+        max_body_bytes: u64,
+        log: Option<&std::path::Path>,
+    ) -> Result<Self, McpError> {
         let mut child = Command::new(command)
             .args(args)
             .envs(env.iter())
@@ -252,12 +270,13 @@ impl StdioChannel {
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         let secrets = scrubbed_values(env);
+        let mut sink = log_sink(log);
         thread::spawn(move || {
             // A server that logs its own connection string or token must not
-            // put it on the operator's terminal, so each line is scrubbed of
-            // the values this definition handed it.
+            // put it on the terminal or in its log, so each line is scrubbed
+            // of the values this definition handed it.
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = writeln!(io::stderr(), "{}", scrub(&line, &secrets));
+                let _ = writeln!(sink, "{}", scrub(&line, &secrets));
             }
         });
         let (sender, lines) = mpsc::channel();
@@ -381,6 +400,34 @@ impl Drop for StdioChannel {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The largest a server log may grow before it is started over.
+const MAX_SERVER_LOG_BYTES: u64 = 1024 * 1024;
+
+/// Where a server's stderr goes: its log file, appended to and started over
+/// once it is past [`MAX_SERVER_LOG_BYTES`], or the terminal when there is no
+/// log or it cannot be opened.
+fn log_sink(log: Option<&std::path::Path>) -> Box<dyn Write + Send> {
+    let Some(path) = log else {
+        return Box::new(io::stderr());
+    };
+    let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() > MAX_SERVER_LOG_BYTES);
+    let opened = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(!oversized)
+                .write(true)
+                .truncate(oversized)
+                .open(path)
+        });
+    match opened {
+        Ok(file) => Box::new(file),
+        Err(_) => Box::new(io::sink()),
     }
 }
 
@@ -709,6 +756,24 @@ pub struct RealChannels<F> {
     /// Builds the HTTP transport. A closure rather than a value because one
     /// factory serves many connections and each gets its own channel.
     pub http: F,
+    /// Where each stdio server's log goes, as `<dir>/<server>.log`. `None`
+    /// leaves it on the terminal.
+    pub logs: Option<std::path::PathBuf>,
+}
+
+/// A server's log file name, with anything a path could misread replaced.
+pub fn log_file_name(server: &str) -> String {
+    let safe: String = server
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{}.log", safe.trim_start_matches('.'))
 }
 
 impl<F> ChannelFactory for RealChannels<F>
@@ -717,13 +782,20 @@ where
 {
     fn connect(&self, definition: &McpServer) -> Result<Box<dyn Channel>, McpError> {
         match &definition.transport {
-            McpTransport::Stdio { command, args, env } => Ok(Box::new(StdioChannel::spawn(
-                command,
-                args,
-                env,
-                Duration::from_millis(definition.timeout_ms),
-                definition.max_body_bytes,
-            )?)),
+            McpTransport::Stdio { command, args, env } => {
+                let log = self
+                    .logs
+                    .as_ref()
+                    .map(|directory| directory.join(log_file_name(&definition.name)));
+                Ok(Box::new(StdioChannel::spawn_logged(
+                    command,
+                    args,
+                    env,
+                    Duration::from_millis(definition.timeout_ms),
+                    definition.max_body_bytes,
+                    log.as_deref(),
+                )?))
+            }
             McpTransport::Http { url, headers } => Ok(Box::new(HttpChannel::new(
                 url,
                 headers,
@@ -1084,6 +1156,47 @@ mod tests {
             ),
             "connecting to [redacted] (debug on)"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_logged_server_writes_its_scrubbed_stderr_to_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory
+            .path()
+            .join("logs")
+            .join(log_file_name("mongo/prod"));
+        let env = LaunchEnv::from(std::collections::BTreeMap::from([(
+            "TOKEN".to_owned(),
+            "secret-token-123".to_owned(),
+        )]));
+        let script = r#"echo "starting with $TOKEN" >&2; read line; printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'"#;
+        let mut channel = StdioChannel::spawn_logged(
+            "sh",
+            &["-c".to_owned(), script.to_owned()],
+            &env,
+            Duration::from_secs(5),
+            1024,
+            Some(&log),
+        )
+        .unwrap();
+        channel.request("probe", json!({})).unwrap();
+        let _ = channel.close();
+        drop(channel);
+        // The stderr thread finishes once the child is gone.
+        let written = (0..100)
+            .find_map(|_| {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains("starting") {
+                    Some(text)
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                }
+            })
+            .expect("the server's log reached its file");
+        assert_eq!(written.trim(), "starting with [redacted]");
+        assert!(log.ends_with("mongo_prod.log"));
     }
 
     #[cfg(unix)]

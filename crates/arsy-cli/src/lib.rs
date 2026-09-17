@@ -9339,8 +9339,10 @@ fn session_mcp(
 fn session_connector() -> &'static connector::McpConnector {
     static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
     CONNECTOR.get_or_init(|| {
+        let home = arsy_kernel::config::config_home();
         connector::McpConnector::new(
-            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
+            home.as_ref().map(|home| home.join("mcp-tools.json")),
+            home.map(|home| home.join("logs").join("mcp")),
         )
     })
 }
