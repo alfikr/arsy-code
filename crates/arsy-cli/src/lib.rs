@@ -2668,20 +2668,23 @@ fn read_line(
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
     let mut width = tui::terminal_width();
-    composer.set_height(tui::terminal_rows());
+    let mut rows = tui::terminal_rows();
+    composer.set_height(rows);
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let next_width = tui::terminal_width();
-            if next_width != width {
+            let (next_width, next_rows) = (tui::terminal_width(), tui::terminal_rows());
+            // Rows too: the chat is anchored to the bottom, so a vertical
+            // resize moves it as much as a horizontal one.
+            if next_width != width || next_rows != rows {
                 transcript
-                    .repaint(stdout, next_width, tui::terminal_rows(), colour, state)
+                    .repaint(stdout, next_width, next_rows, colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
             }
-            width = next_width;
-            composer.set_height(tui::terminal_rows());
+            (width, rows) = (next_width, next_rows);
+            composer.set_height(rows);
             measured = std::time::Instant::now();
         }
         if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
