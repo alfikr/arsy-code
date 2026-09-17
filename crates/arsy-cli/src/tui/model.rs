@@ -185,17 +185,26 @@ pub fn model_rows(
         .iter()
         .map(|choice| {
             let label = format!("[{}] {}", choice.provider, choice.slug);
-            let desc = if choice.name.is_empty() || choice.name == choice.slug {
-                format!("on {}", choice.provider)
-            } else if choice.provider == CODEX_PROVIDER {
-                format!("{} · codex", choice.name)
-            } else {
-                format!("{} · on {}", choice.name, choice.provider)
-            };
-            (label, desc)
+            (label, model_description(choice))
         })
         .collect();
     (Some(rows), selected)
+}
+
+/// What a row says beside its slug: the model's own name, and how a turn on
+/// it runs. The two ChatGPT routes list the same models, so how they run is
+/// the only difference worth reading.
+fn model_description(choice: &ModelChoice) -> String {
+    let runs = match choice.provider.as_str() {
+        CODEX_PROVIDER => "run by the Codex CLI",
+        "codex-oauth" => "ChatGPT login, run by ARSY",
+        _ => "run by ARSY",
+    };
+    if choice.name.is_empty() || choice.name == choice.slug {
+        runs.to_owned()
+    } else {
+        format!("{} · {runs}", choice.name)
+    }
 }
 
 pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) -> String {
@@ -349,5 +358,35 @@ mod cache_tests {
             ]
         );
         assert!(parse_codex_cache(&directory.path().join("missing.json"), "codex").is_empty());
+    }
+
+    #[test]
+    fn each_row_says_how_a_turn_on_it_runs() {
+        let current = ModelRoute {
+            provider: "codex".into(),
+            model: "gpt-5.5".into(),
+        };
+        let choice = |provider: &str, name: &str| ModelChoice {
+            provider: provider.into(),
+            slug: "gpt-5.5".into(),
+            name: name.into(),
+        };
+        let (rows, _) = model_rows(
+            &[
+                choice("codex", "GPT-5.5"),
+                choice("codex-oauth", "GPT-5.5"),
+                choice("hari", ""),
+            ],
+            &current,
+        );
+        let descriptions: Vec<String> = rows.unwrap().into_iter().map(|(_, desc)| desc).collect();
+        assert_eq!(
+            descriptions,
+            [
+                "GPT-5.5 · run by the Codex CLI",
+                "GPT-5.5 · ChatGPT login, run by ARSY",
+                "run by ARSY",
+            ]
+        );
     }
 }
