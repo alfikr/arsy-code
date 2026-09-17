@@ -155,7 +155,12 @@ returns to the task prompt, as at the model picker.
 `/model` lists the models the active endpoint offers, re-read when the picker
 opens so one added since startup appears without a restart. A Codex route lists
 what the CLI cached instead, and an endpoint that lists no models still takes a
-slug as free text. A slug that is not on the list is accepted either way: the
+slug as free text. `codex-oauth` reaches the same ChatGPT backend as the Codex
+CLI, so it lists the same cached models rather than the ones written at login,
+and each row says how a turn on it runs: by the Codex CLI, by ARSY with a
+ChatGPT login, or by ARSY. A remembered or configured `codex-oauth` model the
+backend no longer serves is replaced at startup by the first it does serve, and
+one line says so. A slug that is not on the list is accepted either way: the
 list is what the endpoint advertises, not what it will refuse. Unlike a provider
 change, a model change takes effect on the next turn — the endpoint is the same
 one the session already resolved.
@@ -167,6 +172,11 @@ picker stays open, because an accepted answer is also written to the user
 configuration. A remembered model is re-validated on read, so a file written by
 an older build cannot keep selecting an unusable model. Esc, Ctrl-C, or Ctrl-D at
 the picker leaves the model unchanged and returns to the task prompt.
+
+The composer and status row sit on the bottom rows of the terminal: startup and a
+resize repaint carry the cursor to the last row first, so output scrolls up from
+there. `/new` clears the screen and scrollback and draws the launch card again;
+`/clear` resets only what the model is told and leaves the screen as it is.
 
 While a turn runs, the composer shows elapsed time and queued follow-ups (up to
 16 per running turn), and the active layout re-measures terminal width and
@@ -208,7 +218,7 @@ leaving the other tool's files untouched. Turning on a server a repository's
 file declares asks first, since it then acts with the operator's authority. On
 an inert declaration it asks — showing the full command — before adopting it.
 `arsy mcp enable|disable` accepts Claude and Codex names the same way.
-`/mcp list` and `/mcp show NAME` remain read-only.
+`/mcp list` and `/mcp show NAME` remain read-only. On close, only connections whose state differs from when the dialog opened are reported.
 
 An interactive session holds its MCP connections for as long as it runs. Every
 enabled server starts connecting when the session opens, each on its own thread,
