@@ -158,7 +158,8 @@ what the CLI cached instead, and an endpoint that lists no models still takes a
 slug as free text. `codex-oauth` reaches the same ChatGPT backend as the Codex
 CLI, so it lists the same cached models rather than the ones written at login,
 and each row says how a turn on it runs: by the Codex CLI, by ARSY with a
-ChatGPT login, or by ARSY. A remembered or configured `codex-oauth` model the
+ChatGPT login, or by ARSY. With a `codex-oauth` login the Codex CLI copy of those
+models is not listed, so the ChatGPT models appear once. A remembered or configured `codex-oauth` model the
 backend no longer serves is replaced at startup by the first it does serve, and
 one line says so. A slug that is not on the list is accepted either way: the
 list is what the endpoint advertises, not what it will refuse. Unlike a provider
@@ -229,8 +230,11 @@ start is reported once and not retried until its definition changes. While a
 server connects, the model is offered the tools it published the last time it
 connected under the same definition — cached in `~/.arsy/mcp-tools.json`, keyed
 by a SHA-256 of the definition including its launch values — and a call to one
-waits up to a minute for the connection. A server's stderr is shown with the
-values it was launched with replaced by `[redacted]`. `arsy run` connects for its
+waits up to a minute for the connection. A server's stderr goes to
+`~/.arsy/logs/mcp/<server>.log` rather than the screen, with the values it was
+launched with replaced by `[redacted]`, and is started over past 1 MiB. A server
+that fails to start is shown once, above the next turn, as a card naming each
+server and why. `arsy run` connects for its
 single turn.
 
 The launch card is reprinted whenever the model or the approval mode changes,
