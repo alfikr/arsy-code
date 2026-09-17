@@ -48,8 +48,8 @@ pub struct McpConnector {
     started: Arc<Mutex<BTreeMap<String, String>>>,
     /// Servers whose last attempt under that definition failed.
     failed: Arc<Mutex<BTreeMap<String, String>>>,
-    /// Failures not yet reported.
-    failures: Arc<Mutex<Vec<String>>>,
+    /// Failures not yet reported, as the server's name and why.
+    failures: Arc<Mutex<Vec<(String, String)>>>,
     cache: Option<PathBuf>,
     /// One writer at a time for the cache file.
     cache_lock: Arc<Mutex<()>>,
@@ -108,7 +108,7 @@ impl McpConnector {
     }
 
     /// Failures since the last call, each reported once.
-    pub fn failures(&self) -> Vec<String> {
+    pub fn failures(&self) -> Vec<(String, String)> {
         self.failures
             .lock()
             .map(|mut failures| std::mem::take(&mut *failures))
@@ -194,7 +194,7 @@ impl McpConnector {
                         failed.insert(name.clone(), digest);
                     }
                     if let Ok(mut failures) = failures.lock() {
-                        failures.push(format!("MCP server `{name}` is unavailable: {error}"));
+                        failures.push((name.clone(), error.to_string()));
                     }
                 }
             }

@@ -1816,6 +1816,35 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_mcp_servers_are_rows_that_never_wrap() {
+        let failures = [
+            ("node_repl".to_owned(), "transport failed: cannot start `/Applications/Codex.app/Contents/Resources/cua_node/bin/node_repl`: No such file or directory (os error 2)".to_owned()),
+            ("fluxguard".to_owned(), "transport failed: cannot start `fluxguard`: No such file or directory (os error 2)".to_owned()),
+        ];
+        let rows = mcp_unavailable_rows(60, false, &failures);
+        // Title, two servers, a blank, the hint, and the bottom border.
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(
+            rows[0].starts_with("╭─ ⚠ 2 MCP servers unavailable "),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("│ node_repl  cannot start"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[4].contains("/mcp"));
+        assert!(rows[5].starts_with("╰"));
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) == 60),
+            "every row reaches the border: {rows:?}"
+        );
+        assert!(!rows.concat().contains("transport failed"));
+    }
+
+    #[test]
     fn semantic_transcript_repaints_cards_at_the_current_terminal_width() {
         let mut transcript = Transcript::default();
         transcript.push_user("run cargo test");

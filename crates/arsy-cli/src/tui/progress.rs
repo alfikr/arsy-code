@@ -332,6 +332,61 @@ pub fn hook_note_row(colour: bool, note: &str) -> String {
     paint(colour, sgr_dim(), &format!("  hook: {}", safe_text(note)))
 }
 
+/// MCP servers that could not start, as a card: a titled border in the error
+/// colour, one row per server with why, and where to act on it. Every row is
+/// cut to the card, so a long path never wraps into the conversation.
+pub fn mcp_unavailable_rows(
+    width: usize,
+    colour: bool,
+    failures: &[(String, String)],
+) -> Vec<String> {
+    let width = width.max(MIN_WIDTH);
+    let inner = width.saturating_sub(4);
+    let title = match failures.len() {
+        1 => " ⚠ 1 MCP server unavailable ".to_owned(),
+        count => format!(" ⚠ {count} MCP servers unavailable "),
+    };
+    let name_width = failures
+        .iter()
+        .map(|(name, _)| visible_len(name))
+        .max()
+        .unwrap_or(0);
+    let border = |text: &str| paint(colour, sgr_err(), text);
+    let line = |text: &str, style: &str| {
+        let fitted = fit(text, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        format!(
+            "{} {}{pad} {}",
+            border("│"),
+            paint(colour, style, &fitted),
+            border("│")
+        )
+    };
+    let rule = "─".repeat(width.saturating_sub(4 + visible_len(&title)));
+    std::iter::once(format!(
+        "{}{}{}",
+        border("╭─"),
+        paint(colour, sgr_err(), &title),
+        border(&format!("{rule}─╮"))
+    ))
+    .chain(failures.iter().map(|(name, reason)| {
+        let reason = reason.trim_start_matches("transport failed: ");
+        line(
+            &format!("{:name_width$}  {}", safe_text(name), safe_text(reason)),
+            "",
+        )
+    }))
+    .chain([
+        line("", ""),
+        line(
+            "Switch them off in /mcp · server logs in ~/.arsy/logs/mcp",
+            sgr_dim(),
+        ),
+        border(&format!("╰{}╯", "─".repeat(width.saturating_sub(2)))),
+    ])
+    .collect()
+}
+
 /// Shown when a turn is stopped from the keyboard.
 pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)

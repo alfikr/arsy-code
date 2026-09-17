@@ -3714,14 +3714,17 @@ fn run_turn(
     let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
-            &agent_runtime(
-                &root,
-                &config,
-                true,
-                &session_id.to_string(),
-                Some(session_id),
-                Some(session_connector()),
-                emitter,
+            &mcp_reported(
+                agent_runtime(
+                    &root,
+                    &config,
+                    true,
+                    &session_id.to_string(),
+                    Some(session_id),
+                    Some(session_connector()),
+                    emitter,
+                )?,
+                colour,
             )?
             .with_execution_mode(approval.get().execution_mode()),
             conversation,
@@ -9270,7 +9273,7 @@ fn agent_runtime(
     // An interactive session holds its connections across turns instead, and
     // only brings them in line with configuration here.
     let (connections, pending, discovered) = match (connector, session) {
-        (Some(connector), _) => session_mcp(connector, config, emitter),
+        (Some(connector), _) => session_mcp(connector, config),
         (None, Some(_)) => {
             let (connections, discovered) = mcp::connect_enabled(config, emitter);
             (connections, Default::default(), discovered)
@@ -9313,22 +9316,33 @@ fn agent_runtime(
 fn session_mcp(
     connector: &connector::McpConnector,
     config: &arsy_kernel::config::Config,
-    emitter: &mut Emitter,
 ) -> (
     Option<arsy_code::agent::mcpops::Connections>,
     arsy_code::agent::mcpops::Pending,
     Vec<arsy_code::agent::DynamicTool>,
 ) {
+    // Failures are the interactive session's to show, in its own rows; see
+    // `run_turn`.
     let discovered = connector.sync(config);
-    for failure in connector.failures() {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-MCP-1000",
-            failure,
-            "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
-        ));
-    }
     let (connections, pending) = connector.session();
     (Some(connections), pending, discovered)
+}
+
+/// Show the MCP servers that failed to start since the last turn, as the
+/// session's own rows above the turn, and hand the runtime on.
+#[cfg(feature = "tui")]
+fn mcp_reported(
+    runtime: arsy_code::agent::ToolRuntime,
+    colour: bool,
+) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
+    let failures = session_connector().failures();
+    if !failures.is_empty() {
+        let mut stdout = io::stdout();
+        for row in tui::mcp_unavailable_rows(tui::terminal_width(), colour, &failures) {
+            writeln!(stdout, "{row}").map_err(terminal_failed)?;
+        }
+    }
+    Ok(runtime)
 }
 
 /// The MCP connections of this interactive session, held until it ends.
