@@ -236,10 +236,21 @@ fn fingerprint(server: &McpServer) -> String {
     };
     feed(&server.name);
     feed(server.transport.kind());
-    feed(&server.transport.target());
+    // Each part fed on its own: the display target joins command and
+    // arguments with spaces, so `a b` + `c` and `a` + `b c` would collide.
     let launch = match &server.transport {
-        McpTransport::Stdio { env, .. } => env,
-        McpTransport::Http { headers, .. } => headers,
+        McpTransport::Stdio { command, args, env } => {
+            feed(command);
+            feed(&args.len().to_string());
+            for arg in args {
+                feed(arg);
+            }
+            env
+        }
+        McpTransport::Http { url, headers } => {
+            feed(url);
+            headers
+        }
     };
     for (key, value) in launch.iter() {
         feed(key);

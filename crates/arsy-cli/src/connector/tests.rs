@@ -183,3 +183,23 @@ fn a_changed_launch_value_is_a_different_definition() {
     assert_ne!(one, two);
     assert_eq!(one.len(), 64, "only a SHA-256 digest is kept");
 }
+
+#[test]
+fn a_space_moved_between_command_and_argument_is_a_different_definition() {
+    let server = |command: &str, args: &[&str]| McpServer {
+        name: "docs".to_owned(),
+        transport: McpTransport::Stdio {
+            command: command.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            env: Default::default(),
+        },
+        enabled: true,
+        trust: arsy_kernel::capability::PolicySource::User,
+        timeout_ms: 1_000,
+        max_body_bytes: 1024,
+    };
+    assert_ne!(
+        fingerprint(&server("a b", &["c"])),
+        fingerprint(&server("a", &["b", "c"]))
+    );
+}
