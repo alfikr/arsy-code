@@ -33,6 +33,7 @@ built*; the other numbered docs describe the target design.
 | Crate | Responsibility |
 |---|---|
 | `arsy-kernel` | domain, events, protocol, store, model, context, prompt, capability, policy, agent |
+| `arsy-compat` | Claude Code and Codex configuration read live and translated at the edge |
 | `arsy-code` | fs, search, syntax, LSP, DAP, edit, git, shell, sandboxed execution target |
 | `arsy-cli` | service host, CLI, TUI — produces the `arsy` binary |
 | `arsy-ide` | IDE integration surface |

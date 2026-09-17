@@ -23,6 +23,7 @@ mod acp;
 mod approval;
 mod code;
 mod config_edit;
+mod connector;
 mod eval;
 mod evidence;
 mod extensions;
@@ -1706,12 +1707,43 @@ fn load_config(
         }
         layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
     }
-    arsy_kernel::config::Config::load(&layers).map_err(|error| {
+    let unusable = |error: arsy_kernel::config::ConfigError| {
         Diagnostic::error(
             ARSY_CFG_1000,
             format!("configuration is unusable: {error}"),
             "fix the reported file, then run `arsy config explain`",
         )
+    };
+    // Read twice: the first pass says which tools are switched on and whether
+    // this checkout is trusted, and the second places what those tools declare
+    // below every layer.
+    let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
+    let seeds = compat_seeds(workspace, &config);
+    let contributes = |seed: &arsy_kernel::config::CompatSeed| {
+        !(seed.mcp_servers.is_empty()
+            && seed.policy_rules.is_empty()
+            && seed.models.is_empty()
+            && seed.notes.is_empty())
+    };
+    if !seeds.iter().any(contributes) {
+        return Ok(config);
+    }
+    arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
+}
+
+/// What Claude Code and Codex declare for this workspace, read live.
+fn compat_seeds(
+    workspace: &Path,
+    config: &arsy_kernel::config::Config,
+) -> Vec<arsy_kernel::config::CompatSeed> {
+    let homes = compat_homes();
+    arsy_compat::seeds(&arsy_compat::Context {
+        homes: &homes,
+        root: workspace,
+        trusted: config.trusts(workspace),
+        claude: config.compat_enabled("claude"),
+        codex: config.compat_enabled("codex"),
+        env: &|name| std::env::var(name).ok(),
     })
 }
 
@@ -1741,6 +1773,8 @@ fn selected_model(
         .model
         .clone()
         .or_else(|| config.model_default().map(str::to_owned))
+        // What Claude Code or Codex is set to use, only when arsy.json is silent.
+        .or_else(|| config.compat_model(endpoint).map(str::to_owned))
         .ok_or_else(|| {
             Diagnostic::error(
                 ARSY_PRV_1000,
@@ -2413,6 +2447,12 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let mut sessions: Vec<tui::SessionChoice> = Vec::new();
     let approval =
         std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+    // MCP servers start connecting now, in the background, so the first turn
+    // finds them up or on their way instead of starting them itself.
+    let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    if let Ok(config) = load_config(&workspace, &working, invocation.config.as_deref()) {
+        session_connector().sync(&config);
+    }
 
     let mut state = tui::TuiState::new(workspace.display().to_string(), SessionId::new());
     state.set_effort(effort);
@@ -3538,6 +3578,26 @@ fn run_turn(
     emitter: &mut Emitter,
 ) -> Result<Turn, Diagnostic> {
     let task = prepare_task(invocation, task, emitter)?;
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    // Loaded once per turn, as `arsy run` loads them: a turn finishes with the
+    // hooks it began with.
+    let loaded = hook_engine(&root, &config);
+    let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
+    let task = turn_boundary(
+        hooks,
+        arsy_code::hook::LifecycleEvent::BeforeTurn,
+        &task,
+        emitter,
+    )
+    .map_err(|reason| {
+        Diagnostic::error(
+            "ARSY-HOK-1001",
+            reason,
+            "the hook that refused it is listed by `/hooks`",
+        )
+    })?;
     let RecordedTurn {
         service,
         mut graph,
@@ -3554,8 +3614,6 @@ fn run_turn(
         role: ModelRole::User,
         content: vec![ModelContent::Text { text: task.clone() }],
     });
-    let root = workspace_root(&invocation.workspace)?;
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     emitter.trace(
         "turn.started",
         json!({
@@ -3570,12 +3628,14 @@ fn run_turn(
     let outcome = match native {
         Some(resolved) => native_turn(
             resolved,
+            &config,
             &agent_runtime(
                 &root,
-                &load_config(&root, &working, invocation.config.as_deref())?,
+                &config,
                 true,
                 &session_id.to_string(),
                 Some(session_id),
+                Some(session_connector()),
                 emitter,
             )?
             .with_execution_mode(approval.get().execution_mode()),
@@ -3591,6 +3651,7 @@ fn run_turn(
             composer,
             transcript,
             approval,
+            hooks,
         ),
         None => external_status(
             &root,
@@ -3634,6 +3695,19 @@ fn run_turn(
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
+    // Whatever the turn ended as, which is what Codex's `notify` is for.
+    // Nothing it returns can change what already happened.
+    let stop = match (turn.interrupted, &turn.failure) {
+        (true, _) => "interrupted",
+        (false, Some(_)) => "failed",
+        (false, None) => "answered",
+    };
+    let _ = turn_boundary(
+        hooks,
+        arsy_code::hook::LifecycleEvent::AfterTurn,
+        stop,
+        emitter,
+    );
     emitter.trace(
         "turn.finished",
         json!({
@@ -3802,6 +3876,7 @@ enum Answer {
 #[allow(clippy::too_many_arguments)]
 fn native_turn(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
     history: &arsy_code::agent::budget::History,
@@ -3815,6 +3890,7 @@ fn native_turn(
     composer: &mut tui::Composer,
     transcript: &mut tui::Transcript,
     approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
 ) -> io::Result<Turn> {
     // rather than taken from the last one: an audit that reads a tool-using
     // turn as the price of its final request under-reports what it cost.
@@ -3840,6 +3916,7 @@ fn native_turn(
         )?;
         let mut outcome = native_status(
             resolved,
+            config,
             runtime,
             conversation,
             route,
@@ -3925,6 +4002,7 @@ fn native_turn(
                             approval,
                             completed: &mut completed_calls,
                             interrupted: &mut outcome.interrupted,
+                            hooks,
                         },
                     )?
                 }
@@ -4866,7 +4944,10 @@ fn mcp_choices(
         if rows.iter().any(|(_, choice)| choice.name == name) {
             continue;
         }
-        let native = entry["ecosystem"] == "arsy";
+        // A row the resolved configuration holds carries its real trust; a
+        // declaration nothing reads live is labelled untrusted and starts
+        // nothing until adopted.
+        let native = entry["trust"] != "untrusted";
         let detail = match entry["url"].as_str() {
             Some(url) => url.to_owned(),
             None => std::iter::once(text("command"))
@@ -4983,7 +5064,11 @@ fn apply_mcp_action(
         tui::McpAction::Toggle(index) => {
             let choice = &dialog.choices[index];
             let enabled = !choice.enabled.unwrap_or(false);
+            // Claude Code's and Codex's own files are never written: the
+            // choice is kept in the operator's arsy.json, which outranks them.
+            let declared_elsewhere = choice.source != "arsy";
             let scope = match choice.trust.as_str() {
+                _ if declared_elsewhere => mcp::Scope::User,
                 "user" => mcp::Scope::User,
                 "workspace" => mcp::Scope::Workspace,
                 other => {
@@ -4993,7 +5078,7 @@ fn apply_mcp_action(
                     )))
                 }
             };
-            mcp::set_enabled_in(root, &choice.name, enabled, scope)?;
+            mcp::set_enabled_in(root, &choice.name, enabled, scope, declared_elsewhere)?;
             let state = if enabled { "enabled" } else { "disabled" };
             Ok(format!("MCP `{}` {state}.", choice.name))
         }
@@ -6431,6 +6516,7 @@ fn drain_keys(
 #[allow(clippy::too_many_arguments)]
 fn round_request(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &[ModelMessage],
     route: &tui::ModelRoute,
@@ -6445,6 +6531,7 @@ fn round_request(
         },
         system: system_prompt(
             runtime.workspace(),
+            config,
             &route.provider,
             &route.model,
             runtime.execution_mode(),
@@ -6573,6 +6660,7 @@ struct Answering<'a> {
     approval: &'a approval::ApprovalCell,
     completed: &'a mut std::collections::HashMap<String, String>,
     interrupted: &'a mut bool,
+    hooks: Option<&'a arsy_code::hook::HookEngine>,
 }
 
 /// Run one call and turn what happened into the result the provider is sent.
@@ -6600,6 +6688,7 @@ fn run_call(
         answering.keys,
         answering.decoder,
         answering.approval,
+        answering.hooks,
     )? {
         Executed::Answered(mut result) => {
             if !result.changed_files.is_empty() {
@@ -6649,8 +6738,29 @@ fn execute_call(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
 ) -> io::Result<Executed> {
     let started = std::time::Instant::now();
+    let mut notes = Vec::new();
+    let (arguments, injected) =
+        match hooks.map(|hooks| hook_before_call(hooks, name, arguments, &mut notes)) {
+            None => (arguments.clone(), Vec::new()),
+            Some(hooked) => {
+                let asking = Asking {
+                    name,
+                    arguments,
+                    summary,
+                    keys,
+                    decoder: &mut *decoder,
+                    approval,
+                };
+                match hooked_arguments(terminal, colour, hooked, asking, &notes)? {
+                    Ok(run) => run,
+                    Err(executed) => return Ok(executed),
+                }
+            }
+        };
+    let arguments = &arguments;
     let request = match runtime.prepare(name, arguments) {
         Ok(request) => request,
         Err(failure) => return Ok(Executed::Answered(*failure)),
@@ -6682,7 +6792,71 @@ fn execute_call(
     if let Some(note) = approval_note {
         result.output = format!("{}\nOperator note: {note}", result.output);
     }
+    if let Some(hooks) = hooks {
+        notes.clear();
+        hook_after_call(hooks, name, &injected, &mut result, &mut notes);
+        hook_notes(terminal, colour, &notes)?;
+    }
     Ok(Executed::Answered(result))
+}
+
+/// The arguments a call runs with and what hooks injected for the model.
+#[cfg(feature = "tui")]
+type HookedRun = (Value, Vec<(String, String)>);
+
+/// What `before_operation` leaves the interactive turn to run.
+///
+/// Unlike a scripted run, this surface has an operator, so a hook that wants
+/// one asked gets the approval dialog rather than a refusal.
+#[cfg(feature = "tui")]
+fn hooked_arguments(
+    terminal: &mut io::Stdout,
+    colour: bool,
+    hooked: HookedCall,
+    asking: Asking<'_>,
+    notes: &[String],
+) -> io::Result<Result<HookedRun, Executed>> {
+    hook_notes(terminal, colour, notes)?;
+    let (arguments, injected, reason) = match hooked {
+        HookedCall::Refused(reason) => {
+            return Ok(Err(Executed::Answered(hook_refused(asking.name, reason))))
+        }
+        HookedCall::Run {
+            arguments,
+            injected,
+            approval,
+        } => (arguments, injected, approval),
+    };
+    let Some(reason) = reason else {
+        return Ok(Ok((arguments, injected)));
+    };
+    let answer = confirm_tool(
+        terminal,
+        colour,
+        asking.name,
+        asking.summary,
+        &format!("a hook asks for approval: {reason}"),
+        format_tool_preview(asking.name, &arguments),
+        asking.keys,
+        asking.decoder,
+        asking.approval,
+    )?;
+    Ok(match answer {
+        Answer::Yes { .. } => Ok((arguments, injected)),
+        Answer::No { .. } => Err(Executed::Answered(hook_refused(
+            asking.name,
+            "The operator declined the call a hook asked about.".to_owned(),
+        ))),
+        Answer::Stop => Err(Executed::Stopped),
+    })
+}
+
+/// What the hooks said about a call, as dim rows above it.
+#[cfg(feature = "tui")]
+fn hook_notes(terminal: &mut io::Stdout, colour: bool, notes: &[String]) -> io::Result<()> {
+    notes
+        .iter()
+        .try_for_each(|note| writeln!(terminal, "{}", tui::hook_note_row(colour, note)))
 }
 
 /// What deciding a call needs in order to ask about it.
@@ -7082,6 +7256,7 @@ fn erase_live_response(
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
+    config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &[ModelMessage],
     route: &tui::ModelRoute,
@@ -7095,7 +7270,16 @@ fn native_status(
     composer: &mut tui::Composer,
     approval: &approval::ApprovalCell,
 ) -> io::Result<Turn> {
-    let request = round_request(resolved, runtime, conversation, route, effort, turn, round)?;
+    let request = round_request(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+    )?;
     let events = spawn_stream(Arc::clone(&resolved.provider), request);
 
     let mut outcome = Turn::default();
@@ -7752,6 +7936,7 @@ impl<'a> TaskRun<'a> {
             false,
             &task.to_string(),
             Some(self.session),
+            None,
             emitter,
         )?;
         // A supervisor exists only when policy actually delegates something,
@@ -7794,6 +7979,7 @@ impl<'a> TaskRun<'a> {
             },
             system: system_prompt(
                 &self.root,
+                &self.config,
                 &self.resolved.endpoint.id,
                 &self.model,
                 arsy_code::agent::ExecutionMode::Normal,
@@ -8239,13 +8425,28 @@ fn dispatch(
     )))
 }
 
+/// Where Claude Code and Codex keep the operator's files.
+///
+/// A unit test gets none at all, so what it asserts cannot depend on the
+/// Claude or Codex setup of the machine it happens to run on.
+fn compat_homes() -> arsy_compat::CompatHomes {
+    if cfg!(test) {
+        arsy_compat::CompatHomes::none()
+    } else {
+        arsy_compat::CompatHomes::from_env()
+    }
+}
+
 /// The engine for this workspace, built from the operator's files and the
 /// repository's — the latter only where the operator vouched for it.
 fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::hook::Loaded {
     arsy_code::hook::load(&arsy_code::hook::Discovery {
-        home: std::env::var_os("HOME")
+        homes: compat_homes(),
+        arsy_home: std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from),
+        claude: config.compat_enabled("claude"),
+        codex: config.compat_enabled("codex"),
         root: root.to_path_buf(),
         trusted: config.trusts(root),
         // One means hooks run and nothing they do dispatches again.
@@ -8308,73 +8509,73 @@ fn turn_boundary(
     Ok(prompt)
 }
 
-/// Run one tool call with the lifecycle events around it.
-///
-/// The scripted turn only. The interactive loop reaches the runtime through
-/// `execute_call`, which asks the operator rather than a hook, and a subagent's
-/// calls go through `child_turn`; neither dispatches these events yet.
-///
-/// `before_operation` sees the call before it happens and may rewrite its
-/// arguments, deny it, or ask for an approval nobody is here to give — which,
-/// on a surface with no operator, is a refusal reported to the model rather
-/// than a wait. `after_operation` and `operation_failed` see what it did.
-///
-/// A refused call is a failed result, not an error: the model asked for
-/// something it may not have, and telling it so is how it tries something else.
-fn invoke_hooked(
-    hooks: Option<&arsy_code::hook::HookEngine>,
-    runtime: &arsy_code::agent::ToolRuntime,
+/// What `before_operation` decided about one tool call.
+enum HookedCall {
+    /// Run it with these arguments, which a hook may have rewritten.
+    Run {
+        arguments: Value,
+        /// Context a hook asked the model to see, by the rule that asked.
+        injected: Vec<(String, String)>,
+        /// A hook's reason for wanting the operator asked first.
+        approval: Option<String>,
+    },
+    /// Do not run it; tell the model why.
+    Refused(String),
+}
+
+/// Dispatch `before_operation` for one call. What the hooks said along the way
+/// is added to `notes` for the caller to report its own way.
+fn hook_before_call(
+    hooks: &arsy_code::hook::HookEngine,
     name: &str,
     arguments: &Value,
-    emitter: &mut Emitter,
-) -> arsy_code::agent::ToolResult {
+    notes: &mut Vec<String>,
+) -> HookedCall {
     use arsy_code::hook::{LifecycleEvent, Outcome};
-
-    let Some(hooks) = hooks else {
-        return runtime.invoke(name, arguments);
-    };
-    let refused = |output: String| arsy_code::agent::ToolResult {
-        tool: name.to_owned(),
-        success: false,
-        output,
-        changed_files: Vec::new(),
-        duration: std::time::Duration::ZERO,
-        metadata: json!({"refused_by": "hook"}),
-        artifact: None,
-    };
 
     let before = match hooks.dispatch(LifecycleEvent::BeforeOperation, name, arguments.clone()) {
         Ok(before) => before,
         // The engine's own guards — depth, reentrancy — failing is the harness
         // misbehaving, and `before_operation` fails closed.
-        Err(error) => return refused(format!("the lifecycle engine refused the call: {error}")),
-    };
-    for note in &before.diagnostics {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-HOK-1000",
-            note.clone(),
-            String::new(),
-        ));
-    }
-    let arguments = match before.outcome {
-        Outcome::Deny(reason) => return refused(format!("a hook denied this call: {reason}")),
-        Outcome::RequireApproval(reason) => {
-            return refused(format!(
-                "a hook asked for the operator's approval, and this surface cannot ask for one:                  {reason}"
-            ))
+        Err(error) => {
+            return HookedCall::Refused(format!("the lifecycle engine refused the call: {error}"))
         }
+    };
+    notes.extend(before.diagnostics);
+    match before.outcome {
+        Outcome::Deny(reason) => HookedCall::Refused(format!("a hook denied this call: {reason}")),
         // A rewritten payload is what actually runs, which is the whole point
         // of letting a hook transform one.
-        Outcome::Continue | Outcome::Allow => before.payload,
-    };
+        outcome => HookedCall::Run {
+            arguments: before.payload,
+            injected: before.injected,
+            approval: match outcome {
+                Outcome::RequireApproval(reason) => Some(reason),
+                _ => None,
+            },
+        },
+    }
+}
 
-    let mut result = runtime.invoke(name, &arguments);
+/// Dispatch `after_operation` or `operation_failed` for a call that ran, and
+/// attach what `before_operation` injected to its result.
+///
+/// Both events report what already happened, so a failure here is said and the
+/// result stands.
+fn hook_after_call(
+    hooks: &arsy_code::hook::HookEngine,
+    name: &str,
+    injected: &[(String, String)],
+    result: &mut arsy_code::agent::ToolResult,
+    notes: &mut Vec<String>,
+) {
+    use arsy_code::hook::LifecycleEvent;
+
     // What a hook injected is context the model was meant to see, attributed to
     // the rule that asked for it.
-    for (rule, text) in &before.injected {
+    for (rule, text) in injected {
         result.output.push_str(&format!("\n[hook {rule}] {text}"));
     }
-
     let after = if result.success {
         LifecycleEvent::AfterOperation
     } else {
@@ -8386,20 +8587,71 @@ fn invoke_hooked(
         "output": result.output,
     });
     match hooks.dispatch(after, name, observed) {
-        Ok(dispatch) => {
-            for note in dispatch.diagnostics {
-                emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
-            }
+        Ok(dispatch) => notes.extend(dispatch.diagnostics),
+        Err(error) => notes.push(format!("a hook on `{}` failed: {error}", after.as_str())),
+    }
+}
+
+/// Run one tool call with the lifecycle events around it, on a surface with no
+/// operator to ask.
+///
+/// `before_operation` sees the call before it happens and may rewrite its
+/// arguments, deny it, or ask for an approval nobody is here to give — which,
+/// here, is a refusal reported to the model rather than a wait.
+/// `after_operation` and `operation_failed` see what it did.
+///
+/// A refused call is a failed result, not an error: the model asked for
+/// something it may not have, and telling it so is how it tries something else.
+fn invoke_hooked(
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    runtime: &arsy_code::agent::ToolRuntime,
+    name: &str,
+    arguments: &Value,
+    emitter: &mut Emitter,
+) -> arsy_code::agent::ToolResult {
+    let Some(hooks) = hooks else {
+        return runtime.invoke(name, arguments);
+    };
+    let mut notes = Vec::new();
+    let result = match hook_before_call(hooks, name, arguments, &mut notes) {
+        HookedCall::Refused(reason) => hook_refused(name, reason),
+        HookedCall::Run {
+            approval: Some(reason),
+            ..
+        } => hook_refused(
+            name,
+            format!(
+                "a hook asked for the operator's approval, and this surface cannot ask for one: \
+                 {reason}"
+            ),
+        ),
+        HookedCall::Run {
+            arguments,
+            injected,
+            approval: None,
+        } => {
+            let mut result = runtime.invoke(name, &arguments);
+            hook_after_call(hooks, name, &injected, &mut result, &mut notes);
+            result
         }
-        // Both of these report what already happened, so a failure here is
-        // said and the result stands.
-        Err(error) => emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-HOK-1000",
-            format!("a hook on `{}` failed: {error}", after.as_str()),
-            String::new(),
-        )),
+    };
+    for note in notes {
+        emitter.diagnostic(&Diagnostic::warning("ARSY-HOK-1000", note, String::new()));
     }
     result
+}
+
+/// The result a call a hook stopped sends back to the model.
+fn hook_refused(name: &str, output: String) -> arsy_code::agent::ToolResult {
+    arsy_code::agent::ToolResult {
+        tool: name.to_owned(),
+        success: false,
+        output,
+        changed_files: Vec::new(),
+        duration: std::time::Duration::ZERO,
+        metadata: json!({"refused_by": "hook"}),
+        artifact: None,
+    }
 }
 
 /// One counter out of the telemetry summary the run just printed.
@@ -8889,12 +9141,14 @@ fn artifact_store(root: &Path) -> Result<arsy_kernel::artifact::FileArtifactStor
 /// `session` is the stream durable state belongs to. Without one — a dry run,
 /// or a build with no store open — the runtime offers no `todo.*` tool rather
 /// than a checklist that would vanish when the process ends.
+#[allow(clippy::too_many_arguments)]
 fn agent_runtime(
     root: &Path,
     config: &arsy_kernel::config::Config,
     interactive: bool,
     scope: &str,
     session: Option<SessionId>,
+    connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
@@ -8907,9 +9161,16 @@ fn agent_runtime(
     // Only for a turn that has a session. A dry run or a one-shot inspection
     // has no conversation to offer tools to, and starting somebody's MCP
     // server as a side effect of `arsy code symbol` would be a surprise.
-    let (connections, discovered) = match session {
-        Some(_) => mcp::connect_enabled(config, emitter),
-        None => (None, Vec::new()),
+    //
+    // An interactive session holds its connections across turns instead, and
+    // only brings them in line with configuration here.
+    let (connections, pending, discovered) = match (connector, session) {
+        (Some(connector), _) => session_mcp(connector, config, emitter),
+        (None, Some(_)) => {
+            let (connections, discovered) = mcp::connect_enabled(config, emitter);
+            (connections, Default::default(), discovered)
+        }
+        (None, None) => (None, Default::default(), Vec::new()),
     };
     arsy_code::agent::runtime(
         &workspace,
@@ -8936,10 +9197,47 @@ fn agent_runtime(
                 })
                 .transpose()?,
             mcp: connections,
+            mcp_pending: pending,
         },
     )
     .map(|runtime| runtime.with_dynamic_tools(discovered))
     .map_err(|error| storage_failed(error.to_string()))
+}
+
+/// The session's MCP connections for this turn, and what failed since the last.
+fn session_mcp(
+    connector: &connector::McpConnector,
+    config: &arsy_kernel::config::Config,
+    emitter: &mut Emitter,
+) -> (
+    Option<arsy_code::agent::mcpops::Connections>,
+    arsy_code::agent::mcpops::Pending,
+    Vec<arsy_code::agent::DynamicTool>,
+) {
+    let discovered = connector.sync(config);
+    for failure in connector.failures() {
+        emitter.diagnostic(&Diagnostic::warning(
+            "ARSY-MCP-1000",
+            failure,
+            "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
+        ));
+    }
+    let (connections, pending) = connector.session();
+    (Some(connections), pending, discovered)
+}
+
+/// The MCP connections of this interactive session, held until it ends.
+///
+/// One per process, because an interactive session is one process: every turn
+/// and every resumed session in it reuses the same servers.
+#[cfg(feature = "tui")]
+fn session_connector() -> &'static connector::McpConnector {
+    static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
+    CONNECTOR.get_or_init(|| {
+        connector::McpConnector::new(
+            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
+        )
+    })
 }
 
 /// The system prompt for one turn: the harness's own instructions, then the
@@ -8994,13 +9292,14 @@ fn installed_extensions(_root: &Path) -> Vec<arsy_code::agent::instructions::Ext
 
 fn system_prompt(
     root: &Path,
+    config: &arsy_kernel::config::Config,
     provider: &str,
     model: &str,
     mode: arsy_code::agent::ExecutionMode,
 ) -> Option<String> {
     let workspace = arsy_code::resource::Workspace::open(root).ok()?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
-    let instructions = arsy_code::agent::instructions::discover(&workspace, &working);
+    let instructions = instructions_for(&workspace, config, &working);
     let family = arsy_code::agent::instructions::family_for(provider, model);
     let compiled = arsy_code::agent::instructions::system_prompt(
         family,
@@ -9013,6 +9312,39 @@ fn system_prompt(
     )
     .ok()?;
     Some(arsy_code::agent::instructions::render(&compiled))
+}
+
+/// The operator's own Claude Code and Codex instructions, then the
+/// repository's, root first.
+///
+/// The switches come from the invocation's resolved config, `--config`
+/// included, so the prompt follows the same compat policy as everything else.
+fn instructions_for(
+    workspace: &arsy_code::resource::Workspace,
+    config: &arsy_kernel::config::Config,
+    working: &Path,
+) -> Vec<arsy_code::agent::instructions::Instruction> {
+    use arsy_code::agent::instructions::{self, Instruction, MAX_INSTRUCTION_BYTES};
+    let enabled = |source: &str| config.compat_enabled(source);
+    arsy_compat::instructions::user_instructions(
+        &compat_homes(),
+        enabled("claude"),
+        enabled("codex"),
+        MAX_INSTRUCTION_BYTES,
+    )
+    .into_iter()
+    .map(|found| Instruction {
+        path: found.path.display().to_string(),
+        text: found.text,
+        truncated: found.truncated,
+        operator: true,
+    })
+    .chain(instructions::discover_with(
+        workspace,
+        working,
+        enabled("claude"),
+    ))
+    .collect()
 }
 
 fn platform() -> String {
@@ -9262,6 +9594,7 @@ mod tests {
             true,
             "test",
             None,
+            None,
             &mut Emitter::new(Output::Json),
         )
         .unwrap()
@@ -9317,6 +9650,108 @@ mod tests {
         (typist, keys, done)
     }
 
+    /// A hook that denies every call.
+    struct DenyAll;
+
+    impl arsy_code::hook::HookHandler for DenyAll {
+        fn run(
+            &self,
+            _rule: &arsy_code::hook::HookRule,
+            _payload: &Value,
+        ) -> Result<arsy_code::hook::HandlerResult, arsy_code::hook::HookError> {
+            Ok(arsy_code::hook::HandlerResult {
+                outcome: Some(arsy_code::hook::Outcome::Deny("no patches here".to_owned())),
+                payload: None,
+                inject: None,
+                schedule: None,
+            })
+        }
+    }
+
+    /// The interactive turn dispatches `before_operation`, so a Claude hook
+    /// that blocks a call blocks it here too, before anyone is asked.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_hook_that_denies_a_call_stops_it_in_the_interactive_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let patch = "*** Begin Patch\n*** Add File: note.txt\n+blocked\n*** End Patch\n";
+        let (resolved, _) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "apply_patch".to_owned(),
+                    arguments: json!({ "patch": patch }),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "understood\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut hooks = arsy_code::hook::HookEngine::new(1);
+        hooks.register(
+            arsy_code::hook::HookRule {
+                id: "deny".to_owned(),
+                event: arsy_code::hook::LifecycleEvent::BeforeOperation,
+                matcher: "*".to_owned(),
+                effect: arsy_code::hook::EffectClass::Gate,
+                origin: arsy_kernel::capability::PolicySource::User,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            Box::new(DenyAll),
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"", std::sync::Arc::clone(&approval));
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "write a note".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            Some(&hooks),
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        assert_eq!(turn.response.trim(), "understood");
+        assert!(
+            !workspace.path().join("note.txt").exists(),
+            "the call never ran"
+        );
+        assert_eq!(approval.opened(), 0, "nobody was asked about a denied call");
+        assert!(matches!(
+            conversation[2].content.first(),
+            Some(ModelContent::ToolResult { is_error: true, content, .. })
+                if content.contains("no patches here")
+        ));
+    }
+
     #[cfg(feature = "tui")]
     #[test]
     fn a_confirmed_tool_call_runs_and_its_result_goes_back_to_the_model() {
@@ -9363,6 +9798,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -9376,6 +9812,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9498,6 +9935,7 @@ mod tests {
         }];
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -9511,6 +9949,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
 
@@ -9563,6 +10002,7 @@ mod tests {
         let mut conversation = Vec::new();
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -9576,6 +10016,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9631,6 +10072,7 @@ mod tests {
         // hang up: the calls after it are refused without asking.
         let turn = native_turn(
             &resolved,
+            &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
             &arsy_code::agent::budget::History::default(),
@@ -9644,6 +10086,7 @@ mod tests {
             &mut tui::Composer::default(),
             &mut tui::Transcript::default(),
             &approval,
+            None,
         )
         .unwrap();
         // The typist outlives the turn on purpose, so an unanswered prompt
@@ -10767,6 +11210,47 @@ mod tests {
         let mut traced = Emitter::new(Output::Json).with_debug(true);
         traced.trace("request", json!({"round": 0}));
         assert_eq!(traced.sequence, 1);
+    }
+
+    /// A model Claude Code or Codex is set to use fills in only for an endpoint
+    /// arsy.json leaves without one, and never outranks one it names.
+    #[test]
+    fn another_tools_model_is_used_only_where_arsy_names_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(arsy_kernel::config::CONFIG_FILE);
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.claude]\nkind = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com\"\n",
+        );
+        let seed = arsy_kernel::config::CompatSeed {
+            label: "claude".to_owned(),
+            models: vec![arsy_kernel::config::ModelHint {
+                model: "claude-opus-4-1".to_owned(),
+                dialects: vec![arsy_kernel::config::Dialect::Anthropic],
+                provider: None,
+            }],
+            ..Default::default()
+        };
+        let layers = [(arsy_kernel::config::Layer::User, path.clone())];
+        let config = Config::load_with(&layers, std::slice::from_ref(&seed)).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "claude-opus-4-1"
+        );
+
+        write_config_file(
+            &path,
+            "schema_version = 1\n\n[provider.endpoint.claude]\nkind = \"anthropic\"\n\
+             base_url = \"https://api.anthropic.com\"\nmodel = \"claude-sonnet-5\"\n",
+        );
+        let config = Config::load_with(&layers, &[seed]).unwrap();
+        let endpoint = config.endpoint(None).unwrap().clone();
+        assert_eq!(
+            selected_model(&config, &endpoint, None).unwrap(),
+            "claude-sonnet-5"
+        );
     }
 
     /// `--model` chooses between what policy permits; it cannot reach past it.

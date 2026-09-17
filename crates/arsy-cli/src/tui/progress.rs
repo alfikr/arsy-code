@@ -312,6 +312,11 @@ pub fn assistant_header(colour: bool) -> String {
     paint(colour, sgr_assistant(), "  ✦ Response")
 }
 
+/// What a lifecycle hook said about a call, dimmed so it reads as an aside.
+pub fn hook_note_row(colour: bool, note: &str) -> String {
+    paint(colour, sgr_dim(), &format!("  hook: {}", safe_text(note)))
+}
+
 /// Shown when a turn is stopped from the keyboard.
 pub fn interrupted_row(colour: bool) -> String {
     exec_row(colour, Status::Run, "Interrupted", None)

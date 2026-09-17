@@ -1,0 +1,7 @@
+model = "gpt-5-codex"
+sandbox_mode = "read-only"
+
+[mcp_servers.tags]
+command = "git-tag-mcp"
+env_vars = ["DOCS_TOKEN"]
+tool_timeout_sec = 30

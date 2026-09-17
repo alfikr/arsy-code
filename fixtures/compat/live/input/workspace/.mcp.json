@@ -1,0 +1,6 @@
+{
+  "mcpServers": {
+    "repo-tool": { "command": "./scripts/repo-mcp" },
+    "docs": { "command": "shadowed-docs" }
+  }
+}

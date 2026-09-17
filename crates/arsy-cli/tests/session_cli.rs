@@ -47,6 +47,9 @@ fn recorded(workspace: &Path) -> (SessionId, Vec<String>) {
 fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
     let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.to_str().unwrap()])
+        // Never the Claude Code or Codex setup of the machine running the test.
+        .env("CLAUDE_CONFIG_DIR", workspace.join("no-claude-home"))
+        .env("CODEX_HOME", workspace.join("no-codex-home"))
         .args(args)
         .args(["--output", "json"])
         .output()

@@ -16,7 +16,7 @@
 //! `McpError`.
 
 use arsy_kernel::{
-    config::{McpServer, McpTransport},
+    config::{LaunchEnv, McpServer, McpTransport},
     provider::wire::{header, WireRequest, WireTransport},
 };
 use serde::Serialize;
@@ -224,14 +224,19 @@ pub struct StdioChannel {
 }
 
 impl StdioChannel {
+    /// `env` is added to the environment the child inherits, so a server
+    /// declared with a connection string or token receives it and nothing
+    /// else does.
     pub fn spawn(
         command: &str,
         args: &[String],
+        env: &LaunchEnv,
         timeout: Duration,
         max_body_bytes: u64,
     ) -> Result<Self, McpError> {
         let mut child = Command::new(command)
             .args(args)
+            .envs(env.iter())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // The server's own logs belong on the operator's terminal, not
@@ -246,8 +251,14 @@ impl StdioChannel {
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
+        let secrets = scrubbed_values(env);
         thread::spawn(move || {
-            let _ = io::copy(&mut BufReader::new(stderr), &mut io::stderr());
+            // A server that logs its own connection string or token must not
+            // put it on the operator's terminal, so each line is scrubbed of
+            // the values this definition handed it.
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = writeln!(io::stderr(), "{}", scrub(&line, &secrets));
+            }
         });
         let (sender, lines) = mpsc::channel();
         // A reader thread is what makes a deadline possible: a blocking read on
@@ -373,6 +384,25 @@ impl Drop for StdioChannel {
     }
 }
 
+/// The launch values worth hiding. Very short ones are left alone: replacing
+/// every `1` or `on` in a log would hide the log, not a secret.
+fn scrubbed_values(env: &LaunchEnv) -> Vec<String> {
+    let mut values: Vec<String> = env
+        .iter()
+        .map(|(_, value)| value.to_owned())
+        .filter(|value| value.len() >= 6)
+        .collect();
+    // Longest first, so a value containing another is replaced whole.
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+fn scrub(line: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(line.to_owned(), |line, secret| {
+        line.replace(secret.as_str(), "[redacted]")
+    })
+}
+
 /// Streamable HTTP: one POST per request, answering with JSON or SSE.
 pub struct HttpChannel {
     url: String,
@@ -380,6 +410,10 @@ pub struct HttpChannel {
     /// `Mcp-Session-Id` from the initialize response, replayed on every later
     /// request so the server can correlate them.
     session: Option<String>,
+    /// Headers the definition carries, such as an authorization token. A name
+    /// the protocol sets itself is dropped, so a definition cannot rewrite the
+    /// framing of its own messages.
+    headers: Vec<(String, String)>,
     max_body_bytes: u64,
     next_id: u64,
 }
@@ -387,6 +421,7 @@ pub struct HttpChannel {
 impl HttpChannel {
     pub fn new(
         url: impl Into<String>,
+        headers: &LaunchEnv,
         transport: Box<dyn WireTransport>,
         max_body_bytes: u64,
     ) -> Self {
@@ -394,13 +429,24 @@ impl HttpChannel {
             url: url.into(),
             transport,
             session: None,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
+                .filter(|(name, _)| {
+                    !matches!(
+                        name.as_str(),
+                        "content-type" | "accept" | "mcp-protocol-version" | "mcp-session-id"
+                    )
+                })
+                .collect(),
             max_body_bytes,
             next_id: 1,
         }
     }
 
     fn post(&mut self, message: &Value, expect_reply: Option<u64>) -> Result<Value, McpError> {
-        let mut headers = vec![
+        let mut headers = self.headers.clone();
+        headers.extend([
             ("content-type".to_owned(), "application/json".to_owned()),
             (
                 "accept".to_owned(),
@@ -410,7 +456,7 @@ impl HttpChannel {
                 "mcp-protocol-version".to_owned(),
                 PROTOCOL_VERSION.to_owned(),
             ),
-        ];
+        ]);
         if let Some(session) = &self.session {
             headers.push(("mcp-session-id".to_owned(), session.clone()));
         }
@@ -671,14 +717,16 @@ where
 {
     fn connect(&self, definition: &McpServer) -> Result<Box<dyn Channel>, McpError> {
         match &definition.transport {
-            McpTransport::Stdio { command, args } => Ok(Box::new(StdioChannel::spawn(
+            McpTransport::Stdio { command, args, env } => Ok(Box::new(StdioChannel::spawn(
                 command,
                 args,
+                env,
                 Duration::from_millis(definition.timeout_ms),
                 definition.max_body_bytes,
             )?)),
-            McpTransport::Http { url } => Ok(Box::new(HttpChannel::new(
+            McpTransport::Http { url, headers } => Ok(Box::new(HttpChannel::new(
                 url,
+                headers,
                 (self.http)(),
                 definition.max_body_bytes,
             ))),
@@ -850,6 +898,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "unused".to_owned(),
                 args: Vec::new(),
+                env: Default::default(),
             },
             enabled,
             trust: arsy_kernel::capability::PolicySource::User,
@@ -972,6 +1021,90 @@ mod tests {
             McpError::Disabled("docs".to_owned())
         );
         assert!(slept.is_empty());
+    }
+
+    struct Recording(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl WireTransport for Recording {
+        fn send(
+            &self,
+            request: WireRequest,
+        ) -> Result<arsy_kernel::provider::wire::WireResponse, arsy_kernel::provider::ProviderError>
+        {
+            *self.0.lock().unwrap() = request.headers;
+            Ok(arsy_kernel::provider::wire::WireResponse {
+                status: 401,
+                headers: Vec::new(),
+                lines: Box::new(std::iter::empty()),
+            })
+        }
+    }
+
+    #[test]
+    fn an_http_definition_sends_its_headers_but_not_over_the_protocol() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let headers = LaunchEnv::from(std::collections::BTreeMap::from([
+            ("Authorization".to_owned(), "Bearer token".to_owned()),
+            ("Content-Type".to_owned(), "text/plain".to_owned()),
+        ]));
+        let mut channel = HttpChannel::new(
+            "https://mcp.example.test",
+            &headers,
+            Box::new(Recording(Arc::clone(&sent))),
+            1024,
+        );
+        assert!(matches!(
+            channel.request("initialize", json!({})),
+            Err(McpError::Auth(_))
+        ));
+        let sent = sent.lock().unwrap();
+        assert!(sent.contains(&("authorization".to_owned(), "Bearer token".to_owned())));
+        let content_types: Vec<_> = sent
+            .iter()
+            .filter(|(name, _)| name == "content-type")
+            .collect();
+        assert_eq!(content_types.len(), 1);
+        assert_eq!(content_types[0].1, "application/json");
+    }
+
+    #[test]
+    fn a_servers_log_never_shows_the_values_it_was_launched_with() {
+        let env = LaunchEnv::from(std::collections::BTreeMap::from([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:hunter22@db/prod".to_owned(),
+            ),
+            ("DEBUG".to_owned(), "on".to_owned()),
+        ]));
+        let secrets = scrubbed_values(&env);
+        assert_eq!(
+            scrub(
+                "connecting to postgres://user:hunter22@db/prod (debug on)",
+                &secrets
+            ),
+            "connecting to [redacted] (debug on)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stdio_server_receives_its_launch_env() {
+        let env = LaunchEnv::from(std::collections::BTreeMap::from([(
+            "ARSY_MCP_LAUNCH_PROBE".to_owned(),
+            "from-definition".to_owned(),
+        )]));
+        let reply = r#"read line; printf '{"jsonrpc":"2.0","id":1,"result":{"seen":"%s"}}\n' "$ARSY_MCP_LAUNCH_PROBE""#;
+        let mut channel = StdioChannel::spawn(
+            "sh",
+            &["-c".to_owned(), reply.to_owned()],
+            &env,
+            Duration::from_secs(5),
+            1024,
+        )
+        .unwrap();
+        let result = channel.request("probe", json!({})).unwrap();
+        assert_eq!(result["seen"], "from-definition");
+        let _ = channel.close();
     }
 
     #[test]

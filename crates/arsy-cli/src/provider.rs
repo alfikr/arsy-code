@@ -165,7 +165,8 @@ fn route(config: &Config) -> routing::Decision {
             let model = endpoint
                 .model
                 .clone()
-                .or_else(|| config.model_default().map(str::to_owned))?;
+                .or_else(|| config.model_default().map(str::to_owned))
+                .or_else(|| config.compat_model(endpoint).map(str::to_owned))?;
             Some(routing::Candidate {
                 key: arsy_kernel::provider::ModelKey {
                     provider: endpoint.id.clone(),

@@ -145,6 +145,8 @@ pub struct TurnState {
     pub journal: Option<crate::agent::todoops::Journal>,
     /// MCP servers this turn connected to. `None` offers no `mcp.call`.
     pub mcp: Option<crate::agent::mcpops::Connections>,
+    /// Servers of `mcp` still connecting, whose calls wait for them.
+    pub mcp_pending: crate::agent::mcpops::Pending,
 }
 
 /// Build the registry for one workspace.
@@ -170,6 +172,7 @@ pub fn registry(
     if let Some(connections) = turn.mcp {
         registry.register(crate::agent::mcpops::McpExecutor::new(
             connections,
+            turn.mcp_pending.clone(),
             Arc::clone(&artifacts),
             retain_until_ms,
         ))?;

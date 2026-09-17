@@ -154,13 +154,15 @@ impl CompatibilityImporter {
     pub fn hook_declarations(&self) -> Result<Vec<Value>, CompatError> {
         let source = self.root.join(".claude/settings.json");
         let local = self.root.join(".claude/settings.local.json");
-        let settings = read_json_or_empty(self, &source)?;
-        let overrides = read_json_or_empty(self, &local)?;
-        if overrides.get("hooks").is_some() {
-            claude_hooks(self, &local, &overrides)
-        } else {
-            claude_hooks(self, &source, &settings)
-        }
+        // Claude runs the hooks of both files, so both are listed -- the same
+        // two the runtime loader reads.
+        let mut hooks = claude_hooks(self, &source, &read_json_or_empty(self, &source)?)?;
+        hooks.extend(claude_hooks(
+            self,
+            &local,
+            &read_json_or_empty(self, &local)?,
+        )?);
+        Ok(hooks)
     }
 
     pub fn import(
@@ -215,11 +217,8 @@ impl CompatibilityImporter {
         let local_path = self.root.join(".claude/settings.local.json");
         let mut settings = read_json_or_empty(self, &settings_path)?;
         let local_settings = read_json_or_empty(self, &local_path)?;
-        let hook_source = if local_settings.get("hooks").is_some() {
-            &local_path
-        } else {
-            &settings_path
-        };
+        let mut hooks = claude_hooks(self, &settings_path, &settings)?;
+        hooks.extend(claude_hooks(self, &local_path, &local_settings)?);
         merge_object(&mut settings, local_settings)?;
         let diagnostics = unknown_keys(
             &settings,
@@ -238,7 +237,6 @@ impl CompatibilityImporter {
             map_claude_permission,
         );
         let sources = existing_sources(self, [&settings_path, &local_path])?;
-        let hooks = claude_hooks(self, hook_source, &settings)?;
         let agents = markdown_agents(self, &self.root.join(".claude/agents"), None)?;
         let skills = skills(self, &self.root.join(".claude/skills"), "mapped")?;
         let commands = markdown_declarations(self, &self.root.join(".claude/commands"), "mapped")?;

@@ -19,6 +19,16 @@
       - any-glob-to-any-file:
           - "crates/arsy-kernel/**"
 
+"area: compat":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-compat/**"
+          - "crates/arsy-code/src/compat.rs"
+          - "crates/arsy-cli/tests/compat_cli.rs"
+          - "fixtures/compat/**"
+          - "docs/21-compatibility-claude.md"
+          - "docs/22-compatibility-codex.md"
+
 "area: code":
   - changed-files:
       - any-glob-to-any-file:

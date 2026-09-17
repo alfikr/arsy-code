@@ -23,7 +23,9 @@ remote-transports = ["arsy-code/remote-transports"]
 
 [dependencies]
 arsy-code = { path = "../arsy-code" }
+arsy-compat = { path = "../arsy-compat" }
 arsy-kernel = { path = "../arsy-kernel", features = ["http"] }
+sha2.workspace = true
 resvg = { version = "=0.48.1", default-features = false, optional = true }
 rpassword.workspace = true
 serde.workspace = true

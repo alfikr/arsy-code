@@ -6,16 +6,18 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpChoice {
     pub name: String,
-    /// `arsy` for a connection ARSY defines, otherwise the tool that declared it.
+    /// `arsy` for a connection ARSY defines, otherwise the tool that declared it
+    /// (`claude` and `codex` rows are read live and toggle like ARSY's own).
     pub source: String,
-    /// The layer an ARSY definition came from; empty for a declaration.
+    /// `user` or `workspace` for a connection in the resolved configuration;
+    /// empty for a declaration.
     pub trust: String,
     /// What a connection runs or reaches, shortened for the row.
     pub target: String,
     /// The whole command line or URL, shown before anything is adopted.
     pub detail: String,
-    /// `None` while only another tool declares it: ARSY does not start a
-    /// connection it has not been told to adopt.
+    /// `None` for a declaration ARSY does not read live (OMP, or a tool
+    /// switched off), which starts nothing until it is adopted.
     pub enabled: Option<bool>,
 }
 
@@ -33,6 +35,9 @@ pub enum McpDialogMode {
     Select,
     /// Adopting decides that a program may be started, so it is asked first.
     ConfirmAdopt,
+    /// Turning on a server a repository's Claude or Codex file declares lets it
+    /// act with the operator's authority, so that is asked first too.
+    ConfirmEnable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,94 +73,23 @@ impl McpDialogState {
     pub fn render(&self, width: usize, colour: bool) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
-        let mut lines = Vec::new();
-        match self.mode {
-            McpDialogMode::Select => {
-                lines.push(dialog_top(" MCP ", width, colour));
-                if self.choices.is_empty() {
-                    lines.push(dialog_line(
-                        "  no MCP connection is defined or declared",
-                        inner,
-                        colour,
-                        sgr_dim(),
-                    ));
-                }
-                let name_width = self
-                    .choices
-                    .iter()
-                    .map(|c| visible_len(&c.name))
-                    .max()
-                    .unwrap_or(0);
-                for (index, choice) in self.choices.iter().enumerate() {
-                    let marked = index == self.selected;
-                    let state = match choice.enabled {
-                        Some(true) => "● on ",
-                        Some(false) => "○ off",
-                        None => "◌ —  ",
-                    };
-                    let source = if choice.trust.is_empty() {
-                        choice.source.clone()
-                    } else {
-                        format!("{} · {}", choice.source, choice.trust)
-                    };
-                    let row = format!(
-                        "{} {state}  {:name_width$}  {source:<16}  {}",
-                        if marked { "›" } else { " " },
-                        choice.name,
-                        choice.target,
-                    );
-                    let style = match (marked, choice.enabled) {
-                        (true, _) => sgr_accent(),
-                        (false, Some(true)) => "",
-                        _ => sgr_dim(),
-                    };
-                    lines.push(dialog_line(&row, inner, colour, style));
-                }
-                lines.push(dialog_line("", inner, colour, ""));
-                if let Some(notice) = &self.notice {
-                    lines.push(dialog_line(notice, inner, colour, sgr_dim()));
-                }
-                lines.push(dialog_line(
-                    "[↑/↓] Navigate  [Space/Enter] Toggle or adopt  [Esc] Close",
-                    inner,
-                    colour,
-                    sgr_dim(),
-                ));
-            }
-            McpDialogMode::ConfirmAdopt => {
-                lines.push(dialog_top(" ADOPT MCP CONNECTION ", width, colour));
-                if let Some(choice) = self.choices.get(self.selected) {
-                    lines.push(dialog_line(
-                        &format!(
-                            "Adopt `{}` from {} into your user arsy.json, enabled?",
-                            choice.name, choice.source
-                        ),
-                        inner,
-                        colour,
-                        sgr_accent(),
-                    ));
-                    lines.push(dialog_line(
-                        &format!("It runs: {}", choice.detail),
-                        inner,
-                        colour,
-                        "",
-                    ));
-                    lines.push(dialog_line(
-                        "Environment variables and headers are not copied; a server that needs them will not start.",
-                        inner,
-                        colour,
-                        sgr_dim(),
-                    ));
-                }
-                lines.push(dialog_line("", inner, colour, ""));
-                lines.push(dialog_line(
-                    "[y/Enter] Adopt  [n/Esc] Back",
-                    inner,
-                    colour,
-                    sgr_dim(),
-                ));
-            }
-        }
+        let mut lines = match self.mode {
+            McpDialogMode::Select => self.select_lines(width, inner, colour),
+            McpDialogMode::ConfirmAdopt => self.confirm_lines(
+                " ADOPT MCP CONNECTION ",
+                |choice| format!("Adopt `{}` from {} into your user arsy.json, enabled?", choice.name, choice.source),
+                "Environment variables and headers are not copied; a server that needs them will not start.",
+                "[y/Enter] Adopt  [n/Esc] Back",
+                (width, inner, colour),
+            ),
+            McpDialogMode::ConfirmEnable => self.confirm_lines(
+                " ENABLE REPOSITORY MCP SERVER ",
+                |choice| format!("Turn on `{}`, which this repository's {} file declares?", choice.name, choice.source),
+                "It will act with your authority. The choice is saved in your user arsy.json.",
+                "[y/Enter] Turn on  [n/Esc] Back",
+                (width, inner, colour),
+            ),
+        };
         lines.push(paint(
             colour,
             sgr_border(),
@@ -164,40 +98,119 @@ impl McpDialogState {
         lines.join("\n")
     }
 
+    fn select_lines(&self, width: usize, inner: usize, colour: bool) -> Vec<String> {
+        let mut lines = vec![dialog_top(" MCP ", width, colour)];
+        if self.choices.is_empty() {
+            lines.push(dialog_line(
+                "  no MCP connection is defined or declared",
+                inner,
+                colour,
+                sgr_dim(),
+            ));
+        }
+        let name_width = self
+            .choices
+            .iter()
+            .map(|c| visible_len(&c.name))
+            .max()
+            .unwrap_or(0);
+        lines.extend(self.choices.iter().enumerate().map(|(index, choice)| {
+            let marked = index == self.selected;
+            let style = match (marked, choice.enabled) {
+                (true, _) => sgr_accent(),
+                (false, Some(true)) => "",
+                _ => sgr_dim(),
+            };
+            dialog_line(
+                &choice_row(choice, marked, name_width),
+                inner,
+                colour,
+                style,
+            )
+        }));
+        lines.push(dialog_line("", inner, colour, ""));
+        if let Some(notice) = &self.notice {
+            lines.push(dialog_line(notice, inner, colour, sgr_dim()));
+        }
+        lines.push(dialog_line(
+            "[↑/↓] Navigate  [Space/Enter] Toggle  [Esc] Close",
+            inner,
+            colour,
+            sgr_dim(),
+        ));
+        lines
+    }
+
+    fn confirm_lines(
+        &self,
+        title: &str,
+        question: impl Fn(&McpChoice) -> String,
+        caveat: &str,
+        keys: &str,
+        (width, inner, colour): (usize, usize, bool),
+    ) -> Vec<String> {
+        let mut lines = vec![dialog_top(title, width, colour)];
+        if let Some(choice) = self.choices.get(self.selected) {
+            lines.push(dialog_line(&question(choice), inner, colour, sgr_accent()));
+            lines.push(dialog_line(
+                &format!("It runs: {}", choice.detail),
+                inner,
+                colour,
+                "",
+            ));
+            lines.push(dialog_line(caveat, inner, colour, sgr_dim()));
+        }
+        lines.push(dialog_line("", inner, colour, ""));
+        lines.push(dialog_line(keys, inner, colour, sgr_dim()));
+        lines
+    }
+
     pub fn handle_key(&mut self, key: Key) -> Option<McpAction> {
-        match self.mode {
-            McpDialogMode::Select => match key {
-                Key::Up => {
-                    self.step(false);
-                    None
-                }
-                Key::Down => {
-                    self.step(true);
-                    None
-                }
-                Key::Char(' ') | Key::Enter | Key::Newline => {
-                    match self.choices.get(self.selected)?.enabled {
-                        Some(_) => Some(McpAction::Toggle(self.selected)),
-                        None => {
-                            self.mode = McpDialogMode::ConfirmAdopt;
-                            None
-                        }
-                    }
-                }
-                Key::Interrupt | Key::Eof => Some(McpAction::Close),
-                _ => None,
-            },
-            McpDialogMode::ConfirmAdopt => match key {
-                Key::Char('y' | 'Y') | Key::Enter | Key::Newline => {
-                    self.mode = McpDialogMode::Select;
-                    Some(McpAction::Adopt(self.selected))
-                }
-                Key::Char('n' | 'N') | Key::Interrupt | Key::Eof => {
-                    self.mode = McpDialogMode::Select;
-                    None
-                }
-                _ => None,
-            },
+        match (self.mode, key) {
+            (McpDialogMode::Select, Key::Up) => {
+                self.step(false);
+                None
+            }
+            (McpDialogMode::Select, Key::Down) => {
+                self.step(true);
+                None
+            }
+            (McpDialogMode::Select, Key::Char(' ') | Key::Enter | Key::Newline) => self.activate(),
+            (McpDialogMode::Select, Key::Interrupt | Key::Eof) => Some(McpAction::Close),
+            (McpDialogMode::Select, _) => None,
+            (mode, key) => self.confirm_key(mode, key),
+        }
+    }
+
+    /// Space or Enter on the marked row: act, or ask first where acting would
+    /// start something or raise its authority.
+    fn activate(&mut self) -> Option<McpAction> {
+        let choice = self.choices.get(self.selected)?;
+        match choice.enabled {
+            None => self.mode = McpDialogMode::ConfirmAdopt,
+            Some(false) if choice.source != "arsy" && choice.trust == "workspace" => {
+                self.mode = McpDialogMode::ConfirmEnable;
+            }
+            Some(_) => return Some(McpAction::Toggle(self.selected)),
+        }
+        None
+    }
+
+    fn confirm_key(&mut self, mode: McpDialogMode, key: Key) -> Option<McpAction> {
+        let action = match mode {
+            McpDialogMode::ConfirmEnable => McpAction::Toggle(self.selected),
+            _ => McpAction::Adopt(self.selected),
+        };
+        match key {
+            Key::Char('y' | 'Y') | Key::Enter | Key::Newline => {
+                self.mode = McpDialogMode::Select;
+                Some(action)
+            }
+            Key::Char('n' | 'N') | Key::Interrupt | Key::Eof => {
+                self.mode = McpDialogMode::Select;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -213,6 +226,26 @@ impl McpDialogState {
             (self.selected + count - 1) % count
         };
     }
+}
+
+/// One connection as a row: marker, state, name, where it came from, target.
+fn choice_row(choice: &McpChoice, marked: bool, name_width: usize) -> String {
+    let state = match choice.enabled {
+        Some(true) => "● on ",
+        Some(false) => "○ off",
+        None => "◌ —  ",
+    };
+    let source = if choice.trust.is_empty() {
+        choice.source.clone()
+    } else {
+        format!("{} · {}", choice.source, choice.trust)
+    };
+    format!(
+        "{} {state}  {:name_width$}  {source:<18}  {}",
+        if marked { "›" } else { " " },
+        choice.name,
+        choice.target,
+    )
 }
 
 #[cfg(test)]
@@ -257,6 +290,36 @@ mod tests {
         assert_eq!(dialog.handle_key(Key::Char('y')), Some(McpAction::Adopt(1)));
 
         assert_eq!(dialog.handle_key(Key::Interrupt), Some(McpAction::Close));
+    }
+
+    #[test]
+    fn turning_on_a_repositorys_claude_server_is_asked_first() {
+        let repository = McpChoice {
+            source: "claude".to_owned(),
+            trust: "workspace".to_owned(),
+            ..choice("repo-docs", Some(false))
+        };
+        let operators = McpChoice {
+            source: "codex".to_owned(),
+            trust: "user".to_owned(),
+            ..choice("tags", Some(false))
+        };
+        let mut dialog = McpDialogState::new(vec![repository, operators]);
+
+        assert_eq!(dialog.handle_key(Key::Enter), None);
+        assert_eq!(dialog.mode, McpDialogMode::ConfirmEnable);
+        assert!(dialog.render(80, false).contains("act with your authority"));
+        assert_eq!(
+            dialog.handle_key(Key::Char('y')),
+            Some(McpAction::Toggle(0))
+        );
+
+        // The operator's own Codex server toggles straight away.
+        dialog.handle_key(Key::Down);
+        assert_eq!(
+            dialog.handle_key(Key::Char(' ')),
+            Some(McpAction::Toggle(1))
+        );
     }
 
     #[test]

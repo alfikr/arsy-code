@@ -111,6 +111,7 @@ The system prompt is rebuilt each round from:
 
 ```text
 HARNESS_INSTRUCTIONS               what the tools are for
+  + ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md   the operator's own, when enabled
   + AGENTS.md / CLAUDE.md          root first, then each directory down to cwd
   + task context                   when a caller supplies one
 ```
@@ -118,8 +119,10 @@ HARNESS_INSTRUCTIONS               what the tools are for
 compiled through `arsy_kernel::prompt::compile`, so ordering follows the model
 family and secrets are redacted on the way out.
 
-Discovery is deliberately narrow — `agent::instructions::INSTRUCTION_NAMES`,
-on the ancestor path only, one file per directory. `README.md` and `docs/*.md`
+Discovery is deliberately narrow — on the ancestor path only, each directory
+contributes its agents file (`AGENTS.override.md`, else `AGENTS.md`, else
+`.arsy/AGENTS.md`) and its `CLAUDE.md` unless that is a copy, or `GEMINI.md` when
+it has neither. `README.md` and `docs/*.md`
 are *not* injected; they are documentation the model reads with `search.text`
 and `fs.read` when it needs them. The objective is relevant context, not
 maximum context.

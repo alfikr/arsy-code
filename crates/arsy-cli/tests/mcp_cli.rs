@@ -17,15 +17,28 @@ fn server_command() -> String {
 }
 
 fn arsy(workspace: &Path, args: &[&str]) -> (i32, Value) {
+    // Never the Claude Code setup of the machine running the test.
+    arsy_with_claude(workspace, &workspace.join("no-claude-home"), args)
+}
+
+fn arsy_with_claude(workspace: &Path, claude_home: &Path, args: &[&str]) -> (i32, Value) {
     // Global flags go first: everything after a bare `--` belongs to the
     // connection's own command line, so appending them would hand ARSY's flags
     // to the server instead.
     let output = Command::new(env!("CARGO_BIN_EXE_arsy"))
         .args(["--workspace", workspace.to_str().unwrap()])
+        .env("CLAUDE_CONFIG_DIR", claude_home)
+        .env("CODEX_HOME", workspace.join("no-codex-home"))
+        .env("ARSY_MCP_CLI_SECRET", "never-printed-7f3a")
         .args(["--output", "json"])
         .args(args)
         .output()
         .expect("the binary runs");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("never-printed-7f3a")
+            && !String::from_utf8_lossy(&output.stderr).contains("never-printed-7f3a"),
+        "a launch value reached the output of {args:?}"
+    );
     let stdout = String::from_utf8(output.stdout).expect("machine output is UTF-8");
     let record = stdout
         .lines()
@@ -161,6 +174,76 @@ fn a_connection_is_defined_listed_probed_disabled_and_removed() {
     assert_eq!(code, 2);
     let (code, _) = arsy(workspace.path(), &["mcp", "test", "fixture"]);
     assert_eq!(code, 2);
+}
+
+/// A server only Claude Code declares is connectable with no `arsy.json` at all.
+#[test]
+fn a_server_claude_code_declares_is_probed_without_adopting_it() {
+    let workspace = tempfile::tempdir().unwrap();
+    let served = tempfile::tempdir().unwrap();
+    let claude = tempfile::tempdir().unwrap();
+    let declared = serde_json::json!({"mcpServers": {"from-claude": {
+        "command": server_command(),
+        "args": ["--workspace", served.path().to_str().unwrap(), "serve"],
+        "env": {"ARSY_PROBE_TOKEN": "${ARSY_MCP_CLI_SECRET}"}
+    }}});
+    std::fs::write(claude.path().join(".claude.json"), declared.to_string()).unwrap();
+
+    let (code, probed) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "test", "from-claude"],
+    );
+    assert_eq!(code, 0, "{probed}");
+    assert_eq!(probed["server"]["name"], "arsy");
+
+    let (code, explained) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["config", "explain", "mcp.server.from-claude"],
+    );
+    assert_eq!(code, 0, "{explained}");
+    assert!(
+        explained.to_string().contains(".claude.json"),
+        "the listing names the file it came from: {explained}"
+    );
+
+    // Listed once, as Claude's, with its env named but not shown.
+    let (_, listed) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "list", "--source", "claude"],
+    );
+    let rows: Vec<&Value> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["name"] == "from-claude")
+        .collect();
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_eq!(rows[0]["ecosystem"], "claude");
+    assert_eq!(rows[0]["enabled"], true);
+    assert_eq!(rows[0]["env_keys"], serde_json::json!(["ARSY_PROBE_TOKEN"]));
+
+    // Switching it off writes only the toggle to arsy.json; Claude's file is
+    // untouched and the connection stops.
+    let before = std::fs::read(claude.path().join(".claude.json")).unwrap();
+    let (code, disabled) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "disable", "from-claude", "--scope", "workspace"],
+    );
+    assert_eq!(code, 0, "{disabled}");
+    assert_eq!(
+        std::fs::read(claude.path().join(".claude.json")).unwrap(),
+        before
+    );
+    let (code, _) = arsy_with_claude(
+        workspace.path(),
+        claude.path(),
+        &["mcp", "test", "from-claude"],
+    );
+    assert_eq!(code, 3, "a disabled connection is a policy refusal");
 }
 
 /// Unix-gated: it needs a program that reads nothing and answers nothing, and

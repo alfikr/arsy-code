@@ -21,7 +21,7 @@ The resolver reads these six layers in authority order, then returns the effecti
 2. user `arsy.json`: `~/.arsy/` on every platform;
 3. `.arsy/arsy.json` at the workspace root;
 4. nested `.arsy/arsy.json` files from the workspace root toward the working directory, parent before child;
-5. enabled Claude, Codex, and OMP compatibility imports in their documented precedence order;
+5. enabled Claude and Codex configuration, read live on every launch by `arsy-compat` and placed below every `arsy.json` layer: MCP servers, permission rules, and a fallback model (see [Claude](21-compatibility-claude.md) and [Codex](22-compatibility-codex.md)). Nothing is copied into `arsy.json`; OMP declarations remain inspection-only;
 6. the current session request, including CLI flags. `--config <PATH>` supplies
    one file at this layer. It is the operator speaking for this invocation, so
    it carries their own authority — it may name an endpoint or a credential
@@ -41,6 +41,8 @@ Authority classes are:
 - **user**: enterprise or user may set it; repository content cannot;
 - **intent**: repository/nested/compatibility/session intent is accepted within ceilings;
 - **session**: the session may select a value within resolved policy.
+
+`compat.<source>.enabled` does not merge by `replace`: a `false` from any layer switches the source off and no later layer can switch it back on, so a repository cannot re-enable a tool the operator turned off.
 
 `none` below means the key is absent, not an empty string. Defaults are fallbacks applied only when no layer sets a key; they are not operands in a multi-layer merge.
 
@@ -92,9 +94,9 @@ Authority classes are:
 | `telemetry.enabled` | boolean | `false` | replace | user |
 | `telemetry.endpoint` | HTTPS URL | none | replace | user |
 | `telemetry.include_content` | boolean | `false` | intersection | ceiling |
-| `compat.claude.enabled` | boolean | `true` | replace | intent |
-| `compat.codex.enabled` | boolean | `true` | replace | intent |
-| `compat.omp.enabled` | boolean | `true` | replace | intent |
+| `compat.claude.enabled` | boolean | `true` | `false` sticks | intent |
+| `compat.codex.enabled` | boolean | `true` | `false` sticks | intent |
+| `compat.omp.enabled` | boolean | `true` | `false` sticks | intent |
 | `git.respect_ignore` | boolean | `true` | replace | intent |
 | `ui.output` | `"human"`, `"json"`, or `"ci"` | TTY-derived | replace | session |
 | `ui.color` | `"auto"`, `"always"`, or `"never"` | `"auto"` | replace | session |

@@ -170,6 +170,7 @@ fn definition(
         (Some("stdio") | None, Some(command), None) => McpTransport::Stdio {
             command: command.to_owned(),
             args,
+            env: Default::default(),
         },
         (Some("http"), None, Some(url)) => {
             if !args.is_empty() {
@@ -177,6 +178,7 @@ fn definition(
             }
             McpTransport::Http {
                 url: url.to_owned(),
+                headers: Default::default(),
             }
         }
         (Some("stdio"), None, _) => Err(usage("a stdio connection needs --command <CMD>"))?,
@@ -238,14 +240,14 @@ fn config_broken(error: String) -> Diagnostic {
 fn definition_json(server: &McpServer) -> Value {
     let mut object = serde_json::Map::new();
     match &server.transport {
-        McpTransport::Stdio { command, args } => {
+        McpTransport::Stdio { command, args, .. } => {
             object.insert("transport".to_owned(), json!("stdio"));
             object.insert("command".to_owned(), json!(command));
             if !args.is_empty() {
                 object.insert("args".to_owned(), json!(args));
             }
         }
-        McpTransport::Http { url } => {
+        McpTransport::Http { url, .. } => {
             object.insert("transport".to_owned(), json!("http"));
             object.insert("url".to_owned(), json!(url));
         }
@@ -409,9 +411,11 @@ pub(crate) fn server_from_declaration(declaration: &Value) -> Result<McpServer, 
                         .collect()
                 })
                 .unwrap_or_default(),
+            env: Default::default(),
         },
         "http" => McpTransport::Http {
             url: text("url").to_owned(),
+            headers: Default::default(),
         },
         other => {
             return Err(usage(format!(
@@ -469,18 +473,32 @@ pub fn set_enabled(
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
-    emitter.result(set_enabled_in(&root, name, enabled, scope)?);
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    let config = load_config(&root, &working, invocation.config.as_deref())?;
+    let declared = config.mcp_provenance(name).is_some();
+    emitter.result(set_enabled_in(&root, name, enabled, scope, declared)?);
     Ok(0)
 }
 
 /// Flip the key and describe the result, for a caller that reports it its own
 /// way.
+///
+/// `declared_elsewhere` says Claude Code or Codex declares the connection, so
+/// this file may hold only the toggle for it.
 pub(crate) fn set_enabled_in(
     root: &Path,
     name: &str,
     enabled: bool,
     scope: Scope,
+    declared_elsewhere: bool,
 ) -> Result<Value, Diagnostic> {
+    // Checked here rather than only where a command line is parsed: the /mcp
+    // dialog passes names straight from another tool's file.
+    if !crate::config_edit::is_writable(name) {
+        return Err(usage(format!(
+            "`{name}` cannot be written to arsy.json; switch it off in the file that declares it"
+        )));
+    }
     let path = scope.path(root)?;
     let current = read(&path)?;
     let updated = match crate::config_edit::set_existing(
@@ -492,19 +510,20 @@ pub(crate) fn set_enabled_in(
     .map_err(config_broken)?
     {
         Some(updated) => updated,
-        // The bundled connection is declared before any file is read, so there
-        // is nothing in this one to amend yet. Writing the toggle alone is
-        // what the loader expects: it amends the declaration rather than
-        // restating a command the operator never wrote. Any other name really
-        // is undefined, and a transport-less entry for one would only produce
-        // a file the loader refuses.
-        None if name == arsy_kernel::config::BUNDLED_MCP_SERVER => crate::config_edit::set(
-            &current,
-            &["mcp", "server"],
-            name,
-            json!({ "enabled": enabled }),
-        )
-        .map_err(config_broken)?,
+        // The bundled connection, and one Claude Code or Codex declares, exist
+        // before this file is read, so there is nothing in it to amend yet.
+        // Writing the toggle alone is what the loader expects: it amends the
+        // declaration rather than restating a command the operator never
+        // wrote. Any other name really is undefined.
+        None if declared_elsewhere || name == arsy_kernel::config::BUNDLED_MCP_SERVER => {
+            crate::config_edit::set(
+                &current,
+                &["mcp", "server"],
+                name,
+                json!({ "enabled": enabled }),
+            )
+            .map_err(config_broken)?
+        }
         None => {
             return Err(usage(format!(
                 "no connection named `{name}` is defined in {}",
@@ -704,6 +723,19 @@ mod tests {
     }
 
     #[test]
+    fn a_toggle_refuses_a_name_arsy_json_cannot_hold() {
+        let root = tempfile::tempdir().unwrap();
+        let refused =
+            set_enabled_in(root.path(), "bad\"name", false, Scope::Workspace, true).unwrap_err();
+        assert!(
+            refused.message.contains("cannot be written"),
+            "{}",
+            refused.message
+        );
+        assert!(!root.path().join(".arsy").exists(), "nothing was written");
+    }
+
+    #[test]
     fn an_import_adopts_a_declaration_once_and_never_repoints_one() {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -730,6 +762,7 @@ mod tests {
             McpTransport::Stdio {
                 command: "docs-server".to_owned(),
                 args: vec!["--serve".to_owned()],
+                env: Default::default(),
             }
         );
         // Adopted into a layer the operator owns, not left at the authority of
@@ -749,6 +782,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "mine".to_owned(),
                     args: Vec::new(),
+                    env: Default::default(),
                 },
                 enabled: true,
                 trust: arsy_kernel::config::policy_source(Layer::User),
@@ -782,6 +816,7 @@ mod tests {
             McpTransport::Stdio {
                 command: "mcp-docs".to_owned(),
                 args: vec!["--root".to_owned(), ".".to_owned()],
+                env: Default::default(),
             },
             "arguments after `--` belong to the command, flags of ARSY's do not"
         );
@@ -805,7 +840,8 @@ mod tests {
         assert_eq!(
             server.transport,
             McpTransport::Http {
-                url: "https://mcp.example.test/mcp".to_owned()
+                url: "https://mcp.example.test/mcp".to_owned(),
+                headers: Default::default(),
             }
         );
 
@@ -890,6 +926,7 @@ mod tests {
             McpTransport::Stdio {
                 command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
                 args: vec![r#"--note="a" b"#.to_owned()],
+                env: Default::default(),
             }
         );
 
@@ -948,6 +985,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: "mcp-docs".to_owned(),
                 args: vec!["--root".to_owned(), ".".to_owned()],
+                env: Default::default(),
             },
             enabled: true,
             trust: arsy_kernel::capability::PolicySource::User,
@@ -975,6 +1013,7 @@ mod tests {
             transport: McpTransport::Stdio {
                 command: r"D:\a\arsy-code\target\debug\arsy.exe".to_owned(),
                 args: vec![r#"--note="a" b"#.to_owned(), "\ttabbed".to_owned()],
+                env: Default::default(),
             },
             ..stdio.clone()
         };

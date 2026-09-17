@@ -86,19 +86,22 @@ pub fn inspect_with(
     let mut entries = Vec::new();
     // What the engine actually built, so a listing can say which declarations
     // run rather than repeating that none do.
-    let loaded = if kind == "hook" {
-        Some(crate::hook_engine(
-            root,
-            &crate::load_config(root, working, extra_config)?,
-        ))
+    // Only what reads it loads it: an OMP-only listing never did, and a
+    // broken arsy.json should not start failing it.
+    let needs_config = kind == "hook" || source.is_none_or(|source| source != "omp");
+    let config = if needs_config {
+        crate::load_config(root, working, extra_config)?
     } else {
-        None
+        arsy_kernel::config::Config::default()
     };
-    if kind == "mcp" && source.is_none_or(|source| source == "arsy") {
-        entries.extend(configured(root, working, name, extra_config)?);
+    let loaded = (kind == "hook").then(|| crate::hook_engine(root, &config));
+    if kind == "mcp" {
+        entries.extend(configured(&config, name, source));
     }
     for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
-        if source.is_some_and(|source| source != ecosystem.as_str()) {
+        if source.is_some_and(|source| source != ecosystem.as_str())
+            || read_live(kind, ecosystem, &config)
+        {
             continue;
         }
         if kind == "hook" && ecosystem != Ecosystem::Claude {
@@ -211,45 +214,65 @@ fn runtime_status(
         })
 }
 
-/// ARSY's own `[mcp.server.*]` connections, in the same row shape the imported
+/// Whether a tool's MCP servers are already in the resolved configuration,
+/// because ARSY reads that tool live. Its declarations are then listed from
+/// there, once, with the state they really have.
+fn read_live(kind: &str, ecosystem: Ecosystem, config: &arsy_kernel::config::Config) -> bool {
+    kind == "mcp"
+        && matches!(ecosystem, Ecosystem::Claude | Ecosystem::Codex)
+        && config.compat_enabled(ecosystem.as_str())
+}
+
+/// Every connection the resolved configuration holds — ARSY's own and those
+/// Claude Code and Codex declare — in the same row shape the imported
 /// declarations use so one listing can show both.
 ///
 /// Reading a definition is not connecting: `runtime_status` is `not_loaded`
-/// for every row here, exactly as it is for an import.
+/// for every row here, exactly as it is for an import. Launch env and headers
+/// are listed by name only; their values may be credentials.
 fn configured(
-    root: &Path,
-    working: &Path,
+    config: &arsy_kernel::config::Config,
     name: Option<&str>,
-    extra_config: Option<&Path>,
-) -> Result<Vec<Value>, Diagnostic> {
-    let config = crate::load_config(root, working, extra_config)?;
+    source: Option<&str>,
+) -> Vec<Value> {
     let mut entries = Vec::new();
     for server in config.mcp_servers() {
-        if name.is_some_and(|name| name != server.name) {
+        let provenance = config.mcp_provenance(&server.name);
+        let ecosystem = provenance.map_or("arsy", |provenance| provenance.label.as_str());
+        if name.is_some_and(|name| name != server.name)
+            || source.is_some_and(|source| source != ecosystem)
+        {
             continue;
         }
         let mut entry = json!({
             "name": server.name,
-            "source": format!("{} ({})", arsy_kernel::config::CONFIG_FILE, server.trust),
-            "ecosystem": "arsy",
+            "source": provenance.map_or_else(
+                || format!("{} ({})", arsy_kernel::config::CONFIG_FILE, server.trust),
+                |provenance| provenance.path.display().to_string(),
+            ),
+            "ecosystem": ecosystem,
             "transport": server.transport.kind(),
             "trust": server.trust.to_string(),
-            "level": "native",
+            "level": if provenance.is_some() { "mapped" } else { "native" },
             "enabled": server.enabled,
             "runtime_status": "not_loaded",
             "timeout_ms": server.timeout_ms,
             "max_body_bytes": server.max_body_bytes,
         });
         match &server.transport {
-            arsy_kernel::config::McpTransport::Stdio { command, args } => {
+            arsy_kernel::config::McpTransport::Stdio { command, args, env } => {
                 entry["command"] = json!(command);
                 entry["args"] = json!(args);
+                entry["env_keys"] = json!(env.keys().collect::<Vec<_>>());
             }
-            arsy_kernel::config::McpTransport::Http { url } => entry["url"] = json!(url),
+            arsy_kernel::config::McpTransport::Http { url, headers } => {
+                entry["url"] = json!(url);
+                entry["header_keys"] = json!(headers.keys().collect::<Vec<_>>());
+            }
         }
         entries.push(entry);
     }
-    Ok(entries)
+    entries
 }
 
 /// Add what the lifecycle engine would make of a declared hook: whether the
@@ -668,6 +691,15 @@ mod tests {
         extra: Option<&Path>,
     ) -> Result<Value, Diagnostic> {
         inspect_with(root, kind, name, source, event, extra, &[])
+    }
+
+    #[test]
+    fn an_omp_listing_does_not_depend_on_arsy_json() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".arsy")).unwrap();
+        std::fs::write(root.path().join(".arsy/arsy.json"), "{not json").unwrap();
+        assert!(fixtures(root.path(), "mcp", None, Some("claude"), None, None).is_err());
+        assert!(fixtures(root.path(), "mcp", None, Some("omp"), None, None).is_ok());
     }
 
     fn declared(name: &str, command: &str, args: &[&str], source: &str) -> Value {

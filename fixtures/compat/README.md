@@ -17,5 +17,6 @@ Canonical output is declarative data only. A fixture may request capabilities, h
 | `claude` | nested instructions, project/local settings, skill, hook, agent, plugin, MCP |
 | `codex` | AGENTS override, TOML approval/sandbox mapping, skill, MCP |
 | `omp` | nearest native context, YAML settings, skill, agent, extension quarantine, MCP |
+| `live` | Claude Code and Codex read live: MCP precedence, trust, and secrets; permissions; models; user instructions. Pinned by `crates/arsy-compat/tests/live_golden.rs` in `expected/resolved.json` |
 
 The source behavior is bounded by [the compatibility specifications](../../docs/21-compatibility-claude.md), [Codex mapping](../../docs/22-compatibility-codex.md), [OMP mapping](../../docs/23-compatibility-omp.md), and the pinned revisions in [the claim ledger](../../docs/report-source.md).

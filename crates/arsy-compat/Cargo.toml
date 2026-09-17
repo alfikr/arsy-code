@@ -1,0 +1,20 @@
+[package]
+name = "arsy-compat"
+version.workspace = true
+publish.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arsy-kernel = { path = "../arsy-kernel" }
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
