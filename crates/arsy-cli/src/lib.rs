@@ -2422,11 +2422,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
     let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
-    let mut models = {
-        let mut models = endpoint_models(invocation);
-        models.extend(tui::available_models());
-        models
-    };
+    let mut models = picker_models(invocation);
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
     let replaced_notice = replace_dropped_route(&mut route, &models);
@@ -2925,6 +2921,31 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
         }
     }
     choices
+}
+
+/// Every model `/model` offers.
+///
+/// The ChatGPT backend is listed once. With a `codex-oauth` login ARSY runs
+/// those turns itself, so hooks, MCP, and policy apply, and the Codex CLI's
+/// copy of the same models is not offered beside it; the Codex CLI route is
+/// listed only when there is no such login.
+#[cfg(feature = "tui")]
+fn picker_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
+    one_chatgpt_group(endpoint_models(invocation), tui::available_models())
+}
+
+#[cfg(feature = "tui")]
+fn one_chatgpt_group(
+    mut configured: Vec<tui::ModelChoice>,
+    codex_cli: Vec<tui::ModelChoice>,
+) -> Vec<tui::ModelChoice> {
+    if !configured
+        .iter()
+        .any(|choice| choice.provider == CODEX_OAUTH_ENDPOINT)
+    {
+        configured.extend(codex_cli);
+    }
+    configured
 }
 
 /// The models one endpoint offers.
@@ -5425,9 +5446,7 @@ fn open_picker(
         Some("/model") => {
             // Re-read, so a model added to any endpoint since startup is
             // offered without restarting.
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
-            *opening.models = models;
+            *opening.models = picker_models(invocation);
             Ok(Some(Prompt::Model))
         }
         Some("/provider") => {
@@ -11337,6 +11356,26 @@ mod tests {
             selected_model(&config, &endpoint, None).unwrap(),
             "claude-sonnet-5"
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_chatgpt_models_are_offered_once() {
+        let choice = |provider: &str, slug: &str| tui::ModelChoice {
+            provider: provider.to_owned(),
+            slug: slug.to_owned(),
+            name: String::new(),
+        };
+        let cli = vec![choice("codex", "gpt-5.5")];
+        let with_login = one_chatgpt_group(
+            vec![choice("codex-oauth", "gpt-5.5"), choice("hari", "mimo")],
+            cli.clone(),
+        );
+        assert!(with_login.iter().all(|choice| choice.provider != "codex"));
+        let without_login = one_chatgpt_group(vec![choice("hari", "mimo")], cli);
+        assert!(without_login
+            .iter()
+            .any(|choice| choice.provider == "codex"));
     }
 
     /// A codex-oauth model the backend dropped is replaced by one it serves;
