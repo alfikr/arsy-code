@@ -705,7 +705,9 @@ pub mod presets {
             label: "OpenAI Codex — sign in with a ChatGPT account",
             dialect: Dialect::OpenaiResponses,
             base_url: "https://chatgpt.com/backend-api/codex",
-            models: &["gpt-5-codex", "gpt-5", "gpt-5-mini"],
+            // Only a starting point written at login: the picker offers what
+            // Codex's own model cache says the backend currently serves.
+            models: &["gpt-5.5"],
             build_oauth: || OAuth {
                 authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
                 token_url: "https://auth.openai.com/oauth/token".to_owned(),

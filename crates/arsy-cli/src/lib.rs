@@ -2422,11 +2422,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
     let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
-    let mut models = {
-        let mut models = endpoint_models(invocation);
-        models.extend(tui::available_models());
-        models
-    };
+    let mut models = picker_models(invocation);
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
     let (mut resolved_providers, mut unavailable_providers) =
@@ -2461,6 +2457,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // The first drawing of the card, so the loop below does not read it as a
     // change and repaint over the notices printed under it.
     state.card_is_stale();
+    write!(stdout, "{}", tui::bottom_padding(tui::terminal_rows())).map_err(terminal_failed)?;
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -2669,20 +2666,23 @@ fn read_line(
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
     let mut width = tui::terminal_width();
-    composer.set_height(tui::terminal_rows());
+    let mut rows = tui::terminal_rows();
+    composer.set_height(rows);
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
-            let next_width = tui::terminal_width();
-            if next_width != width {
+            let (next_width, next_rows) = (tui::terminal_width(), tui::terminal_rows());
+            // Rows too: the chat is anchored to the bottom, so a vertical
+            // resize moves it as much as a horizontal one.
+            if next_width != width || next_rows != rows {
                 transcript
-                    .repaint(stdout, next_width, colour, state)
+                    .repaint(stdout, next_width, next_rows, colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
             }
-            width = next_width;
-            composer.set_height(tui::terminal_rows());
+            (width, rows) = (next_width, next_rows);
+            composer.set_height(rows);
             measured = std::time::Instant::now();
         }
         if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
@@ -2864,11 +2864,7 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     let mut choices = Vec::new();
     if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
         for endpoint in config.endpoints() {
-            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-                provider: endpoint.id.clone(),
-                slug: slug.clone(),
-                name: format!("on {}", endpoint.id),
-            }));
+            choices.extend(configured_models(&endpoint.id, &endpoint.models));
         }
     }
     // Model discovery must be read-only. Probing the macOS keychain here
@@ -2878,15 +2874,67 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     for preset in arsy_kernel::oauth::presets::all() {
         let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
         if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
-            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
-                provider: preset.id.to_string(),
-                slug: (*slug).to_string(),
-                name: format!("on {}", preset.id),
-            }));
+            let slugs: Vec<String> = preset
+                .models
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect();
+            choices.extend(configured_models(preset.id, &slugs));
         }
     }
     choices
 }
+
+/// Every model `/model` offers.
+///
+/// The ChatGPT backend is listed once. With a `codex-oauth` login ARSY runs
+/// those turns itself, so hooks, MCP, and policy apply, and the Codex CLI's
+/// copy of the same models is not offered beside it; the Codex CLI route is
+/// listed only when there is no such login.
+#[cfg(feature = "tui")]
+fn picker_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
+    one_chatgpt_group(endpoint_models(invocation), tui::available_models())
+}
+
+#[cfg(feature = "tui")]
+fn one_chatgpt_group(
+    mut configured: Vec<tui::ModelChoice>,
+    codex_cli: Vec<tui::ModelChoice>,
+) -> Vec<tui::ModelChoice> {
+    if !configured
+        .iter()
+        .any(|choice| choice.provider == CODEX_OAUTH_ENDPOINT)
+    {
+        configured.extend(codex_cli);
+    }
+    configured
+}
+
+/// The models one endpoint offers.
+///
+/// `codex-oauth` reaches the ChatGPT Codex backend, whose models change under
+/// the account: the list written at login goes stale and a model it names is
+/// then refused. So it offers what Codex's own cache says the backend serves,
+/// and falls back to the configured list only when there is no cache.
+fn configured_models(endpoint: &str, slugs: &[String]) -> Vec<tui::ModelChoice> {
+    if endpoint == CODEX_OAUTH_ENDPOINT {
+        let served = tui::codex_cache_models(endpoint);
+        if !served.is_empty() {
+            return served;
+        }
+    }
+    slugs
+        .iter()
+        .map(|slug| tui::ModelChoice {
+            provider: endpoint.to_owned(),
+            slug: slug.clone(),
+            name: String::new(),
+        })
+        .collect()
+}
+
+/// ARSY's own endpoint for the ChatGPT Codex backend.
+const CODEX_OAUTH_ENDPOINT: &str = "codex-oauth";
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,
 /// else the remembered theme, else the default — with any `[theme]` role
@@ -3629,14 +3677,17 @@ fn run_turn(
         Some(resolved) => native_turn(
             resolved,
             &config,
-            &agent_runtime(
-                &root,
-                &config,
-                true,
-                &session_id.to_string(),
-                Some(session_id),
-                Some(session_connector()),
-                emitter,
+            &mcp_reported(
+                agent_runtime(
+                    &root,
+                    &config,
+                    true,
+                    &session_id.to_string(),
+                    Some(session_id),
+                    Some(session_connector()),
+                    emitter,
+                )?,
+                colour,
             )?
             .with_execution_mode(approval.get().execution_mode()),
             conversation,
@@ -4356,7 +4407,7 @@ fn slash_command(
     emitter: &mut Emitter,
 ) -> Result<TaskPass, Diagnostic> {
     if manages_session(line) {
-        let next = manage_session(line, restoring, typing.sessions, stdout)?;
+        let next = manage_session(line, restoring, typing.sessions, stdout, typing.colour)?;
         return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
     }
     if steers_turn(line) {
@@ -4991,7 +5042,7 @@ fn run_mcp_dialog(
     let root = workspace_root(&invocation.workspace)?;
     let mut rows = mcp_choices(&root, invocation)?;
     let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
-    let mut changes: Vec<String> = Vec::new();
+    let opened = dialog.choices.clone();
     let mut drawn = 0;
     loop {
         let frame = dialog.render(tui::terminal_width(), colour);
@@ -5008,6 +5059,7 @@ fn run_mcp_dialog(
             None => continue,
             Some(tui::McpAction::Close) => {
                 write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+                let mut changes = net_mcp_changes(&opened, &dialog.choices);
                 if !changes.is_empty() {
                     changes.push("MCP changes take effect from the next turn.".to_owned());
                     writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
@@ -5018,15 +5070,37 @@ fn run_mcp_dialog(
             Some(action) => action,
         };
         dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
-            Ok(change) => {
-                changes.push(change.clone());
-                change
-            }
+            Ok(change) => change,
             Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
         });
         rows = mcp_choices(&root, invocation)?;
         dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
     }
+}
+
+/// What the dialog changed, comparing where each connection ended with where it
+/// started: a server switched off and on again changed nothing and is not
+/// reported, however many times it was toggled.
+#[cfg(feature = "tui")]
+fn net_mcp_changes(opened: &[tui::McpChoice], closed: &[tui::McpChoice]) -> Vec<String> {
+    closed
+        .iter()
+        .filter_map(|after| {
+            let before = opened
+                .iter()
+                .find(|choice| choice.name == after.name)
+                .and_then(|choice| choice.enabled);
+            match (before, after.enabled) {
+                (None, Some(true)) => Some(format!("MCP `{}` adopted, enabled.", after.name)),
+                (Some(before), Some(now)) if before != now => Some(format!(
+                    "MCP `{}` {}.",
+                    after.name,
+                    if now { "enabled" } else { "disabled" }
+                )),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Wait for the next key and let the dialog answer it. A keyboard that hung up
@@ -5112,14 +5186,28 @@ fn manages_session(line: &str) -> bool {
 #[cfg(feature = "tui")]
 fn manage_session(
     line: &str,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     sessions: &mut Vec<tui::SessionChoice>,
     stdout: &mut io::Stdout,
+    colour: bool,
 ) -> Result<Option<Prompt>, Diagnostic> {
     let mut words = line.split_whitespace();
     match words.next() {
+        // A new session starts on a clean terminal: screen and scrollback are
+        // cleared and the launch card drawn again, so nothing of the old
+        // conversation reads as part of the new one.
         Some("/new") => {
-            let started = start_session(restoring);
+            let started = start_session(&mut restoring);
+            restoring
+                .transcript
+                .repaint(
+                    stdout,
+                    tui::terminal_width(),
+                    tui::terminal_rows(),
+                    colour,
+                    restoring.state,
+                )
+                .map_err(terminal_failed)?;
             writeln!(stdout, "Started new session {started}.").map_err(terminal_failed)?;
             Ok(None)
         }
@@ -5241,7 +5329,7 @@ fn rename_session(
 #[cfg(feature = "tui")]
 fn delete_session(
     id: Option<&str>,
-    restoring: Restoring<'_>,
+    mut restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
 ) -> Result<(), Diagnostic> {
     let current = restoring.state.session_id();
@@ -5254,7 +5342,7 @@ fn delete_session(
     if target != current {
         return writeln!(stdout, "Deleted session {target}.").map_err(terminal_failed);
     }
-    let started = start_session(restoring);
+    let started = start_session(&mut restoring);
     writeln!(
         stdout,
         "Deleted current session. Started fresh session {started}."
@@ -5264,7 +5352,7 @@ fn delete_session(
 
 /// Begin a session with nothing carried over from the one before it.
 #[cfg(feature = "tui")]
-fn start_session(restoring: Restoring<'_>) -> SessionId {
+fn start_session(restoring: &mut Restoring<'_>) -> SessionId {
     let started = SessionId::new();
     restoring.state.set_session_id(started);
     restoring.conversation.clear();
@@ -5326,9 +5414,7 @@ fn open_picker(
         Some("/model") => {
             // Re-read, so a model added to any endpoint since startup is
             // offered without restarting.
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
-            *opening.models = models;
+            *opening.models = picker_models(invocation);
             Ok(Some(Prompt::Model))
         }
         Some("/provider") => {
@@ -9165,7 +9251,7 @@ fn agent_runtime(
     // An interactive session holds its connections across turns instead, and
     // only brings them in line with configuration here.
     let (connections, pending, discovered) = match (connector, session) {
-        (Some(connector), _) => session_mcp(connector, config, emitter),
+        (Some(connector), _) => session_mcp(connector, config),
         (None, Some(_)) => {
             let (connections, discovered) = mcp::connect_enabled(config, emitter);
             (connections, Default::default(), discovered)
@@ -9208,22 +9294,33 @@ fn agent_runtime(
 fn session_mcp(
     connector: &connector::McpConnector,
     config: &arsy_kernel::config::Config,
-    emitter: &mut Emitter,
 ) -> (
     Option<arsy_code::agent::mcpops::Connections>,
     arsy_code::agent::mcpops::Pending,
     Vec<arsy_code::agent::DynamicTool>,
 ) {
+    // Failures are the interactive session's to show, in its own rows; see
+    // `run_turn`.
     let discovered = connector.sync(config);
-    for failure in connector.failures() {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-MCP-1000",
-            failure,
-            "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
-        ));
-    }
     let (connections, pending) = connector.session();
     (Some(connections), pending, discovered)
+}
+
+/// Show the MCP servers that failed to start since the last turn, as the
+/// session's own rows above the turn, and hand the runtime on.
+#[cfg(feature = "tui")]
+fn mcp_reported(
+    runtime: arsy_code::agent::ToolRuntime,
+    colour: bool,
+) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
+    let failures = session_connector().failures();
+    if !failures.is_empty() {
+        let mut stdout = io::stdout();
+        for row in tui::mcp_unavailable_rows(tui::terminal_width(), colour, &failures) {
+            writeln!(stdout, "{row}").map_err(terminal_failed)?;
+        }
+    }
+    Ok(runtime)
 }
 
 /// The MCP connections of this interactive session, held until it ends.
@@ -9234,8 +9331,10 @@ fn session_mcp(
 fn session_connector() -> &'static connector::McpConnector {
     static CONNECTOR: std::sync::OnceLock<connector::McpConnector> = std::sync::OnceLock::new();
     CONNECTOR.get_or_init(|| {
+        let home = arsy_kernel::config::config_home();
         connector::McpConnector::new(
-            arsy_kernel::config::config_home().map(|home| home.join("mcp-tools.json")),
+            home.as_ref().map(|home| home.join("mcp-tools.json")),
+            home.map(|home| home.join("logs").join("mcp")),
         )
     })
 }
@@ -11251,6 +11350,55 @@ mod tests {
             selected_model(&config, &endpoint, None).unwrap(),
             "claude-sonnet-5"
         );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_chatgpt_models_are_offered_once() {
+        let choice = |provider: &str, slug: &str| tui::ModelChoice {
+            provider: provider.to_owned(),
+            slug: slug.to_owned(),
+            name: String::new(),
+        };
+        let cli = vec![choice("codex", "gpt-5.5")];
+        let with_login = one_chatgpt_group(
+            vec![choice("codex-oauth", "gpt-5.5"), choice("hari", "mimo")],
+            cli.clone(),
+        );
+        assert!(with_login.iter().all(|choice| choice.provider != "codex"));
+        let without_login = one_chatgpt_group(vec![choice("hari", "mimo")], cli);
+        assert!(without_login
+            .iter()
+            .any(|choice| choice.provider == "codex"));
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn closing_mcp_reports_only_what_ended_different() {
+        let choice = |name: &str, enabled: Option<bool>| tui::McpChoice {
+            name: name.to_owned(),
+            source: "arsy".to_owned(),
+            trust: "user".to_owned(),
+            target: "x".to_owned(),
+            detail: "x".to_owned(),
+            enabled,
+        };
+        let opened = [
+            choice("git-tag", Some(true)),
+            choice("stitch", Some(true)),
+            choice("jira", None),
+        ];
+        // git-tag toggled off, on, off; stitch off and on again; jira adopted.
+        let closed = [
+            choice("git-tag", Some(false)),
+            choice("stitch", Some(true)),
+            choice("jira", Some(true)),
+        ];
+        assert_eq!(
+            net_mcp_changes(&opened, &closed),
+            ["MCP `git-tag` disabled.", "MCP `jira` adopted, enabled."]
+        );
+        assert!(net_mcp_changes(&opened, &opened).is_empty());
     }
 
     /// `--model` chooses between what policy permits; it cannot reach past it.

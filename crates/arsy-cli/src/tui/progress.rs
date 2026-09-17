@@ -55,15 +55,17 @@ impl Transcript {
         });
     }
 
-    /// Clear native scrollback and replay the semantic transcript at `width`.
+    /// Clear native scrollback and replay the semantic transcript at `width`,
+    /// starting from the bottom of a terminal `rows` tall.
     pub fn repaint(
         &self,
         terminal: &mut dyn Write,
         width: usize,
+        rows: usize,
         colour: bool,
         state: &TuiState,
     ) -> std::io::Result<()> {
-        write!(terminal, "\x1b[3J\x1b[H\x1b[2J")?;
+        write!(terminal, "\x1b[3J\x1b[H\x1b[2J{}", bottom_padding(rows))?;
         writeln!(terminal, "{}", state.render(width, colour))?;
         writeln!(
             terminal,
@@ -74,6 +76,19 @@ impl Transcript {
         }
         terminal.flush()
     }
+}
+
+/// Blank lines that carry the cursor from the top of a terminal `rows` tall to
+/// its last row.
+///
+/// The composer is painted under whatever was written last, so everything
+/// written from the bottom row scrolls up from there: the input block stays on
+/// the bottom rows and the conversation grows above it, instead of starting
+/// under a short screen of output with empty rows beneath it. Padding rather
+/// than a scroll region, which would keep lines out of the terminal's own
+/// scrollback in Ghostty and Zed.
+pub fn bottom_padding(rows: usize) -> String {
+    "\n".repeat(rows.saturating_sub(1))
 }
 
 /// One transcript entry, as the rows it occupies.
@@ -315,6 +330,61 @@ pub fn assistant_header(colour: bool) -> String {
 /// What a lifecycle hook said about a call, dimmed so it reads as an aside.
 pub fn hook_note_row(colour: bool, note: &str) -> String {
     paint(colour, sgr_dim(), &format!("  hook: {}", safe_text(note)))
+}
+
+/// MCP servers that could not start, as a card: a titled border in the error
+/// colour, one row per server with why, and where to act on it. Every row is
+/// cut to the card, so a long path never wraps into the conversation.
+pub fn mcp_unavailable_rows(
+    width: usize,
+    colour: bool,
+    failures: &[(String, String)],
+) -> Vec<String> {
+    let width = width.max(MIN_WIDTH);
+    let inner = width.saturating_sub(4);
+    let title = match failures.len() {
+        1 => " ⚠ 1 MCP server unavailable ".to_owned(),
+        count => format!(" ⚠ {count} MCP servers unavailable "),
+    };
+    let name_width = failures
+        .iter()
+        .map(|(name, _)| visible_len(name))
+        .max()
+        .unwrap_or(0);
+    let border = |text: &str| paint(colour, sgr_err(), text);
+    let line = |text: &str, style: &str| {
+        let fitted = fit(text, inner);
+        let pad = " ".repeat(inner.saturating_sub(visible_len(&fitted)));
+        format!(
+            "{} {}{pad} {}",
+            border("│"),
+            paint(colour, style, &fitted),
+            border("│")
+        )
+    };
+    let rule = "─".repeat(width.saturating_sub(4 + visible_len(&title)));
+    std::iter::once(format!(
+        "{}{}{}",
+        border("╭─"),
+        paint(colour, sgr_err(), &title),
+        border(&format!("{rule}─╮"))
+    ))
+    .chain(failures.iter().map(|(name, reason)| {
+        let reason = reason.trim_start_matches("transport failed: ");
+        line(
+            &format!("{:name_width$}  {}", safe_text(name), safe_text(reason)),
+            "",
+        )
+    }))
+    .chain([
+        line("", ""),
+        line(
+            "Switch them off in /mcp · server logs in ~/.arsy/logs/mcp",
+            sgr_dim(),
+        ),
+        border(&format!("╰{}╯", "─".repeat(width.saturating_sub(2)))),
+    ])
+    .collect()
 }
 
 /// Shown when a turn is stopped from the keyboard.

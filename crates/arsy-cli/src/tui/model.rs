@@ -15,6 +15,16 @@ pub struct ModelChoice {
 /// This is Codex's own cache, so an unreadable or reshaped file is not an
 /// error: the picker falls back to free text, which always worked.
 pub fn available_models() -> Vec<ModelChoice> {
+    codex_cache_models(CODEX_PROVIDER)
+}
+
+/// The models the ChatGPT Codex backend currently serves this account, offered
+/// under `provider`.
+///
+/// Codex refreshes this cache from the backend itself, so it is the one list
+/// of models that actually answer — for the Codex CLI route and for ARSY's own
+/// `codex-oauth` endpoint alike, which reach the same backend.
+pub fn codex_cache_models(provider: &str) -> Vec<ModelChoice> {
     let home = std::env::var_os("CODEX_HOME").map_or_else(
         || {
             std::env::var_os("HOME")
@@ -23,7 +33,11 @@ pub fn available_models() -> Vec<ModelChoice> {
         },
         std::path::PathBuf::from,
     );
-    let Ok(text) = std::fs::read_to_string(home.join("models_cache.json")) else {
+    parse_codex_cache(&home.join("models_cache.json"), provider)
+}
+
+fn parse_codex_cache(path: &std::path::Path, provider: &str) -> Vec<ModelChoice> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     let Ok(cache) = serde_json::from_str::<Value>(&text) else {
@@ -40,7 +54,7 @@ pub fn available_models() -> Vec<ModelChoice> {
             Some((
                 model.get("priority").and_then(Value::as_i64).unwrap_or(0),
                 ModelChoice {
-                    provider: CODEX_PROVIDER.to_owned(),
+                    provider: provider.to_owned(),
                     slug: slug.to_owned(),
                     name: model
                         .get("display_name")
@@ -171,17 +185,26 @@ pub fn model_rows(
         .iter()
         .map(|choice| {
             let label = format!("[{}] {}", choice.provider, choice.slug);
-            let desc = if choice.name.is_empty() || choice.name == choice.slug {
-                format!("on {}", choice.provider)
-            } else if choice.provider == CODEX_PROVIDER {
-                format!("{} · codex", choice.name)
-            } else {
-                format!("{} · on {}", choice.name, choice.provider)
-            };
-            (label, desc)
+            (label, model_description(choice))
         })
         .collect();
     (Some(rows), selected)
+}
+
+/// What a row says beside its slug: the model's own name, and how a turn on
+/// it runs. The two ChatGPT routes list the same models, so how they run is
+/// the only difference worth reading.
+fn model_description(choice: &ModelChoice) -> String {
+    let runs = match choice.provider.as_str() {
+        CODEX_PROVIDER => "run by the Codex CLI",
+        "codex-oauth" => "ChatGPT login, run by ARSY",
+        _ => "run by ARSY",
+    };
+    if choice.name.is_empty() || choice.name == choice.slug {
+        runs.to_owned()
+    } else {
+        format!("{} · {runs}", choice.name)
+    }
 }
 
 pub fn model_prompt(models: &[ModelChoice], current: &ModelRoute, colour: bool) -> String {
@@ -300,4 +323,70 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn the_codex_cache_lists_what_the_backend_serves_in_its_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("models_cache.json");
+        std::fs::write(
+            &path,
+            r#"{"models": [
+                {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list", "priority": 3},
+                {"slug": "gpt-reserve", "visibility": "hide", "priority": 0},
+                {"slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list", "priority": 1}
+            ]}"#,
+        )
+        .unwrap();
+        let listed = parse_codex_cache(&path, "codex-oauth");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|choice| (
+                    choice.provider.as_str(),
+                    choice.slug.as_str(),
+                    choice.name.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("codex-oauth", "gpt-5.6-sol", "GPT-5.6-Sol"),
+                ("codex-oauth", "gpt-5.5", "GPT-5.5"),
+            ]
+        );
+        assert!(parse_codex_cache(&directory.path().join("missing.json"), "codex").is_empty());
+    }
+
+    #[test]
+    fn each_row_says_how_a_turn_on_it_runs() {
+        let current = ModelRoute {
+            provider: "codex".into(),
+            model: "gpt-5.5".into(),
+        };
+        let choice = |provider: &str, name: &str| ModelChoice {
+            provider: provider.into(),
+            slug: "gpt-5.5".into(),
+            name: name.into(),
+        };
+        let (rows, _) = model_rows(
+            &[
+                choice("codex", "GPT-5.5"),
+                choice("codex-oauth", "GPT-5.5"),
+                choice("hari", ""),
+            ],
+            &current,
+        );
+        let descriptions: Vec<String> = rows.unwrap().into_iter().map(|(_, desc)| desc).collect();
+        assert_eq!(
+            descriptions,
+            [
+                "GPT-5.5 · run by the Codex CLI",
+                "GPT-5.5 · ChatGPT login, run by ARSY",
+                "run by ARSY",
+            ]
+        );
+    }
 }

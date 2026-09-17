@@ -558,6 +558,7 @@ pub fn connect_enabled(
     Vec<arsy_code::agent::DynamicTool>,
 ) {
     let channels = RealChannels {
+        logs: None,
         http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
             Box::new(arsy_kernel::provider::http::HttpTransport::default())
         },
@@ -615,6 +616,7 @@ pub fn test(
     }
 
     let channels = RealChannels {
+        logs: None,
         http: || -> Box<dyn arsy_kernel::provider::wire::WireTransport> {
             Box::new(arsy_kernel::provider::http::HttpTransport::default())
         },

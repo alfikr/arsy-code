@@ -1816,6 +1816,35 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_mcp_servers_are_rows_that_never_wrap() {
+        let failures = [
+            ("node_repl".to_owned(), "transport failed: cannot start `/Applications/Codex.app/Contents/Resources/cua_node/bin/node_repl`: No such file or directory (os error 2)".to_owned()),
+            ("fluxguard".to_owned(), "transport failed: cannot start `fluxguard`: No such file or directory (os error 2)".to_owned()),
+        ];
+        let rows = mcp_unavailable_rows(60, false, &failures);
+        // Title, two servers, a blank, the hint, and the bottom border.
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(
+            rows[0].starts_with("╭─ ⚠ 2 MCP servers unavailable "),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[1].starts_with("│ node_repl  cannot start"),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[4].contains("/mcp"));
+        assert!(rows[5].starts_with("╰"));
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) == 60),
+            "every row reaches the border: {rows:?}"
+        );
+        assert!(!rows.concat().contains("transport failed"));
+    }
+
+    #[test]
     fn semantic_transcript_repaints_cards_at_the_current_terminal_width() {
         let mut transcript = Transcript::default();
         transcript.push_user("run cargo test");
@@ -1823,8 +1852,16 @@ mod tests {
         let state = TuiState::new("/workspace".into(), SessionId::new());
         let mut output = std::io::Cursor::new(Vec::new());
 
-        transcript.repaint(&mut output, 40, false, &state).unwrap();
+        transcript
+            .repaint(&mut output, 40, 6, false, &state)
+            .unwrap();
         let text = String::from_utf8(output.into_inner()).unwrap();
+        // Cleared, then carried to the last of six rows before anything is
+        // written, so the replay fills the screen from the bottom.
+        assert!(
+            text.starts_with("\x1b[3J\x1b[H\x1b[2J\n\n\n\n\n"),
+            "{text:?}"
+        );
         assert!(text.contains("› You run cargo test"));
         assert!(!text.contains("✦ Response"));
         let card_line = text
