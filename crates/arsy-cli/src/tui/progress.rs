@@ -55,15 +55,17 @@ impl Transcript {
         });
     }
 
-    /// Clear native scrollback and replay the semantic transcript at `width`.
+    /// Clear native scrollback and replay the semantic transcript at `width`,
+    /// starting from the bottom of a terminal `rows` tall.
     pub fn repaint(
         &self,
         terminal: &mut dyn Write,
         width: usize,
+        rows: usize,
         colour: bool,
         state: &TuiState,
     ) -> std::io::Result<()> {
-        write!(terminal, "\x1b[3J\x1b[H\x1b[2J")?;
+        write!(terminal, "\x1b[3J\x1b[H\x1b[2J{}", bottom_padding(rows))?;
         writeln!(terminal, "{}", state.render(width, colour))?;
         writeln!(
             terminal,
@@ -74,6 +76,19 @@ impl Transcript {
         }
         terminal.flush()
     }
+}
+
+/// Blank lines that carry the cursor from the top of a terminal `rows` tall to
+/// its last row.
+///
+/// The composer is painted under whatever was written last, so everything
+/// written from the bottom row scrolls up from there: the input block stays on
+/// the bottom rows and the conversation grows above it, instead of starting
+/// under a short screen of output with empty rows beneath it. Padding rather
+/// than a scroll region, which would keep lines out of the terminal's own
+/// scrollback in Ghostty and Zed.
+pub fn bottom_padding(rows: usize) -> String {
+    "\n".repeat(rows.saturating_sub(1))
 }
 
 /// One transcript entry, as the rows it occupies.

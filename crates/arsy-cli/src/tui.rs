@@ -1823,8 +1823,16 @@ mod tests {
         let state = TuiState::new("/workspace".into(), SessionId::new());
         let mut output = std::io::Cursor::new(Vec::new());
 
-        transcript.repaint(&mut output, 40, false, &state).unwrap();
+        transcript
+            .repaint(&mut output, 40, 6, false, &state)
+            .unwrap();
         let text = String::from_utf8(output.into_inner()).unwrap();
+        // Cleared, then carried to the last of six rows before anything is
+        // written, so the replay fills the screen from the bottom.
+        assert!(
+            text.starts_with("\x1b[3J\x1b[H\x1b[2J\n\n\n\n\n"),
+            "{text:?}"
+        );
         assert!(text.contains("› You run cargo test"));
         assert!(!text.contains("✦ Response"));
         let card_line = text

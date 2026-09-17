@@ -2461,6 +2461,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     // The first drawing of the card, so the loop below does not read it as a
     // change and repaint over the notices printed under it.
     state.card_is_stale();
+    write!(stdout, "{}", tui::bottom_padding(tui::terminal_rows())).map_err(terminal_failed)?;
     writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
     writeln!(
         stdout,
@@ -2677,7 +2678,7 @@ fn read_line(
             let next_width = tui::terminal_width();
             if next_width != width {
                 transcript
-                    .repaint(stdout, next_width, colour, state)
+                    .repaint(stdout, next_width, tui::terminal_rows(), colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
             }
