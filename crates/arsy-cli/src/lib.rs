@@ -2865,11 +2865,7 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     let mut choices = Vec::new();
     if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
         for endpoint in config.endpoints() {
-            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-                provider: endpoint.id.clone(),
-                slug: slug.clone(),
-                name: format!("on {}", endpoint.id),
-            }));
+            choices.extend(configured_models(&endpoint.id, &endpoint.models));
         }
     }
     // Model discovery must be read-only. Probing the macOS keychain here
@@ -2879,15 +2875,42 @@ fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
     for preset in arsy_kernel::oauth::presets::all() {
         let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
         if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
-            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
-                provider: preset.id.to_string(),
-                slug: (*slug).to_string(),
-                name: format!("on {}", preset.id),
-            }));
+            let slugs: Vec<String> = preset
+                .models
+                .iter()
+                .map(|slug| (*slug).to_owned())
+                .collect();
+            choices.extend(configured_models(preset.id, &slugs));
         }
     }
     choices
 }
+
+/// The models one endpoint offers.
+///
+/// `codex-oauth` reaches the ChatGPT Codex backend, whose models change under
+/// the account: the list written at login goes stale and a model it names is
+/// then refused. So it offers what Codex's own cache says the backend serves,
+/// and falls back to the configured list only when there is no cache.
+fn configured_models(endpoint: &str, slugs: &[String]) -> Vec<tui::ModelChoice> {
+    if endpoint == CODEX_OAUTH_ENDPOINT {
+        let served = tui::codex_cache_models(endpoint);
+        if !served.is_empty() {
+            return served;
+        }
+    }
+    slugs
+        .iter()
+        .map(|slug| tui::ModelChoice {
+            provider: endpoint.to_owned(),
+            slug: slug.clone(),
+            name: String::new(),
+        })
+        .collect()
+}
+
+/// ARSY's own endpoint for the ChatGPT Codex backend.
+const CODEX_OAUTH_ENDPOINT: &str = "codex-oauth";
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,
 /// else the remembered theme, else the default — with any `[theme]` role
