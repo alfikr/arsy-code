@@ -186,7 +186,10 @@ impl McpConnector {
                         connections.insert(name.clone(), connection);
                     }
                 }
+                // A superseded attempt reports nothing: its failure is not
+                // the current definition's.
                 Ok(_) => {}
+                Err(_) if !is_current(&started, &name, &digest) => {}
                 Err(error) => {
                     if let Ok(mut failed) = failed.lock() {
                         failed.insert(name.clone(), digest);
