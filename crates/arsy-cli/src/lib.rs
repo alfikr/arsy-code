@@ -2120,6 +2120,57 @@ fn store_oauth_login(
     }
     save_catalog(&records)?;
 
+    // An endpoint still pointed at the withdrawn keyring is re-pointed at the
+    // file the token just went into. Signing in again is what moves such a
+    // credential, and a move that left the configuration behind would have
+    // stored a token nothing reads.
+    let stale_keyring = login
+        .configured
+        .as_ref()
+        .and_then(|endpoint| endpoint.credential.as_ref())
+        .is_some_and(|existing| existing.store() == OS_STORE_ID);
+    if stale_keyring {
+        // `write_config` owns the user file and only that one, so an endpoint
+        // a repository or an enterprise layer defined is not ours to edit. Say
+        // so rather than report a move that did not happen: the operator would
+        // otherwise meet the same refusal next turn, told to run the command
+        // they just ran.
+        let mut repointed = false;
+        write_config(|config| {
+            match config_edit::set_existing(
+                config,
+                &["provider", "endpoint", provider],
+                "credential",
+                serde_json::Value::String(handle.to_string()),
+            )? {
+                Some(updated) => {
+                    repointed = true;
+                    Ok(updated)
+                }
+                None => Ok(config.to_owned()),
+            }
+        })
+        .map_err(|error| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!(
+                    "signed in, but `provider.endpoint.{provider}.credential` still names the \
+                     keyring: {error}"
+                ),
+                format!("set it to `{handle}` by hand; the credential is already stored"),
+            )
+        })?;
+        if !repointed {
+            emitter.diagnostic(&Diagnostic::warning(
+                ARSY_PRV_1000,
+                format!(
+                    "signed in, but `provider.endpoint.{provider}` is not defined in the user \
+                     configuration, so its `credential` still names the withdrawn keyring"
+                ),
+                format!("set it to `{handle}` in the file `arsy config explain` names for it"),
+            ));
+        }
+    }
     // A preset that had no endpoint of its own gets one written now, pointed at
     // the credential just stored, so `/model` and a turn find it like any other.
     let mut wrote_endpoint = false;
