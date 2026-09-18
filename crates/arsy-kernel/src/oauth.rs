@@ -157,7 +157,7 @@ pub const fn uses_device_grant(oauth: &OAuth) -> bool {
 /// device grant is: from the shape of the client's own fields, not a
 /// separate flag naming the grant. A manual-grant client also takes its
 /// token-endpoint fields as JSON rather than form-encoded, which
-/// [`authorization_code_manual`] and [`refresh`] both honour.
+/// [`begin_manual`]/[`finish_manual`] and [`refresh`] both honour.
 pub fn uses_manual_grant(oauth: &OAuth) -> bool {
     oauth
         .redirect_uri
@@ -323,27 +323,32 @@ pub fn authorization_code(
     token_set(&value)
 }
 
-/// One authorization-code login with PKCE, over the issuer's own hosted
-/// callback page rather than a loopback redirect.
+/// What the operator has to do to finish a manual authorization-code login:
+/// visit `authorize_url`, approve, and paste back the code the issuer's
+/// hosted callback page shows. `verifier` is kept so [`finish_manual`] can
+/// validate what comes back and complete the PKCE exchange; a caller that
+/// cannot hold the whole struct across two turns (a TUI collecting the
+/// pasted line as its own separate step, say) only needs to keep `verifier`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManualPrompt {
+    pub authorize_url: String,
+    pub verifier: String,
+}
+
+/// Start a manual authorization-code login with PKCE, over the issuer's own
+/// hosted callback page rather than a loopback redirect.
 ///
 /// Anthropic's Claude Code OAuth client works this way: nothing local can
 /// receive `oauth.redirect_uri`, because it names a page Anthropic serves
-/// itself. That page shows the operator a `code#state` pair to paste back,
-/// which [`uses_manual_grant`] recognises from `redirect_uri` not being a
-/// loopback URL — the same way the device grant is recognised from
-/// `device_authorization_url` being set. `state` doubles as a second PKCE
-/// verifier the operator relays by hand, so a code copied from someone
-/// else's login is refused just like an unmatched callback would be.
-pub fn authorization_code_manual(
-    transport: &dyn WireTransport,
-    oauth: &OAuth,
-    visit: &mut dyn FnMut(&str),
-    read_code: &mut dyn FnMut() -> Result<String, OAuthError>,
-) -> Result<TokenSet, OAuthError> {
+/// itself. That page shows the operator a `code#state` pair to paste back —
+/// [`finish_manual`] takes it from there. Split from the exchange itself,
+/// the way [`begin_device`]/[`poll_device`] are, so a caller that has to
+/// wait for the operator through its own input loop (rather than blocking
+/// here on one) can hold `verifier` in the meantime and finish later.
+pub fn begin_manual(oauth: &OAuth) -> Result<ManualPrompt, OAuthError> {
     let redirect = oauth.redirect_uri.as_deref().ok_or_else(|| {
         OAuthError::Local("this provider has no redirect_uri configured".to_owned())
     })?;
-
     let verifier = random_token();
     let challenge = base64url(&sha256(verifier.as_bytes()));
     let scope = oauth.scopes.join(" ");
@@ -362,16 +367,32 @@ pub fn authorization_code_manual(
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str())),
     );
-    visit(&format!("{}?{}", oauth.authorize_url, form_encode(&params)));
+    Ok(ManualPrompt {
+        authorize_url: format!("{}?{}", oauth.authorize_url, form_encode(&params)),
+        verifier,
+    })
+}
 
-    let pasted = read_code()?;
+/// Finish a manual login: validate the operator's pasted code against
+/// `verifier` from [`begin_manual`], and exchange it for a token set.
+///
+/// `state` doubles as a second PKCE verifier the operator relays by hand, so
+/// a code copied from someone else's login is refused just like an
+/// unmatched loopback callback would be. The hosted page shows
+/// `code#state`; a bare code (no separator) is tolerated too, matched
+/// against `verifier` — which the operator can never have mistyped, because
+/// they never saw it.
+pub fn finish_manual(
+    transport: &dyn WireTransport,
+    oauth: &OAuth,
+    verifier: &str,
+    pasted: &str,
+) -> Result<TokenSet, OAuthError> {
+    let redirect = oauth.redirect_uri.as_deref().ok_or_else(|| {
+        OAuthError::Local("this provider has no redirect_uri configured".to_owned())
+    })?;
     let pasted = pasted.trim();
-    // The hosted page shows `code#state`; a bare code (no separator) is
-    // tolerated too, matched against the verifier — which the operator can
-    // never have mistyped, because they never saw it.
-    let (code, state) = pasted
-        .split_once('#')
-        .unwrap_or((pasted, verifier.as_str()));
+    let (code, state) = pasted.split_once('#').unwrap_or((pasted, verifier));
     if state != verifier {
         return Err(OAuthError::Abandoned(
             "the pasted code did not belong to this login".to_owned(),
@@ -387,7 +408,7 @@ pub fn authorization_code_manual(
                 ("code", code),
                 ("redirect_uri", redirect),
                 ("client_id", &oauth.client_id),
-                ("code_verifier", &verifier),
+                ("code_verifier", verifier),
                 ("state", state),
             ],
             oauth.client_secret.as_deref(),
@@ -1259,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_grant_visits_a_hosted_url_and_exchanges_a_matching_pasted_code_as_json() {
+    fn manual_grant_begins_a_hosted_url_and_finishes_with_a_matching_pasted_code_as_json() {
         let oauth = manual_oauth();
 
         for (paste_wrong_state, expect_ok) in [(false, true), (true, false)] {
@@ -1267,26 +1288,26 @@ mod tests {
                 200,
                 r#"{"access_token":"at-1","refresh_token":"rt-1","expires_in":3600}"#,
             )]);
-            let captured = std::cell::RefCell::new(String::new());
-            let result = authorization_code_manual(
+            let prompt = begin_manual(&oauth).unwrap();
+            assert!(prompt
+                .authorize_url
+                .starts_with("https://issuer.test/authorize?"));
+            assert!(
+                prompt.authorize_url.contains("code=true"),
+                "{}",
+                prompt.authorize_url
+            );
+
+            let state = if paste_wrong_state {
+                "someone-elses".to_owned()
+            } else {
+                prompt.verifier.clone()
+            };
+            let result = finish_manual(
                 &issuer,
                 &oauth,
-                &mut |url| *captured.borrow_mut() = url.to_owned(),
-                &mut || {
-                    let visited = captured.borrow();
-                    let real_state = visited
-                        .split("state=")
-                        .nth(1)
-                        .and_then(|rest| rest.split('&').next())
-                        .unwrap()
-                        .to_owned();
-                    let state = if paste_wrong_state {
-                        "someone-elses".to_owned()
-                    } else {
-                        real_state
-                    };
-                    Ok(format!("the-code#{state}"))
-                },
+                &prompt.verifier,
+                &format!("the-code#{state}"),
             );
             assert_eq!(
                 result.is_ok(),
@@ -1296,9 +1317,6 @@ mod tests {
             if expect_ok {
                 let tokens = result.unwrap();
                 assert_eq!(tokens.access_token, "at-1");
-                let visited = captured.into_inner();
-                assert!(visited.starts_with("https://issuer.test/authorize?"));
-                assert!(visited.contains("code=true"), "{visited}");
                 let sent = issuer.sent.lock().unwrap();
                 let body: Value = serde_json::from_str(&sent[0])
                     .expect("the token exchange body is JSON, not form-encoded");
@@ -1314,10 +1332,9 @@ mod tests {
     #[test]
     fn manual_grant_tolerates_a_pasted_code_with_no_state_suffix() {
         let issuer = FakeIssuer::new(vec![(200, r#"{"access_token":"at-1"}"#)]);
-        let tokens = authorization_code_manual(&issuer, &manual_oauth(), &mut |_| {}, &mut || {
-            Ok("bare-code".to_owned())
-        })
-        .unwrap();
+        let oauth = manual_oauth();
+        let prompt = begin_manual(&oauth).unwrap();
+        let tokens = finish_manual(&issuer, &oauth, &prompt.verifier, "bare-code").unwrap();
         assert_eq!(tokens.access_token, "at-1");
         let sent = issuer.sent.lock().unwrap();
         let body: Value = serde_json::from_str(&sent[0]).unwrap();
