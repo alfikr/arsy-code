@@ -26,6 +26,14 @@ pub struct AnthropicProvider<T> {
     key: ApiKey,
     transport: T,
     redactor: Redactor,
+    /// Set when `key` is a Claude Code OAuth access token rather than a
+    /// Console API key. Anthropic only accepts the token in `x-api-key` when
+    /// the request also carries the beta flag that names the client that
+    /// signed in this way ([`oauth::presets::get("claude-oauth")`]); a plain
+    /// API key needs none of this and is rejected if it is sent anyway.
+    ///
+    /// [`oauth::presets::get("claude-oauth")`]: crate::oauth::presets::get
+    oauth: bool,
 }
 
 impl<T: WireTransport> AnthropicProvider<T> {
@@ -43,11 +51,19 @@ impl<T: WireTransport> AnthropicProvider<T> {
             key,
             transport,
             redactor: Redactor::new(),
+            oauth: false,
         }
     }
 
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Mark `key` as a Claude Code OAuth access token, so every request
+    /// carries the beta header Anthropic's OAuth client requires.
+    pub fn with_oauth(mut self) -> Self {
+        self.oauth = true;
         self
     }
 
@@ -100,14 +116,21 @@ impl<T: WireTransport> AnthropicProvider<T> {
                 ),
             );
         }
+        let mut headers = vec![
+            ("x-api-key".to_owned(), self.key.expose().to_owned()),
+            ("anthropic-version".to_owned(), API_VERSION.to_owned()),
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+        ];
+        if self.oauth {
+            // Without this, Anthropic rejects a Claude Code OAuth access
+            // token sent in `x-api-key` outright — the header is how the
+            // dialect tells an OAuth-issued token from a Console API key.
+            headers.push(("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()));
+        }
         WireRequest {
             url: format!("{}/v1/messages", self.base_url.trim_end_matches('/')),
-            headers: vec![
-                ("x-api-key".to_owned(), self.key.expose().to_owned()),
-                ("anthropic-version".to_owned(), API_VERSION.to_owned()),
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("accept".to_owned(), "text/event-stream".to_owned()),
-            ],
+            headers,
             body: Value::Object(body).to_string(),
         }
     }

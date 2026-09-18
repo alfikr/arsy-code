@@ -242,6 +242,27 @@ fn the_adapter_owns_wire_format_and_authentication() {
 }
 
 #[test]
+fn an_oauth_credential_carries_the_claude_code_beta_header_a_plain_key_does_not() {
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport)
+            .with_oauth();
+    let encoded = provider.encode(&request(Vec::new()));
+    assert!(encoded
+        .headers
+        .contains(&("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned())));
+
+    let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
+    let plain =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+    assert!(!plain
+        .encode(&request(Vec::new()))
+        .headers
+        .iter()
+        .any(|(name, _)| name == "anthropic-beta"));
+}
+
+#[test]
 fn model_call_redacts_registered_credentials_before_the_wire() {
     let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
     let sent = Arc::clone(&transport.sent);
