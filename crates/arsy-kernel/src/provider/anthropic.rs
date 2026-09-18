@@ -3,6 +3,14 @@
 //! HTTP itself is injected as [`WireTransport`] rather than depended on, so the
 //! part that differs per provider — body shape, headers, status mapping, SSE
 //! semantics — is the part that is testable here.
+//!
+//! A Claude Code OAuth access token ([`with_oauth`](AnthropicProvider::with_oauth))
+//! is not a drop-in replacement for a Console API key: Anthropic's server only
+//! accepts one when the request also carries the right beta flags, opens with
+//! the exact system-prompt identity string Claude Code itself sends, and
+//! spells any tool name that collides with Claude Code's own tools in Claude
+//! Code's casing. Get any of the three wrong and the whole request is
+//! rejected — not just the part that looks related.
 
 pub use super::wire::{ApiKey, WireRequest, WireResponse, WireTransport};
 use super::{
@@ -11,7 +19,7 @@ use super::{
 };
 use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Wire version Anthropic requires on every request.
 pub const API_VERSION: &str = "2023-06-01";
@@ -20,6 +28,59 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// Smallest thinking budget the Messages API accepts.
 const THINKING_FLOOR: u32 = 1024;
 
+/// Beta flags the Claude Code OAuth client sends together, verbatim, on
+/// every request made with an OAuth-issued token. `oauth-2025-04-20` is
+/// what lets a bearer token stand in for a Console API key at all;
+/// `claude-code-20250219` is the compatibility flag the server checks the
+/// system-prompt identity and tool names against — dropping it does not
+/// relax those checks, it just removes the flag that explains why they are
+/// being made. The other two match what the official client always sends
+/// in this mode, matching official OAuth-consuming clients such as
+/// OpenCode's `opencode-anthropic-auth`.
+const CLAUDE_CODE_BETA: &str = "oauth-2025-04-20,claude-code-20250219,\
+     interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+
+/// The exact system-prompt block Claude Code itself sends first. An
+/// OAuth-authenticated request without it is rejected even though the
+/// error Anthropic returns for it does not say so.
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Claude Code's own tool names. Anthropic's server validates tool names
+/// against this set on an OAuth-authenticated request: a name that
+/// collides case-insensitively (ARSY's `bash`, say) has to be sent in
+/// exactly this casing or the request is rejected, and the reply has to be
+/// mapped back to whatever casing the caller actually used. A name with no
+/// collision here passes through untouched either way.
+const CLAUDE_CODE_TOOL_NAMES: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// The Claude Code spelling of `name`, when it collides case-insensitively
+/// with one; `name` itself otherwise.
+fn claude_code_tool_name(name: &str) -> &str {
+    CLAUDE_CODE_TOOL_NAMES
+        .iter()
+        .find(|canonical| canonical.eq_ignore_ascii_case(name))
+        .copied()
+        .unwrap_or(name)
+}
+
 pub struct AnthropicProvider<T> {
     descriptor: ProviderDescriptor,
     base_url: String,
@@ -27,12 +88,9 @@ pub struct AnthropicProvider<T> {
     transport: T,
     redactor: Redactor,
     /// Set when `key` is a Claude Code OAuth access token rather than a
-    /// Console API key. Anthropic only accepts the token in `x-api-key` when
-    /// the request also carries the beta flag that names the client that
-    /// signed in this way ([`oauth::presets::get("claude-oauth")`]); a plain
-    /// API key needs none of this and is rejected if it is sent anyway.
-    ///
-    /// [`oauth::presets::get("claude-oauth")`]: crate::oauth::presets::get
+    /// Console API key. An OAuth-issued token has to be sent, encoded, and
+    /// replied to differently in three places `encode` touches — see the
+    /// module doc — not just given an extra header.
     oauth: bool,
 }
 
@@ -91,12 +149,35 @@ impl<T: WireTransport> AnthropicProvider<T> {
             );
         }
 
-        if let Some(system) = &request.system {
+        if self.oauth {
+            // An OAuth-authenticated request opens with Claude Code's own
+            // identity, or Anthropic rejects it outright; the operator's
+            // real system prompt (if any) follows as a second block.
+            let mut blocks = vec![json!({
+                "type": "text",
+                "text": CLAUDE_CODE_IDENTITY,
+                "cache_control": {"type": "ephemeral"},
+            })];
+            if let Some(system) = &request.system {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }));
+            }
+            body.insert("system".to_owned(), Value::Array(blocks));
+        } else if let Some(system) = &request.system {
             body.insert("system".to_owned(), json!(system));
         }
         body.insert(
             "messages".to_owned(),
-            Value::Array(request.messages.iter().map(encode_message).collect()),
+            Value::Array(
+                request
+                    .messages
+                    .iter()
+                    .map(|message| encode_message(message, self.oauth))
+                    .collect(),
+            ),
         );
         if !request.tools.is_empty() {
             body.insert(
@@ -106,8 +187,13 @@ impl<T: WireTransport> AnthropicProvider<T> {
                         .tools
                         .iter()
                         .map(|tool| {
+                            let name = if self.oauth {
+                                claude_code_tool_name(&tool.name)
+                            } else {
+                                tool.name.as_str()
+                            };
                             json!({
-                                "name": tool.name,
+                                "name": name,
                                 "description": tool.description,
                                 "input_schema": tool.input_schema,
                             })
@@ -117,16 +203,21 @@ impl<T: WireTransport> AnthropicProvider<T> {
             );
         }
         let mut headers = vec![
-            ("x-api-key".to_owned(), self.key.expose().to_owned()),
             ("anthropic-version".to_owned(), API_VERSION.to_owned()),
             ("content-type".to_owned(), "application/json".to_owned()),
             ("accept".to_owned(), "text/event-stream".to_owned()),
         ];
         if self.oauth {
-            // Without this, Anthropic rejects a Claude Code OAuth access
-            // token sent in `x-api-key` outright — the header is how the
-            // dialect tells an OAuth-issued token from a Console API key.
-            headers.push(("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()));
+            // Anthropic rejects an OAuth-issued token sent as `x-api-key`
+            // outright; it has to ride as a bearer token instead, with no
+            // `x-api-key` header present at all.
+            headers.push((
+                "authorization".to_owned(),
+                format!("Bearer {}", self.key.expose()),
+            ));
+            headers.push(("anthropic-beta".to_owned(), CLAUDE_CODE_BETA.to_owned()));
+        } else {
+            headers.push(("x-api-key".to_owned(), self.key.expose().to_owned()));
         }
         WireRequest {
             url: format!("{}/v1/messages", self.base_url.trim_end_matches('/')),
@@ -136,24 +227,35 @@ impl<T: WireTransport> AnthropicProvider<T> {
     }
 }
 
-fn encode_message(message: &super::ModelMessage) -> Value {
+fn encode_message(message: &super::ModelMessage, oauth: bool) -> Value {
     json!({
         "role": match message.role {
             ModelRole::User => "user",
             ModelRole::Assistant => "assistant",
         },
-        "content": message.content.iter().map(encode_content).collect::<Vec<_>>(),
+        "content": message
+            .content
+            .iter()
+            .map(|content| encode_content(content, oauth))
+            .collect::<Vec<_>>(),
     })
 }
 
-fn encode_content(content: &ModelContent) -> Value {
+fn encode_content(content: &ModelContent, oauth: bool) -> Value {
     match content {
         ModelContent::Text { text } => json!({ "type": "text", "text": text }),
         ModelContent::ToolCall {
             id,
             name,
             arguments,
-        } => json!({ "type": "tool_use", "id": id, "name": name, "input": arguments }),
+        } => {
+            let name = if oauth {
+                claude_code_tool_name(name)
+            } else {
+                name.as_str()
+            };
+            json!({ "type": "tool_use", "id": id, "name": name, "input": arguments })
+        }
         ModelContent::ToolResult {
             id,
             content,
@@ -186,7 +288,23 @@ impl<T: WireTransport> ModelProvider for AnthropicProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        Ok(Box::new(EventDecoder::new(response.lines)))
+        // The wire echoes back whatever name `encode` sent; when that was
+        // Claude Code's spelling of a colliding tool, this maps it back to
+        // the name the caller actually asked for. Empty when nothing
+        // collided, which costs the lookup nothing.
+        let tool_names: HashMap<String, String> = if self.oauth {
+            request
+                .tools
+                .iter()
+                .filter_map(|tool| {
+                    let mapped = claude_code_tool_name(&tool.name);
+                    (mapped != tool.name).then(|| (mapped.to_owned(), tool.name.clone()))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        Ok(Box::new(EventDecoder::new(response.lines, tool_names)))
     }
 }
 
@@ -229,6 +347,9 @@ struct EventDecoder {
     /// One wire event can carry two canonical facts (usage and stop reason).
     queue: VecDeque<ModelEvent>,
     done: bool,
+    /// Claude Code's spelling of a tool name -> what the caller actually
+    /// named it. Empty outside OAuth mode, or when nothing collided.
+    tool_names: HashMap<String, String>,
 }
 
 struct ToolBlock {
@@ -238,12 +359,16 @@ struct ToolBlock {
 }
 
 impl EventDecoder {
-    fn new(lines: Box<dyn Iterator<Item = Result<String, String>> + Send>) -> Self {
+    fn new(
+        lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
+        tool_names: HashMap<String, String>,
+    ) -> Self {
         Self {
             lines,
             blocks: Vec::new(),
             queue: VecDeque::new(),
             done: false,
+            tool_names,
         }
     }
 
@@ -297,7 +422,12 @@ impl EventDecoder {
             return Ok(());
         }
         let id = field(block, "id")?.to_owned();
-        let name = field(block, "name")?.to_owned();
+        let wire_name = field(block, "name")?;
+        let name = self
+            .tool_names
+            .get(wire_name)
+            .cloned()
+            .unwrap_or_else(|| wire_name.to_owned());
         if self.blocks.len() != index {
             return Err(ProviderError::Decode(format!(
                 "content block {index} started out of order"
