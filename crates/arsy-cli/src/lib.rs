@@ -63,7 +63,7 @@ use arsy_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -2054,6 +2054,28 @@ fn auth_login(
         }));
         arsy_kernel::oauth::poll_device(&transport, &oauth, &prompt, &mut std::thread::sleep)
             .map_err(login_failed)?
+    } else if arsy_kernel::oauth::uses_manual_grant(&oauth) {
+        // Anthropic's Claude Code OAuth client has no loopback redirect: the
+        // issuer's own hosted page shows the operator a code to paste back.
+        let interactive = emitter.output == Output::Human;
+        let tokens = arsy_kernel::oauth::authorization_code_manual(
+            &transport,
+            &oauth,
+            &mut |authorize| {
+                let opened = interactive && open_browser(authorize);
+                let _ = writeln!(
+                    io::stderr(),
+                    "{}\n  {authorize}\nAfter you approve, paste the code shown back here:",
+                    if opened {
+                        "Opening your browser to sign in. If it did not open, visit:"
+                    } else {
+                        "Open this URL to sign in:"
+                    }
+                );
+            },
+            &mut read_pasted_code,
+        );
+        tokens.map_err(login_failed)?
     } else {
         // Open the browser for an interactive operator; a scripted or headless
         // run (`--output json|ci`) only prints the URL. Either way the URL is
@@ -2198,6 +2220,27 @@ fn open_browser(url: &str) -> bool {
         let _ = url;
         false
     }
+}
+
+/// Read the one line the operator pastes back for a manual OAuth grant: the
+/// code an issuer's hosted callback page showed them, once they approved.
+/// Unlike [`read_stdin`], this reads a single line rather than to EOF — the
+/// operator presses Enter, not Ctrl-D.
+fn read_pasted_code() -> Result<String, arsy_kernel::oauth::OAuthError> {
+    let _ = write!(io::stderr(), "Paste the code here: ");
+    let _ = io::stderr().flush();
+    let mut line = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|error| arsy_kernel::oauth::OAuthError::Local(error.to_string()))?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(arsy_kernel::oauth::OAuthError::Abandoned(
+            "no code was pasted".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
