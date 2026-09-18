@@ -157,13 +157,10 @@ pub const THEMES: &[(&str, &str)] = &[
     ("dark", "the original — grey text, cyan accents"),
     ("ocean", "cool — teal and blue"),
     ("sunset", "warm — amber and rose"),
-    (
-        "vivid",
-        "vivid — vibrant, high-contrast, multi-colored accents",
-    ),
-    ("dracula", "dracula — iconic purple, cyan, green, and pink"),
-    ("nord", "nord — arctic frost and cool pastel accents"),
-    ("mono", "greys only, no hue"),
+    ("vivid", "vibrant — high-contrast, multi-colored accents"),
+    ("dracula", "iconic — purple, cyan, green, and pink"),
+    ("nord", "arctic — frost and cool pastel accents"),
+    ("mono", "neutral — greys only, no hue"),
 ];
 
 /// The theme in force when nothing has been chosen: the original palette.
