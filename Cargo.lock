@@ -75,7 +75,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "arsy-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arsy-code",
  "arsy-compat",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "arsy-code"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arsy-compat",
  "arsy-kernel",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "arsy-compat"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "arsy-kernel",
  "serde_json",
@@ -125,14 +125,14 @@ dependencies = [
 
 [[package]]
 name = "arsy-ide"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "arsy-kernel"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "globset",
  "keyring",
@@ -151,14 +151,14 @@ dependencies = [
 
 [[package]]
 name = "arsy-pty"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "arsy-sandbox"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "landlock",
  "libc",
