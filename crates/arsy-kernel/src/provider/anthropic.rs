@@ -19,7 +19,10 @@ use super::{
 };
 use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
+};
 
 /// Wire version Anthropic requires on every request.
 pub const API_VERSION: &str = "2023-06-01";
@@ -71,14 +74,39 @@ const CLAUDE_CODE_TOOL_NAMES: &[&str] = &[
     "WebSearch",
 ];
 
-/// The Claude Code spelling of `name`, when it collides case-insensitively
-/// with one; `name` itself otherwise.
-fn claude_code_tool_name(name: &str) -> &str {
-    CLAUDE_CODE_TOOL_NAMES
+/// Give `name` a wire spelling every Anthropic tool name has to match —
+/// `^[a-zA-Z0-9_-]{1,128}$`, API key or OAuth token alike, so a dotted name
+/// such as ARSY's `fs.read` does not qualify on its own — and, only under
+/// OAuth, Claude Code's own casing when it collides case-insensitively with
+/// one of Claude Code's tools.
+fn wire_tool_name(name: &str, oauth: bool) -> Cow<'_, str> {
+    let legal = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    let sanitized: Cow<str> = if legal {
+        Cow::Borrowed(name)
+    } else {
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+            .into()
+    };
+    if !oauth {
+        return sanitized;
+    }
+    match CLAUDE_CODE_TOOL_NAMES
         .iter()
-        .find(|canonical| canonical.eq_ignore_ascii_case(name))
-        .copied()
-        .unwrap_or(name)
+        .find(|canonical| canonical.eq_ignore_ascii_case(&sanitized))
+    {
+        Some(canonical) => Cow::Borrowed(*canonical),
+        None => sanitized,
+    }
 }
 
 pub struct AnthropicProvider<T> {
@@ -187,11 +215,7 @@ impl<T: WireTransport> AnthropicProvider<T> {
                         .tools
                         .iter()
                         .map(|tool| {
-                            let name = if self.oauth {
-                                claude_code_tool_name(&tool.name)
-                            } else {
-                                tool.name.as_str()
-                            };
+                            let name = wire_tool_name(&tool.name, self.oauth);
                             json!({
                                 "name": name,
                                 "description": tool.description,
@@ -249,11 +273,7 @@ fn encode_content(content: &ModelContent, oauth: bool) -> Value {
             name,
             arguments,
         } => {
-            let name = if oauth {
-                claude_code_tool_name(name)
-            } else {
-                name.as_str()
-            };
+            let name = wire_tool_name(name, oauth);
             json!({ "type": "tool_use", "id": id, "name": name, "input": arguments })
         }
         ModelContent::ToolResult {
@@ -288,22 +308,19 @@ impl<T: WireTransport> ModelProvider for AnthropicProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        // The wire echoes back whatever name `encode` sent; when that was
-        // Claude Code's spelling of a colliding tool, this maps it back to
-        // the name the caller actually asked for. Empty when nothing
-        // collided, which costs the lookup nothing.
-        let tool_names: HashMap<String, String> = if self.oauth {
-            request
-                .tools
-                .iter()
-                .filter_map(|tool| {
-                    let mapped = claude_code_tool_name(&tool.name);
-                    (mapped != tool.name).then(|| (mapped.to_owned(), tool.name.clone()))
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        // The wire echoes back whatever name `encode` sent; when that
+        // differed from the caller's own name — a dotted name that had to
+        // be sanitized, or Claude Code's spelling of a colliding tool under
+        // OAuth — this maps it back to the name the caller actually asked
+        // for. Empty when nothing differed, which costs the lookup nothing.
+        let tool_names: HashMap<String, String> = request
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                let mapped = wire_tool_name(&tool.name, self.oauth);
+                (mapped != tool.name).then(|| (mapped.into_owned(), tool.name.clone()))
+            })
+            .collect();
         Ok(Box::new(EventDecoder::new(response.lines, tool_names)))
     }
 }
