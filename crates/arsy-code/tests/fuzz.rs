@@ -131,8 +131,6 @@ fn the_command_seed_corpus_fails_closed() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
-
     #[test]
     fn an_arbitrary_path_never_escapes_the_workspace(
         path in r"[a-z./\\:\u0000\u00e9 -]{0,64}",
