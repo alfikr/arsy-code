@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # Long soak; the in-tree runs use the per-test case counts.
+      # Long soak; local runs keep the proptest default of 256 cases.
       PROPTEST_CASES: "20000"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
