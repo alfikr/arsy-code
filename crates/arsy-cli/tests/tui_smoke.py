@@ -153,17 +153,18 @@ def main():
             terminal.send(b"/plan cancel\r")
             terminal.expect("Planning cancelled. Approval mode: default.")
 
-            # Shift+Tab updates the footer directly and does not print a
-            # synthetic approval command for every key repeat.
+            # Shift+Tab changes the mode where the card names it: the launch
+            # card is re-rendered with the new mode, and no MODE row is added
+            # to the scrollback, so cycling modes does not stack rows.
             terminal.send(b"\x1b[Z")
             terminal.expect("acceptEdits")
-            # The mode change is recorded in the transcript as well as applied.
-            # It is the one row that changes what the harness may do, and it
-            # was dead code until recently: `push_mode_change` existed and
-            # nothing called it.
-            terminal.expect("MODE")
             terminal.send(b"\x1b[Z")
             terminal.expect("⏸ PLAN")
+            with terminal.lock:
+                mode_rows = terminal.received.count(b"MODE ")
+                assert mode_rows == 0, (
+                    f"Shift+Tab printed {mode_rows} MODE rows into the scrollback"
+                )
             terminal.send(b"/approval default\r")
             terminal.expect("Approval mode: default")
             with terminal.lock:

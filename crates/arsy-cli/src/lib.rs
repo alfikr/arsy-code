@@ -2543,7 +2543,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         native,
         native_requested,
         detected,
-        provider_available,
+        mut provider_available,
     } = open_route(invocation, &workspace)?;
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
@@ -2724,7 +2724,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Typing {
                 workspace: &workspace,
                 colour,
-                provider_available,
+                provider_available: &mut provider_available,
                 route: &mut route,
                 effort: &mut effort,
                 models: &mut models,
@@ -4499,28 +4499,25 @@ fn submitted(
     input: tui::Action,
     approval: &approval::ApprovalCell,
     state: &mut tui::TuiState,
-    transcript: &mut tui::Transcript,
-    terminal: &mut impl Write,
-    colour: bool,
+    _transcript: &mut tui::Transcript,
+    _terminal: &mut impl Write,
+    _colour: bool,
 ) -> Option<String> {
     match input {
         tui::Action::Submit(line) => Some(line),
         // `e` is answered in the read loop, before it could ever reach here.
         tui::Action::Expand => None,
         tui::Action::CycleMode => {
-            // The mode change is recorded as well as applied. It is the one
-            // thing in the transcript that changes what the harness is allowed
-            // to do, so a reader scrolling back has to be able to see where it
-            // happened rather than infer it from what stopped asking.
             let was = approval.get().label();
             let mode = cycle_approval_mode(approval);
             state.set_approval_mode(mode.label());
             if was != mode.label() {
-                transcript.push_mode_change(was, mode.label());
-                // Written now as well as recorded: a change the operator made
-                // with a keystroke has to appear where they made it, not only
-                // after something else forces a repaint.
-                let _ = writeln!(terminal, "{}", tui::mode_row(was, mode.label(), colour));
+                // The launch card is the one place the mode is named in full,
+                // so a change re-renders it rather than adding another row to
+                // the scrollback: cycling through four modes is not four
+                // pieces of history, it is one boundary the reader can see
+                // wherever they happen to be looking.
+                state.card_is_stale();
             }
             None
         }
@@ -4584,6 +4581,8 @@ fn answer_prompt(
             typing.draft,
             typing.providers,
             typing.chosen,
+            typing.models,
+            typing.route,
             stdout,
         )?,
         Prompt::Effort => take_effort(line, typing.effort, restoring.state, stdout, emitter)?,
@@ -4607,10 +4606,15 @@ fn answer_prompt(
         )?,
         Prompt::Auth(step) => take_auth(
             invocation,
+            typing.workspace,
             step,
             line,
             typing.auth_draft,
             typing.providers,
+            typing.route,
+            typing.provider_available,
+            typing.resolved_providers,
+            typing.unavailable_providers,
             stdout,
             emitter,
         )?,
@@ -4665,7 +4669,7 @@ enum TaskPass {
 struct Typing<'a> {
     workspace: &'a Path,
     colour: bool,
-    provider_available: bool,
+    provider_available: &'a mut bool,
     route: &'a mut tui::ModelRoute,
     effort: &'a mut Option<Effort>,
     models: &'a mut Vec<tui::ModelChoice>,
@@ -4813,7 +4817,7 @@ fn run_task(
     restoring.transcript.push_user(line);
     write!(stdout, "{}", composer.commit(line, typing.colour)).map_err(terminal_failed)?;
     stdout.flush().map_err(terminal_failed)?;
-    if !typing.provider_available {
+    if !*typing.provider_available {
         emitter.diagnostic(&Diagnostic::error(
             ARSY_PRV_1000,
             "provider unavailable",
@@ -5474,7 +5478,7 @@ fn run_hook_dialog(
     let root = workspace_root(&invocation.workspace)?;
     let mut rows = hook_choices(&root, invocation)?;
     let mut dialog = tui::HookDialogState::new(rows);
-    let mut changes: Vec<String> = Vec::new();
+    let mut changed = 0usize;
     let mut drawn = 0;
     loop {
         drawn = repaint_dialog(
@@ -5514,7 +5518,7 @@ fn run_hook_dialog(
         dialog.notice = Some(match change {
             Ok(()) => {
                 let state = if enabled { "on" } else { "off" };
-                changes.push(format!("hook `{}` switched {state}.", choice.matcher));
+                changed += 1;
                 format!("hook `{}` switched {state}.", choice.matcher)
             }
             Err(reason) => reason,
@@ -5522,69 +5526,8 @@ fn run_hook_dialog(
         rows = hook_choices(&root, invocation)?;
         dialog.reload(rows);
     }
-    close_dialog(
-        stdout,
-        drawn,
-        &changes,
-        "hook changes take effect from the next turn.",
-    )?;
+    close_dialog(stdout, drawn, &hook_close_line(changed), "")?;
     Ok(())
-}
-
-/// What reading one composer line ended with.
-#[cfg(feature = "tui")]
-enum EditOutcome {
-    /// A complete line, ready to be validated and written.
-    Line(String),
-    /// Interrupt, escape, or EOF from a live channel: the dialog takes back
-    /// the screen.
-    BackToDialog,
-    /// The keyboard hung up: nothing left to answer, so the session ends.
-    SessionEnded,
-}
-
-/// Read one line at the composer for an edited setting, feeding the decoder
-/// byte by byte.
-#[cfg(feature = "tui")]
-fn edit_setting_line(
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Result<EditOutcome, Diagnostic> {
-    let mut line = String::new();
-    loop {
-        let byte = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
-            Ok(byte) => byte,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if decoder.flush_escape().is_some() {
-                    return Ok(EditOutcome::BackToDialog);
-                }
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Ok(EditOutcome::SessionEnded)
-            }
-        };
-        let Some(key) = decoder.feed(byte) else {
-            continue;
-        };
-        match key {
-            tui::Key::Interrupt | tui::Key::Eof => return Ok(EditOutcome::BackToDialog),
-            tui::Key::Enter | tui::Key::Newline => break,
-            tui::Key::Backspace => {
-                line.pop();
-                write!(stdout, "\x1b[D\x1b[K").map_err(terminal_failed)?;
-            }
-            tui::Key::Char(character) => {
-                line.push(character);
-                write!(stdout, "{character}").map_err(terminal_failed)?;
-            }
-            _ => {}
-        }
-        stdout.flush().map_err(terminal_failed)?;
-    }
-    writeln!(stdout).map_err(terminal_failed)?;
-    Ok(EditOutcome::Line(line))
 }
 
 /// Apply one edited setting's new value, printing what happened. `None` when
@@ -5677,7 +5620,7 @@ fn run_skill_dialog(
     let root = workspace_root(&invocation.workspace)?;
     let mut rows = skill_choices(&root, invocation)?;
     let mut dialog = tui::SkillDialogState::new(rows);
-    let mut changes: Vec<String> = Vec::new();
+    let mut changed = 0usize;
     let mut drawn = 0;
     loop {
         drawn = repaint_dialog(
@@ -5707,7 +5650,7 @@ fn run_skill_dialog(
                 }) {
                     Ok(()) => {
                         let state = if offering { "offered" } else { "switched off" };
-                        changes.push(format!("skill `{}` {state}.", choice.name));
+                        changed += 1;
                         dialog.notice = Some(format!("skill `{}` {state}.", choice.name));
                     }
                     Err(reason) => dialog.notice = Some(reason),
@@ -5734,43 +5677,10 @@ fn run_skill_dialog(
             }
         }
     }
-    close_dialog(
-        stdout,
-        drawn,
-        &changes,
-        "skill changes take effect from the next turn.",
-    )?;
+    close_dialog(stdout, drawn, &skill_close_line(changed), "")?;
     Ok(())
 }
 
-/// Collect one setting's new value at the composer, then write it.
-///
-/// The dialog has stepped aside, so this reads the line itself and answers
-/// with the dialog again rather than with a prompt state.
-#[cfg(feature = "tui")]
-fn edit_setting(
-    invocation: &Invocation,
-    row: &tui::SettingRow,
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    colour: bool,
-) -> Result<(), Diagnostic> {
-    match edit_setting_line(stdout, keys, decoder)? {
-        EditOutcome::SessionEnded => Ok(()),
-        EditOutcome::BackToDialog => run_settings_dialog(invocation, stdout, colour, keys, decoder),
-        EditOutcome::Line(line) => {
-            // Written: the composer confirms the new value before the dialog
-            // takes the screen back.
-            let notice = match apply_edited_setting(row, &line) {
-                Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&line)),
-                Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
-            };
-            writeln!(stdout, "{notice}").map_err(terminal_failed)?;
-            run_settings_dialog(invocation, stdout, colour, keys, decoder)
-        }
-    }
-}
 /// Every setting the registry names, as the dialog offers it.
 #[cfg(feature = "tui")]
 fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRow>, Diagnostic> {
@@ -5778,13 +5688,26 @@ fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRow>, Diagnos
     Ok(config
         .settings()
         .into_iter()
-        .map(|view| tui::SettingRow {
-            key: view.key,
-            value: view.value,
-            default: view.default,
-            description: view.description,
-            choices: view.choices,
-            set: view.set,
+        .map(|view| {
+            // The registry names a kind for every key it lists, so the dialog
+            // edits by the same table the loader validates against.
+            let kind = match arsy_kernel::config::setting(&view.key).map(|s| s.kind) {
+                Some(arsy_kernel::config::SettingKind::Bool) => tui::SettingKind::Bool,
+                Some(arsy_kernel::config::SettingKind::Choice(_)) => tui::SettingKind::Choice,
+                Some(arsy_kernel::config::SettingKind::Integer { min, max }) => {
+                    tui::SettingKind::Integer { min, max }
+                }
+                Some(arsy_kernel::config::SettingKind::Text) | None => tui::SettingKind::Text,
+            };
+            tui::SettingRow {
+                key: view.key,
+                value: view.value,
+                default: view.default,
+                description: view.description,
+                choices: view.choices,
+                kind,
+                set: view.set,
+            }
         })
         .collect())
 }
@@ -5808,7 +5731,7 @@ fn run_settings_dialog(
             drawn,
             &dialog.render(tui::terminal_width(), colour),
         )?;
-        let action = match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+        match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
         }) {
             None => continue,
@@ -5835,23 +5758,20 @@ fn run_settings_dialog(
                 dialog.reload(rows);
                 continue;
             }
-            Some(tui::SettingsAction::Edit(index)) => index,
+            Some(tui::SettingsAction::Apply(index, pending)) => {
+                let row = dialog.rows[index].clone();
+                let notice = match apply_edited_setting(&row, &pending) {
+                    Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&pending)),
+                    Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
+                };
+                dialog.notice = Some(notice);
+                rows = setting_rows(invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
         };
-        // Editing asks for the value at the composer, so the dialog steps
-        // aside and the answer comes back as a line.
-        let row = dialog.rows[action].clone();
-        let prompt = tui::setting_prompt(&row);
-        close_dialog(stdout, drawn, &[], "")?;
-        write!(stdout, "{prompt}").map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
-        return edit_setting(invocation, &row, stdout, keys, decoder, colour);
     }
-    close_dialog(
-        stdout,
-        drawn,
-        &changes,
-        "settings take effect when ARSY starts again.",
-    )?;
+    close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
 }
 
@@ -5947,7 +5867,7 @@ fn run_mcp_dialog(
     let root = workspace_root(&invocation.workspace)?;
     let mut rows = mcp_choices(&root, invocation)?;
     let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
-    let mut changes: Vec<String> = Vec::new();
+    let mut changed = 0usize;
     let mut drawn = 0;
     loop {
         let frame = dialog.render(tui::terminal_width(), colour);
@@ -5963,19 +5883,14 @@ fn run_mcp_dialog(
         let action = match next_mcp_action(&mut dialog, keys, decoder) {
             None => continue,
             Some(tui::McpAction::Close) => {
-                write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
-                if !changes.is_empty() {
-                    changes.push("MCP changes take effect from the next turn.".to_owned());
-                    writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
-                        .map_err(terminal_failed)?;
-                }
+                close_dialog(stdout, drawn, &mcp_close_line(changed), "")?;
                 return Ok(());
             }
             Some(action) => action,
         };
         dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
             Ok(change) => {
-                changes.push(change.clone());
+                changed += 1;
                 change
             }
             Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
@@ -6049,6 +5964,51 @@ fn apply_mcp_action(
         }
         tui::McpAction::Close => Ok(String::new()),
     }
+}
+
+/// The one line the hook dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn hook_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "{changed} hook{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The one line the skill dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn skill_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "{changed} skill{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The one line the MCP dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn mcp_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "MCP: {changed} connection{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
 }
 
 /// The slash commands that act on the recorded session rather than on the
@@ -6500,6 +6460,8 @@ fn take_provider(
     draft: &mut tui::ProviderDraft,
     providers: &mut Vec<String>,
     chosen: &mut Option<String>,
+    models: &mut Vec<tui::ModelChoice>,
+    route: &mut tui::ModelRoute,
     stdout: &mut io::Stdout,
 ) -> Result<Prompt, Diagnostic> {
     let message = match provider_step(step, line, draft, providers) {
@@ -6509,6 +6471,19 @@ fn take_provider(
             *providers = configured_providers(invocation);
             *chosen = configured_default(invocation);
             *draft = tui::ProviderDraft::default();
+            // A removed endpoint's models must not stay in the picker, and a
+            // route that named it can no longer be driven by this session.
+            let removed = provider_step_removed(&message);
+            if let Some(name) = &removed {
+                models.retain(|choice| &choice.provider != name);
+                if route.provider == *name {
+                    *route = tui::ModelRoute {
+                        provider: tui::CODEX_PROVIDER.to_owned(),
+                        model: "default".into(),
+                    };
+                    return Ok(Prompt::Task);
+                }
+            }
             // Configuration decides the provider, so the session has to be
             // restarted to pick up a change to it rather than pretend the
             // running one moved.
@@ -6526,7 +6501,24 @@ fn take_provider(
         }
     };
     writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
+    if let Some(name) = provider_step_removed(&message) {
+        writeln!(
+            stdout,
+            "The session was on {name}; `/model` picks another endpoint."
+        )
+        .map_err(terminal_failed)?;
+    }
     Ok(Prompt::Task)
+}
+
+/// The provider name a removal message reports, or nothing for any other
+/// step's outcome.
+#[cfg(feature = "tui")]
+fn provider_step_removed(message: &str) -> Option<String> {
+    message
+        .strip_prefix("Removed provider ")
+        .and_then(|rest| rest.strip_suffix(" and its credentials."))
+        .map(str::to_owned)
 }
 
 /// Take the reasoning effort the operator picked.
@@ -6582,29 +6574,111 @@ fn take_model(
 }
 
 /// Carry the credential wizard one step, and say which step comes next.
+///
+/// A finished login or stored key is used now rather than after a restart:
+/// the credential is on disk, so the same resolution the session opened with
+/// can read it, and the route moves to the provider that was just authorised.
+/// Nothing else about the configuration is claimed to have reloaded.
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn take_auth(
     invocation: &Invocation,
+    workspace: &Path,
     step: tui::AuthStep,
     line: &str,
     draft: &mut String,
-    providers: &[String],
+    providers: &mut Vec<String>,
+    route: &mut tui::ModelRoute,
+    provider_available: &mut bool,
+    resolved: &mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable: &mut std::collections::HashSet<String>,
     stdout: &mut io::Stdout,
     emitter: &mut Emitter,
 ) -> Result<Prompt, Diagnostic> {
-    let (message, next) = match auth_step(invocation, step, line, draft, providers, emitter) {
-        Ok(AuthNext::Ask(next)) => return Ok(Prompt::Auth(next)),
-        // Finished or abandoned, the draft goes either way: a credential is
-        // never left in memory for the next question to pick up.
-        Ok(AuthNext::Done(message) | AuthNext::Cancelled(message)) => {
-            draft.clear();
-            (message, Prompt::Task)
-        }
-        Err(reason) => (reason, Prompt::Auth(step)),
+    // The provider whose credential was just written: the login step names it
+    // in the answer, the key step names it in the draft it is about to clear.
+    let authorised = match step {
+        tui::AuthStep::LoginProvider => line.trim().to_owned(),
+        tui::AuthStep::SetKey => draft.clone(),
+        _ => String::new(),
     };
+    let (mut message, next, finished) =
+        match auth_step(invocation, step, line, draft, providers, emitter) {
+            Ok(AuthNext::Ask(next)) => return Ok(Prompt::Auth(next)),
+            // Finished or abandoned, the draft goes either way: a credential
+            // is never left in memory for the next question to pick up.
+            Ok(done @ AuthNext::Done(_)) => {
+                draft.clear();
+                let done_message = match done {
+                    AuthNext::Done(done_message) => done_message,
+                    _ => String::new(),
+                };
+                (done_message, Prompt::Task, true)
+            }
+            Ok(AuthNext::Cancelled(message)) => {
+                draft.clear();
+                (message, Prompt::Task, false)
+            }
+            Err(reason) => (reason, Prompt::Auth(step), false),
+        };
+
+    if finished && !authorised.is_empty() {
+        // The endpoint may have only just been written (a preset that had
+        // none), so the configured list is re-read rather than appended to.
+        if !providers.iter().any(|name| name == &authorised) {
+            *providers = configured_providers(invocation);
+        }
+        if activate_signed_in_provider(
+            invocation,
+            workspace,
+            &authorised,
+            route,
+            resolved,
+            unavailable,
+        ) {
+            message = format!("Signed in to `{authorised}`; you can use it now.");
+            *provider_available = true;
+        }
+    }
     writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
     Ok(next)
+}
+
+/// Point the running session at a provider whose credential was just stored.
+///
+/// The credential is on disk, so the same resolution the session opened with
+/// can read it now. A provider the session could not resolve earlier — the
+/// usual reason it was told to restart — is retried, because the missing
+/// credential is exactly what the login just wrote. Only the route moves:
+/// no claim is made that the whole configuration reloaded.
+#[cfg(feature = "tui")]
+fn activate_signed_in_provider(
+    invocation: &Invocation,
+    workspace: &Path,
+    provider: &str,
+    route: &mut tui::ModelRoute,
+    resolved: &mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable: &mut std::collections::HashSet<String>,
+) -> bool {
+    unavailable.remove(provider);
+    let Some(found) = resolve_route(invocation, workspace, provider, resolved, unavailable) else {
+        return false;
+    };
+    let Ok(root) = workspace_root(&invocation.workspace) else {
+        return false;
+    };
+    let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    let model = load_config(&root, &working, invocation.config.as_deref())
+        .ok()
+        .and_then(|config| selected_model(&config, &found.endpoint, None).ok());
+    let Some(model) = model else {
+        return false;
+    };
+    *route = tui::ModelRoute {
+        provider: provider.to_owned(),
+        model,
+    };
+    true
 }
 
 /// What the pickers read to draw themselves.
