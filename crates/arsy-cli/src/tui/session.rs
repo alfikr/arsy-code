@@ -276,6 +276,13 @@ impl SessionDialogState {
         match key {
             Key::Enter | Key::Newline => {
                 let title = self.rename_buffer.trim().to_owned();
+                if title.is_empty() {
+                    // Nothing typed is not a rename: committing it would
+                    // write an empty title the list then renders as ` · ""`.
+                    // Staying in the mode is also what leaves the operator
+                    // their buffer to finish.
+                    return None;
+                }
                 let id = self.marked()?;
                 Some(SessionAction::Rename(id, title))
             }
@@ -341,6 +348,17 @@ impl SessionDialogState {
     }
 }
 
+/// The label the picker shows for a session, and the one `Composer::finish`
+/// restores into the line when Enter picks a row: an untitled session is its
+/// UUID, a titled one is `<uuid> · <title>`. `session_rows` builds the same
+/// string, so a change here is a change there.
+fn choice_label(choice: &SessionChoice) -> String {
+    match &choice.title {
+        Some(title) => format!("{} · {}", choice.id, title),
+        None => choice.id.to_string(),
+    }
+}
+
 pub fn resolve_session_answer(
     answer: &str,
     sessions: &[SessionChoice],
@@ -357,15 +375,298 @@ pub fn resolve_session_answer(
             None => Err(format!("no session {number}; choose 1-{}", sessions.len())),
         };
     }
-    if let Ok(id) = answer.parse::<SessionId>() {
-        return Ok(id);
+    // The row as the picker wrote it. A titled row comes back as
+    // `<uuid> · <title>`, which is neither a number nor a UUID on its own.
+    if let Some(choice) = sessions.iter().find(|s| choice_label(s) == answer) {
+        return Ok(choice.id);
     }
-    // Prefix search
+    // A UUID the label starts with, and so a leading prefix of one: the
+    // label always begins with the session's UUID.
     if let Some(choice) = sessions
         .iter()
-        .find(|s| s.id.to_string().starts_with(answer))
+        .find(|s| choice_label(s).starts_with(answer))
     {
         return Ok(choice.id);
     }
+    // The title the operator gave it, so the name they chose is as good an
+    // answer as the ID they never read.
+    if let Some(choice) = sessions.iter().find(|s| {
+        s.title
+            .as_deref()
+            .is_some_and(|title| title.starts_with(answer))
+    }) {
+        return Ok(choice.id);
+    }
+    // A UUID this list does not hold is still a UUID the store may know.
+    if let Ok(id) = answer.parse::<SessionId>() {
+        return Ok(id);
+    }
     Err(format!("`{answer}` is not a valid session ID"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(title: Option<&str>) -> SessionChoice {
+        SessionChoice {
+            id: SessionId::new(),
+            title: title.map(str::to_owned),
+            events: 3,
+            last_seen: "2m ago".to_owned(),
+        }
+    }
+
+    fn dialog(sessions: Vec<SessionChoice>) -> SessionDialogState {
+        SessionDialogState::new(sessions, SessionId::new())
+    }
+
+    #[test]
+    fn up_and_down_wrap_around_the_list() {
+        let mut dialog = dialog(vec![session(None), session(None)]);
+
+        assert_eq!(dialog.handle_key(Key::Up), None);
+        assert_eq!(
+            dialog.selected, 1,
+            "Up from the first row wraps to the last"
+        );
+        assert_eq!(dialog.handle_key(Key::Down), None);
+        assert_eq!(dialog.selected, 0);
+        assert_eq!(dialog.handle_key(Key::Down), None);
+        assert_eq!(
+            dialog.selected, 1,
+            "Down from the last row wraps to the first"
+        );
+    }
+
+    #[test]
+    fn enter_resumes_the_marked_row_and_interrupt_cancels() {
+        let first = session(None);
+        let second = session(None);
+        let (first_id, second_id) = (first.id, second.id);
+        let mut dialog = dialog(vec![first, second]);
+
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(SessionAction::Resume(first_id))
+        );
+        dialog.handle_key(Key::Down);
+        assert_eq!(
+            dialog.handle_key(Key::Newline),
+            Some(SessionAction::Resume(second_id))
+        );
+        assert_eq!(
+            dialog.handle_key(Key::Interrupt),
+            Some(SessionAction::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_digit_resumes_that_row() {
+        let first = session(None);
+        let second = session(Some("feature work"));
+        let (first_id, second_id) = (first.id, second.id);
+        let mut dialog = dialog(vec![first, second]);
+
+        assert_eq!(
+            dialog.handle_key(Key::Char('2')),
+            Some(SessionAction::Resume(second_id))
+        );
+        assert_eq!(dialog.selected, 1, "the marker follows the row picked");
+        assert_eq!(
+            dialog.handle_key(Key::Char('1')),
+            Some(SessionAction::Resume(first_id))
+        );
+        assert_eq!(dialog.handle_key(Key::Char('9')), None, "no such row");
+        assert_eq!(
+            dialog.handle_key(Key::Char('0')),
+            None,
+            "rows count from one"
+        );
+        assert_eq!(dialog.mode, SessionDialogMode::Select);
+    }
+
+    #[test]
+    fn r_opens_rename_on_the_marked_row() {
+        let sessions = vec![session(None), session(Some("feature work"))];
+        let second = sessions[1].id;
+        let mut dialog = dialog(sessions);
+
+        assert_eq!(dialog.handle_key(Key::Char('r')), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Rename);
+        assert_eq!(dialog.rename_buffer, "", "an untitled row starts empty");
+        assert_eq!(dialog.handle_key(Key::Interrupt), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select);
+
+        dialog.handle_key(Key::Down);
+        assert_eq!(dialog.selected, 1);
+        dialog.handle_key(Key::Char('R'));
+        assert_eq!(dialog.mode, SessionDialogMode::Rename);
+        assert_eq!(
+            dialog.rename_buffer, "feature work",
+            "a titled row starts from the title it has"
+        );
+
+        dialog.handle_key(Key::Backspace);
+        dialog.handle_key(Key::Char('!'));
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(SessionAction::Rename(second, "feature wor!".to_owned()))
+        );
+
+        // Esc drops the buffer and returns to the list.
+        dialog.rename_buffer = "discard me".to_owned();
+        assert_eq!(dialog.handle_key(Key::Interrupt), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select);
+    }
+
+    #[test]
+    fn an_empty_title_is_not_committed() {
+        let target = session(Some("feature work"));
+        let id = target.id;
+        let mut dialog = dialog(vec![target]);
+        dialog.handle_key(Key::Char('r'));
+        for _ in 0.."feature work".len() {
+            dialog.handle_key(Key::Backspace);
+        }
+
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            None,
+            "nothing typed, nothing renamed"
+        );
+        assert_eq!(
+            dialog.mode,
+            SessionDialogMode::Rename,
+            "the operator keeps typing"
+        );
+        assert_eq!(dialog.handle_key(Key::Newline), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Rename);
+
+        // Whitespace is no more of a title than nothing is.
+        dialog.handle_key(Key::Char(' '));
+        assert_eq!(dialog.handle_key(Key::Enter), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Rename);
+        dialog.handle_key(Key::Char('x'));
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(SessionAction::Rename(id, "x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn d_asks_before_deleting() {
+        let sessions = vec![session(None), session(Some("feature work"))];
+        let second = sessions[1].id;
+        let mut dialog = dialog(sessions);
+
+        dialog.handle_key(Key::Down);
+        assert_eq!(dialog.handle_key(Key::Char('d')), None);
+        assert_eq!(dialog.mode, SessionDialogMode::ConfirmDelete);
+        assert!(dialog.render(80, false).contains("permanently remove"));
+
+        assert_eq!(dialog.handle_key(Key::Char('n')), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select);
+
+        // Enter confirms as readily as `y` does, once the mode is armed.
+        dialog.handle_key(Key::Char('d'));
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(SessionAction::Delete(second))
+        );
+
+        // Esc backs out of the confirmation, as `n` does.
+        dialog.mode = SessionDialogMode::Select;
+        dialog.handle_key(Key::Char('d'));
+        assert_eq!(dialog.handle_key(Key::Interrupt), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select);
+    }
+
+    #[test]
+    fn an_empty_list_cancels_rather_than_acting() {
+        let mut dialog = dialog(Vec::new());
+
+        assert_eq!(dialog.handle_key(Key::Enter), Some(SessionAction::Cancel));
+        assert_eq!(dialog.handle_key(Key::Char('d')), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select, "nothing to delete");
+        assert_eq!(dialog.handle_key(Key::Char('r')), None);
+        assert_eq!(dialog.mode, SessionDialogMode::Select, "nothing to rename");
+        assert_eq!(dialog.handle_key(Key::Up), None);
+        assert_eq!(dialog.selected, 0);
+    }
+
+    #[test]
+    fn a_row_is_named_by_its_number_label_uuid_or_title() {
+        let first = session(Some("feature work"));
+        let second = session(None);
+        let (first_id, second_id) = (first.id, second.id);
+        let sessions = vec![first, second];
+        let current = SessionId::new();
+        let uuid = first_id.to_string();
+
+        assert_eq!(
+            resolve_session_answer("1", &sessions, current).unwrap(),
+            first_id
+        );
+        assert_eq!(
+            resolve_session_answer("2", &sessions, current).unwrap(),
+            second_id
+        );
+
+        // The whole label, which is what Enter on a row restores into the
+        // line, taken from the picker itself so the two cannot drift.
+        let (rows, _) = session_rows(&sessions, None);
+        let label = rows.unwrap()[0].0.clone();
+        assert_eq!(label, format!("{uuid} · feature work"));
+        assert_eq!(
+            resolve_session_answer(&label, &sessions, current).unwrap(),
+            first_id
+        );
+
+        // The UUID a titled row's label starts with, and a prefix of one.
+        assert_eq!(
+            resolve_session_answer(&uuid, &sessions, current).unwrap(),
+            first_id
+        );
+        assert_eq!(
+            resolve_session_answer(&uuid[..8], &sessions, current).unwrap(),
+            first_id
+        );
+
+        // The title, so the name they chose works as well as the ID.
+        assert_eq!(
+            resolve_session_answer("feat", &sessions, current).unwrap(),
+            first_id
+        );
+
+        // An untitled row is its UUID, as it always was.
+        assert_eq!(
+            resolve_session_answer(&second_id.to_string(), &sessions, current).unwrap(),
+            second_id
+        );
+    }
+
+    #[test]
+    fn an_answer_that_names_nothing_is_rejected() {
+        let sessions = vec![session(Some("feature work"))];
+        let current = SessionId::new();
+
+        assert_eq!(
+            resolve_session_answer("nothing like this", &sessions, current).unwrap_err(),
+            "`nothing like this` is not a valid session ID"
+        );
+        assert_eq!(
+            resolve_session_answer("4", &sessions, current).unwrap_err(),
+            "no session 4; choose 1-1"
+        );
+        assert_eq!(
+            resolve_session_answer("1", &[], current).unwrap_err(),
+            "no sessions found"
+        );
+        assert_eq!(
+            resolve_session_answer("  ", &sessions, current).unwrap(),
+            current,
+            "an empty line keeps the session it is already in"
+        );
+    }
 }
