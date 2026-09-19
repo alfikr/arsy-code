@@ -14,8 +14,8 @@
 
 use super::{
     wire::{ApiKey, WireRequest, WireResponse, WireTransport},
-    CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelMessage, ModelProvider,
-    ModelRole, ProviderDescriptor, ProviderError, StopReason, ToolSchema,
+    CanonicalModelRequest, Effort, ModelContent, ModelEvent, ModelEventStream, ModelMessage,
+    ModelProvider, ModelRole, ProviderDescriptor, ProviderError, StopReason, ToolSchema,
 };
 use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
@@ -321,28 +321,42 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
     }
 }
 
-fn routed_wire_model(model: &str, effort: Option<crate::provider::Effort>) -> &str {
-    use crate::provider::Effort;
-    match (model, effort) {
-        ("gemini-3.8-flash", Some(Effort::Low)) => "gemini-3.8-flash-low",
-        ("gemini-3.8-flash", Some(Effort::Medium)) => "gemini-3.8-flash-medium",
-        ("gemini-3.8-flash", Some(Effort::High) | None) => "gemini-3.8-flash-high",
+/// The model the API is asked for: flash carries the effort as a suffix, Pro
+/// maps its levels onto two ids, and anything unrecognized passes through
+/// untouched (including the empty model, which is never rewritten).
+fn routed_wire_model(model: &str, effort: Option<Effort>) -> &str {
+    match model {
+        "gemini-3.8-flash" => gemini_3_8_flash(effort),
+        "gemini-3.7-flash" => gemini_3_7_flash(effort),
+        "gemini-3.1-pro" => gemini_3_1_pro(effort),
+        other => other,
+    }
+}
 
-        ("gemini-3.7-flash", Some(Effort::Low)) => "gemini-3.7-flash-low",
-        ("gemini-3.7-flash", Some(Effort::Medium)) => "gemini-3.7-flash-medium",
-        ("gemini-3.7-flash", Some(Effort::High) | None) => "gemini-3.7-flash-high",
+/// Flash names its thinking level in the model id, and unset means the default.
+fn gemini_3_8_flash(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.8-flash-low",
+        Some(Effort::Medium) => "gemini-3.8-flash-medium",
+        Some(Effort::High) | None => "gemini-3.8-flash-high",
+    }
+}
 
-        ("gemini-3.1-pro", Some(Effort::Low)) => "gemini-3.1-pro-low",
-        ("gemini-3.1-pro", Some(Effort::Medium)) => "gemini-3.1-pro-high",
-        ("gemini-3.1-pro", Some(Effort::High) | None) => "gemini-pro-agent",
+fn gemini_3_7_flash(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.7-flash-low",
+        Some(Effort::Medium) => "gemini-3.7-flash-medium",
+        Some(Effort::High) | None => "gemini-3.7-flash-high",
+    }
+}
 
-        ("claude-3-7-sonnet", Some(Effort::Medium | Effort::High)) => "claude-3-7-sonnet-thinking",
-        ("claude-sonnet-4-5", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-5-thinking",
-        ("claude-sonnet-4-6", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-6-thinking",
-        ("claude-opus-4-5", Some(Effort::Medium | Effort::High)) => "claude-opus-4-5-thinking",
-        ("claude-opus-4-6", Some(Effort::Medium | Effort::High)) => "claude-opus-4-6-thinking",
-
-        (other, _) => other,
+/// Pro has no `-medium` id, so medium reuses the high variant, and high (the
+/// default) routes to the dedicated agent model.
+fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.1-pro-low",
+        Some(Effort::Medium) => "gemini-3.1-pro-high",
+        Some(Effort::High) | None => "gemini-pro-agent",
     }
 }
 
