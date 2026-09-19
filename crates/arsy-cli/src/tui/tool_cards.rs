@@ -106,6 +106,13 @@ pub fn tool_running_frame_with_output(
 }
 
 /// Execution state passed to format the live running tool card.
+///
+/// How many lines a running card shows once `e` has expanded it: a tail
+/// rather than the whole buffer, because the buffer is capped and a
+/// long-running command can print thousands of lines. Expanding is for
+/// watching it work, not for reading a log from the top.
+const RUNNING_PREVIEW_LINES: usize = 8;
+
 pub struct RunningToolState<'a> {
     pub name: &'a str,
     pub summary: &'a str,
@@ -119,13 +126,30 @@ pub struct RunningToolState<'a> {
 pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>) -> Vec<String> {
     if modern_style() {
         let kind = tool_card_kind(state.name);
-        let detail = state
-            .live_output
-            .lines()
-            .last()
-            .filter(|line| !line.trim().is_empty())
-            .unwrap_or(state.summary);
-        let body = vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)];
+        // Collapsed, the card carries the call's newest line, because that is
+        // the part a reader needs to know it is alive. Expanded, it carries a
+        // tail, for the same reason a finished card does: a test suite says
+        // what it is doing at the end, and `e` is how the rest comes back.
+        let body: Vec<arsy_tui::Line> = if state.expanded {
+            let lines: Vec<&str> = state
+                .live_output
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let start = lines.len().saturating_sub(RUNNING_PREVIEW_LINES);
+            lines[start..]
+                .iter()
+                .map(|line| arsy_tui::Line::of((*line).to_owned(), arsy_tui::Role::Dim))
+                .collect()
+        } else {
+            let detail = state
+                .live_output
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(state.summary);
+            vec![arsy_tui::Line::of(detail.to_owned(), arsy_tui::Role::Dim)]
+        };
         let status = CardStatus {
             lead: format!(
                 "{} running · {}",
