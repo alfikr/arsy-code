@@ -3377,130 +3377,170 @@ fn auth_step(
         return Ok(AuthNext::Cancelled("Auth unchanged.".to_owned()));
     }
     match step {
-        tui::AuthStep::Pick => match answer {
-            // A built-in preset is always an option, so `login` never dead-ends
-            // the way `set` does with nothing configured.
-            "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
-            "list" => {
-                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-                let human = human_credentials(&records);
-                let rendered = human
-                    .get("credentials")
-                    .and_then(Value::as_str)
-                    .unwrap_or("No credentials catalogued.");
-                Ok(AuthNext::Done(rendered.to_owned()))
-            }
-            "set" => {
-                if providers.is_empty() {
-                    return Err(
-                        "no providers are configured; configure a provider endpoint first"
-                            .to_owned(),
-                    );
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
-            }
-            "remove" => {
-                let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-                if records.is_empty() {
-                    return Err("no credentials are saved in the catalog".to_owned());
-                }
-                Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
-            }
-            other => Err(format!(
-                "`{}` is not one of login, list, set, remove",
-                tui::safe_text(other)
-            )),
-        },
+        tui::AuthStep::Pick => auth_pick(invocation, answer, providers),
         tui::AuthStep::LoginProvider => {
-            let known = providers.iter().any(|p| p == answer)
-                || arsy_kernel::oauth::presets::get(answer).is_some();
-            if !known {
-                return Err(format!(
-                    "`{}` is not a configured provider or a built-in preset",
-                    tui::safe_text(answer)
-                ));
-            }
-            let oauth = resolve_oauth_login(invocation, answer)
-                .map_err(|e| e.message)?
-                .oauth;
-            if arsy_kernel::oauth::uses_manual_grant(&oauth) {
-                // No loopback listener can catch this issuer's redirect, and
-                // no background poll can wait it out either: the operator
-                // has to paste a code back, and that has to arrive through
-                // this same line editor on a later turn — a blocking stdin
-                // read here would compete with it and never see a keystroke.
-                let prompt = arsy_kernel::oauth::begin_manual(&oauth).map_err(|e| e.to_string())?;
-                let opened = emitter.output == Output::Human && open_browser(&prompt.authorize_url);
-                *draft_provider = format!("{answer}\n{}", prompt.verifier);
-                let _ = writeln!(
-                    io::stderr(),
-                    "{}\n  {}\nThen paste the code it shows you here.",
-                    if opened {
-                        "Opening your browser to sign in. If it did not open, visit:"
-                    } else {
-                        "Open this URL to sign in:"
-                    },
-                    prompt.authorize_url
-                );
-                return Ok(AuthNext::Ask(tui::AuthStep::PasteCode));
-            }
-            auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
-            Ok(AuthNext::Done(format!(
-                "Signed in to `{answer}` with OAuth."
-            )))
+            auth_login_provider(invocation, answer, draft_provider, providers, emitter)
         }
-        tui::AuthStep::SetProvider => {
-            if !providers.iter().any(|p| p == answer) {
-                return Err(format!(
-                    "`{}` is not a configured provider",
-                    tui::safe_text(answer)
-                ));
-            }
-            *draft_provider = answer.to_owned();
-            Ok(AuthNext::Ask(tui::AuthStep::SetKey))
-        }
-        tui::AuthStep::SetKey => {
-            store_credential(invocation, draft_provider, "keychain", answer)
-                .map_err(|e| e.to_string())?;
-            Ok(AuthNext::Done(format!(
-                "Stored API key for `{draft_provider}` in the credential store."
-            )))
-        }
-        tui::AuthStep::RemoveHandle => {
-            let handle: SecretHandle =
-                SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
-            let store = CatalogStore::resolve(invocation);
-            let mut records = catalog(store).map_err(|e| e.message)?;
-            records.retain(|r| r.handle != handle);
-            save_catalog(store, &records).map_err(|e| e.message)?;
-            match handle.store() {
-                OS_STORE_ID => {
-                    let _ = OsCredentialStore.remove(handle.name());
-                }
-                FILE_STORE_ID => {
-                    let _ = FileCredentialStore.remove(handle.name());
-                }
-                _ => {}
-            }
-            Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
-        }
-        tui::AuthStep::PasteCode => {
-            let (provider, verifier) = draft_provider
-                .split_once('\n')
-                .map(|(provider, verifier)| (provider.to_owned(), verifier.to_owned()))
-                .ok_or_else(|| "the login was interrupted; run `/auth login` again".to_owned())?;
-            let login = resolve_oauth_login(invocation, &provider).map_err(|e| e.message)?;
-            let transport = arsy_kernel::provider::http::HttpTransport::default();
-            let tokens =
-                arsy_kernel::oauth::finish_manual(&transport, &login.oauth, &verifier, answer)
-                    .map_err(|e| e.to_string())?;
-            store_oauth_login(invocation, &provider, &login, tokens, emitter)
-                .map_err(|e| e.message)?;
-            Ok(AuthNext::Done(format!(
-                "Signed in to `{provider}` with OAuth."
-            )))
-        }
+        tui::AuthStep::SetProvider => auth_set_provider(answer, draft_provider, providers),
+        tui::AuthStep::SetKey => auth_set_key(invocation, draft_provider, answer),
+        tui::AuthStep::RemoveHandle => auth_remove_handle(invocation, answer),
+        tui::AuthStep::PasteCode => auth_paste_code(invocation, draft_provider, answer, emitter),
     }
+}
+
+#[cfg(feature = "tui")]
+fn auth_pick(
+    invocation: &Invocation,
+    answer: &str,
+    providers: &[String],
+) -> Result<AuthNext, String> {
+    match answer {
+        // A built-in preset is always an option, so `login` never dead-ends
+        // the way `set` does with nothing configured.
+        "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
+        "list" => {
+            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+            let human = human_credentials(&records);
+            let rendered = human
+                .get("credentials")
+                .and_then(Value::as_str)
+                .unwrap_or("No credentials catalogued.");
+            Ok(AuthNext::Done(rendered.to_owned()))
+        }
+        "set" => {
+            if providers.is_empty() {
+                return Err(
+                    "no providers are configured; configure a provider endpoint first".to_owned(),
+                );
+            }
+            Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
+        }
+        "remove" => {
+            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
+            if records.is_empty() {
+                return Err("no credentials are saved in the catalog".to_owned());
+            }
+            Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
+        }
+        other => Err(format!(
+            "`{}` is not one of login, list, set, remove",
+            tui::safe_text(other)
+        )),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn auth_login_provider(
+    invocation: &Invocation,
+    answer: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let known =
+        providers.iter().any(|p| p == answer) || arsy_kernel::oauth::presets::get(answer).is_some();
+    if !known {
+        return Err(format!(
+            "`{}` is not a configured provider or a built-in preset",
+            tui::safe_text(answer)
+        ));
+    }
+    let oauth = resolve_oauth_login(invocation, answer)
+        .map_err(|e| e.message)?
+        .oauth;
+    if arsy_kernel::oauth::uses_manual_grant(&oauth) {
+        // No loopback listener can catch this issuer's redirect, and no
+        // background poll can wait it out either: the operator has to paste
+        // a code back, and that has to arrive through this same line editor
+        // on a later turn — a blocking stdin read here would compete with
+        // it and never see a keystroke.
+        let prompt = arsy_kernel::oauth::begin_manual(&oauth).map_err(|e| e.to_string())?;
+        let opened = emitter.output == Output::Human && open_browser(&prompt.authorize_url);
+        *draft_provider = format!("{answer}\n{}", prompt.verifier);
+        let _ = writeln!(
+            io::stderr(),
+            "{}\n  {}\nThen paste the code it shows you here.",
+            if opened {
+                "Opening your browser to sign in. If it did not open, visit:"
+            } else {
+                "Open this URL to sign in:"
+            },
+            prompt.authorize_url
+        );
+        return Ok(AuthNext::Ask(tui::AuthStep::PasteCode));
+    }
+    auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
+    Ok(AuthNext::Done(format!(
+        "Signed in to `{answer}` with OAuth."
+    )))
+}
+
+#[cfg(feature = "tui")]
+fn auth_set_provider(
+    answer: &str,
+    draft_provider: &mut String,
+    providers: &[String],
+) -> Result<AuthNext, String> {
+    if !providers.iter().any(|p| p == answer) {
+        return Err(format!(
+            "`{}` is not a configured provider",
+            tui::safe_text(answer)
+        ));
+    }
+    *draft_provider = answer.to_owned();
+    Ok(AuthNext::Ask(tui::AuthStep::SetKey))
+}
+
+#[cfg(feature = "tui")]
+fn auth_set_key(
+    invocation: &Invocation,
+    draft_provider: &str,
+    answer: &str,
+) -> Result<AuthNext, String> {
+    store_credential(invocation, draft_provider, "keychain", answer).map_err(|e| e.to_string())?;
+    Ok(AuthNext::Done(format!(
+        "Stored API key for `{draft_provider}` in the credential store."
+    )))
+}
+
+#[cfg(feature = "tui")]
+fn auth_remove_handle(invocation: &Invocation, answer: &str) -> Result<AuthNext, String> {
+    let handle: SecretHandle =
+        SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
+    let store = CatalogStore::resolve(invocation);
+    let mut records = catalog(store).map_err(|e| e.message)?;
+    records.retain(|r| r.handle != handle);
+    save_catalog(store, &records).map_err(|e| e.message)?;
+    match handle.store() {
+        OS_STORE_ID => {
+            let _ = OsCredentialStore.remove(handle.name());
+        }
+        FILE_STORE_ID => {
+            let _ = FileCredentialStore.remove(handle.name());
+        }
+        _ => {}
+    }
+    Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
+}
+
+#[cfg(feature = "tui")]
+fn auth_paste_code(
+    invocation: &Invocation,
+    draft_provider: &str,
+    answer: &str,
+    emitter: &mut Emitter,
+) -> Result<AuthNext, String> {
+    let (provider, verifier) = draft_provider
+        .split_once('\n')
+        .ok_or_else(|| "the login was interrupted; run `/auth login` again".to_owned())?;
+    let login = resolve_oauth_login(invocation, provider).map_err(|e| e.message)?;
+    let transport = arsy_kernel::provider::http::HttpTransport::default();
+    let tokens = arsy_kernel::oauth::finish_manual(&transport, &login.oauth, verifier, answer)
+        .map_err(|e| e.to_string())?;
+    store_oauth_login(invocation, provider, &login, tokens, emitter).map_err(|e| e.message)?;
+    Ok(AuthNext::Done(format!(
+        "Signed in to `{provider}` with OAuth."
+    )))
 }
 /// One host serves several models, so the model step takes a list. The first is
 /// the endpoint's default; the rest are what `/model` offers beside it.
