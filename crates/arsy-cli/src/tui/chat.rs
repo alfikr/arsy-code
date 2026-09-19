@@ -10,7 +10,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rename", "rename current session; <TITLE>"),
     (
         "/session",
-        "manage sessions; list | rename <TITLE> | delete [ID]",
+        "sessions; alone opens the manager | list | rename <TITLE> | delete [ID]",
     ),
     (
         "/approval",
@@ -32,10 +32,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/mcp",
         "MCP connections; alone toggles and adopts | list | show NAME, --source claude|codex|omp",
     ),
-    ("/hooks", "inspect Claude hooks; list, --event NAME"),
+    (
+        "/hooks",
+        "lifecycle hooks; alone opens the manager | list, --event NAME",
+    ),
+    (
+        "/skill",
+        "skills; alone opens the manager | list [--source KIND]",
+    ),
     (
         "/settings",
-        "show effective configuration and where each value came from; [KEY]",
+        "settings; alone opens the editor | show effective configuration, [KEY]",
     ),
     ("/doctor", "check workspace, storage, and sandbox assurance"),
     (
@@ -605,8 +612,14 @@ impl Composer {
                 self.take();
                 Action::Redraw
             }
-            // Shift+Tab is handled by the session loop immediately. The draft
-            // stays in the composer, and no synthetic task enters history.
+            // `e` with an empty line expands the last tool call's output, the
+            // way Shift+Tab changes the mode where it stands: the composer
+            // hands the key up rather than turning it into text. Only when
+            // the line is empty, so typing a prompt that starts with `e` is
+            // still typing.
+            Key::Char('e') if !self.picking && !self.masked && self.buffer.is_empty() => {
+                Action::Expand
+            }
             Key::CycleMode if !self.picking && !self.masked => Action::CycleMode,
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,

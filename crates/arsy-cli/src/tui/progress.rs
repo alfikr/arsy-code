@@ -22,6 +22,8 @@ enum TranscriptEntry {
         output: String,
         success: bool,
         duration_ms: u64,
+        /// Whether the card shows the call's whole output rather than a tail.
+        expanded: bool,
     },
     Todos(Value),
     ModeChange {
@@ -101,7 +103,28 @@ impl Transcript {
             output: output.to_owned(),
             success,
             duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            expanded: false,
         });
+    }
+
+    /// Toggle how much of the last tool call's output is shown, and answer
+    /// whether there was one to toggle.
+    ///
+    /// Expansion is per entry rather than global, so going back to a call
+    /// leaves the later ones as they were.
+    pub fn toggle_last_tool(&mut self) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
+        else {
+            return false;
+        };
+        if let TranscriptEntry::Tool { expanded, .. } = entry {
+            *expanded = !*expanded;
+        }
+        true
     }
 
     /// Clear native scrollback and replay the semantic transcript at `width`.
@@ -128,6 +151,19 @@ impl Transcript {
     }
 }
 
+/// How many of a finished call's lines a collapsed card shows.
+///
+/// A run of a test suite says why it failed at the end, so the tail is the
+/// part a reader needs; expanding with `e` is how the rest comes back.
+const TOOL_PREVIEW_LINES: usize = 6;
+
+/// The last `keep` lines of a call's output, in order.
+fn output_tail(output: &str, keep: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.len().saturating_sub(keep);
+    lines[start..].join("\n")
+}
+
 /// One transcript entry, as the rows it occupies.
 ///
 /// Split from the repaint so that walking the transcript and drawing one of
@@ -151,13 +187,19 @@ fn write_entry(
             output,
             success,
             duration_ms,
+            expanded,
         } => {
+            let shown: std::borrow::Cow<'_, str> = if *expanded {
+                std::borrow::Cow::Borrowed(output.as_str())
+            } else {
+                std::borrow::Cow::Owned(output_tail(output, TOOL_PREVIEW_LINES))
+            };
             let card = tool_card(
                 width,
                 colour,
                 name,
                 summary,
-                output,
+                &shown,
                 *success,
                 std::time::Duration::from_millis(*duration_ms),
             );

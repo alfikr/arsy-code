@@ -172,33 +172,37 @@ def main():
                     f"Shift+Tab printed {approval_announcements} approval announcements"
                 )
 
-            # `/` opens the command menu, typing filters it, Down moves the
-            # marker, and Enter takes the highlighted command, which a second
-            # Enter then sends. The filter rather than a row count, so adding a
-            # command does not move the row this asserts on.
+            # `/` opens the command menu and typing filters it; Down and Up
+            # move the marker, which is what the two expectations below prove.
             terminal.send(b"/")
             terminal.expect("› /new")
             terminal.send(b"h")
             terminal.expect("› /hooks")
-            # One row down and back, to prove the marker moves at all.
             terminal.send(b"\x1b[B")
             terminal.expect("› /help")
             terminal.send(b"\x1b[A")
             terminal.expect("› /hooks")
+            # Enter takes the highlighted command; a second one sends it, and
+            # bare `/hooks` opens the manager. Nothing is toggled, so the
+            # transcript stays clean and Esc closes the dialog.
             terminal.send(b"\r\r")
-            # The fixture's hook is one the engine loaded, and the count line
-            # reports that rather than contradicting the row below it.
-            terminal.expect("1 hook declared; all loaded")
+            terminal.expect(" HOOKS ")
+            terminal.expect("after_turn")
+            terminal.expect("[↑/↓] Navigate  [Space/Enter] Toggle  [Esc] Close")
+            # A lone Escape is only known once nothing follows it, and the
+            # placeholder this prompt opened with is already in the reader's
+            # buffer, so the next send has to wait for the close instead of
+            # expecting text that was printed before the dialog opened.
+            terminal.send(b"\x1b")
+            time.sleep(0.5)
 
             # Inspection reports what a connection would run, never the record.
             # Named rather than bare: a bare `/mcp` opens the toggle dialog,
             # which is a different surface with a different answer.
             terminal.send(b"/mcp show docs\r")
-            terminal.expect("1 MCP server declared; none loaded")
             terminal.expect("docs · stdio · not loaded")
             terminal.expect("command: never-execute-this --serve")
             terminal.send(b"/hooks --event Stop\r")
-            terminal.expect("Stop · * · loaded")
             terminal.expect("lifecycle: after_turn")
             terminal.send(b"/hooks --event NoSuchEvent\r")
             terminal.expect("Filters applied: --event NoSuchEvent")

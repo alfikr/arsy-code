@@ -63,6 +63,7 @@ use arsy_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -2834,6 +2835,14 @@ fn read_line(
             match composer.press(key) {
                 tui::Action::Submit(line) => return Ok(Some(tui::Action::Submit(line))),
                 tui::Action::CycleMode => return Ok(Some(tui::Action::CycleMode)),
+                tui::Action::Expand => {
+                    if transcript.toggle_last_tool() {
+                        transcript
+                            .repaint(stdout, width, colour, state)
+                            .map_err(terminal_failed)?;
+                    }
+                    break;
+                }
                 tui::Action::Quit => return Ok(None),
                 tui::Action::Redraw => break,
                 tui::Action::None => {}
@@ -4489,6 +4498,8 @@ fn submitted(
 ) -> Option<String> {
     match input {
         tui::Action::Submit(line) => Some(line),
+        // `e` is answered in the read loop, before it could ever reach here.
+        tui::Action::Expand => None,
         tui::Action::CycleMode => {
             // The mode change is recorded as well as applied. It is the one
             // thing in the transcript that changes what the harness is allowed
@@ -4685,10 +4696,27 @@ fn answer_task(
     }
     if line.trim().starts_with('/') || line.trim().is_empty() {
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-        // `/mcp` alone opens the dialog, which writes the configuration; with
-        // any argument it is the read-only inspection it always was.
-        if line.trim() == "/mcp" {
-            run_mcp_dialog(invocation, stdout, typing.colour, keys, decoder)?;
+        // `/mcp`, `/hooks`, `/skill`, `/session` and `/settings` alone open
+        // their dialog, which writes the operator's configuration; with any
+        // argument each is the read-only inspection it always was.
+        let dialog = match line.trim() {
+            "/mcp" => Some(Dialog::Mcp),
+            "/hooks" => Some(Dialog::Hooks),
+            "/skill" => Some(Dialog::Skill),
+            "/session" => Some(Dialog::Session),
+            "/settings" => Some(Dialog::Settings),
+            _ => None,
+        };
+        if let Some(dialog) = dialog {
+            run_dialog(
+                dialog,
+                invocation,
+                restoring,
+                stdout,
+                typing.colour,
+                keys,
+                decoder,
+            )?;
             return Ok(TaskPass::Go);
         }
         return slash_command(line, invocation, typing, restoring, stdout, emitter);
@@ -4696,6 +4724,17 @@ fn answer_task(
     run_task(
         line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
     )
+}
+
+/// Which dialog a bare slash command opened.
+#[cfg(feature = "tui")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dialog {
+    Mcp,
+    Hooks,
+    Skill,
+    Session,
+    Settings,
 }
 
 /// Answer a slash command typed at the task prompt.
@@ -5283,6 +5322,40 @@ fn run_session_dialog(
     }
 }
 
+/// Open the dialog a bare slash command named.
+///
+/// Every one of these writes the operator's own `arsy.json`, so a bare
+/// command reaches here and a command with an argument stays the read-only
+/// inspection it always was.
+#[cfg(feature = "tui")]
+fn run_dialog(
+    dialog: Dialog,
+    invocation: &Invocation,
+    restoring: Restoring<'_>,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    match dialog {
+        Dialog::Mcp => run_mcp_dialog(invocation, stdout, colour, keys, decoder),
+        Dialog::Hooks => run_hook_dialog(invocation, stdout, colour, keys, decoder),
+        Dialog::Skill => run_skill_dialog(invocation, stdout, colour, keys, decoder),
+        Dialog::Session => run_session_dialog(
+            tui::SessionDialogState::new(
+                load_workspace_sessions(restoring.workspace),
+                restoring.state.session_id(),
+            ),
+            restoring,
+            stdout,
+            colour,
+            keys,
+            decoder,
+        ),
+        Dialog::Settings => run_settings_dialog(invocation, stdout, colour, keys, decoder),
+    }
+}
+
 /// Every MCP connection ARSY defines, then every one another tool declares
 /// under a name ARSY does not already use, with the entries they came from.
 #[cfg(feature = "tui")]
@@ -5330,6 +5403,497 @@ fn mcp_choices(
         rows.push((entry.clone(), choice));
     }
     Ok(rows)
+}
+
+/// Every lifecycle hook declared, as the dialog offers it.
+#[cfg(feature = "tui")]
+fn hook_choices(root: &Path, invocation: &Invocation) -> Result<Vec<tui::HookChoice>, Diagnostic> {
+    let report =
+        integrations::inspect(root, "hook", None, None, None, invocation.config.as_deref())?;
+    let config = load_config_for(invocation)?;
+    Ok(report["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let declaration = entry["declaration"].as_str()?.to_owned();
+            Some(tui::HookChoice {
+                declaration,
+                event: entry["event"].as_str().unwrap_or("?").to_owned(),
+                matcher: entry["matcher"].as_str().unwrap_or("*").to_owned(),
+                source: format!(
+                    "{} · {}",
+                    entry["ecosystem"].as_str().unwrap_or("?"),
+                    entry["source"].as_str().unwrap_or("?")
+                ),
+                enabled: !config
+                    .hook_disabled()
+                    .contains(entry["declaration"].as_str()?),
+            })
+        })
+        .collect())
+}
+
+#[cfg(feature = "tui")]
+fn run_hook_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = hook_choices(&root, invocation)?;
+    let mut dialog = tui::HookDialogState::new(rows);
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        let action = match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            None => continue,
+            Some(tui::HookAction::Close) => {
+                break;
+            }
+            Some(tui::HookAction::Toggle(index)) => index,
+        };
+        let choice = dialog.choices[action].clone();
+        let enabled = !choice.enabled;
+        // `hook.disabled` is an object of booleans, so a switch-off writes
+        // `true` for the declaration and a switch-on removes the key: a key
+        // that is absent is the same as one that says the hook runs.
+        let change = write_config(|config| {
+            if enabled {
+                config_edit::remove(config, &["hook", "disabled", &choice.declaration])
+                    .map(|_updated| config.to_owned())
+            } else {
+                config_edit::set(
+                    config,
+                    &["hook", "disabled"],
+                    &choice.declaration,
+                    serde_json::Value::Bool(true),
+                )
+                .map(|_updated| config.to_owned())
+            }
+        });
+        dialog.notice = Some(match change {
+            Ok(()) => {
+                let state = if enabled { "on" } else { "off" };
+                changes.push(format!("hook `{}` switched {state}.", choice.matcher));
+                format!("hook `{}` switched {state}.", choice.matcher)
+            }
+            Err(reason) => reason,
+        });
+        rows = hook_choices(&root, invocation)?;
+        dialog.reload(rows);
+    }
+    close_dialog(
+        stdout,
+        drawn,
+        &changes,
+        "hook changes take effect from the next turn.",
+    )?;
+    Ok(())
+}
+
+/// What reading one composer line ended with.
+#[cfg(feature = "tui")]
+enum EditOutcome {
+    /// A complete line, ready to be validated and written.
+    Line(String),
+    /// Interrupt, escape, or EOF from a live channel: the dialog takes back
+    /// the screen.
+    BackToDialog,
+    /// The keyboard hung up: nothing left to answer, so the session ends.
+    SessionEnded,
+}
+
+/// Read one line at the composer for an edited setting, feeding the decoder
+/// byte by byte.
+#[cfg(feature = "tui")]
+fn edit_setting_line(
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<EditOutcome, Diagnostic> {
+    let mut line = String::new();
+    loop {
+        let byte = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => byte,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if decoder.flush_escape().is_some() {
+                    return Ok(EditOutcome::BackToDialog);
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(EditOutcome::SessionEnded)
+            }
+        };
+        let Some(key) = decoder.feed(byte) else {
+            continue;
+        };
+        match key {
+            tui::Key::Interrupt | tui::Key::Eof => return Ok(EditOutcome::BackToDialog),
+            tui::Key::Enter | tui::Key::Newline => break,
+            tui::Key::Backspace => {
+                line.pop();
+                write!(stdout, "\x1b[D\x1b[K").map_err(terminal_failed)?;
+            }
+            tui::Key::Char(character) => {
+                line.push(character);
+                write!(stdout, "{character}").map_err(terminal_failed)?;
+            }
+            _ => {}
+        }
+        stdout.flush().map_err(terminal_failed)?;
+    }
+    writeln!(stdout).map_err(terminal_failed)?;
+    Ok(EditOutcome::Line(line))
+}
+
+/// Apply one edited setting's new value, printing what happened. `None` when
+/// the key is unknown to this build, `Some(reason)` when the value was
+/// rejected, `Ok` state when it was written.
+#[cfg(feature = "tui")]
+fn apply_edited_setting(row: &tui::SettingRow, line: &str) -> Result<Option<String>, String> {
+    let Some(setting) = arsy_kernel::config::setting(&row.key) else {
+        return Ok(Some(format!(
+            "`{}` is not a setting this build can write",
+            row.key
+        )));
+    };
+    if let Err(reason) = setting.kind.check(line) {
+        return Ok(Some(reason));
+    }
+    write_config(|config| {
+        let (path, leaf) = setting_path(&row.key)?;
+        config_edit::set(config, &path, leaf, setting.kind.to_json(line))
+            .map(|_updated| config.to_owned())
+    })
+    .map(|_| None)
+}
+/// One ecosystem's declared skills, as the dialog offers them.
+///
+/// Per-skill row building lives here so `skill_choices` stays a flat pass
+/// over the ecosystems; the importer, config and root are shared, not grown.
+#[cfg(feature = "tui")]
+fn ecosystem_skill_rows(
+    rows: &mut Vec<tui::SkillChoice>,
+    ecosystem: arsy_code::compat::Ecosystem,
+    config: &arsy_kernel::config::Config,
+    root: &Path,
+    importer: &arsy_code::compat::CompatibilityImporter,
+) -> Result<(), Diagnostic> {
+    let skills = importer.skill_declarations(ecosystem).map_err(|error| {
+        Diagnostic::error(
+            "ARSY-CMP-1001",
+            format!("{} skills could not be read: {error}", ecosystem.as_str()),
+            "fix the source directory; no skill was loaded",
+        )
+    })?;
+    for skill in skills {
+        let name = skill["name"].as_str().unwrap_or("?").to_owned();
+        let key = format!("{}/{name}", ecosystem.as_str());
+        rows.push(tui::SkillChoice {
+            key: key.clone(),
+            name,
+            ecosystem: ecosystem.as_str().to_owned(),
+            source: skill["source"].as_str().unwrap_or("?").to_owned(),
+            description: skill_description(root, skill["source"].as_str().unwrap_or("")),
+            disabled: config.skill_disabled().contains(&key).then_some(true),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn skill_choices(
+    root: &Path,
+    invocation: &Invocation,
+) -> Result<Vec<tui::SkillChoice>, Diagnostic> {
+    let config = load_config_for(invocation)?;
+    let importer = arsy_code::compat::CompatibilityImporter::new(root);
+    let mut rows = Vec::new();
+    for ecosystem in [
+        arsy_code::compat::Ecosystem::Claude,
+        arsy_code::compat::Ecosystem::Codex,
+        arsy_code::compat::Ecosystem::Omp,
+    ] {
+        ecosystem_skill_rows(&mut rows, ecosystem, &config, root, &importer)?;
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "tui")]
+fn run_skill_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = skill_choices(&root, invocation)?;
+    let mut dialog = tui::SkillDialogState::new(rows);
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            None => continue,
+            Some(tui::SkillAction::Close) => {
+                break;
+            }
+            Some(tui::SkillAction::Toggle(index)) => {
+                let choice = dialog.choices[index].clone();
+                let offering = choice.disabled == Some(true);
+                match write_config(|config| {
+                    config_edit::set(
+                        config,
+                        &["skill", "disabled"],
+                        &choice.key,
+                        serde_json::Value::Bool(!offering),
+                    )
+                    .map(|_updated| config.to_owned())
+                }) {
+                    Ok(()) => {
+                        let state = if offering { "offered" } else { "switched off" };
+                        changes.push(format!("skill `{}` {state}.", choice.name));
+                        dialog.notice = Some(format!("skill `{}` {state}.", choice.name));
+                    }
+                    Err(reason) => dialog.notice = Some(reason),
+                }
+                rows = skill_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Some(tui::SkillAction::Read(index)) => {
+                let choice = dialog.choices[index].clone();
+                match std::fs::read_to_string(root.join(choice.source.trim_start_matches("./"))) {
+                    Ok(body) => {
+                        close_dialog(stdout, drawn, &[], "")?;
+                        drawn = 0;
+                        writeln!(stdout, "{}", tui::skill_body(&body, &choice.name))
+                            .map_err(terminal_failed)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        dialog.notice =
+                            Some(format!("`{}` could not be read: {error}", choice.source));
+                    }
+                }
+            }
+        }
+    }
+    close_dialog(
+        stdout,
+        drawn,
+        &changes,
+        "skill changes take effect from the next turn.",
+    )?;
+    Ok(())
+}
+
+/// Collect one setting's new value at the composer, then write it.
+///
+/// The dialog has stepped aside, so this reads the line itself and answers
+/// with the dialog again rather than with a prompt state.
+#[cfg(feature = "tui")]
+fn edit_setting(
+    invocation: &Invocation,
+    row: &tui::SettingRow,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    colour: bool,
+) -> Result<(), Diagnostic> {
+    match edit_setting_line(stdout, keys, decoder)? {
+        EditOutcome::SessionEnded => Ok(()),
+        EditOutcome::BackToDialog => run_settings_dialog(invocation, stdout, colour, keys, decoder),
+        EditOutcome::Line(line) => {
+            // Written: the composer confirms the new value before the dialog
+            // takes the screen back.
+            let notice = match apply_edited_setting(row, &line) {
+                Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&line)),
+                Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
+            };
+            writeln!(stdout, "{notice}").map_err(terminal_failed)?;
+            run_settings_dialog(invocation, stdout, colour, keys, decoder)
+        }
+    }
+}
+/// Every setting the registry names, as the dialog offers it.
+#[cfg(feature = "tui")]
+fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRow>, Diagnostic> {
+    let config = load_config_for(invocation)?;
+    Ok(config
+        .settings()
+        .into_iter()
+        .map(|view| tui::SettingRow {
+            key: view.key,
+            value: view.value,
+            default: view.default,
+            description: view.description,
+            choices: view.choices,
+            set: view.set,
+        })
+        .collect())
+}
+
+#[cfg(feature = "tui")]
+fn run_settings_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let mut rows = setting_rows(invocation)?;
+    let mut dialog = tui::SettingsDialogState::new(rows);
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        let action = match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            None => continue,
+            Some(tui::SettingsAction::Close) => break,
+            Some(tui::SettingsAction::Reset(index)) => {
+                let row = dialog.rows[index].clone();
+                let removed = match setting_path(&row.key) {
+                    Ok((path, _leaf)) => write_config(|config| {
+                        config_edit::remove(config, &path).map(|_updated| config.to_owned())
+                    }),
+                    Err(reason) => Err(reason),
+                };
+                match removed {
+                    Ok(_) => {
+                        changes.push(format!("`{}` back to its default.", row.key));
+                        dialog.notice = Some(format!(
+                            "`{}` removed; it stands at its default {}.",
+                            row.key, row.default
+                        ));
+                    }
+                    Err(reason) => dialog.notice = Some(reason),
+                }
+                rows = setting_rows(invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Some(tui::SettingsAction::Edit(index)) => index,
+        };
+        // Editing asks for the value at the composer, so the dialog steps
+        // aside and the answer comes back as a line.
+        let row = dialog.rows[action].clone();
+        let prompt = tui::setting_prompt(&row);
+        close_dialog(stdout, drawn, &[], "")?;
+        write!(stdout, "{prompt}").map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+        return edit_setting(invocation, &row, stdout, keys, decoder, colour);
+    }
+    close_dialog(
+        stdout,
+        drawn,
+        &changes,
+        "settings take effect when ARSY starts again.",
+    )?;
+    Ok(())
+}
+
+/// The dotted key as the path its object sits at and the leaf that names it.
+#[cfg(feature = "tui")]
+fn setting_path(key: &str) -> Result<(Vec<&str>, &str), String> {
+    let (path, leaf) = key
+        .rsplit_once('.')
+        .ok_or_else(|| format!("`{key}` is not a dotted key this build can write"))?;
+    Ok((path.split('.').collect(), leaf))
+}
+
+/// The configuration resolved for this workspace, for a dialog that needs to
+/// know what the layers said before it writes.
+#[cfg(feature = "tui")]
+fn load_config_for(invocation: &Invocation) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    load_config(&root, &working, invocation.config.as_deref())
+}
+
+/// Erase and redraw a dialog frame, returning the rows it now occupies.
+#[cfg(feature = "tui")]
+fn repaint_dialog(
+    stdout: &mut io::Stdout,
+    _colour: bool,
+    drawn: usize,
+    frame: &str,
+) -> Result<usize, Diagnostic> {
+    let up = if drawn > 0 {
+        format!("\x1b[{drawn}A")
+    } else {
+        String::new()
+    };
+    write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    Ok(frame.lines().count())
+}
+
+/// Erase a dialog and report what it changed, or nothing when it did not.
+#[cfg(feature = "tui")]
+fn close_dialog(
+    stdout: &mut io::Stdout,
+    drawn: usize,
+    changes: &[String],
+    note: &str,
+) -> Result<(), Diagnostic> {
+    write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+    if !changes.is_empty() {
+        let mut lines = changes.to_vec();
+        lines.push(note.to_owned());
+        writeln!(stdout, "{}", tui::safe_text(&lines.join("\n"))).map_err(terminal_failed)?;
+    }
+    stdout.flush().map_err(terminal_failed)?;
+    Ok(())
+}
+
+/// Wait for the next key and let the dialog answer it. A keyboard that hung
+/// up closes the dialog rather than holding the session on it.
+#[cfg(feature = "tui")]
+fn next_dialog_action<State, Action>(
+    dialog: &mut State,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    handle: impl Fn(&mut State, tui::Key) -> Option<Action>,
+) -> Option<Action> {
+    loop {
+        // A lone Escape is only known once nothing follows it.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        };
+        if let Some(key) = key {
+            return handle(dialog, key);
+        }
+    }
 }
 
 /// Drive the `/mcp` dialog until it is closed.
@@ -6409,6 +6973,9 @@ fn provider_keys(
                 cycle_approval_mode(board.approval);
                 typed = true;
             }
+            // Mid-turn the line belongs to the operator's draft, so `e`
+            // stays text rather than expanding anything.
+            tui::Action::Expand => typed = true,
             // A line sent while the provider is busy runs as soon as this
             // turn ends, rather than being dropped or blocking.
             tui::Action::Submit(line) if !line.trim().is_empty() => {
@@ -6862,7 +7429,9 @@ fn drain_keys(
                     composer.restore(line);
                 }
             }
-            tui::Action::Submit(_) | tui::Action::Redraw => typed = Typed::Redraw,
+            tui::Action::Expand | tui::Action::Submit(_) | tui::Action::Redraw => {
+                typed = Typed::Redraw
+            }
             tui::Action::Quit => outcome.quit = true,
             tui::Action::None => {}
         }
@@ -8926,6 +9495,7 @@ fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::
             .map(PathBuf::from),
         claude: config.compat_enabled("claude"),
         codex: config.compat_enabled("codex"),
+        disabled: config.hook_disabled().clone(),
         root: root.to_path_buf(),
         trusted: config.trusts(root),
         // One means hooks run and nothing they do dispatches again.
@@ -9728,12 +10298,18 @@ fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
             .collect();
     }
     // `summary`: one line per server, in the order they first spoke, so a
-    // server that said something is never silently dropped.
+    // server that said something is never silently dropped. The map holds
+    // each server's slot so counting stays linear in the logs, not quadratic
+    // in servers × lines.
     let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut slots: HashMap<String, usize> = HashMap::new();
     for (server, _) in logs {
-        match counts.iter_mut().find(|(name, _)| *name == server) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((server, 1)),
+        if let Some(&index) = slots.get(server.as_str()) {
+            counts[index].1 += 1;
+        } else {
+            let index = counts.len();
+            counts.push((server, 1));
+            slots.insert(counts[index].0.clone(), index);
         }
     }
     counts
@@ -9782,6 +10358,7 @@ const MAX_RECALLED_MEMORY_BYTES: usize = 4 * 1024;
 /// Only loadable plugins are listed. One whose manifest now asks for more than
 /// was approved cannot run, and offering it would produce a refusal the model
 /// could do nothing about.
+
 #[cfg(feature = "wasm")]
 fn installed_extensions(root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
     let (installed, _unreadable) = arsy_code::plugin::Registry::open(root)
@@ -9803,12 +10380,6 @@ fn installed_extensions(root: &Path) -> Vec<arsy_code::agent::instructions::Exte
         .collect()
 }
 
-/// A build without the WASM host can install nothing, so it lists nothing.
-#[cfg(not(feature = "wasm"))]
-fn installed_extensions(_root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
-    Vec::new()
-}
-
 fn system_prompt(
     root: &Path,
     config: &arsy_kernel::config::Config,
@@ -9824,6 +10395,7 @@ fn system_prompt(
         family,
         &instructions,
         &installed_extensions(root),
+        &prompt_skills(root, config),
         memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
         mode,
         &arsy_kernel::secret::Redactor::new(),
@@ -9831,6 +10403,59 @@ fn system_prompt(
     )
     .ok()?;
     Some(arsy_code::agent::instructions::render(&compiled))
+}
+
+/// Every declared skill the operator has not switched off, with the
+/// description its front matter declares.
+///
+/// Off beats discovered: a skill in `skill.disabled` is still listed by
+/// `arsy skill list`, which is where an operator goes to find out what they
+/// switched off, but the model is not told about it at all.
+fn prompt_skills(
+    root: &Path,
+    config: &arsy_kernel::config::Config,
+) -> Vec<arsy_code::agent::instructions::Skill> {
+    use arsy_code::agent::instructions::Skill;
+    use arsy_code::compat::Ecosystem;
+    let importer = arsy_code::compat::CompatibilityImporter::new(root);
+    [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp]
+        .into_iter()
+        .filter_map(|ecosystem| {
+            let skills = importer.skill_declarations(ecosystem).ok()?;
+            Some(skills.into_iter().filter_map(move |skill| {
+                let name = skill["name"].as_str()?.to_owned();
+                let key = format!("{}/{}", ecosystem.as_str(), name);
+                if config.skill_disabled().contains(&key) {
+                    return None;
+                }
+                let path = skill["source"].as_str()?.to_owned();
+                Some(Skill {
+                    name,
+                    ecosystem: ecosystem.as_str().to_owned(),
+                    description: skill_description(root, &path),
+                    path,
+                })
+            }))
+        })
+        .flatten()
+        .collect()
+}
+
+/// The one line a `SKILL.md` front matter offers as its description.
+///
+/// `fs.read` can carry the whole file to the model, so a body that fails to
+/// read costs the skill its description and nothing more: the name and the
+/// path are still enough for the model to find it when it wants to.
+fn skill_description(root: &Path, relative: &str) -> Option<String> {
+    let path = root.join(relative.trim_start_matches("./"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let body = text.strip_prefix("---")?;
+    let front = body.split("---").next()?;
+    front.lines().find_map(|line| {
+        let value = line.strip_prefix("description:")?;
+        let description = value.trim().trim_matches('"').trim_matches('\'');
+        (!description.is_empty()).then(|| description.to_owned())
+    })
 }
 
 /// The operator's own Claude Code and Codex instructions, then the
@@ -10226,6 +10851,7 @@ mod tests {
         hooks.register(
             arsy_code::hook::HookRule {
                 id: "deny".to_owned(),
+                declaration: "test#PreToolUse[0].0".to_owned(),
                 event: arsy_code::hook::LifecycleEvent::BeforeOperation,
                 matcher: "*".to_owned(),
                 effect: arsy_code::hook::EffectClass::Gate,
@@ -11374,6 +12000,7 @@ mod tests {
                     | "/approval"
                     | "/plan"
                     | "/todo"
+                    | "/skill"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }

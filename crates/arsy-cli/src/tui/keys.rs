@@ -143,6 +143,8 @@ pub enum Action {
     Submit(String),
     /// Change approval mode without submitting or queueing the draft.
     CycleMode,
+    /// Show or hide the last tool call's whole output.
+    Expand,
     Quit,
     Redraw,
     None,
