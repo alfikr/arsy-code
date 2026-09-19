@@ -935,7 +935,12 @@ pub mod presets {
             label: "Claude Pro/Max — sign in with a Claude.ai account",
             dialect: Dialect::Anthropic,
             base_url: "https://api.anthropic.com",
-            models: &["claude-sonnet-4-6", "claude-opus-4-6"],
+            models: &[
+                "claude-sonnet-5",
+                "claude-opus-5",
+                "claude-fable-5-1",
+                "claude-haiku-4-5",
+            ],
             build_oauth: || OAuth {
                 authorize_url: "https://claude.ai/oauth/authorize".to_owned(),
                 token_url: "https://console.anthropic.com/v1/oauth/token".to_owned(),
