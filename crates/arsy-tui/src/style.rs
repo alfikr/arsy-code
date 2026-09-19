@@ -111,7 +111,42 @@ impl Role {
         })
     }
 
+    /// The key a card role has: `tool_<category>_<slot>`.
+    ///
+    /// The four slots are separate tables because a card's accent, body tint,
+    /// header tint, and border are four different surfaces, and each is named
+    /// the same way for every category.
     const fn tool_key(self) -> Option<&'static str> {
+        match self {
+            Self::ToolBashAccent
+            | Self::ToolFileAccent
+            | Self::ToolSearchAccent
+            | Self::ToolMcpAccent
+            | Self::ToolNetworkAccent
+            | Self::ToolGenericAccent => Self::tool_accent_key(self),
+            Self::ToolBashBg
+            | Self::ToolFileBg
+            | Self::ToolSearchBg
+            | Self::ToolMcpBg
+            | Self::ToolNetworkBg
+            | Self::ToolGenericBg => Self::tool_body_key(self),
+            Self::ToolBashHeadBg
+            | Self::ToolFileHeadBg
+            | Self::ToolSearchHeadBg
+            | Self::ToolMcpHeadBg
+            | Self::ToolNetworkHeadBg
+            | Self::ToolGenericHeadBg => Self::tool_head_key(self),
+            Self::ToolBashBorder
+            | Self::ToolFileBorder
+            | Self::ToolSearchBorder
+            | Self::ToolMcpBorder
+            | Self::ToolNetworkBorder
+            | Self::ToolGenericBorder => Self::tool_border_key(self),
+            _ => None,
+        }
+    }
+
+    const fn tool_accent_key(self) -> Option<&'static str> {
         Some(match self {
             Self::ToolBashAccent => "tool_bash_accent",
             Self::ToolFileAccent => "tool_file_accent",
@@ -119,18 +154,36 @@ impl Role {
             Self::ToolMcpAccent => "tool_mcp_accent",
             Self::ToolNetworkAccent => "tool_network_accent",
             Self::ToolGenericAccent => "tool_generic_accent",
+            _ => return None,
+        })
+    }
+
+    const fn tool_body_key(self) -> Option<&'static str> {
+        Some(match self {
             Self::ToolBashBg => "tool_bash_bg",
             Self::ToolFileBg => "tool_file_bg",
             Self::ToolSearchBg => "tool_search_bg",
             Self::ToolMcpBg => "tool_mcp_bg",
             Self::ToolNetworkBg => "tool_network_bg",
             Self::ToolGenericBg => "tool_generic_bg",
+            _ => return None,
+        })
+    }
+
+    const fn tool_head_key(self) -> Option<&'static str> {
+        Some(match self {
             Self::ToolBashHeadBg => "tool_bash_head_bg",
             Self::ToolFileHeadBg => "tool_file_head_bg",
             Self::ToolSearchHeadBg => "tool_search_head_bg",
             Self::ToolMcpHeadBg => "tool_mcp_head_bg",
             Self::ToolNetworkHeadBg => "tool_network_head_bg",
             Self::ToolGenericHeadBg => "tool_generic_head_bg",
+            _ => return None,
+        })
+    }
+
+    const fn tool_border_key(self) -> Option<&'static str> {
+        Some(match self {
             Self::ToolBashBorder => "tool_bash_border",
             Self::ToolFileBorder => "tool_file_border",
             Self::ToolSearchBorder => "tool_search_border",
@@ -163,32 +216,63 @@ impl Role {
         })
     }
 
+    /// The role a card key names. A card key is `tool_<category>_<slot>`, so
+    /// the key itself says which slot of which category is meant.
     fn tool_from_key(key: &str) -> Option<Self> {
-        Some(match key {
-            "tool_bash_accent" => Self::ToolBashAccent,
-            "tool_file_accent" => Self::ToolFileAccent,
-            "tool_search_accent" => Self::ToolSearchAccent,
-            "tool_mcp_accent" => Self::ToolMcpAccent,
-            "tool_network_accent" => Self::ToolNetworkAccent,
-            "tool_generic_accent" => Self::ToolGenericAccent,
-            "tool_bash_bg" => Self::ToolBashBg,
-            "tool_file_bg" => Self::ToolFileBg,
-            "tool_search_bg" => Self::ToolSearchBg,
-            "tool_mcp_bg" => Self::ToolMcpBg,
-            "tool_network_bg" => Self::ToolNetworkBg,
-            "tool_generic_bg" => Self::ToolGenericBg,
-            "tool_bash_head_bg" => Self::ToolBashHeadBg,
-            "tool_file_head_bg" => Self::ToolFileHeadBg,
-            "tool_search_head_bg" => Self::ToolSearchHeadBg,
-            "tool_mcp_head_bg" => Self::ToolMcpHeadBg,
-            "tool_network_head_bg" => Self::ToolNetworkHeadBg,
-            "tool_generic_head_bg" => Self::ToolGenericHeadBg,
-            "tool_bash_border" => Self::ToolBashBorder,
-            "tool_file_border" => Self::ToolFileBorder,
-            "tool_search_border" => Self::ToolSearchBorder,
-            "tool_mcp_border" => Self::ToolMcpBorder,
-            "tool_network_border" => Self::ToolNetworkBorder,
-            "tool_generic_border" => Self::ToolGenericBorder,
+        let (category, slot) = key.strip_prefix("tool_")?.split_once('_')?;
+        match slot {
+            "accent" => Self::tool_accent_from_key(category),
+            "bg" => Self::tool_body_from_key(category),
+            "head_bg" => Self::tool_head_from_key(category),
+            "border" => Self::tool_border_from_key(category),
+            _ => None,
+        }
+    }
+
+    fn tool_accent_from_key(category: &str) -> Option<Self> {
+        Some(match category {
+            "bash" => Self::ToolBashAccent,
+            "file" => Self::ToolFileAccent,
+            "search" => Self::ToolSearchAccent,
+            "mcp" => Self::ToolMcpAccent,
+            "network" => Self::ToolNetworkAccent,
+            "generic" => Self::ToolGenericAccent,
+            _ => return None,
+        })
+    }
+
+    fn tool_body_from_key(category: &str) -> Option<Self> {
+        Some(match category {
+            "bash" => Self::ToolBashBg,
+            "file" => Self::ToolFileBg,
+            "search" => Self::ToolSearchBg,
+            "mcp" => Self::ToolMcpBg,
+            "network" => Self::ToolNetworkBg,
+            "generic" => Self::ToolGenericBg,
+            _ => return None,
+        })
+    }
+
+    fn tool_head_from_key(category: &str) -> Option<Self> {
+        Some(match category {
+            "bash" => Self::ToolBashHeadBg,
+            "file" => Self::ToolFileHeadBg,
+            "search" => Self::ToolSearchHeadBg,
+            "mcp" => Self::ToolMcpHeadBg,
+            "network" => Self::ToolNetworkHeadBg,
+            "generic" => Self::ToolGenericHeadBg,
+            _ => return None,
+        })
+    }
+
+    fn tool_border_from_key(category: &str) -> Option<Self> {
+        Some(match category {
+            "bash" => Self::ToolBashBorder,
+            "file" => Self::ToolFileBorder,
+            "search" => Self::ToolSearchBorder,
+            "mcp" => Self::ToolMcpBorder,
+            "network" => Self::ToolNetworkBorder,
+            "generic" => Self::ToolGenericBorder,
             _ => return None,
         })
     }

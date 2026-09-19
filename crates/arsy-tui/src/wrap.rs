@@ -9,6 +9,7 @@
 //! answer wraps where it looks like it should.
 
 use crate::line::{Line, Span};
+use crate::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 /// Break `line` into rows no wider than `width` columns.
@@ -24,59 +25,96 @@ pub fn wrap(line: &Line, width: usize) -> Vec<Line> {
         return vec![line.clone()];
     }
 
-    let mut rows: Vec<Line> = Vec::new();
-    let mut row = Line::new();
-    let mut used = 0;
-
+    let mut wrapped = Wrapping::new(width);
     for span in &line.spans {
-        for word in split_keeping_spaces(span.text()) {
-            let word_width = UnicodeWidthStr::width(word);
+        wrapped.place(span);
+    }
+    wrapped.finish()
+}
 
-            // A space that falls exactly at the edge is dropped rather than
-            // carried to the next row, where it would indent it by one.
-            if word.trim().is_empty() && used + word_width > width {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
-                continue;
-            }
+/// The rows a wrap has produced, and the one still being filled.
+///
+/// The row in progress is state rather than a local because a break happens in
+/// the middle of a span's words rather than at the edge of one: a word too wide
+/// for the whole row is cut into pieces, and each piece has to be placed with
+/// whatever the previous piece left behind.
+struct Wrapping {
+    width: usize,
+    rows: Vec<Line>,
+    row: Line,
+    used: usize,
+}
 
-            if used + word_width <= width {
-                row = row.push_span(Span::new(word, span.style));
-                used += word_width;
-                continue;
-            }
-
-            // Does not fit here. Start a new row unless this row is empty, in
-            // which case the word is wider than the width and has to be split.
-            if used > 0 && word_width <= width {
-                rows.push(std::mem::take(&mut row));
-                used = 0;
-                if word.trim().is_empty() {
-                    continue;
-                }
-                row = row.push_span(Span::new(word, span.style));
-                used = word_width;
-                continue;
-            }
-
-            for chunk in split_to_width(word, width, used) {
-                if used + UnicodeWidthStr::width(chunk.as_str()) > width {
-                    rows.push(std::mem::take(&mut row));
-                    used = 0;
-                }
-                used += UnicodeWidthStr::width(chunk.as_str());
-                row = row.push_span(Span::new(chunk, span.style));
-            }
+impl Wrapping {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            rows: Vec::new(),
+            row: Line::new(),
+            used: 0,
         }
     }
-    rows.push(row);
 
-    // A line of only spaces wraps to nothing visible; give back one blank row
-    // rather than an empty vector, so a caller counting rows is not surprised.
-    if rows.is_empty() {
-        rows.push(Line::blank());
+    /// The rows built, with the row still being filled last.
+    fn finish(mut self) -> Vec<Line> {
+        self.rows.push(self.row);
+        self.rows
     }
-    rows
+
+    /// Break the row here: it is finished, and the next word starts a new one.
+    fn break_row(&mut self) {
+        self.rows.push(std::mem::take(&mut self.row));
+        self.used = 0;
+    }
+
+    /// Put one span's words on the rows, breaking where they do not fit.
+    fn place(&mut self, span: &Span) {
+        for word in split_keeping_spaces(span.text()) {
+            self.place_word(word, span.style);
+        }
+    }
+
+    /// Put one word on the row being filled, breaking and cutting as needed.
+    fn place_word(&mut self, word: &str, style: Style) {
+        let word_width = UnicodeWidthStr::width(word);
+
+        // A space that falls exactly at the edge is dropped rather than
+        // carried to the next row, where it would indent it by one.
+        if word.trim().is_empty() && self.used + word_width > self.width {
+            self.break_row();
+            return;
+        }
+
+        if self.used + word_width <= self.width {
+            self.push(word, style, word_width);
+            return;
+        }
+
+        // Does not fit here. Start a new row unless this row is empty, in
+        // which case the word is wider than the width and has to be split.
+        if self.used > 0 && word_width <= self.width {
+            self.break_row();
+            if word.trim().is_empty() {
+                return;
+            }
+            self.push(word, style, word_width);
+            return;
+        }
+
+        for chunk in split_to_width(word, self.width, self.used) {
+            let chunk_width = UnicodeWidthStr::width(chunk.as_str());
+            if self.used + chunk_width > self.width {
+                self.break_row();
+            }
+            self.push(&chunk, style, chunk_width);
+        }
+    }
+
+    /// Add one piece of a span to the row being filled.
+    fn push(&mut self, text: &str, style: Style, columns: usize) {
+        self.row = std::mem::take(&mut self.row).push_span(Span::new(text, style));
+        self.used += columns;
+    }
 }
 
 /// Words and the runs of spaces between them, in order, so a break can happen

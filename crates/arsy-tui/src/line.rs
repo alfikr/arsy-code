@@ -11,6 +11,8 @@
 //! reach the terminal and move the cursor out from under the renderer.
 
 use crate::style::{Role, Style};
+use std::iter::Peekable;
+use std::slice::Iter;
 use unicode_width::UnicodeWidthStr;
 
 /// Reset, after any styled run.
@@ -147,16 +149,8 @@ impl Line {
             if used >= width {
                 break;
             }
-            let mut kept = String::new();
-            for character in span.text.chars() {
-                let step = UnicodeWidthStr::width(character.to_string().as_str());
-                if used + step > width {
-                    used = width;
-                    break;
-                }
-                kept.push(character);
-                used += step;
-            }
+            let (kept, taken) = prefix_fitting(&span.text, width, used);
+            used = taken;
             out = out.push(kept, span.style);
         }
         out
@@ -197,10 +191,7 @@ impl Line {
         let mut out = String::with_capacity(self.width() + 16);
         let mut spans = self.spans.iter().peekable();
         while let Some(span) = spans.next() {
-            let mut run = span.text.clone();
-            while spans.peek().is_some_and(|next| next.style == span.style) {
-                run.push_str(&spans.next().expect("peeked").text);
-            }
+            let run = same_style_run(span, &mut spans);
             if span.style.is_plain() {
                 out.push_str(&run);
                 continue;
@@ -228,6 +219,40 @@ impl From<Span> for Line {
     fn from(span: Span) -> Self {
         Self::new().push_span(span)
     }
+}
+
+/// The longest prefix of `text` that fits in the columns `used` leaves, and how
+/// many columns the row has taken once that prefix is on it.
+///
+/// A glyph that straddles the edge is dropped rather than half-printed, so a
+/// prefix that stops short still reports the full width: the caller is cutting
+/// a row to fit, and a row that came up one column short is a row that leaves a
+/// gap where the next span should have started.
+fn prefix_fitting(text: &str, width: usize, used: usize) -> (String, usize) {
+    let mut kept = String::new();
+    let mut taken = used;
+    for character in text.chars() {
+        let step = UnicodeWidthStr::width(character.to_string().as_str());
+        if taken + step > width {
+            return (kept, width);
+        }
+        kept.push(character);
+        taken += step;
+    }
+    (kept, taken)
+}
+
+/// `span`'s text followed by every span after it that shares its style, taken
+/// off `rest`.
+///
+/// The spans of one run are written as one escape pair, so where a row was cut
+/// into pieces is not something the terminal can tell.
+fn same_style_run<'a>(span: &Span, rest: &mut Peekable<Iter<'a, Span>>) -> String {
+    let mut run = span.text.clone();
+    while rest.peek().is_some_and(|next| next.style == span.style) {
+        run.push_str(&rest.next().expect("peeked").text);
+    }
+    run
 }
 
 #[cfg(test)]

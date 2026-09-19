@@ -283,6 +283,37 @@ impl Palette {
     }
 
     fn tool_code(&self, role: Role) -> Option<&str> {
+        match role {
+            Role::ToolBashAccent
+            | Role::ToolFileAccent
+            | Role::ToolSearchAccent
+            | Role::ToolMcpAccent
+            | Role::ToolNetworkAccent
+            | Role::ToolGenericAccent => self.tool_accent_code(role),
+            Role::ToolBashBg
+            | Role::ToolFileBg
+            | Role::ToolSearchBg
+            | Role::ToolMcpBg
+            | Role::ToolNetworkBg
+            | Role::ToolGenericBg => self.tool_body_code(role),
+            Role::ToolBashHeadBg
+            | Role::ToolFileHeadBg
+            | Role::ToolSearchHeadBg
+            | Role::ToolMcpHeadBg
+            | Role::ToolNetworkHeadBg
+            | Role::ToolGenericHeadBg => self.tool_head_code(role),
+            Role::ToolBashBorder
+            | Role::ToolFileBorder
+            | Role::ToolSearchBorder
+            | Role::ToolMcpBorder
+            | Role::ToolNetworkBorder
+            | Role::ToolGenericBorder => self.tool_border_code(role),
+            _ => None,
+        }
+    }
+
+    /// The accent a card of the role's category is titled in.
+    fn tool_accent_code(&self, role: Role) -> Option<&str> {
         Some(match role {
             Role::ToolBashAccent => &self.tool_bash_accent,
             Role::ToolFileAccent => &self.tool_file_accent,
@@ -290,18 +321,39 @@ impl Palette {
             Role::ToolMcpAccent => &self.tool_mcp_accent,
             Role::ToolNetworkAccent => &self.tool_network_accent,
             Role::ToolGenericAccent => &self.tool_generic_accent,
+            _ => return None,
+        })
+    }
+
+    /// The body tint of a card of the role's category.
+    fn tool_body_code(&self, role: Role) -> Option<&str> {
+        Some(match role {
             Role::ToolBashBg => &self.tool_bash_bg,
             Role::ToolFileBg => &self.tool_file_bg,
             Role::ToolSearchBg => &self.tool_search_bg,
             Role::ToolMcpBg => &self.tool_mcp_bg,
             Role::ToolNetworkBg => &self.tool_network_bg,
             Role::ToolGenericBg => &self.tool_generic_bg,
+            _ => return None,
+        })
+    }
+
+    /// The header tint of a card of the role's category.
+    fn tool_head_code(&self, role: Role) -> Option<&str> {
+        Some(match role {
             Role::ToolBashHeadBg => &self.tool_bash_head_bg,
             Role::ToolFileHeadBg => &self.tool_file_head_bg,
             Role::ToolSearchHeadBg => &self.tool_search_head_bg,
             Role::ToolMcpHeadBg => &self.tool_mcp_head_bg,
             Role::ToolNetworkHeadBg => &self.tool_network_head_bg,
             Role::ToolGenericHeadBg => &self.tool_generic_head_bg,
+            _ => return None,
+        })
+    }
+
+    /// The border of a card of the role's category.
+    fn tool_border_code(&self, role: Role) -> Option<&str> {
+        Some(match role {
             Role::ToolBashBorder => &self.tool_bash_border,
             Role::ToolFileBorder => &self.tool_file_border,
             Role::ToolSearchBorder => &self.tool_search_border,
@@ -337,32 +389,63 @@ impl Palette {
         })
     }
 
+    /// The field a `[theme]` key names. A card key is `tool_<category>_<slot>`,
+    /// so the key itself says which slot of which category is meant.
     fn tool_slot(&mut self, role: &str) -> Option<&mut String> {
-        Some(match role {
-            "tool_bash_accent" => &mut self.tool_bash_accent,
-            "tool_file_accent" => &mut self.tool_file_accent,
-            "tool_search_accent" => &mut self.tool_search_accent,
-            "tool_mcp_accent" => &mut self.tool_mcp_accent,
-            "tool_network_accent" => &mut self.tool_network_accent,
-            "tool_generic_accent" => &mut self.tool_generic_accent,
-            "tool_bash_bg" => &mut self.tool_bash_bg,
-            "tool_file_bg" => &mut self.tool_file_bg,
-            "tool_search_bg" => &mut self.tool_search_bg,
-            "tool_mcp_bg" => &mut self.tool_mcp_bg,
-            "tool_network_bg" => &mut self.tool_network_bg,
-            "tool_generic_bg" => &mut self.tool_generic_bg,
-            "tool_bash_head_bg" => &mut self.tool_bash_head_bg,
-            "tool_file_head_bg" => &mut self.tool_file_head_bg,
-            "tool_search_head_bg" => &mut self.tool_search_head_bg,
-            "tool_mcp_head_bg" => &mut self.tool_mcp_head_bg,
-            "tool_network_head_bg" => &mut self.tool_network_head_bg,
-            "tool_generic_head_bg" => &mut self.tool_generic_head_bg,
-            "tool_bash_border" => &mut self.tool_bash_border,
-            "tool_file_border" => &mut self.tool_file_border,
-            "tool_search_border" => &mut self.tool_search_border,
-            "tool_mcp_border" => &mut self.tool_mcp_border,
-            "tool_network_border" => &mut self.tool_network_border,
-            "tool_generic_border" => &mut self.tool_generic_border,
+        let (category, slot) = role.strip_prefix("tool_")?.split_once('_')?;
+        match slot {
+            "accent" => self.tool_accent_slot(category),
+            "bg" => self.tool_body_slot(category),
+            "head_bg" => self.tool_head_slot(category),
+            "border" => self.tool_border_slot(category),
+            _ => None,
+        }
+    }
+
+    fn tool_accent_slot(&mut self, category: &str) -> Option<&mut String> {
+        Some(match category {
+            "bash" => &mut self.tool_bash_accent,
+            "file" => &mut self.tool_file_accent,
+            "search" => &mut self.tool_search_accent,
+            "mcp" => &mut self.tool_mcp_accent,
+            "network" => &mut self.tool_network_accent,
+            "generic" => &mut self.tool_generic_accent,
+            _ => return None,
+        })
+    }
+
+    fn tool_body_slot(&mut self, category: &str) -> Option<&mut String> {
+        Some(match category {
+            "bash" => &mut self.tool_bash_bg,
+            "file" => &mut self.tool_file_bg,
+            "search" => &mut self.tool_search_bg,
+            "mcp" => &mut self.tool_mcp_bg,
+            "network" => &mut self.tool_network_bg,
+            "generic" => &mut self.tool_generic_bg,
+            _ => return None,
+        })
+    }
+
+    fn tool_head_slot(&mut self, category: &str) -> Option<&mut String> {
+        Some(match category {
+            "bash" => &mut self.tool_bash_head_bg,
+            "file" => &mut self.tool_file_head_bg,
+            "search" => &mut self.tool_search_head_bg,
+            "mcp" => &mut self.tool_mcp_head_bg,
+            "network" => &mut self.tool_network_head_bg,
+            "generic" => &mut self.tool_generic_head_bg,
+            _ => return None,
+        })
+    }
+
+    fn tool_border_slot(&mut self, category: &str) -> Option<&mut String> {
+        Some(match category {
+            "bash" => &mut self.tool_bash_border,
+            "file" => &mut self.tool_file_border,
+            "search" => &mut self.tool_search_border,
+            "mcp" => &mut self.tool_mcp_border,
+            "network" => &mut self.tool_network_border,
+            "generic" => &mut self.tool_generic_border,
             _ => return None,
         })
     }
@@ -529,6 +612,17 @@ pub fn builtin_palette(name: &str) -> Option<Palette> {
 mod tests {
     use super::*;
 
+    /// Every key a theme names maps to a role that has a code on `palette`.
+    fn assert_every_role_has_a_code(name: &str, palette: &Palette) {
+        for key in THEME_ROLES {
+            let role = Role::from_key(key).unwrap_or_else(|| panic!("{key} is not a role"));
+            let code = palette
+                .code(role)
+                .unwrap_or_else(|| panic!("{key} has no code"));
+            assert!(code.starts_with("\x1b["), "{name}.{key} is not an escape");
+        }
+    }
+
     /// Every name the picker offers has a palette, and every role has a code
     /// except `Plain`, which is the terminal's own foreground.
     #[test]
@@ -536,13 +630,7 @@ mod tests {
         for (name, description) in THEMES {
             let palette = builtin_palette(name).unwrap_or_else(|| panic!("{name} has no palette"));
             assert!(!description.is_empty(), "{name} has no description");
-            for key in THEME_ROLES {
-                let role = Role::from_key(key).unwrap_or_else(|| panic!("{key} is not a role"));
-                let code = palette
-                    .code(role)
-                    .unwrap_or_else(|| panic!("{key} has no code"));
-                assert!(code.starts_with("\x1b["), "{name}.{key} is not an escape");
-            }
+            assert_every_role_has_a_code(name, &palette);
         }
         assert!(builtin_palette("chartreuse").is_none());
         assert!(builtin_palette(DEFAULT_THEME).is_some());
@@ -550,6 +638,17 @@ mod tests {
             .expect("dark")
             .code(Role::Plain)
             .is_none());
+    }
+
+    /// Every tint in `tints` is a `48;` background on `palette`.
+    fn assert_tints_are_backgrounds(name: &str, palette: &Palette, tints: &[Role]) {
+        for tint in tints {
+            let code = palette.code(*tint).expect("a tint has a colour");
+            assert!(
+                code.starts_with("\x1b[48;"),
+                "{name}.{tint:?} is not a background"
+            );
+        }
     }
 
     /// Every card tint is a real background, and an operator who recolours one
@@ -573,13 +672,7 @@ mod tests {
         ];
         for (name, _) in THEMES {
             let palette = builtin_palette(name).expect("a built-in theme");
-            for tint in tints {
-                let code = palette.code(tint).expect("a tint has a colour");
-                assert!(
-                    code.starts_with("\x1b[48;"),
-                    "{name}.{tint:?} is not a background"
-                );
-            }
+            assert_tints_are_backgrounds(name, &palette, &tints);
         }
 
         // A neutral theme takes the composer's surface rather than six hues.

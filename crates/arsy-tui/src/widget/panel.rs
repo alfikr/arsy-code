@@ -157,15 +157,37 @@ mod tests {
         )
     }
 
+    /// A drawn row carries no box-drawing glyph: the panel is a block of
+    /// colour, and a frame drawn with characters is what it replaced.
+    fn assert_no_box_drawing(row: &Line) {
+        let text = row.text();
+        for glyph in ['╭', '╮', '╰', '╯', '│', '─'] {
+            assert!(!text.contains(glyph), "{glyph} found in {text:?}");
+        }
+    }
+
     /// The thing the whole redesign is about: a panel is colour, not lines.
     #[test]
     fn a_panel_contains_no_box_drawing_at_all() {
         let body = [Line::of("p99 30.0s · timeout ceiling reached", Role::Dim)];
         for row in drawn(72, &body) {
-            let text = row.text();
-            for glyph in ['╭', '╮', '╰', '╯', '│', '─'] {
-                assert!(!text.contains(glyph), "{glyph} found in {text:?}");
-            }
+            assert_no_box_drawing(&row);
+        }
+    }
+
+    /// Every row of a panel `width` wide reaches its right edge and is tinted
+    /// the whole way, which is what makes it read as a block of colour rather
+    /// than as a highlight behind some words.
+    fn assert_rows_fill_the_tint(width: usize, body: &[Line]) {
+        for row in drawn(width, body) {
+            assert_eq!(row.width(), width, "{:?} at width {width}", row.text());
+            let tinted: usize = row
+                .spans
+                .iter()
+                .filter(|span| span.style.bg.is_some())
+                .map(crate::Span::width)
+                .sum();
+            assert_eq!(tinted, width, "not tinted edge to edge: {:?}", row.text());
         }
     }
 
@@ -182,16 +204,7 @@ mod tests {
             ),
         ];
         for width in [MIN_WIDTH, 40, 72, 120] {
-            for row in drawn(width, &body) {
-                assert_eq!(row.width(), width, "{:?} at width {width}", row.text());
-                let tinted: usize = row
-                    .spans
-                    .iter()
-                    .filter(|span| span.style.bg.is_some())
-                    .map(crate::Span::width)
-                    .sum();
-                assert_eq!(tinted, width, "not tinted edge to edge: {:?}", row.text());
-            }
+            assert_rows_fill_the_tint(width, &body);
         }
     }
 
