@@ -89,6 +89,15 @@ const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox",
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
 
+/// Names a `[theme] base` may take. The palettes themselves are the CLI's —
+/// they are display, and the kernel has no screen — so the two lists are held
+/// together by a test there rather than by one depending on the other.
+pub const THEME_BASES: &[&str] = &[
+    "dark", "ocean", "sunset", "vivid", "dracula", "nord", "mono",
+];
+/// The theme in force when no layer names one.
+pub const DEFAULT_THEME_BASE: &str = "dark";
+
 /// The value shape of one editable setting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingKind {
@@ -217,6 +226,12 @@ pub const SETTINGS: &[Setting] = &[
         kind: SettingKind::Bool,
         default: "true",
         description: "read OMP's files as a lower layer",
+    },
+    Setting {
+        key: "theme.base",
+        kind: SettingKind::Choice(THEME_BASES),
+        default: DEFAULT_THEME_BASE,
+        description: "the palette an interactive transcript is drawn in",
     },
 ];
 
@@ -978,8 +993,8 @@ impl Config {
         match key {
             "credentials.store" => self.credential_store().to_owned(),
             "ui.style" => self.ui_style().to_owned(),
-            "ui.mcp_log" => self.mcp_log().to_owned(),
             "execution.max_parallel" => self.max_parallel_tools().to_string(),
+            "theme.base" => self.theme_base().to_owned(),
             _ => match key
                 .strip_prefix("compat.")
                 .and_then(|rest| rest.strip_suffix(".enabled"))
@@ -1233,14 +1248,19 @@ impl Config {
         self.model_default.as_deref()
     }
 
-    /// How many independent tool calls one round may run at once.
-    pub fn max_parallel_tools(&self) -> usize {
-        self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
-    }
-
     /// The `[theme]` table, empty when the file did not set one.
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    /// `theme.base`: the palette an interactive transcript is drawn in.
+    pub fn theme_base(&self) -> &str {
+        self.theme.base.as_deref().unwrap_or(DEFAULT_THEME_BASE)
+    }
+
+    /// How many independent tool calls one round may run at once.
+    pub fn max_parallel_tools(&self) -> usize {
+        self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {

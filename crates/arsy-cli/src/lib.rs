@@ -2795,20 +2795,27 @@ fn read_line(
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
     let mut width = tui::terminal_width();
-    composer.set_height(tui::terminal_rows());
+    let mut composer_height = tui::terminal_rows();
+    composer.set_height(composer_height);
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
             let next_width = tui::terminal_width();
-            if next_width != width {
+            let next_rows = tui::terminal_rows();
+            // Rows count too: a taller terminal shows more of the command
+            // menu, and a wider one reflows the transcript. Measuring both is
+            // what makes a terminal dragged between sizes settle rather than
+            // keep the shape it was opened with.
+            if next_width != width || next_rows != composer_height {
                 transcript
                     .repaint(stdout, next_width, colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
             }
             width = next_width;
-            composer.set_height(tui::terminal_rows());
+            composer_height = next_rows;
+            composer.set_height(next_rows);
             measured = std::time::Instant::now();
         }
         if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
@@ -5275,21 +5282,23 @@ fn run_session_dialog(
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
 ) -> Result<(), Diagnostic> {
-    let width = tui::terminal_width();
-    writeln!(stdout, "{}{}", modern_gap(), dialog.render(width, colour))
-        .map_err(terminal_failed)?;
-    stdout.flush().map_err(terminal_failed)?;
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
     loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
         // A keyboard that hung up leaves the dialog, rather than holding the
-        // session on a list nothing can answer.
-        let Ok(byte) = keys.recv() else {
-            return Ok(());
-        };
-        let Some(action) = decoder.feed(byte).and_then(|key| dialog.handle_key(key)) else {
-            write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
-                .map_err(terminal_failed)?;
-            stdout.flush().map_err(terminal_failed)?;
-            continue;
+        // session on a list nothing can answer. A lone Escape reaches here as
+        // an interrupt only because the key loop flushes it once nothing
+        // follows.
+        let Some(action) = next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) else {
+            break;
         };
         let borrowed = Restoring {
             workspace: restoring.workspace,
@@ -5302,24 +5311,44 @@ fn run_session_dialog(
         };
         match action {
             tui::SessionAction::Resume(id) => {
+                close_dialog(stdout, drawn, &[], "")?;
                 let loaded = resume_into(id, borrowed);
                 writeln!(stdout, "Resumed session {id} ({loaded} message(s) loaded).")
                     .map_err(terminal_failed)?;
+                return Ok(());
             }
             tui::SessionAction::Rename(id, title) => {
-                if let Ok(store) = open_store(borrowed.workspace) {
-                    let _ = store.set_session_title(id, &title);
+                // A write that failed is reported as failed, not as a rename:
+                // an operator who cannot see the difference cannot trust
+                // either answer.
+                match open_store(borrowed.workspace)
+                    .and_then(|store| store.set_session_title(id, &title).map_err(storage_failed))
+                {
+                    Ok(()) => changes.push(format!("Renamed session {id} to \"{title}\".")),
+                    Err(error) => {
+                        changes.push(format!("`{title}` was not written: {}", error.message))
+                    }
                 }
-                writeln!(stdout, "Renamed session {id} to \"{title}\".")
-                    .map_err(terminal_failed)?;
             }
             tui::SessionAction::Delete(id) => {
+                close_dialog(stdout, drawn, &[], "")?;
+                drawn = 0;
                 delete_session(Some(&id.to_string()), borrowed, stdout)?;
             }
-            tui::SessionAction::Cancel => {}
+            tui::SessionAction::Cancel => {
+                close_dialog(stdout, drawn, &changes, "")?;
+                return Ok(());
+            }
         }
-        return Ok(());
+        // The list has changed under the marker: back to it, on the row the
+        // action left standing.
+        dialog.mode = tui::SessionDialogMode::Select;
+        dialog.rename_buffer.clear();
+        dialog.sessions = load_workspace_sessions(restoring.workspace);
+        dialog.selected = 0;
     }
+    close_dialog(stdout, drawn, &changes, "")?;
+    Ok(())
 }
 
 /// Open the dialog a bare slash command named.
@@ -5591,6 +5620,12 @@ fn ecosystem_skill_rows(
     root: &Path,
     importer: &arsy_code::compat::CompatibilityImporter,
 ) -> Result<(), Diagnostic> {
+    // A source the operator switched off is not offered here either: its
+    // skills reach neither the model nor the dialog, and a switch that showed
+    // rows the prompt ignores would be lying about what it controls.
+    if !config.compat_enabled(ecosystem.as_str()) {
+        return Ok(());
+    }
     let skills = importer.skill_declarations(ecosystem).map_err(|error| {
         Diagnostic::error(
             "ARSY-CMP-1001",
@@ -10297,8 +10332,9 @@ fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
             .map(|(server, line)| format!("mcp {server}: {line}"))
             .collect();
     }
-    // `summary`: one line per server, in the order they first spoke, so a
-    // server that said something is never silently dropped. The map holds
+    // `summary`: one line for the turn, because a workspace with four servers
+    // that each say something on connect would otherwise spend four rows of
+    // the transcript saying nothing an operator can act on. The map holds
     // each server's slot so counting stays linear in the logs, not quadratic
     // in servers × lines.
     let mut counts: Vec<(String, usize)> = Vec::new();
@@ -10312,13 +10348,15 @@ fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
             slots.insert(counts[index].0.clone(), index);
         }
     }
-    counts
-        .into_iter()
-        .map(|(server, count)| {
-            let lines = if count == 1 { "line" } else { "lines" };
-            format!("mcp {server} · {count} log {lines} · `ui.mcp_log = \"full\"` to read them")
-        })
-        .collect()
+    let lines: usize = counts.iter().map(|(_, count)| count).sum();
+    let word = if lines == 1 { "line" } else { "lines" };
+    let what = match counts.as_slice() {
+        [(server, _)] => server.clone(),
+        servers => format!("{} servers", servers.len()),
+    };
+    vec![format!(
+        "mcp {what} · {lines} log {word} · `ui.mcp_log = \"full\"` to read them"
+    )]
 }
 
 /// The MCP connections of this interactive session, held until it ends.
@@ -10420,6 +10458,10 @@ fn prompt_skills(
     let importer = arsy_code::compat::CompatibilityImporter::new(root);
     [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp]
         .into_iter()
+        // A source the operator switched off contributes nothing, the same as
+        // its hooks and its instructions: `compat.<source>.enabled` governs
+        // everything that source's files carry.
+        .filter(|ecosystem| config.compat_enabled(ecosystem.as_str()))
         .filter_map(|ecosystem| {
             let skills = importer.skill_declarations(ecosystem).ok()?;
             Some(skills.into_iter().filter_map(move |skill| {
@@ -11686,26 +11728,26 @@ mod tests {
         let summary = mcp_log_rows(logs(), "summary");
         assert_eq!(
             summary.len(),
-            2,
-            "one row per server, not per line: {summary:?}"
+            1,
+            "one row for the turn, not one per server or per line: {summary:?}"
         );
         assert!(
-            summary[0].starts_with("mcp mongodb · 2 log lines"),
-            "{summary:?}"
+            summary[0].contains("3 log lines"),
+            "the row counts every line the servers wrote: {summary:?}"
         );
         assert!(
-            summary[1].starts_with("mcp postgres · 1 log line"),
-            "a single line is not called lines: {summary:?}"
+            summary[0].contains("2 servers"),
+            "the row says how many servers spoke: {summary:?}"
         );
         assert!(
-            summary.iter().all(|row| row.contains("ui.mcp_log")),
+            summary[0].contains("ui.mcp_log"),
             "the summary says how to read the rest: {summary:?}"
         );
 
         // An unknown level is read as `summary` rather than as `full`: the
         // configuration refuses one at load, so this is only reachable by a
         // caller passing something odd, and the quiet reading is the safe one.
-        assert_eq!(mcp_log_rows(logs(), "whatever").len(), 2);
+        assert_eq!(mcp_log_rows(logs(), "whatever").len(), 1);
     }
 
     /// The catalog lives beside the user configuration and nowhere else, and a
@@ -12945,5 +12987,25 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod theme_registry_tests {
+    /// `/settings` offers `theme.base` from the kernel's registry, while the
+    /// palettes themselves are arsy-tui's. Neither can depend on the other, so
+    /// this test is what holds the two lists together: a theme added to one
+    /// and not the other is either offered and unrenderable, or renderable and
+    /// unreachable from the editor.
+    #[test]
+    fn the_settings_registry_names_exactly_the_built_in_themes() {
+        let registry: Vec<&str> = arsy_kernel::config::THEME_BASES.to_vec();
+        let rendered: Vec<&str> = crate::tui::THEMES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(registry, rendered, "the two theme lists have drifted");
+        assert_eq!(
+            arsy_kernel::config::DEFAULT_THEME_BASE,
+            crate::tui::DEFAULT_THEME,
+            "the two defaults are different themes"
+        );
     }
 }
