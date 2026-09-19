@@ -207,6 +207,12 @@ fn the_classic_renderer_paints_exactly_what_it_painted_before() {
             path.display()
         )
     });
+    // The file is compared against a string this test built with `\n`, so a
+    // checkout that turned every line ending into `\r\n` would otherwise fail
+    // here with a mismatch no line-by-line diff can show — the lines compare
+    // equal and only their terminators differ. That is what a Windows runner's
+    // default `core.autocrlf` produces, and it says nothing about the renderer.
+    let expected = expected.replace("\r\n", "\n");
 
     if expected != captured {
         // The first differing line, because a whole-file dump of escape codes
