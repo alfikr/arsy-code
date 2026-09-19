@@ -737,51 +737,133 @@ fn claude_hooks(
         .ok_or_else(|| CompatError::Parse("hooks must be an object".into()))?;
     let mut mapped = Vec::new();
     for (original_event, entries) in hooks {
-        // The mapping lives with the engine that dispatches it: a declaration
-        // reported here as `before_operation` has to be the one the engine
-        // will actually run.
-        let event = crate::hook::LifecycleEvent::from_external(original_event)
-            .map_or("unsupported", crate::hook::LifecycleEvent::as_str);
-        let entries = entries
-            .as_array()
-            .ok_or_else(|| CompatError::Parse("hook event must contain an array".into()))?;
-        for entry in entries {
-            let matcher = match entry.get("matcher") {
-                None => "*",
-                Some(value) => value
-                    .as_str()
-                    .ok_or_else(|| CompatError::Parse("hook matcher must be a string".into()))?,
-            };
-            let handlers = entry
-                .get("hooks")
-                .and_then(Value::as_array)
-                .ok_or_else(|| CompatError::Parse("hook entry requires a hooks array".into()))?;
-            for handler in handlers {
-                let kind = required_json_string(handler, "type")?;
-                let key = match kind {
-                    "command" => "command",
-                    "prompt" | "agent" => "prompt",
-                    "http" => "url",
-                    _ => continue,
-                };
-                if required_json_string(handler, key)?.trim().is_empty() {
-                    return Err(CompatError::Parse("hook handler must not be empty".into()));
-                }
-            }
-            mapped.push(json!({
-                "source": importer.source(source)?,
-                "event": event,
-                "original_event": original_event,
-                "matcher": map_tool(matcher).unwrap_or(matcher),
-                "effect": if handlers.iter().all(|handler| handler["type"] == "command") { "external_command" } else { "external_hook" },
-                "handlers": handlers.iter().map(|handler| json!({"type": handler.get("type"), "status": "not_loaded"})).collect::<Vec<_>>(),
-                "level": if event == "unsupported" { "unsupported" } else { "mapped" },
-            }));
-        }
+        mapped.extend(claude_hook_event(
+            importer,
+            source,
+            original_event,
+            entries,
+        )?);
     }
     Ok(mapped)
 }
 
+/// One event's declarations: the mapping lives with the engine that
+/// dispatches it, so a declaration reported here as `before_operation` has
+/// to be the one the engine will actually run.
+fn claude_hook_event(
+    importer: &CompatibilityImporter,
+    source: &Path,
+    original_event: &str,
+    entries: &Value,
+) -> Result<Vec<Value>, CompatError> {
+    let event = crate::hook::LifecycleEvent::from_external(original_event)
+        .map_or("unsupported", crate::hook::LifecycleEvent::as_str);
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| CompatError::Parse("hook event must contain an array".into()))?;
+    let mut mapped = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        mapped.extend(claude_hook_entry(
+            importer,
+            source,
+            original_event,
+            event,
+            position,
+            entry,
+        )?);
+    }
+    Ok(mapped)
+}
+
+/// One entry of one event: read it once, then emit one row per handler.
+fn claude_hook_entry(
+    importer: &CompatibilityImporter,
+    source: &Path,
+    original_event: &str,
+    event: &str,
+    position: usize,
+    entry: &Value,
+) -> Result<Vec<Value>, CompatError> {
+    let matcher = match entry.get("matcher") {
+        None => "*",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| CompatError::Parse("hook matcher must be a string".into()))?,
+    };
+    let handlers = entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CompatError::Parse("hook entry requires a hooks array".into()))?;
+    // The entry's reading, which every handler of it shares: a matcher
+    // is declared once for the entry, and so is the class the engine
+    // would register it as.
+    let effect = if handlers.iter().all(|handler| handler["type"] == "command") {
+        "external_command"
+    } else {
+        "external_hook"
+    };
+    let matcher = map_tool(matcher).unwrap_or(matcher);
+    // One row per handler, because the key an operator switches off
+    // names one handler: an entry holding two is two declarations, and
+    // a single row for both would name neither of them.
+    let mut mapped = Vec::new();
+    for (index, handler) in handlers.iter().enumerate() {
+        mapped.push(claude_hook_handler(
+            importer,
+            source,
+            original_event,
+            event,
+            position,
+            index,
+            matcher,
+            effect,
+            handler,
+        )?);
+    }
+    Ok(mapped)
+}
+
+/// One handler of one entry, as the single declaration row the engine keys it by.
+fn claude_hook_handler(
+    importer: &CompatibilityImporter,
+    source: &Path,
+    original_event: &str,
+    event: &str,
+    position: usize,
+    index: usize,
+    matcher: &str,
+    effect: &str,
+    handler: &Value,
+) -> Result<Value, CompatError> {
+    let kind = required_json_string(handler, "type")?;
+    // A handler whose type this build has no reading of is still
+    // declared, and still a key an operator can switch off, so it
+    // is listed rather than dropped.
+    if let Some(key) = match kind {
+        "command" => Some("command"),
+        "prompt" | "agent" => Some("prompt"),
+        "http" => Some("url"),
+        _ => None,
+    } {
+        if required_json_string(handler, key)?.trim().is_empty() {
+            return Err(CompatError::Parse("hook handler must not be empty".into()));
+        }
+    }
+    Ok(json!({
+        "source": importer.source(source)?,
+        "event": event,
+        "original_event": original_event,
+        // The key the engine builds for this declaration, so a
+        // listing and the operator's own switches name one thing.
+        "declaration": format!("{}#{original_event}[{position}].{index}", source.display()),
+        "position": position,
+        "index": index,
+        "matcher": matcher,
+        "effect": effect,
+        "handlers": [json!({"type": handler.get("type"), "status": "not_loaded"})],
+        "level": if event == "unsupported" { "unsupported" } else { "mapped" },
+    }))
+}
 /// The MCP connections the operator declared for Claude in their own home
 /// directory, rather than in a workspace.
 ///
@@ -1231,6 +1313,56 @@ mod tests {
         ] {
             assert!(claude_hooks(&importer, &local, &bad).is_err());
         }
+    }
+
+    /// The key the engine builds and the key a row carries have to be the same
+    /// string, or an operator switching a declaration off would be naming
+    /// something the engine never registers.
+    #[test]
+    fn a_hook_row_names_the_declaration_key_the_engine_registers() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join(".claude/settings.json");
+        let settings = json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "audit"},
+                    {"type": "prompt", "prompt": "think about it"}
+                ]},
+                {"hooks": [{"type": "command", "command": "check"}]}
+            ],
+            "Stop": [{"hooks": [{"type": "command", "command": "done"}]}]
+        }});
+        let importer = CompatibilityImporter::new(root.path());
+
+        let hooks = claude_hooks(&importer, &source, &settings).unwrap();
+        let declarations: Vec<&str> = hooks
+            .iter()
+            .map(|hook| hook["declaration"].as_str().unwrap())
+            .collect();
+        // One row per handler, so the second handler of the first entry is a
+        // declaration of its own and not folded into the first.
+        assert_eq!(
+            declarations,
+            [
+                format!("{}#PreToolUse[0].0", source.display()),
+                format!("{}#PreToolUse[0].1", source.display()),
+                format!("{}#PreToolUse[1].0", source.display()),
+                format!("{}#Stop[0].0", source.display()),
+            ],
+            "{hooks:#?}"
+        );
+        // The two numbers that compose it, so a listing can show them apart
+        // from the key.
+        let nested = &hooks[2];
+        assert_eq!(nested["position"], 1);
+        assert_eq!(nested["index"], 0);
+        assert_eq!(nested["original_event"], "PreToolUse");
+        assert_eq!(nested["handlers"].as_array().unwrap().len(), 1);
+        // The entry's own reading still reaches every row of it: `Bash` maps,
+        // and an entry with a `prompt` in it is not a plain command hook.
+        assert_eq!(hooks[0]["matcher"], "process.exec");
+        assert_eq!(hooks[1]["effect"], "external_hook");
+        assert_eq!(hooks[1]["level"], "mapped");
     }
 
     #[test]

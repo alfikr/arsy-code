@@ -146,6 +146,14 @@ pub enum EffectClass {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HookRule {
     pub id: String,
+    /// The declaration this rule came from: `<source path>#<external
+    /// event>[<position>].<index>` for a [CL]-shaped file, `<source
+    /// path>#notify` for Codex's `notify`.
+    ///
+    /// Stable across runs for the same file contents, so it is what
+    /// `arsy hook list` and the `/hooks` dialog display, and what the
+    /// operator's own switches name.
+    pub declaration: String,
     pub event: LifecycleEvent,
     /// Glob over the event's subject — an operation kind, a command name. `*`
     /// matches every subject.
@@ -605,6 +613,10 @@ pub struct Discovery {
     /// until they have.
     pub trusted: bool,
     pub max_depth: u32,
+    /// Declaration keys this operator switched off in their own `arsy.json`.
+    /// A rule whose `declaration` is in here is not registered, and the file
+    /// it came from is still read and reported.
+    pub disabled: BTreeSet<String>,
 }
 
 /// What one declaration file became.
@@ -758,7 +770,7 @@ fn read_source(
         Kind::ClaudeSettings | Kind::ArsyGuard => serde_json::from_str::<Value>(&text)
             .map_err(|error| error.to_string())
             .and_then(|value| claude_rules(&value, origin, path, discovery)),
-        Kind::CodexNotify => codex_notify(&text, origin, discovery),
+        Kind::CodexNotify => codex_notify(&text, origin, path, discovery),
     };
     let (rules, notes) = match parsed {
         Ok(loaded) => loaded,
@@ -769,6 +781,8 @@ fn read_source(
         }
     };
     report.notes = notes;
+    // What the file declares, not what survives this operator's switches: a
+    // file whose every hook is off is still a file that was read.
     report.rules = rules.len();
     if rules.is_empty() {
         // A settings file with no hooks in it is not a refusal.
@@ -783,8 +797,21 @@ fn read_source(
         report.status = "not_loaded";
         return report;
     }
+    let off = rules
+        .iter()
+        .filter(|(rule, _)| discovery.disabled.contains(&rule.declaration))
+        .count();
+    if off > 0 {
+        report.notes.push(format!(
+            "`hook.disabled` switches off {off} of the {} rules this file declares",
+            report.rules
+        ));
+    }
     report.status = "loaded";
     for (rule, handler) in rules {
+        if discovery.disabled.contains(&rule.declaration) {
+            continue;
+        }
         engine.register(rule, Box::new(handler));
     }
     report
@@ -852,6 +879,11 @@ fn claude_rules(
                 // the matcher vocabulary here is a glob rather than an
                 // alternation. One rule per alternative says the same thing in
                 // the vocabulary the engine has.
+                //
+                // Every handler is counted, including the ones skipped above:
+                // the key has to name where in the file the declaration is,
+                // not where it landed in this build's reading of it.
+                let declaration = format!("{}#{external}[{position}].{index}", source.display());
                 for alternative in declared.split('|') {
                     let matcher = matcher_for(alternative);
                     rules.push((
@@ -865,6 +897,7 @@ fn claude_rules(
                                     format!(":{matcher}")
                                 }
                             ),
+                            declaration: declaration.clone(),
                             event,
                             matcher,
                             effect: effect_for(event),
@@ -886,6 +919,7 @@ fn claude_rules(
 fn codex_notify(
     config: &str,
     origin: PolicySource,
+    source: &Path,
     discovery: &Discovery,
 ) -> Result<Rules, String> {
     // A document, not a value: `FromStr` for `toml::Value` reads one value and
@@ -914,6 +948,7 @@ fn codex_notify(
         vec![(
             HookRule {
                 id: "codex:notify".to_owned(),
+                declaration: format!("{}#notify", source.display()),
                 // Codex runs it when the turn ends, and nothing it prints is
                 // read back, so it observes.
                 event: LifecycleEvent::AfterTurn,
@@ -1008,6 +1043,9 @@ fn label(source: &Path) -> String {
 pub fn describe(rule: &HookRule) -> Value {
     json!({
         "id": rule.id,
+        // The key `hook.disabled` names, so a listing can offer the switch the
+        // engine would honour rather than the rule's own id.
+        "declaration": rule.declaration,
         "event": rule.event.as_str(),
         "matcher": rule.matcher,
         "effect": rule.effect,
@@ -1055,6 +1093,7 @@ mod tests {
             root: root.to_path_buf(),
             trusted,
             max_depth: 4,
+            disabled: Default::default(),
         }
     }
 
@@ -1167,6 +1206,74 @@ mod tests {
             "{:?}",
             report.notes
         );
+    }
+
+    /// A declaration the operator switched off in their own configuration
+    /// does not register, and the file that declares it is still a file that
+    /// was read — including when every hook in it is off.
+    #[test]
+    fn a_switched_off_declaration_does_not_register_but_its_file_is_still_read() {
+        let home = home_with(&[(".claude/settings.json", CLAUDE)]);
+        let workspace = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        let audit = format!("{}#PreToolUse[0].0", settings.display());
+
+        let mut switched = discovery(home.path(), workspace.path(), false);
+        switched.disabled = BTreeSet::from([audit.clone()]);
+        let loaded = load(&switched);
+
+        let rules: Vec<&HookRule> = loaded.engine.rules().collect();
+        assert!(
+            !rules.iter().any(|rule| rule.declaration == audit),
+            "{rules:?}"
+        );
+        // The file declares four rules: the `Bash` audit hook, `Edit|Write`
+        // which is two subjects in one declaration, and `Stop`. Switching one
+        // declaration off removes one of them — and only the rules of that
+        // declaration, which is why the two alternatives of `Edit|Write` are
+        // both still here.
+        assert!(!rules.iter().any(|rule| rule.matcher == "process.exec"));
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| rule.declaration.ends_with("#PreToolUse[1].0"))
+                .count(),
+            2,
+            "{rules:?}"
+        );
+
+        let report = loaded
+            .sources
+            .iter()
+            .find(|source| source.path == settings)
+            .expect("the file is still reported");
+        assert_eq!(report.status, "loaded");
+        assert_eq!(report.rules, 4, "the count is what the file declares");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("switches off 1 of the 4")),
+            "{:?}",
+            report.notes
+        );
+
+        // Every hook in the file off is still a file that was read, and none
+        // of its rules run.
+        let mut all = discovery(home.path(), workspace.path(), false);
+        all.disabled = std::iter::once(audit)
+            .chain(rules.iter().map(|rule| rule.declaration.clone()))
+            .collect();
+        let loaded = load(&all);
+        assert!(loaded.engine.rules().next().is_none());
+        let report = loaded
+            .sources
+            .iter()
+            .find(|source| source.path == settings)
+            .unwrap();
+        assert_eq!(report.status, "loaded");
+        assert_eq!(report.rules, 4);
     }
 
     /// Codex has one lifecycle callback. An operator who uses Codex has
@@ -1310,6 +1417,7 @@ mod tests {
     ) -> HookRule {
         HookRule {
             id: id.to_owned(),
+            declaration: id.to_owned(),
             event,
             matcher: "*".to_owned(),
             effect,
