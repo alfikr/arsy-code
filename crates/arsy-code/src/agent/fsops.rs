@@ -9,6 +9,7 @@
 //! one place; none of them touch `std::fs` directly.
 
 use crate::{
+    agent::instructions::Skill,
     edit::{self, EditAddress, EditOperation},
     resource::{DirEntry, ResolveError, Workspace},
 };
@@ -172,6 +173,10 @@ pub struct FileExecutor {
     workspace: PathBuf,
     artifacts: Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    /// The skills the prompt listed, so `skill://<name>` resolves to the file
+    /// the listing pointed at. Empty for every operation but `fs.read`, and
+    /// empty is fine there: a read of a path resolves as a path.
+    skills: Vec<Skill>,
 }
 
 impl FileExecutor {
@@ -180,6 +185,7 @@ impl FileExecutor {
         workspace: &Workspace,
         artifacts: Arc<dyn ArtifactStore>,
         retain_until_ms: u64,
+        skills: Vec<Skill>,
     ) -> Arc<Self> {
         Arc::new(Self {
             operation,
@@ -197,6 +203,7 @@ impl FileExecutor {
             workspace: workspace.path().to_owned(),
             artifacts,
             retain_until_ms,
+            skills,
         })
     }
 
@@ -235,16 +242,6 @@ impl OperationExecutor for FileExecutor {
         let number = |key: &str| input.get(key).and_then(Value::as_u64);
 
         let (value, touched, state) = match self.operation {
-            FileOperation::Read => {
-                let path = string("path");
-                let result = read(&workspace, path, number("offset"), number("limit"))?;
-                let digest = result.digest.clone();
-                (
-                    self.put(&result, request.actor.clone())?,
-                    path.to_owned(),
-                    Some(digest),
-                )
-            }
             FileOperation::List => {
                 let path = input.get("path").and_then(Value::as_str).unwrap_or(".");
                 let entries = workspace.list(path).map_err(resolve)?;
@@ -258,6 +255,20 @@ impl OperationExecutor for FileExecutor {
                     )?,
                     path.to_owned(),
                     None,
+                )
+            }
+            FileOperation::Read => {
+                let path = string("path");
+                let path = match skill_path(path, &self.skills) {
+                    Some(resolved) => resolved?,
+                    None => path.to_owned(),
+                };
+                let result = read(&workspace, &path, number("offset"), number("limit"))?;
+                let digest = result.digest.clone();
+                (
+                    self.put(&result, request.actor.clone())?,
+                    path,
+                    Some(digest),
                 )
             }
             FileOperation::Write | FileOperation::Create => {
@@ -348,6 +359,39 @@ fn entry(entry: DirEntry) -> ListEntry {
         directory: entry.directory,
         bytes: entry.bytes,
     }
+}
+
+/// The scheme a skill is addressed by, matching the ecosystem family's
+/// convention: the prompt lists skills by name and the model reads one with
+/// `skill://<name>`.
+const SKILL_SCHEME: &str = "skill://";
+
+/// Resolve a `skill://<name>` path to the file it names, or `None` when the
+/// path is not a skill reference.
+///
+/// Skills live in more than one ecosystem directory, so the name is matched
+/// against what discovery found rather than against one fixed root. A name
+/// nothing declared is an error rather than a miss: the model read the
+/// listing before it asked, so a miss means the listing was stale and saying
+/// so is more useful than an empty result.
+fn skill_path(path: &str, skills: &[Skill]) -> Option<Result<String, OperationError>> {
+    let name = path.strip_prefix(SKILL_SCHEME)?.trim_matches('/');
+    if name.is_empty() {
+        return Some(Err(OperationError::Execution(format!(
+            "`{path}` names no skill"
+        ))));
+    }
+    Some(
+        skills
+            .iter()
+            .find(|skill| skill.name == name)
+            .map(|skill| skill.path.clone())
+            .ok_or_else(|| {
+                OperationError::Execution(format!(
+                    "no skill named `{name}` is listed for this session"
+                ))
+            }),
+    )
 }
 
 /// Read a file, optionally a window of it.
@@ -492,12 +536,18 @@ pub fn executors(
     workspace: &Workspace,
     artifacts: &Arc<dyn ArtifactStore>,
     retain_until_ms: u64,
+    skills: &[Skill],
 ) -> Vec<Arc<dyn OperationExecutor>> {
     FileOperation::ALL
         .into_iter()
         .map(|operation| {
-            FileExecutor::new(operation, workspace, Arc::clone(artifacts), retain_until_ms)
-                as Arc<dyn OperationExecutor>
+            FileExecutor::new(
+                operation,
+                workspace,
+                Arc::clone(artifacts),
+                retain_until_ms,
+                skills.to_vec(),
+            ) as Arc<dyn OperationExecutor>
         })
         .collect()
 }

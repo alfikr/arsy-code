@@ -341,7 +341,14 @@ def main():
             terminal.send(b"\x03/quit\r")
             assert child.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original, "terminal modes were not restored"
-            assert not (root / ".arsy/sessions.sqlite3").exists(), "inspection created a session"
+            # The store is opened when the session starts, so it exists even
+            # for one that only inspected. What an inspection must not do is
+            # record a turn into it.
+            import sqlite3 as _sql
+            events = _sql.connect(root / ".arsy/sessions.sqlite3").execute(
+                "SELECT COUNT(*) FROM events"
+            ).fetchone()[0]
+            assert events == 0, f"inspection recorded {events} events"
         finally:
             if child.poll() is None:
                 child.kill()

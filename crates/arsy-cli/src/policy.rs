@@ -64,6 +64,7 @@ pub fn explain(
         &arsy_kernel::domain::SessionId::new().to_string(),
         // A dry run explains what would happen; it writes nothing anywhere.
         arsy_code::operations::TurnState::default(),
+        &[],
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let contract = registry.contract(&kind).ok_or_else(|| {

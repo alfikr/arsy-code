@@ -124,7 +124,7 @@ fn call(
     // session or task to share, so a fresh scope is the correct isolation,
     // not an approximation of one.
     let scope = arsy_kernel::domain::SessionId::new().to_string();
-    let runtime = crate::agent_runtime(&root, &config, false, &scope, None, None, emitter)?;
+    let runtime = crate::agent_runtime(&root, &config, false, &scope, None, None, emitter, &[])?;
     let workspace = arsy_code::resource::Workspace::open(&root)
         .map_err(|error| crate::storage_failed(error.to_string()))?;
     let registry = arsy_code::operations::registry(
@@ -136,6 +136,7 @@ fn call(
         // A single inspection dispatches one read-only operation; it opens no
         // session, so it offers no durable checklist either.
         arsy_code::operations::TurnState::default(),
+        &[],
     )
     .map_err(|error| crate::storage_failed(error.to_string()))?;
     let kind = arsy_kernel::operation::OperationKind::new(operation)

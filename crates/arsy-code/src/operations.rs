@@ -167,6 +167,7 @@ pub fn registry(
     reachable: Reachable,
     scope: &str,
     turn: TurnState,
+    skills: &[crate::agent::instructions::Skill],
 ) -> Result<OperationRegistry, RegistrationError> {
     let mut registry = OperationRegistry::new();
     if let Some(connections) = turn.mcp {
@@ -199,7 +200,7 @@ pub fn registry(
     // agent so that `arsy policy explain`, the MCP server, and a turn all see
     // the same set: a tool the model can call is a tool an operator can reason
     // about beforehand.
-    for executor in crate::agent::fsops::executors(workspace, &artifacts, retain_until_ms)
+    for executor in crate::agent::fsops::executors(workspace, &artifacts, retain_until_ms, skills)
         .into_iter()
         .chain(crate::agent::searchops::executors(
             workspace,
@@ -322,6 +323,7 @@ mod tests {
             Reachable::default(),
             "test",
             TurnState::default(),
+            &[],
         )
         .unwrap();
 
@@ -394,6 +396,7 @@ mod tests {
             },
             "test",
             TurnState::default(),
+            &[],
         )
         .unwrap();
         assert!(with_remote

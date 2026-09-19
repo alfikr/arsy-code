@@ -127,30 +127,41 @@ impl SessionDialogState {
                 let title = " SESSIONS ";
                 let mut lines = vec![dialog_top(title, width, colour)];
 
-                if self.sessions.is_empty() {
-                    lines.push(dialog_line(
-                        "  no recorded sessions found",
-                        inner,
-                        colour,
-                        sgr_dim(),
-                    ));
+                // The session this process is running is always in the list,
+                // even before its first recorded turn: an operator who opened
+                // the dialog to rename what they are doing is not asking
+                // whether anything was recorded.
+                let listed = if self.sessions.iter().any(|s| s.id == self.active_session) {
+                    self.sessions.clone()
                 } else {
-                    for (idx, s) in self.sessions.iter().enumerate() {
-                        let is_sel = idx == self.selected;
-                        let is_active = s.id == self.active_session;
-                        let radio = if is_sel { "(•)" } else { "( )" };
-                        let active_tag = if is_active { " [active]" } else { "" };
-                        let title_part = match &s.title {
-                            Some(t) => format!(" · \"{t}\""),
-                            None => String::new(),
-                        };
-                        let row_label =
-                            format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
-                        let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
-                        lines.push(dialog_line(&row_label, inner, colour, sgr));
-                        let detail = format!("     {} events · {}", s.events, s.last_seen);
-                        lines.push(dialog_line(&detail, inner, colour, sgr_dim()));
-                    }
+                    let mut listed = self.sessions.clone();
+                    listed.insert(
+                        0,
+                        SessionChoice {
+                            id: self.active_session,
+                            title: None,
+                            events: 0,
+                            last_seen: "this session".to_owned(),
+                        },
+                    );
+                    listed
+                };
+
+                for (idx, s) in listed.iter().enumerate() {
+                    let is_sel = idx == self.selected;
+                    let is_active = s.id == self.active_session;
+                    let radio = if is_sel { "(•)" } else { "( )" };
+                    let active_tag = if is_active { " [active]" } else { "" };
+                    let title_part = match &s.title {
+                        Some(t) => format!(" · \"{t}\""),
+                        None => String::new(),
+                    };
+                    let row_label =
+                        format!("{radio} {}. {}{title_part}{active_tag}", idx + 1, s.id);
+                    let sgr = if is_sel { sgr_accent() } else { sgr_dim() };
+                    lines.push(dialog_line(&row_label, inner, colour, sgr));
+                    let detail = format!("     {} events · {}", s.events, s.last_seen);
+                    lines.push(dialog_line(&detail, inner, colour, sgr_dim()));
                 }
 
                 lines.push(dialog_line("", inner, colour, ""));

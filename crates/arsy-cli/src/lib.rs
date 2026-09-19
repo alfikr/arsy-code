@@ -2584,6 +2584,11 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
+    // Opened here rather than at the first recorded turn, because a session
+    // that has not run one — plan mode, a refused turn, an operator still
+    // deciding — is still a session: /session and the status row should name
+    // it, and a turn that comes later finds the store already there.
+    let _store = open_store(&workspace)?;
     // The first drawing of the card, so the loop below does not read it as a
     // change and repaint over the notices printed under it.
     state.card_is_stale();
@@ -4046,6 +4051,7 @@ fn run_turn(
                 Some(session_id),
                 Some(session_connector()),
                 emitter,
+                &prompt_skills(&root, &config),
             )?
             .with_execution_mode(approval.get().execution_mode()),
             conversation,
@@ -4727,6 +4733,8 @@ fn answer_task(
                 typing.colour,
                 keys,
                 decoder,
+                typing.theme,
+                typing.roles,
             )?;
             return Ok(TaskPass::Go);
         }
@@ -5369,6 +5377,8 @@ fn run_dialog(
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    theme: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Diagnostic> {
     match dialog {
         Dialog::Mcp => run_mcp_dialog(invocation, stdout, colour, keys, decoder),
@@ -5385,7 +5395,9 @@ fn run_dialog(
             keys,
             decoder,
         ),
-        Dialog::Settings => run_settings_dialog(invocation, stdout, colour, keys, decoder),
+        Dialog::Settings => {
+            run_settings_dialog(invocation, stdout, colour, keys, decoder, theme, roles)
+        }
     }
 }
 
@@ -5719,6 +5731,8 @@ fn run_settings_dialog(
     colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    theme: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), Diagnostic> {
     let mut rows = setting_rows(invocation)?;
     let mut dialog = tui::SettingsDialogState::new(rows);
@@ -5765,6 +5779,13 @@ fn run_settings_dialog(
                     Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
                 };
                 dialog.notice = Some(notice);
+                // Two settings cannot wait for a restart, because they change
+                // the screen the operator is looking at rather than what a
+                // later session does. Applying one here is what makes it real:
+                // a theme that only edits a file has not been chosen.
+                if let Some(live) = apply_live_setting(&row, &pending, theme, roles) {
+                    dialog.notice = Some(live);
+                }
                 rows = setting_rows(invocation)?;
                 dialog.reload(rows);
                 continue;
@@ -5773,6 +5794,35 @@ fn run_settings_dialog(
     }
     close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
+}
+
+/// Apply the two settings that change what is on the screen right now, and
+/// answer with the line to show, or `None` for one that waits for a restart.
+///
+/// A theme that only edits a file has not been chosen: the operator is
+/// looking at the palette when they pick it.
+#[cfg(feature = "tui")]
+fn apply_live_setting(
+    row: &tui::SettingRow,
+    value: &str,
+    theme: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    match row.key.as_str() {
+        "theme.base" => {
+            tui::set_palette(value, roles);
+            *theme = value.to_owned();
+            Some(format!("Theme: {value}"))
+        }
+        "ui.style" => {
+            tui::set_render_style(match value {
+                "classic" => tui::RenderStyle::Classic,
+                _ => tui::RenderStyle::Modern,
+            });
+            Some(format!("Transcript style: {value}"))
+        }
+        _ => None,
+    }
 }
 
 /// The dotted key as the path its object sits at and the leaf that names it.
@@ -9095,6 +9145,9 @@ impl TaskRun {
             Some(self.session),
             None,
             emitter,
+            // A subagent works from the same prompt its parent was given, so
+            // it reads the same skill listing.
+            &prompt_skills(&self.root, &self.config),
         )?;
         // A supervisor exists only when policy actually delegates something,
         // so a workspace that grants nothing sees no spawn tool rather than one
@@ -10300,6 +10353,7 @@ fn agent_runtime(
     session: Option<SessionId>,
     connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
+    skills: &[arsy_code::agent::instructions::Skill],
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
         .map_err(|error| storage_failed(error.to_string()))?;
@@ -10349,6 +10403,7 @@ fn agent_runtime(
             mcp: connections,
             mcp_pending: pending,
         },
+        skills,
     )
     .map(|runtime| runtime.with_dynamic_tools(discovered))
     .map_err(|error| storage_failed(error.to_string()))
@@ -10863,6 +10918,7 @@ mod tests {
             None,
             None,
             &mut Emitter::new(Output::Json),
+            &[],
         )
         .unwrap()
     }
