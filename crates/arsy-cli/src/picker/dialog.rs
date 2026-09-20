@@ -66,6 +66,11 @@ pub(crate) fn hook_choices(
         .as_array()
         .into_iter()
         .flatten()
+        // Only a declaration the engine registers is a declaration switching
+        // off can reach: an unsupported event, or a handler type this build
+        // never runs, would take the toggle, write a key that matches nothing,
+        // and then read back as "off" — a change that never happened.
+        .filter(|entry| entry["level"] == "mapped" && entry["handlers"][0]["type"] == "command")
         .filter_map(|entry| {
             let declaration = entry["declaration"].as_str()?.to_owned();
             Some(tui::HookChoice {
