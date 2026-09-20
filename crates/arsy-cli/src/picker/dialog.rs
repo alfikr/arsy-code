@@ -1,0 +1,719 @@
+//! The dialogs a bare `/mcp`, `/hooks`, `/skill`, `/session` or `/settings`
+//! opens, and the frame loop they repaint through.
+
+use super::prompt::{Dialog, Prompt, Restoring};
+use super::session::load_workspace_sessions;
+use super::wizard::{catalog_handles, write_config};
+#[cfg(feature = "tui")]
+use crate::*;
+use arsy_kernel::domain::SessionId;
+use arsy_kernel::provider::Effort;
+use arsy_kernel::secret::{FileCredentialStore, Redactor, SecretError, SecretHandle};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+pub(crate) fn mcp_choices(
+    root: &Path,
+    invocation: &Invocation,
+) -> Result<Vec<(Value, tui::McpChoice)>, Diagnostic> {
+    let report =
+        integrations::inspect(root, "mcp", None, None, None, invocation.config.as_deref())?;
+    let mut rows: Vec<(Value, tui::McpChoice)> = Vec::new();
+    for entry in report["entries"].as_array().into_iter().flatten() {
+        let text = |key: &str| entry[key].as_str().unwrap_or_default().to_owned();
+        let name = text("name");
+        // The first row under a name is the one a toggle acts on: ARSY's own
+        // definition is listed first, and it is the one that runs.
+        if rows.iter().any(|(_, choice)| choice.name == name) {
+            continue;
+        }
+        // A row the resolved configuration holds carries its real trust; a
+        // declaration nothing reads live is labelled untrusted and starts
+        // nothing until adopted.
+        let native = entry["trust"] != "untrusted";
+        let detail = match entry["url"].as_str() {
+            Some(url) => url.to_owned(),
+            None => std::iter::once(text("command"))
+                .chain(
+                    entry["args"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned),
+                )
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let choice = tui::McpChoice {
+            name,
+            source: text("ecosystem"),
+            trust: if native { text("trust") } else { String::new() },
+            target: integrations::target(entry),
+            detail,
+            enabled: native.then(|| entry["enabled"].as_bool().unwrap_or(false)),
+        };
+        rows.push((entry.clone(), choice));
+    }
+    Ok(rows)
+}
+
+/// Every lifecycle hook declared, as the dialog offers it.
+#[cfg(feature = "tui")]
+pub(crate) fn hook_choices(
+    root: &Path,
+    invocation: &Invocation,
+) -> Result<Vec<tui::HookChoice>, Diagnostic> {
+    let report =
+        integrations::inspect(root, "hook", None, None, None, invocation.config.as_deref())?;
+    let config = load_config_for(invocation)?;
+    Ok(report["entries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let declaration = entry["declaration"].as_str()?.to_owned();
+            Some(tui::HookChoice {
+                declaration,
+                event: entry["event"].as_str().unwrap_or("?").to_owned(),
+                matcher: entry["matcher"].as_str().unwrap_or("*").to_owned(),
+                source: format!(
+                    "{} · {}",
+                    entry["ecosystem"].as_str().unwrap_or("?"),
+                    entry["source"].as_str().unwrap_or("?")
+                ),
+                enabled: !config
+                    .hook_disabled()
+                    .contains(entry["declaration"].as_str()?),
+            })
+        })
+        .collect())
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn run_hook_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = hook_choices(&root, invocation)?;
+    let mut dialog = tui::HookDialogState::new(rows);
+    let mut changed = 0usize;
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::HookAction::Close) => {
+                break;
+            }
+            Keyed::Acted(tui::HookAction::Toggle(index)) => index,
+        };
+        let choice = dialog.choices[action].clone();
+        let enabled = !choice.enabled;
+        // `hook.disabled` is an object of booleans, so a switch-off writes
+        // `true` for the declaration and a switch-on removes the key: a key
+        // that is absent is the same as one that says the hook runs.
+        let change = write_config(|config| {
+            if enabled {
+                config_edit::remove(config, &["hook", "disabled", &choice.declaration])
+                    .map(|_updated| config.to_owned())
+            } else {
+                config_edit::set(
+                    config,
+                    &["hook", "disabled"],
+                    &choice.declaration,
+                    serde_json::Value::Bool(true),
+                )
+                .map(|_updated| config.to_owned())
+            }
+        });
+        dialog.notice = Some(match change {
+            Ok(()) => {
+                let state = if enabled { "on" } else { "off" };
+                changed += 1;
+                format!("hook `{}` switched {state}.", choice.matcher)
+            }
+            Err(reason) => reason,
+        });
+        rows = hook_choices(&root, invocation)?;
+        dialog.reload(rows);
+    }
+    close_dialog(stdout, drawn, &hook_close_line(changed), "")?;
+    Ok(())
+}
+
+/// Apply one edited setting's new value, printing what happened. `None` when
+/// the key is unknown to this build, `Some(reason)` when the value was
+/// rejected, `Ok` state when it was written.
+#[cfg(feature = "tui")]
+pub(crate) fn apply_edited_setting(
+    row: &tui::SettingRow,
+    line: &str,
+) -> Result<Option<String>, String> {
+    let Some(setting) = arsy_kernel::config::setting(&row.key) else {
+        return Ok(Some(format!(
+            "`{}` is not a setting this build can write",
+            row.key
+        )));
+    };
+    if let Err(reason) = setting.kind.check(line) {
+        return Ok(Some(reason));
+    }
+    write_config(|config| {
+        let (path, leaf) = setting_path(&row.key)?;
+        config_edit::set(config, &path, leaf, setting.kind.to_json(line))
+            .map(|_updated| config.to_owned())
+    })
+    .map(|_| None)
+}
+/// One ecosystem's declared skills, as the dialog offers them.
+///
+/// Per-skill row building lives here so `skill_choices` stays a flat pass
+/// over the ecosystems; the importer, config and root are shared, not grown.
+#[cfg(feature = "tui")]
+pub(crate) fn ecosystem_skill_rows(
+    rows: &mut Vec<tui::SkillChoice>,
+    ecosystem: arsy_code::compat::Ecosystem,
+    config: &arsy_kernel::config::Config,
+    root: &Path,
+    importer: &arsy_code::compat::CompatibilityImporter,
+) {
+    // A source the operator switched off is not offered here either: its
+    // skills reach neither the model nor the dialog, and a switch that showed
+    // rows the prompt ignores would be lying about what it controls.
+    if !config.compat_enabled(ecosystem.as_str()) {
+        return;
+    }
+    let Ok(skills) = importer.skill_declarations(ecosystem) else {
+        return;
+    };
+    for skill in skills {
+        let Some(name) = skill["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        // A workspace skill by the name of one already listed — a user skill,
+        // or another workspace's — is the one the operator means to have.
+        if rows.iter().any(|row| row.name == name) {
+            continue;
+        }
+        let key = format!("{}/{name}", ecosystem.as_str());
+        rows.push(tui::SkillChoice {
+            key: key.clone(),
+            name,
+            ecosystem: ecosystem.as_str().to_owned(),
+            source: skill["source"].as_str().unwrap_or("?").to_owned(),
+            description: skill_description(root, skill["source"].as_str().unwrap_or("")),
+            disabled: config.skill_disabled().contains(&key).then_some(true),
+        });
+    }
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn skill_choices(
+    root: &Path,
+    invocation: &Invocation,
+) -> Result<Vec<tui::SkillChoice>, Diagnostic> {
+    let config = load_config_for(invocation)?;
+    let importer = arsy_code::compat::CompatibilityImporter::new(root);
+    let mut rows = Vec::new();
+    // The operator's own home first, in the order the compat switches run.
+    let homes = compat_homes();
+    for skill in arsy_compat::skills::all(
+        &homes,
+        config.compat_enabled("claude"),
+        config.compat_enabled("codex"),
+    ) {
+        let key = format!("{}/{}", skill.ecosystem, skill.name);
+        rows.push(tui::SkillChoice {
+            key: key.clone(),
+            name: skill.name,
+            ecosystem: skill.ecosystem.to_owned(),
+            source: skill.path.display().to_string(),
+            description: skill_description(root, &skill.path.display().to_string()),
+            disabled: config.skill_disabled().contains(&key).then_some(true),
+        });
+    }
+    for ecosystem in [
+        arsy_code::compat::Ecosystem::Claude,
+        arsy_code::compat::Ecosystem::Codex,
+        arsy_code::compat::Ecosystem::Omp,
+    ] {
+        ecosystem_skill_rows(&mut rows, ecosystem, &config, root, &importer);
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn run_skill_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = skill_choices(&root, invocation)?;
+    let mut dialog = tui::SkillDialogState::new(rows);
+    let mut changed = 0usize;
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::SkillAction::Close) => {
+                break;
+            }
+            Keyed::Acted(tui::SkillAction::Toggle(index)) => {
+                let choice = dialog.choices[index].clone();
+                let offering = choice.disabled == Some(true);
+                match write_config(|config| {
+                    config_edit::set(
+                        config,
+                        &["skill", "disabled"],
+                        &choice.key,
+                        serde_json::Value::Bool(!offering),
+                    )
+                    .map(|_updated| config.to_owned())
+                }) {
+                    Ok(()) => {
+                        let state = if offering { "offered" } else { "switched off" };
+                        changed += 1;
+                        dialog.notice = Some(format!("skill `{}` {state}.", choice.name));
+                    }
+                    Err(reason) => dialog.notice = Some(reason),
+                }
+                rows = skill_choices(&root, invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Keyed::Acted(tui::SkillAction::Read(index)) => {
+                let choice = dialog.choices[index].clone();
+                match std::fs::read_to_string(root.join(choice.source.trim_start_matches("./"))) {
+                    Ok(body) => {
+                        close_dialog(stdout, drawn, &[], "")?;
+                        drawn = 0;
+                        writeln!(stdout, "{}", tui::skill_body(&body, &choice.name))
+                            .map_err(terminal_failed)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        dialog.notice =
+                            Some(format!("`{}` could not be read: {error}", choice.source));
+                    }
+                }
+            }
+        }
+    }
+    close_dialog(stdout, drawn, &skill_close_line(changed), "")?;
+    Ok(())
+}
+
+/// Every setting the registry names, as the dialog offers it.
+#[cfg(feature = "tui")]
+pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRow>, Diagnostic> {
+    let config = load_config_for(invocation)?;
+    Ok(config
+        .settings()
+        .into_iter()
+        .map(|view| {
+            // The registry names a kind for every key it lists, so the dialog
+            // edits by the same table the loader validates against.
+            let kind = match arsy_kernel::config::setting(&view.key).map(|s| s.kind) {
+                Some(arsy_kernel::config::SettingKind::Bool) => tui::SettingKind::Bool,
+                Some(arsy_kernel::config::SettingKind::Choice(_)) => tui::SettingKind::Choice,
+                Some(arsy_kernel::config::SettingKind::Integer { min, max }) => {
+                    tui::SettingKind::Integer { min, max }
+                }
+                Some(arsy_kernel::config::SettingKind::Text) | None => tui::SettingKind::Text,
+            };
+            tui::SettingRow {
+                key: view.key,
+                value: view.value,
+                default: view.default,
+                description: view.description,
+                choices: view.choices,
+                kind,
+                set: view.set,
+            }
+        })
+        .collect())
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn run_settings_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    theme: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
+) -> Result<(), Diagnostic> {
+    let mut rows = setting_rows(invocation)?;
+    let mut dialog = tui::SettingsDialogState::new(rows);
+    let mut changes: Vec<String> = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::SettingsAction::Close) => break,
+            Keyed::Acted(tui::SettingsAction::Reset(index)) => {
+                let row = dialog.rows[index].clone();
+                let removed = match setting_path(&row.key) {
+                    Ok((path, _leaf)) => write_config(|config| {
+                        config_edit::remove(config, &path).map(|_updated| config.to_owned())
+                    }),
+                    Err(reason) => Err(reason),
+                };
+                match removed {
+                    Ok(_) => {
+                        changes.push(format!("`{}` back to its default.", row.key));
+                        dialog.notice = Some(format!(
+                            "`{}` removed; it stands at its default {}.",
+                            row.key, row.default
+                        ));
+                    }
+                    Err(reason) => dialog.notice = Some(reason),
+                }
+                rows = setting_rows(invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+            Keyed::Acted(tui::SettingsAction::Apply(index, pending)) => {
+                let row = dialog.rows[index].clone();
+                let notice = match apply_edited_setting(&row, &pending) {
+                    Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&pending)),
+                    Ok(Some(reason)) | Err(reason) => tui::safe_text(&reason),
+                };
+                dialog.notice = Some(notice);
+                // Two settings cannot wait for a restart, because they change
+                // the screen the operator is looking at rather than what a
+                // later session does. Applying one here is what makes it real:
+                // a theme that only edits a file has not been chosen.
+                if let Some(live) = apply_live_setting(&row, &pending, theme, roles) {
+                    dialog.notice = Some(live);
+                }
+                rows = setting_rows(invocation)?;
+                dialog.reload(rows);
+                continue;
+            }
+        };
+    }
+    close_dialog(stdout, drawn, &changes, "")?;
+    Ok(())
+}
+
+/// Apply the two settings that change what is on the screen right now, and
+/// answer with the line to show, or `None` for one that waits for a restart.
+///
+/// A theme that only edits a file has not been chosen: the operator is
+/// looking at the palette when they pick it.
+#[cfg(feature = "tui")]
+pub(crate) fn apply_live_setting(
+    row: &tui::SettingRow,
+    value: &str,
+    theme: &mut String,
+    roles: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    match row.key.as_str() {
+        "theme.base" => {
+            tui::set_palette(value, roles);
+            *theme = value.to_owned();
+            Some(format!("Theme: {value}"))
+        }
+        "ui.style" => {
+            tui::set_render_style(match value {
+                "classic" => tui::RenderStyle::Classic,
+                _ => tui::RenderStyle::Modern,
+            });
+            Some(format!("Transcript style: {value}"))
+        }
+        _ => None,
+    }
+}
+
+/// The dotted key as the path its object sits at and the leaf that names it.
+#[cfg(feature = "tui")]
+pub(crate) fn setting_path(key: &str) -> Result<(Vec<&str>, &str), String> {
+    let (path, leaf) = key
+        .rsplit_once('.')
+        .ok_or_else(|| format!("`{key}` is not a dotted key this build can write"))?;
+    Ok((path.split('.').collect(), leaf))
+}
+
+/// The configuration resolved for this workspace, for a dialog that needs to
+/// know what the layers said before it writes.
+#[cfg(feature = "tui")]
+pub(crate) fn load_config_for(
+    invocation: &Invocation,
+) -> Result<arsy_kernel::config::Config, Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    load_config(&root, &working, invocation.config.as_deref())
+}
+
+/// Erase and redraw a dialog frame, returning the rows it now occupies.
+#[cfg(feature = "tui")]
+pub(crate) fn repaint_dialog(
+    stdout: &mut io::Stdout,
+    _colour: bool,
+    drawn: usize,
+    frame: &str,
+) -> Result<usize, Diagnostic> {
+    let up = if drawn > 0 {
+        format!("\x1b[{drawn}A")
+    } else {
+        String::new()
+    };
+    write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
+    stdout.flush().map_err(terminal_failed)?;
+    Ok(frame.lines().count())
+}
+
+/// Erase a dialog and report what it changed, or nothing when it did not.
+#[cfg(feature = "tui")]
+pub(crate) fn close_dialog(
+    stdout: &mut io::Stdout,
+    drawn: usize,
+    changes: &[String],
+    note: &str,
+) -> Result<(), Diagnostic> {
+    write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
+    if !changes.is_empty() {
+        let mut lines = changes.to_vec();
+        lines.push(note.to_owned());
+        writeln!(stdout, "{}", tui::safe_text(&lines.join("\n"))).map_err(terminal_failed)?;
+    }
+    stdout.flush().map_err(terminal_failed)?;
+    Ok(())
+}
+
+/// What one key did to a dialog.
+#[cfg(feature = "tui")]
+pub(crate) enum Keyed<Action> {
+    /// The dialog answered with an action.
+    Acted(Action),
+    /// The dialog took the key and changed its own state; redraw, keep going.
+    Redraw,
+    /// The keyboard hung up; nothing more will arrive.
+    Ended,
+}
+
+/// Wait for the next key and let the dialog answer it.
+///
+/// `Redraw` and `Ended` are distinct on purpose. A key that only moves the
+/// dialog's own marker — an arrow, `r` on the session list — is answered with
+/// no action, and a driver that read that as "close" would shut the dialog on
+/// the first arrow rather than redraw it.
+#[cfg(feature = "tui")]
+pub(crate) fn next_dialog_key<State, Action>(
+    dialog: &mut State,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    handle: impl Fn(&mut State, tui::Key) -> Option<Action>,
+) -> Keyed<Action> {
+    loop {
+        // A lone Escape is only known once nothing follows it.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Keyed::Ended,
+        };
+        if let Some(key) = key {
+            return match handle(dialog, key) {
+                Some(action) => Keyed::Acted(action),
+                None => Keyed::Redraw,
+            };
+        }
+    }
+}
+
+/// Drive the `/mcp` dialog until it is closed.
+///
+/// Each key redraws the frame over the last one rather than under it, and the
+/// frame is erased on close, so moving through the list leaves nothing behind;
+/// only a line per change made stays in the scrollback.
+#[cfg(feature = "tui")]
+pub(crate) fn run_mcp_dialog(
+    invocation: &Invocation,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Result<(), Diagnostic> {
+    let root = workspace_root(&invocation.workspace)?;
+    let mut rows = mcp_choices(&root, invocation)?;
+    let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
+    let mut changed = 0usize;
+    let mut drawn = 0;
+    loop {
+        let frame = dialog.render(tui::terminal_width(), colour);
+        let up = if drawn > 0 {
+            format!("\x1b[{drawn}A")
+        } else {
+            String::new()
+        };
+        write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+        drawn = frame.lines().count();
+
+        let action = match next_mcp_action(&mut dialog, keys, decoder) {
+            None => continue,
+            Some(tui::McpAction::Close) => {
+                close_dialog(stdout, drawn, &mcp_close_line(changed), "")?;
+                return Ok(());
+            }
+            Some(action) => action,
+        };
+        dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
+            Ok(change) => {
+                changed += 1;
+                change
+            }
+            Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
+        });
+        rows = mcp_choices(&root, invocation)?;
+        dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
+    }
+}
+
+/// Wait for the next key and let the dialog answer it. A keyboard that hung up
+/// closes the dialog rather than holding the session on it.
+#[cfg(feature = "tui")]
+pub(crate) fn next_mcp_action(
+    dialog: &mut tui::McpDialogState,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+) -> Option<tui::McpAction> {
+    loop {
+        // A lone Escape is only known once nothing follows it.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Some(tui::McpAction::Close)
+            }
+        };
+        if let Some(key) = key {
+            return dialog.handle_key(key);
+        }
+    }
+}
+
+/// Write the change a toggle or an adoption asks for, and say what it did.
+#[cfg(feature = "tui")]
+pub(crate) fn apply_mcp_action(
+    root: &Path,
+    rows: &[(Value, tui::McpChoice)],
+    dialog: &tui::McpDialogState,
+    action: tui::McpAction,
+) -> Result<String, Diagnostic> {
+    match action {
+        tui::McpAction::Toggle(index) => {
+            let choice = &dialog.choices[index];
+            let enabled = !choice.enabled.unwrap_or(false);
+            // Claude Code's and Codex's own files are never written: the
+            // choice is kept in the operator's arsy.json, which outranks them.
+            let declared_elsewhere = choice.source != "arsy";
+            let scope = match choice.trust.as_str() {
+                _ if declared_elsewhere => mcp::Scope::User,
+                "user" => mcp::Scope::User,
+                "workspace" => mcp::Scope::Workspace,
+                other => {
+                    return Err(usage(format!(
+                        "`{}` is defined by the {other} configuration; change it there",
+                        choice.name
+                    )))
+                }
+            };
+            mcp::set_enabled_in(root, &choice.name, enabled, scope, declared_elsewhere)?;
+            let state = if enabled { "enabled" } else { "disabled" };
+            Ok(format!("MCP `{}` {state}.", choice.name))
+        }
+        tui::McpAction::Adopt(index) => {
+            let server = mcp::server_from_declaration(&rows[index].0)?;
+            let written = mcp::add_in(root, &server, mcp::Scope::User)?;
+            Ok(format!(
+                "MCP `{}` adopted into {}, enabled.",
+                server.name,
+                written["path"].as_str().unwrap_or("arsy.json")
+            ))
+        }
+        tui::McpAction::Close => Ok(String::new()),
+    }
+}
+
+/// The one line the hook dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn hook_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "{changed} hook{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The one line the skill dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn skill_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "{changed} skill{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The one line the MCP dialog prints on close, or nothing when it changed
+/// nothing.
+#[cfg(feature = "tui")]
+fn mcp_close_line(changed: usize) -> Vec<String> {
+    (changed > 0)
+        .then(|| {
+            format!(
+                "MCP: {changed} connection{} changed; they take effect from the next turn.",
+                if changed == 1 { "" } else { "s" }
+            )
+        })
+        .into_iter()
+        .collect()
+}
