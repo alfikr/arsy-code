@@ -169,7 +169,40 @@ workspace contains.
   before retrying.
 - Reachability outside the core path is mixed. Memory recall, orchestration,
   telemetry, repository mapping, LSP-backed intelligence, DAP, MCP, hooks, and
-  WASM plugin operations have reachable slices; workspace coordination remains
-  test-only, child execution remains synchronous, and several integrations are
-  absent from interactive or child turns. The source-audited status table and
-  dependency order are in [`31-roadmap.md`](31-roadmap.md).
+  WASM plugin operations have reachable slices, and several integrations are
+  still absent from interactive or child turns. The source-audited status
+  table and dependency order are in [`31-roadmap.md`](31-roadmap.md).
+
+## Delegation, as built
+
+`task.spawn` records a child in the session's task graph, admits it against
+bounded slots, hands it to a worker thread, and returns its task and attempt
+ids. The parent keeps its turn and reads the answer back with `task.wait`,
+`task.result`, or `task.status`, stops one with `task.cancel`, and narrows a
+running one with `task.send`. A turn that never delegates still gets
+`task.criterion`, because committing to what done means is not delegation.
+
+Each child runs in a view of its own. A reader gets an immutable checkout
+pinned to a revision; an isolated writer gets a Git worktree on its own
+branch, and `task.integrate` is the only way its work reaches the workspace.
+The harness commits the writer's view for it, so a writer needs no process
+authority to produce a revision an integrator can name.
+
+Cancellation reaches a child between rounds and between tool calls, which are
+the points where stopping leaves a workspace the child can describe. The
+durable request is recorded before the flag is set, so a process that dies
+between the two comes back knowing the attempt was told to stop. A call
+already in flight still finishes, for the reason above.
+
+`ToolRuntime` itself holds no cancellation flag; the token lives on the
+attempt and is polled by the child loop, not by the runtime.
+
+## Verification, as built
+
+A completion proof is rebuilt from recorded operations, never stored and
+trusted. `arsy verify <session>` reads the same event stream from outside the
+run and exits nonzero unless every required criterion is met by valid, fresh,
+attributable evidence — refusing a pass from a different command, another
+task, a superseded attempt, a missing artifact, or another revision. The graph
+will not promote a task to verified without such a proof, so "the turn
+finished" cannot stand in for "the work holds".
