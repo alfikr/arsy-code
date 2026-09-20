@@ -2,17 +2,6 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-#[cfg(feature = "tui")]
-use crate::picker::prompt::{
-    answer_prompt, cancels_to_task, leave_picker, masked, offer_rows, open_picker, prompt_status,
-    steer_turn, steers_turn, submitted, Dialog, Leaving, Picker, Prompt, Restoring, Running,
-    Typing,
-};
-use crate::picker::remembered::{
-    endpoint_models, remember_model, resolve_palette, saved_effort, saved_route,
-};
-use crate::picker::session::{load_workspace_sessions, reconstruct_session_conversation};
-use crate::picker::wizard::configured_default;
 use crate::run::{charge_turn, context_budget, merge, prepare_task};
 #[cfg(feature = "tui")]
 use crate::*;
@@ -1482,7 +1471,7 @@ pub(crate) fn stream_row(
 /// What the keys pressed while a round streams amount to.
 #[cfg(feature = "tui")]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum Typed {
+pub(crate) enum Typed {
     /// Nothing that changes what is on screen.
     Quiet,
     Redraw,
@@ -2113,14 +2102,6 @@ fn refused(name: &str, reason: String) -> Granted {
     )))
 }
 
-fn write_unwrapped_lines(terminal: &mut impl Write, lines: &[String]) -> io::Result<()> {
-    write!(terminal, "{}", tui::DISABLE_AUTOWRAP)?;
-    for line in lines {
-        writeln!(terminal, "{line}")?;
-    }
-    write!(terminal, "{}", tui::ENABLE_AUTOWRAP)
-}
-
 #[cfg(feature = "tui")]
 // Every argument is one the live view needs and none of them group into a
 // meaningful type: the terminal, the call, and the keyboard are three unrelated
@@ -2172,7 +2153,7 @@ fn dispatch_tool_live(
         live_output: "",
         expanded,
     };
-    let mut last_rendered_lines = 0;
+    let _last_rendered_lines = 0;
     let draw = |terminal: &mut io::Stdout,
                 composer: &mut tui::Composer,
                 state: &tui::RunningToolState<'_>|

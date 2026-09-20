@@ -8,8 +8,7 @@ use super::dialog::{
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
-    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette, saved_effort,
-    saved_route, saved_theme,
+    apply_theme, endpoint_models, remember_effort, remember_model, resolve_palette,
 };
 #[cfg(feature = "tui")]
 use super::session::{
@@ -17,8 +16,8 @@ use super::session::{
 };
 #[cfg(feature = "tui")]
 use super::wizard::{
-    auth_step, catalog_handles, configured_default, effort_line, provider_step, write_config,
-    AuthNext, ProviderNext,
+    auth_step, catalog_handles, configured_default, effort_line, provider_step, AuthNext,
+    ProviderNext,
 };
 #[cfg(feature = "tui")]
 use crate::turn::run_turn;

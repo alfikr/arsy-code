@@ -4,12 +4,8 @@
 #[cfg(feature = "tui")]
 use crate::*;
 use arsy_kernel::domain::SessionId;
-use arsy_kernel::provider::Effort;
-use arsy_kernel::secret::{FileCredentialStore, Redactor, SecretError, SecretHandle};
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use serde_json::Value;
+use std::path::Path;
 pub(crate) fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
     let Ok(store) = open_store(workspace) else {
         return Vec::new();

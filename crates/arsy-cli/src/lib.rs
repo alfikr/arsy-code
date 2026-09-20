@@ -21,7 +21,6 @@
 mod acp;
 #[cfg(feature = "tui")]
 mod approval;
-mod catalog;
 mod code;
 mod config_edit;
 mod config_load;
@@ -48,35 +47,30 @@ mod transcript;
 pub mod tui;
 mod turn;
 
-#[cfg(feature = "tui")]
-use arsy_kernel::provider::Effort;
 use config_load::{bootstrap_user_config, replace_file};
+pub(crate) use config_load::{load_config, selected_model};
 #[cfg(feature = "tui")]
 use picker::prompt::{
     answer_prompt, cancels_to_task, leave_picker, masked, offer_rows, open_palette, open_route,
-    prompt_status, seed_providers, steer_turn, steers_turn, submitted, Leaving, Opened, Picker,
-    Prompt, Restoring, TaskPass, Typing,
+    prompt_status, seed_providers, submitted, Leaving, Opened, Picker, Prompt, Restoring, TaskPass,
+    Typing,
 };
 #[cfg(feature = "tui")]
-use picker::remembered::{
-    endpoint_models, remember_model, resolve_palette, saved_effort, saved_route,
-};
+use picker::remembered::{endpoint_models, saved_effort, saved_route};
 #[cfg(feature = "tui")]
-use picker::session::{
-    configured_providers, load_workspace_sessions, reconstruct_session_conversation,
-};
+use picker::session::configured_providers;
 #[cfg(feature = "tui")]
 use picker::wizard::configured_default;
 #[cfg(feature = "tui")]
 use picker::wizard::write_config;
 use run as run_mod;
 use run::{
-    doctor, graph_failed, merge, prepare_task, read_image, resume, unusable, TaskRun,
-    CONTEXT_BUDGET_TOKENS, TASK_BUDGET, TASK_LEASE_MS,
+    doctor, graph_failed, merge, prepare_task, resume, TaskRun, CONTEXT_BUDGET_TOKENS, TASK_BUDGET,
+    TASK_LEASE_MS,
 };
 use run_mod::run as run_command;
 #[cfg(feature = "tui")]
-use turn::{block_gap, modern_gap};
+use turn::modern_gap;
 
 use arsy_kernel::{
     artifact::unix_time_ms,
@@ -1623,104 +1617,6 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
 /// Every discovered configuration layer, plus the one `--config` named.
 ///
 /// The extra file is applied last, so it wins a conflicting value — and only
-/// that: `provider.allowed`, `model.allowed`, and the policy rules all merge
-/// by intersection, so a session file can narrow the run but never widen it.
-fn load_config(
-    workspace: &Path,
-    working: &Path,
-    extra: Option<&Path>,
-) -> Result<arsy_kernel::config::Config, Diagnostic> {
-    bootstrap_user_config();
-    let mut layers = arsy_kernel::config::layers(workspace, working);
-    if let Some(path) = extra {
-        // Unlike a discovered layer, a path the operator typed is theirs to
-        // get right: a missing one is a mistake, not an absent optional file.
-        if !path.exists() {
-            return Err(Diagnostic::error(
-                ARSY_CFG_1000,
-                format!("--config names `{}`, which does not exist", path.display()),
-                "pass the path to an existing arsy.json, or drop --config",
-            ));
-        }
-        layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
-    }
-    let unusable = |error: arsy_kernel::config::ConfigError| {
-        Diagnostic::error(
-            ARSY_CFG_1000,
-            format!("configuration is unusable: {error}"),
-            "fix the reported file, then run `arsy config explain`",
-        )
-    };
-    // Read twice: the first pass says which tools are switched on and whether
-    // this checkout is trusted, and the second places what those tools declare
-    // below every layer.
-    let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
-    let seeds = compat_seeds(workspace, &config);
-    let contributes = |seed: &arsy_kernel::config::CompatSeed| {
-        !(seed.mcp_servers.is_empty()
-            && seed.policy_rules.is_empty()
-            && seed.models.is_empty()
-            && seed.notes.is_empty())
-    };
-    if !seeds.iter().any(contributes) {
-        return Ok(config);
-    }
-    arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
-}
-
-/// What Claude Code and Codex declare for this workspace, read live.
-fn compat_seeds(
-    workspace: &Path,
-    config: &arsy_kernel::config::Config,
-) -> Vec<arsy_kernel::config::CompatSeed> {
-    let homes = compat_homes();
-    arsy_compat::seeds(&arsy_compat::Context {
-        homes: &homes,
-        root: workspace,
-        trusted: config.trusts(workspace),
-        claude: config.compat_enabled("claude"),
-        codex: config.compat_enabled("codex"),
-        env: &|name| std::env::var(name).ok(),
-    })
-}
-
-/// The model a turn asks for: `--model` when it was given, otherwise whatever
-/// configuration resolved.
-///
-/// A named model is checked against `model.allowed` before it is used. The
-/// ceiling is the point of the flag being an override and not an escape: an
-/// operator may choose between the models policy permits, and naming one it
-/// does not is refused rather than silently ignored or silently obeyed.
-fn selected_model(
-    config: &Config,
-    endpoint: &arsy_kernel::config::Endpoint,
-    requested: Option<&str>,
-) -> Result<String, Diagnostic> {
-    if let Some(model) = requested {
-        if !config.model_is_allowed(model) {
-            return Err(Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("--model `{model}` is excluded by the model.allowed ceiling"),
-                "run `arsy model list` for the models this configuration permits",
-            ));
-        }
-        return Ok(model.to_owned());
-    }
-    endpoint
-        .model
-        .clone()
-        .or_else(|| config.model_default().map(str::to_owned))
-        // What Claude Code or Codex is set to use, only when arsy.json is silent.
-        .or_else(|| config.compat_model(endpoint).map(str::to_owned))
-        .ok_or_else(|| {
-            Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("provider `{}` does not say which model to use", endpoint.id),
-                "set `model` on the provider endpoint, or `model.default`, in arsy.json, or \
-                 pass --model",
-            )
-        })
-}
 
 /// The catalog under the `file` store, beside the user configuration.
 const CATALOG_FILE: &str = "credentials.json";
@@ -2735,37 +2631,71 @@ fn read_line(
         }
         write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
-        loop {
-            // The timeout is what tells a lone Escape apart from the start of
-            // an arrow-key sequence.
-            let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
-                Ok(byte) => decoder.feed(byte),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let key = decoder.flush_escape();
-                    if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100)
-                    {
-                        break;
-                    }
-                    key
+        match drain_input_keys(
+            keys, decoder, composer, stdout, colour, width, transcript, state, refreshed,
+        )? {
+            Drain::Refresh => {}
+            Drain::Answer(answer) => return Ok(answer),
+        }
+    }
+}
+
+/// What one pass of the key loop asked for.
+enum Drain {
+    /// Redraw and measure the terminal again.
+    Refresh,
+    /// The line ended one way or another; hand the action up.
+    Answer(Option<tui::Action>),
+}
+
+/// Take the keys waiting, ending the line when one of them ends it.
+///
+/// A helper rather than the body of `read_line`'s inner loop, because the two
+/// loops answer different questions — when to repaint, and what a key means —
+/// and neither should have to hold the other's state.
+#[allow(clippy::too_many_arguments)]
+fn drain_input_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    stdout: &mut dyn Write,
+    colour: bool,
+    width: usize,
+    transcript: &mut tui::Transcript,
+    state: &tui::TuiState,
+    refreshed: std::time::Instant,
+) -> Result<Drain, Diagnostic> {
+    loop {
+        // The timeout is what tells a lone Escape apart from the start of an
+        // arrow-key sequence.
+        let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
+            Ok(byte) => decoder.feed(byte),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let key = decoder.flush_escape();
+                if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100) {
+                    return Ok(Drain::Refresh);
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
-            };
-            let Some(key) = key else { continue };
-            match composer.press(key) {
-                tui::Action::Submit(line) => return Ok(Some(tui::Action::Submit(line))),
-                tui::Action::CycleMode => return Ok(Some(tui::Action::CycleMode)),
-                tui::Action::Expand => {
-                    if transcript.toggle_last_tool() {
-                        transcript
-                            .repaint(stdout, width, colour, state)
-                            .map_err(terminal_failed)?;
-                    }
-                    break;
-                }
-                tui::Action::Quit => return Ok(None),
-                tui::Action::Redraw => break,
-                tui::Action::None => {}
+                key
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(Drain::Answer(None));
+            }
+        };
+        let Some(key) = key else { continue };
+        match composer.press(key) {
+            tui::Action::Submit(line) => return Ok(Drain::Answer(Some(tui::Action::Submit(line)))),
+            tui::Action::CycleMode => return Ok(Drain::Answer(Some(tui::Action::CycleMode))),
+            tui::Action::Expand => {
+                if transcript.toggle_last_tool() {
+                    transcript
+                        .repaint(stdout, width, colour, state)
+                        .map_err(terminal_failed)?;
+                }
+                return Ok(Drain::Refresh);
+            }
+            tui::Action::Quit => return Ok(Drain::Answer(None)),
+            tui::Action::Redraw => return Ok(Drain::Refresh),
+            tui::Action::None => {}
         }
     }
 }
@@ -3607,10 +3537,12 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::picker::session::reconstruct_session_conversation;
     use crate::picker::wizard::effort_line;
     use crate::picker::wizard::{auth_step, provider_step, AuthNext, ProviderNext};
-    use crate::run::{charge, MAX_IMAGE_BYTES};
-    use crate::turn::{drive_provider, native_turn, stream_row, Painter, Streaming};
+    use crate::run::{charge, read_image, MAX_IMAGE_BYTES};
+    use crate::turn::{block_gap, drive_provider, native_turn, stream_row, Painter, Streaming};
+    use arsy_kernel::provider::Effort;
     use arsy_kernel::{
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},

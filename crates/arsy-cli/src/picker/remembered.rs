@@ -4,13 +4,9 @@
 use super::wizard::catalog_handles;
 #[cfg(feature = "tui")]
 use crate::*;
-use arsy_kernel::domain::SessionId;
 use arsy_kernel::provider::Effort;
-use arsy_kernel::secret::{FileCredentialStore, Redactor, SecretError, SecretHandle};
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 /// Persist the picked model, reporting only that persistence failed — the
 /// choice still applies to this session.
 #[cfg(feature = "tui")]

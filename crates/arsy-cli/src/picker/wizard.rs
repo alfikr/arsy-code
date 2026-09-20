@@ -1,16 +1,12 @@
 //! The `/provider` and `/auth` wizards: every step validates its own answer,
 //! and nothing is written until the last one.
 
-use super::remembered::{endpoint_models, resolve_palette};
 #[cfg(feature = "tui")]
 use crate::*;
-use arsy_kernel::domain::SessionId;
 use arsy_kernel::provider::Effort;
-use arsy_kernel::secret::{FileCredentialStore, Redactor, SecretError, SecretHandle};
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use arsy_kernel::secret::{FileCredentialStore, SecretHandle};
+use serde_json::Value;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 
 /// Where `/provider` goes after an answer.
 #[cfg(feature = "tui")]

@@ -1,7 +1,7 @@
 //! Layered configuration: reading every layer for a workspace, bootstrapping
 //! the user file, and rewriting any of them atomically.
 
-use crate::{compat_homes, usage, Diagnostic, ARSY_CFG_1000, ARSY_PRV_1000};
+use crate::{compat_homes, Diagnostic, ARSY_CFG_1000, ARSY_PRV_1000};
 
 fn config_home_overridden() -> bool {
     std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
@@ -125,7 +125,7 @@ pub(crate) fn bootstrap_user_config() {
 /// The extra file is applied last, so it wins a conflicting value — and only
 /// that: `provider.allowed`, `model.allowed`, and the policy rules all merge
 /// by intersection, so a session file can narrow the run but never widen it.
-fn load_config(
+pub(crate) fn load_config(
     workspace: &Path,
     working: &Path,
     extra: Option<&Path>,
@@ -169,7 +169,7 @@ fn load_config(
 }
 
 /// What Claude Code and Codex declare for this workspace, read live.
-fn compat_seeds(
+pub(crate) fn compat_seeds(
     workspace: &Path,
     config: &arsy_kernel::config::Config,
 ) -> Vec<arsy_kernel::config::CompatSeed> {
@@ -191,7 +191,7 @@ fn compat_seeds(
 /// ceiling is the point of the flag being an override and not an escape: an
 /// operator may choose between the models policy permits, and naming one it
 /// does not is refused rather than silently ignored or silently obeyed.
-fn selected_model(
+pub(crate) fn selected_model(
     config: &Config,
     endpoint: &arsy_kernel::config::Endpoint,
     requested: Option<&str>,

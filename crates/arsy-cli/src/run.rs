@@ -2,7 +2,6 @@
 //! outcome, whichever state the session store was left in.
 
 use crate::*;
-use arsy_kernel::provider::Effort;
 
 /// Run one scripted turn for `arsy run`.
 #[cfg(feature = "tui")]

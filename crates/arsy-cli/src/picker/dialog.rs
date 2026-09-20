@@ -1,18 +1,12 @@
 //! The dialogs a bare `/mcp`, `/hooks`, `/skill`, `/session` or `/settings`
 //! opens, and the frame loop they repaint through.
 
-use super::prompt::{Dialog, Prompt, Restoring};
-use super::session::load_workspace_sessions;
-use super::wizard::{catalog_handles, write_config};
+use super::wizard::write_config;
 #[cfg(feature = "tui")]
 use crate::*;
-use arsy_kernel::domain::SessionId;
-use arsy_kernel::provider::Effort;
-use arsy_kernel::secret::{FileCredentialStore, Redactor, SecretError, SecretHandle};
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use serde_json::Value;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 pub(crate) fn mcp_choices(
     root: &Path,
     invocation: &Invocation,
