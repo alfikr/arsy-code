@@ -995,6 +995,7 @@ impl Config {
             "ui.style" => self.ui_style().to_owned(),
             "execution.max_parallel" => self.max_parallel_tools().to_string(),
             "theme.base" => self.theme_base().to_owned(),
+            "ui.mcp_log" => self.mcp_log().to_owned(),
             _ => match key
                 .strip_prefix("compat.")
                 .and_then(|rest| rest.strip_suffix(".enabled"))
