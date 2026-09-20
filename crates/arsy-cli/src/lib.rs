@@ -3409,35 +3409,40 @@ fn prompt_skills(
             config.compat_enabled("codex"),
         )
     };
-    let mut listed: Vec<Skill> = user_skills
-        .into_iter()
-        .filter(|skill| {
-            !config
-                .skill_disabled()
-                .contains(&format!("{}/{}", skill.ecosystem, skill.name))
-        })
-        .map(|skill| Skill {
-            name: skill.name,
-            ecosystem: skill.ecosystem.to_owned(),
-            description: skill_description(root, &skill.path.display().to_string()),
-            path: skill.path.display().to_string(),
-        })
-        .collect();
-
-    let mut taken: std::collections::HashSet<String> =
-        listed.iter().map(|skill| skill.name.clone()).collect();
+    // The workspace is listed first and claims its names, so a repository that
+    // ships a skill by the same name as one of the operator's own is the one
+    // that skill means: project overrides home, the precedence the ecosystems
+    // use.
+    let mut listed: Vec<Skill> = Vec::new();
+    let mut taken = std::collections::HashSet::new();
     for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
         workspace_skills(&mut listed, &mut taken, ecosystem, config, root, &importer);
     }
+    listed.extend(
+        user_skills
+            .into_iter()
+            .filter(|skill| {
+                !config
+                    .skill_disabled()
+                    .contains(&format!("{}/{}", skill.ecosystem, skill.name))
+                    && !taken.contains(&skill.name)
+            })
+            .map(|skill| Skill {
+                name: skill.name,
+                ecosystem: skill.ecosystem.to_owned(),
+                description: skill_description(root, &skill.path.display().to_string()),
+                path: skill.path.display().to_string(),
+            }),
+    );
     listed
 }
 
 /// The workspace skills of one ecosystem, appended to `listed` under their
 /// names.
 ///
-/// `taken` holds the names already listed: a workspace skill by the same name
-/// as a user skill is the one the workspace means to have — project overrides
-/// the operator's home, the same precedence the ecosystems use.
+/// `taken` collects the names as they are listed, and the workspace is listed
+/// before the operator's home: a name claimed here is the one the home copy
+/// then yields to.
 fn workspace_skills(
     listed: &mut Vec<arsy_code::agent::instructions::Skill>,
     taken: &mut std::collections::HashSet<String>,
