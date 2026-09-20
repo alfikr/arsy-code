@@ -12,7 +12,7 @@ fn relative(value: &Value, input: &Path) -> Value {
     let text = serde_json::to_string(value)
         .unwrap()
         .replace(root.trim_matches('"'), "<fixture>")
-        .replace('\\', "/");
+        .replace("\\\\", "/");
     serde_json::from_str(&text).unwrap()
 }
 
