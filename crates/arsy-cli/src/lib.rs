@@ -8175,22 +8175,22 @@ impl<'a> TaskRun<'a> {
 
         let started = Instant::now();
         let mut recorder = telemetry::Recorder::new(&self.config, self.actor.clone())?;
-        let mut supervising = delegates.then_some((supervisor, &mut self.graph));
-        let outcome = dispatch(
-            self.resolved.provider.as_ref(),
+        let max_parallel_tools = self.config.max_parallel_tools();
+        let (outcome, interventions) = dispatch_with_refresh(
+            &mut self.resolved,
+            &self.config,
+            self.invocation.provider.as_deref(),
+            &self.root,
+            &self.model,
+            task,
             &agent,
             &request,
             &mut recorder,
-            &mut supervising,
+            &mut self.graph,
             hooks,
-            self.config.max_parallel_tools(),
+            max_parallel_tools,
             emitter,
         );
-        let interventions: Vec<Value> = supervising
-            .as_ref()
-            .map(|(supervisor, _)| supervisor.interventions().to_vec())
-            .unwrap_or_default();
-        drop(supervising);
         let stop = match &outcome {
             Ok(_) => "answered".to_owned(),
             Err(error) => format!("provider:{}", error.code()),
@@ -8363,6 +8363,113 @@ fn context_budget(resolved: &provider::Resolved) -> u32 {
 /// answers every result with another call would otherwise spend the run on its
 /// own loop.
 const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
+
+/// Dispatch a scripted turn, and once more if a stale OAuth access token is
+/// why it failed.
+///
+/// `dispatch` itself never retries a [`ProviderError::Auth`]: an identical
+/// request would fail identically, the way `stream_with_retry`'s own doc
+/// comment says. What is retryable here is not the request but the
+/// credential — `arsy run` resolves a provider once and keeps it for the
+/// whole task (see `TaskRun::open`), so a token that expires mid-task is
+/// never re-checked until this catches it. Re-resolving the same endpoint
+/// exercises the refresh path `provider::stored` already has; a plain API
+/// key is left alone; a refresh that itself fails surfaces the original
+/// error unchanged, asking the operator to sign in again.
+///
+/// A retry rebuilds the delegation supervisor rather than reusing the
+/// first one, which is safe: an auth failure happens on the very first
+/// model call, before any delegation this task's supervisor could lose.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_refresh(
+    resolved: &mut provider::Resolved,
+    config: &Config,
+    requested_provider: Option<&str>,
+    root: &Path,
+    model: &str,
+    task: TaskId,
+    agent: &arsy_code::agent::ToolRuntime,
+    request: &CanonicalModelRequest,
+    recorder: &mut telemetry::Recorder,
+    graph: &mut TaskGraph,
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    max_parallel_tools: usize,
+    emitter: &mut Emitter,
+) -> (Result<Value, ProviderError>, Vec<Value>) {
+    let supervisor = subagent::Supervisor::new(
+        root.to_path_buf(),
+        config,
+        resolved,
+        model.to_owned(),
+        task,
+        agent,
+    );
+    let delegates = supervisor.can_delegate();
+    let mut supervising = delegates.then_some((supervisor, &mut *graph));
+    let outcome = dispatch(
+        resolved.provider.as_ref(),
+        agent,
+        request,
+        recorder,
+        &mut supervising,
+        hooks,
+        max_parallel_tools,
+        emitter,
+    );
+    let interventions: Vec<Value> = supervising
+        .as_ref()
+        .map(|(supervisor, _)| supervisor.interventions().to_vec())
+        .unwrap_or_default();
+    drop(supervising);
+
+    if !should_refresh_and_retry(&outcome, resolved.source) {
+        return (outcome, interventions);
+    }
+    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
+        return (outcome, interventions);
+    };
+    *resolved = refreshed;
+    emitter.trace(
+        "credential.refreshed",
+        json!({"provider": resolved.endpoint.id}),
+    );
+    let supervisor = subagent::Supervisor::new(
+        root.to_path_buf(),
+        config,
+        resolved,
+        model.to_owned(),
+        task,
+        agent,
+    );
+    let delegates = supervisor.can_delegate();
+    let mut supervising = delegates.then_some((supervisor, graph));
+    let outcome = dispatch(
+        resolved.provider.as_ref(),
+        agent,
+        request,
+        recorder,
+        &mut supervising,
+        hooks,
+        max_parallel_tools,
+        emitter,
+    );
+    let interventions = supervising
+        .as_ref()
+        .map(|(supervisor, _)| supervisor.interventions().to_vec())
+        .unwrap_or_default();
+    (outcome, interventions)
+}
+/// Whether a failed dispatch is worth resolving a fresh credential and
+/// trying again for: only an authentication failure, and only when the
+/// credential came from an OAuth login. An API key that is rejected will be
+/// rejected identically the second time, and any other error class is
+/// already `stream_with_retry`'s job, not this one's.
+fn should_refresh_and_retry(
+    outcome: &Result<Value, ProviderError>,
+    source: provider::CredentialSource,
+) -> bool {
+    matches!(outcome, Err(ProviderError::Auth(_))) && source == provider::CredentialSource::OAuth
+}
 
 /// Run one scripted turn to completion, executing the tools the model asks for.
 ///
@@ -9684,6 +9791,35 @@ mod tests {
 
         std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR);
         std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_stale_oauth_token_is_the_only_failure_worth_a_fresh_credential() {
+        let auth = || Err(ProviderError::Auth("expired".to_owned()));
+        assert!(should_refresh_and_retry(
+            &auth(),
+            provider::CredentialSource::OAuth
+        ));
+        for other in [
+            provider::CredentialSource::ConfiguredEnv,
+            provider::CredentialSource::Keyring,
+            provider::CredentialSource::File,
+            provider::CredentialSource::DefaultEnv,
+            provider::CredentialSource::None,
+        ] {
+            assert!(
+                !should_refresh_and_retry(&auth(), other),
+                "an API key rejected once will be rejected identically again: {other:?}"
+            );
+        }
+        assert!(!should_refresh_and_retry(
+            &Err(ProviderError::RateLimited { retry_after: None }),
+            provider::CredentialSource::OAuth
+        ));
+        assert!(!should_refresh_and_retry(
+            &Ok(json!({"answer": "ok"})),
+            provider::CredentialSource::OAuth
+        ));
     }
 
     /// A provider that replays a scripted round per request and records what
