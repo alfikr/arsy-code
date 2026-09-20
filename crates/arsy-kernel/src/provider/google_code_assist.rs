@@ -322,13 +322,20 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
 }
 
 /// The model the API is asked for: flash carries the effort as a suffix, Pro
-/// maps its levels onto two ids, and anything unrecognized passes through
-/// untouched (including the empty model, which is never rewritten).
+/// maps its levels onto two ids, a Claude model asked to think names the
+/// thinking variant, and anything unrecognized passes through untouched
+/// (including the empty model, which is never rewritten).
 fn routed_wire_model(model: &str, effort: Option<Effort>) -> &str {
+    let thinking = matches!(effort, Some(Effort::Medium | Effort::High));
     match model {
         "gemini-3.8-flash" => gemini_3_8_flash(effort),
         "gemini-3.7-flash" => gemini_3_7_flash(effort),
         "gemini-3.1-pro" => gemini_3_1_pro(effort),
+        "claude-3-7-sonnet" if thinking => "claude-3-7-sonnet-thinking",
+        "claude-sonnet-4-5" if thinking => "claude-sonnet-4-5-thinking",
+        "claude-sonnet-4-6" if thinking => "claude-sonnet-4-6-thinking",
+        "claude-opus-4-5" if thinking => "claude-opus-4-5-thinking",
+        "claude-opus-4-6" if thinking => "claude-opus-4-6-thinking",
         other => other,
     }
 }
@@ -350,13 +357,14 @@ fn gemini_3_7_flash(effort: Option<Effort>) -> &'static str {
     }
 }
 
-/// Pro has no `-medium` id, so medium reuses the high variant, and high (the
-/// default) routes to the dedicated agent model.
+/// Pro names only a low variant and an agent model for high; medium and an
+/// unset effort ask for the plain id, which is the only other name the API
+/// was told about.
 fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
     match effort {
         Some(Effort::Low) => "gemini-3.1-pro-low",
-        Some(Effort::Medium) => "gemini-3.1-pro-high",
-        Some(Effort::High) | None => "gemini-pro-agent",
+        Some(Effort::High) => "gemini-pro-agent",
+        Some(Effort::Medium) | None => "gemini-3.1-pro",
     }
 }
 
