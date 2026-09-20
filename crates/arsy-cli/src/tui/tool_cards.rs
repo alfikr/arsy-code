@@ -101,7 +101,7 @@ pub fn tool_running_frame_with_output(
             &fit(&detail, terminal_width().saturating_sub(24))
         ),
         elapsed_ms,
-        if expanded { "e collapse" } else { "e expand" }
+        if expanded { "^O collapse" } else { "^O expand" }
     )
 }
 
@@ -155,9 +155,9 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
                 "{} running · {}",
                 state.frame,
                 if state.expanded {
-                    "e collapse"
+                    "^O collapse"
                 } else {
-                    "e expand"
+                    "^O expand"
                 }
             ),
             duration_ms: Some(state.elapsed_ms),
@@ -238,9 +238,9 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
     }
 
     let toggle_hint = if state.expanded {
-        " [e: collapse] "
+        " [^O: collapse] "
     } else {
-        " [e: expand] "
+        " [^O: expand] "
     };
     let top = arsy_tui::widget::top_rule(width, Some(&arsy_tui::Line::of(header, accent)), border);
     let mut lines = vec![render_line_segments(colour, &top)];

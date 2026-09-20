@@ -612,14 +612,11 @@ impl Composer {
                 self.take();
                 Action::Redraw
             }
-            // `e` with an empty line expands the last tool call's output, the
-            // way Shift+Tab changes the mode where it stands: the composer
-            // hands the key up rather than turning it into text. Only when
-            // the line is empty, so typing a prompt that starts with `e` is
-            // still typing.
-            Key::Char('e') if !self.picking && !self.masked && self.buffer.is_empty() => {
-                Action::Expand
-            }
+            // Ctrl-O expands the last tool call's output, the way Shift+Tab
+            // changes the mode where it stands: the composer hands the key up
+            // rather than turning it into text. A control byte rather than a
+            // letter, so a prompt that starts with `e` is still typing.
+            Key::Expand if !self.picking && !self.masked => Action::Expand,
             Key::CycleMode if !self.picking && !self.masked => Action::CycleMode,
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,

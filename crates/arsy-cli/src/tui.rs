@@ -1942,7 +1942,7 @@ mod tests {
             false,
         );
         assert!(running.contains("line two"));
-        assert!(running.contains("e expand"));
+        assert!(running.contains("^O expand"));
         let expanded = tool_running_frame_with_output(
             false,
             "⠙",
@@ -1966,7 +1966,7 @@ mod tests {
         assert_eq!(running_box.len(), 3);
         assert!(running_box[0].contains("$ cargo test"));
         assert!(running_box[1].contains("running (120ms)"));
-        assert!(running_box[2].contains("[e: expand]"));
+        assert!(running_box[2].contains("[^O: expand]"));
 
         let long_output = (1..=20)
             .map(|i| format!("line {i}"))
