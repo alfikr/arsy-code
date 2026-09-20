@@ -90,7 +90,6 @@ pub(crate) fn unusable(mut diagnostic: Diagnostic, emitter: &mut Emitter) -> i32
 /// How long a task's lease runs before another process may take it over.
 ///
 /// A turn still in flight has not lost its lease; a process that died halfway
-
 pub(crate) const TASK_LEASE_MS: u64 = 30 * 60 * 1000;
 
 /// What one task may spend before it is stopped rather than continued.
@@ -691,7 +690,6 @@ pub(crate) fn dispatch(
 /// Where Claude Code and Codex keep the operator's files.
 ///
 /// A unit test gets none at all, so what it asserts cannot depend on the
-
 pub(crate) fn charge_turn(
     resolved: Option<&provider::Resolved>,
     model: &str,

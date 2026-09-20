@@ -439,10 +439,7 @@ mod tests {
     fn dialog(sessions: Vec<SessionChoice>) -> SessionDialogState {
         // The active session is the list's first row, so `new` injects
         // nothing and the rows are exactly the ones the test passed.
-        let active = sessions
-            .first()
-            .map(|s| s.id)
-            .unwrap_or_else(SessionId::new);
+        let active = sessions.first().map(|s| s.id).unwrap_or_default();
         SessionDialogState::new(sessions, active)
     }
 

@@ -260,6 +260,7 @@ fn skill_listing(skills: &[Skill]) -> Option<String> {
 /// Compilation goes through the kernel's prompt compiler rather than string
 /// concatenation, so ordering is the family's, secrets are redacted on the way
 /// out, and every segment is traceable to the fragment it came from.
+#[allow(clippy::too_many_arguments)]
 pub fn system_prompt(
     family: ModelFamily,
     instructions: &[Instruction],

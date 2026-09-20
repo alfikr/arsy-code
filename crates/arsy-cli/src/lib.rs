@@ -1616,8 +1616,6 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
 /// applied policy would silently run under something the operator never wrote.
 /// Every discovered configuration layer, plus the one `--config` named.
 ///
-/// The extra file is applied last, so it wins a conflicting value — and only
-
 /// The catalog under the `file` store, beside the user configuration.
 const CATALOG_FILE: &str = "credentials.json";
 
@@ -3078,7 +3076,6 @@ const MAX_CHILD_TOOL_ROUNDS: usize = 8;
 /// zero, because a running total that silently treats every unpriced turn as
 /// free is worse than one that admits the gap: the first is wrong and looks
 /// right, the second is right about what it does not know.
-
 fn installed_sandbox_assurance() -> arsy_kernel::policy::SandboxAssurance {
     let Ok(executable) = std::env::current_exe() else {
         return arsy_kernel::policy::SandboxAssurance::None;
@@ -3341,7 +3338,6 @@ const MAX_RECALLED_MEMORY_BYTES: usize = 4 * 1024;
 /// Only loadable plugins are listed. One whose manifest now asks for more than
 /// was approved cannot run, and offering it would produce a refusal the model
 /// could do nothing about.
-
 #[cfg(feature = "wasm")]
 fn installed_extensions(root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
     let (installed, _unreadable) = arsy_code::plugin::Registry::open(root)

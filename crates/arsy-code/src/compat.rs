@@ -824,6 +824,7 @@ fn claude_hook_entry(
 }
 
 /// One handler of one entry, as the single declaration row the engine keys it by.
+#[allow(clippy::too_many_arguments)]
 fn claude_hook_handler(
     importer: &CompatibilityImporter,
     source: &Path,

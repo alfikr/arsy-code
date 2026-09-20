@@ -587,6 +587,7 @@ pub(crate) fn run_session_dialog(
 /// command reaches here and a command with an argument stays the read-only
 /// inspection it always was.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_dialog(
     dialog: Dialog,
     invocation: &Invocation,
@@ -1214,6 +1215,7 @@ pub(crate) fn slash_command(
 
 /// Send the line to the model as the task it is.
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_task(
     line: &str,
     invocation: &Invocation,
@@ -1403,7 +1405,6 @@ pub(crate) fn inspect_command(
 }
 
 /// Fix the palette before the first frame.
-
 /// Fix the palette before the first frame.
 ///
 /// A rejected `[theme]` override is reported and dropped, never left to blank

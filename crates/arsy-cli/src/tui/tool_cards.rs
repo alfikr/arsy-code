@@ -139,7 +139,7 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
             let start = lines.len().saturating_sub(RUNNING_PREVIEW_LINES);
             lines[start..]
                 .iter()
-                .map(|line| arsy_tui::Line::of((*line).to_owned(), arsy_tui::Role::Dim))
+                .map(|line| arsy_tui::Line::of(*line, arsy_tui::Role::Dim))
                 .collect()
         } else {
             let detail = state
@@ -148,7 +148,7 @@ pub fn tool_running_box(width: usize, colour: bool, state: &RunningToolState<'_>
                 .rev()
                 .find(|line| !line.trim().is_empty())
                 .unwrap_or(state.summary);
-            vec![arsy_tui::Line::of(detail.to_owned(), arsy_tui::Role::Dim)]
+            vec![arsy_tui::Line::of(detail, arsy_tui::Role::Dim)]
         };
         let status = CardStatus {
             lead: format!(

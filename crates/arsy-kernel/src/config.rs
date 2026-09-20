@@ -1077,7 +1077,7 @@ impl Config {
     ) -> Result<(), ConfigError> {
         let disabled = as_table(value, "skill.disabled", path)?;
         for (name, value) in disabled {
-            self.apply_skill_disabled(layer, path, &name, value)?;
+            self.apply_skill_disabled(layer, path, name, value)?;
         }
         Ok(())
     }
@@ -1802,7 +1802,7 @@ impl Config {
     ) -> Result<(), ConfigError> {
         let disabled = as_table(value, "hook.disabled", path)?;
         for (declaration, value) in disabled {
-            self.apply_hook_disabled(layer, path, &declaration, value)?;
+            self.apply_hook_disabled(layer, path, declaration, value)?;
         }
         Ok(())
     }
