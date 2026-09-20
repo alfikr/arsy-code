@@ -6,9 +6,12 @@ use std::{fs, path::Path};
 /// declaration was read from does not depend on where the checkout lives.
 /// The same substitution `arsy-compat`'s live golden makes.
 fn relative(value: &Value, input: &Path) -> Value {
+    // A separator that JSON escapes is escaped in the haystack too, so the
+    // root is written the way the document writes it before it can match.
+    let root = serde_json::to_string(&input.display().to_string()).unwrap();
     let text = serde_json::to_string(value)
         .unwrap()
-        .replace(&input.display().to_string(), "<fixture>")
+        .replace(root.trim_matches('"'), "<fixture>")
         .replace('\\', "/");
     serde_json::from_str(&text).unwrap()
 }

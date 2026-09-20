@@ -1215,7 +1215,9 @@ mod tests {
     fn a_switched_off_declaration_does_not_register_but_its_file_is_still_read() {
         let home = home_with(&[(".claude/settings.json", CLAUDE)]);
         let workspace = tempfile::tempdir().unwrap();
-        let settings = home.path().join(".claude/settings.json");
+        // Joined a component at a time, so the key reads the way discovery
+        // spells it on a platform whose separator is not a slash.
+        let settings = home.path().join(".claude").join("settings.json");
         let audit = format!("{}#PreToolUse[0].0", settings.display());
 
         let mut switched = discovery(home.path(), workspace.path(), false);
