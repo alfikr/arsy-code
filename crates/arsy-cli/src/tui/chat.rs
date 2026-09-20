@@ -561,6 +561,11 @@ impl Composer {
     /// The keys that move through the line, the menu, or the history.
     fn navigate(&mut self, key: Key) -> Option<Action> {
         match key {
+            // When a picker offers rows, Up/Down always navigate the menu,
+            // even if filtering narrows the matches to none. This prevents
+            // Up/Down from falling through to history navigation.
+            Key::Up if self.offered.is_some() => Some(self.mark(false)),
+            Key::Down if self.offered.is_some() => Some(self.mark(true)),
             // An open menu owns Up/Down: it is the list in front of the reader,
             // and history is still one Escape or Backspace away. The ends wrap,
             // so a short list is never a dead end in one direction.
