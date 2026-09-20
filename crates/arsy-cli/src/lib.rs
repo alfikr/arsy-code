@@ -3537,7 +3537,9 @@ mod tests {
     use crate::picker::wizard::effort_line;
     use crate::picker::wizard::{auth_step, provider_step, AuthNext, ProviderNext};
     use crate::run::{charge, read_image, MAX_IMAGE_BYTES};
-    use crate::turn::{block_gap, drive_provider, native_turn, stream_row, Painter, Streaming};
+    #[cfg(all(feature = "tui", unix))]
+    use crate::turn::drive_provider;
+    use crate::turn::{block_gap, native_turn, stream_row, Painter, Streaming};
     use arsy_kernel::provider::Effort;
     use arsy_kernel::{
         event::{EventPayload, EventStore},
@@ -4695,9 +4697,6 @@ mod tests {
         assert_eq!(provider, "claude-oauth");
         assert_eq!(verifier.len(), 43, "a 32-byte PKCE verifier, unpadded");
     }
-
-    /// The catalog is metadata, so where it lives is the operator's choice and
-    /// the default costs no unlock prompt.
 
     /// `ui.mcp_log` decides how much of a server's own logging survives to the
     /// transcript. A server that said something is never silently dropped at
