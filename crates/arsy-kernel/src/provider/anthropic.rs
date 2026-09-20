@@ -360,7 +360,7 @@ fn error_message(body: &str) -> Option<String> {
 /// cut short therefore yields no executable call.
 struct EventDecoder {
     lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
-    blocks: Vec<ToolBlock>,
+    blocks: HashMap<usize, ToolBlock>,
     /// One wire event can carry two canonical facts (usage and stop reason).
     queue: VecDeque<ModelEvent>,
     done: bool,
@@ -382,7 +382,7 @@ impl EventDecoder {
     ) -> Self {
         Self {
             lines,
-            blocks: Vec::new(),
+            blocks: HashMap::new(),
             queue: VecDeque::new(),
             done: false,
             tool_names,
@@ -445,16 +445,14 @@ impl EventDecoder {
             .get(wire_name)
             .cloned()
             .unwrap_or_else(|| wire_name.to_owned());
-        if self.blocks.len() != index {
-            return Err(ProviderError::Decode(format!(
-                "content block {index} started out of order"
-            )));
-        }
-        self.blocks.push(ToolBlock {
-            id: id.clone(),
-            name: name.clone(),
-            arguments: String::new(),
-        });
+        self.blocks.insert(
+            index,
+            ToolBlock {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: String::new(),
+            },
+        );
         self.queue
             .push_back(ModelEvent::ToolCallStarted { index, id, name });
         Ok(())
@@ -474,7 +472,7 @@ impl EventDecoder {
             }),
             Some("input_json_delta") => {
                 let fragment = field(delta, "partial_json")?.to_owned();
-                let block = self.blocks.get_mut(index).ok_or_else(|| {
+                let block = self.blocks.get_mut(&index).ok_or_else(|| {
                     ProviderError::Decode(format!("delta for unstarted block {index}"))
                 })?;
                 block.arguments.push_str(&fragment);
@@ -492,7 +490,7 @@ impl EventDecoder {
     /// must parse as a whole, or the call is rejected rather than guessed at.
     fn block_stop(&mut self, value: &Value) -> Result<(), ProviderError> {
         let index = block_index(value)?;
-        let Some(block) = self.blocks.get(index) else {
+        let Some(block) = self.blocks.get(&index) else {
             return Ok(());
         };
         // An empty-input tool call is legal and encodes as `{}`.

@@ -212,6 +212,54 @@ fn a_truncated_tool_call_yields_no_completed_call() {
     );
 }
 
+/// A text block at index 0 followed by a tool call at index 1 must not be
+/// mistaken for an out-of-order block: `blocks` used to grow only on
+/// `tool_use` blocks, so its length diverged from the wire's shared index
+/// space the moment any other block type came first.
+#[test]
+fn a_tool_call_after_a_text_block_is_not_out_of_order() {
+    let transport = FakeTransport::streaming(vec![
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"looking"}}"#,
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs.read"}}"#,
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"Cargo.toml\"}"}}"#,
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+    ]);
+    let provider =
+        AnthropicProvider::with_base_url("https://example.test", ApiKey::new("sk-test"), transport);
+
+    let events = collect(provider.stream(&request(vec![read_tool()])).unwrap());
+
+    assert_eq!(
+        events,
+        vec![
+            ModelEvent::TextDelta {
+                text: "looking".to_owned(),
+            },
+            ModelEvent::ToolCallStarted {
+                index: 1,
+                id: "toolu_1".to_owned(),
+                name: "fs.read".to_owned(),
+            },
+            ModelEvent::ToolCallDelta {
+                index: 1,
+                fragment: "{\"path\":\"Cargo.toml\"}".to_owned(),
+            },
+            ModelEvent::ToolCallCompleted {
+                index: 1,
+                id: "toolu_1".to_owned(),
+                name: "fs.read".to_owned(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            ModelEvent::Completed {
+                stop: StopReason::ToolUse,
+            },
+        ]
+    );
+}
+
 #[test]
 fn the_adapter_owns_wire_format_and_authentication() {
     let transport = FakeTransport::streaming(vec![r#"data: {"type":"message_stop"}"#]);
