@@ -3164,6 +3164,10 @@ fn agent_runtime(
     interactive: bool,
     scope: &str,
     session: Option<SessionId>,
+    // The task and attempt this turn runs under, when it has one. Evidence the
+    // turn records — a validation, above all — is attributed to them, so a
+    // later reader can tell which try of which task it belongs to.
+    lineage: Option<(TaskId, Option<arsy_kernel::domain::AttemptId>)>,
     connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
     skills: &[arsy_code::agent::instructions::Skill],
@@ -3210,6 +3214,8 @@ fn agent_runtime(
                         store: open_store(root)? as Arc<dyn EventStore>,
                         session,
                         actor: actor(),
+                        task: lineage.map(|(task, _)| task),
+                        attempt: lineage.and_then(|(_, attempt)| attempt),
                     })
                 })
                 .transpose()?,
@@ -3541,7 +3547,7 @@ mod tests {
     use crate::picker::session::reconstruct_session_conversation;
     use crate::picker::wizard::effort_line;
     use crate::picker::wizard::{auth_step, provider_step, AuthNext, ProviderNext};
-    use crate::run::{charge, read_image, MAX_IMAGE_BYTES};
+    use crate::run::{charge, is_stale_oauth_token, read_image, MAX_IMAGE_BYTES};
     #[cfg(all(feature = "tui", unix))]
     use crate::turn::drive_provider;
     use crate::turn::{block_gap, native_turn, stream_row, Painter, Streaming};
@@ -3719,6 +3725,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn a_stale_oauth_token_is_the_only_failure_worth_a_fresh_credential() {
+        let auth = ProviderError::Auth("expired".to_owned());
+        assert!(is_stale_oauth_token(
+            &auth,
+            provider::CredentialSource::OAuth
+        ));
+        for other in [
+            provider::CredentialSource::ConfiguredEnv,
+            provider::CredentialSource::File,
+            provider::CredentialSource::DefaultEnv,
+            provider::CredentialSource::None,
+        ] {
+            assert!(
+                !is_stale_oauth_token(&auth, other),
+                "an API key rejected once will be rejected identically again: {other:?}"
+            );
+        }
+        assert!(!is_stale_oauth_token(
+            &ProviderError::RateLimited { retry_after: None },
+            provider::CredentialSource::OAuth
+        ));
+    }
+
     /// A provider that replays a scripted round per request and records what
     /// it was asked, so a test can assert on the conversation the loop built.
     #[cfg(feature = "tui")]
@@ -3726,6 +3756,10 @@ mod tests {
         descriptor: arsy_kernel::provider::ProviderDescriptor,
         rounds: std::sync::Mutex<std::collections::VecDeque<Vec<ModelEvent>>>,
         seen: std::sync::Mutex<Vec<CanonicalModelRequest>>,
+        /// Errors to fail `stream` with before falling through to `rounds`,
+        /// oldest first. Empty for every existing test, which never fails.
+        fail_first:
+            std::sync::Mutex<std::collections::VecDeque<arsy_kernel::provider::ProviderError>>,
     }
 
     #[cfg(feature = "tui")]
@@ -3740,6 +3774,9 @@ mod tests {
         ) -> Result<arsy_kernel::provider::ModelEventStream, arsy_kernel::provider::ProviderError>
         {
             self.seen.lock().unwrap().push(request.clone());
+            if let Some(error) = self.fail_first.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             let events = self.rounds.lock().unwrap().pop_front().unwrap_or_default();
             Ok(Box::new(events.into_iter().map(Ok)))
         }
@@ -3754,6 +3791,7 @@ mod tests {
             },
             rounds: std::sync::Mutex::new(rounds.into()),
             seen: std::sync::Mutex::new(Vec::new()),
+            fail_first: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
         let resolved = provider::Resolved {
             provider: scripted.clone(),
@@ -3775,6 +3813,22 @@ mod tests {
         (resolved, scripted)
     }
 
+    /// Like [`resolved`], but the provider fails its first `stream` call
+    /// with `error` before falling through to the scripted rounds, and its
+    /// credential is sourced from OAuth rather than an environment
+    /// variable — for a test that exercises recovery from a stale token
+    /// mid-session.
+    #[cfg(feature = "tui")]
+    fn resolved_failing_first(
+        error: arsy_kernel::provider::ProviderError,
+        rounds: Vec<Vec<ModelEvent>>,
+    ) -> (provider::Resolved, std::sync::Arc<Scripted>) {
+        let (mut resolved, scripted) = resolved(rounds);
+        scripted.fail_first.lock().unwrap().push_back(error);
+        resolved.source = provider::CredentialSource::OAuth;
+        (resolved, scripted)
+    }
+
     #[cfg(feature = "tui")]
     fn route() -> tui::ModelRoute {
         tui::ModelRoute {
@@ -3792,6 +3846,7 @@ mod tests {
             &load_config(root, root, None).unwrap(),
             true,
             "test",
+            None,
             None,
             None,
             &mut Emitter::new(Output::Json),
@@ -3875,7 +3930,7 @@ mod tests {
     fn a_hook_that_denies_a_call_stops_it_in_the_interactive_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let patch = "*** Begin Patch\n*** Add File: note.txt\n+blocked\n*** End Patch\n";
-        let (resolved, _) = resolved(vec![
+        let (mut resolved, _) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -3919,7 +3974,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -3959,7 +4014,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let patch =
             "*** Begin Patch\n*** Add File: note.txt\n+written by the tool loop\n*** End Patch\n";
-        let (resolved, scripted) = resolved(vec![
+        let (mut resolved, scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -3998,7 +4053,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -4101,7 +4156,7 @@ mod tests {
     fn a_successful_duplicate_command_runs_once_and_finishes_the_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let command = "printf x >> duplicate-command-marker";
-        let (resolved, scripted) = resolved(vec![
+        let (mut resolved, scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -4135,7 +4190,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -4175,7 +4230,7 @@ mod tests {
     #[test]
     fn a_declined_tool_call_does_not_run_and_the_model_is_told_so() {
         let workspace = tempfile::tempdir().unwrap();
-        let (resolved, _scripted) = resolved(vec![
+        let (mut resolved, _scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -4202,7 +4257,7 @@ mod tests {
         let (typist, keys, done) = typed(b"d", std::sync::Arc::clone(&approval));
         let mut conversation = Vec::new();
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -4264,7 +4319,7 @@ mod tests {
                 },
             ]
         };
-        let (resolved, scripted) = resolved(vec![asking(), asking()]);
+        let (mut resolved, scripted) = resolved(vec![asking(), asking()]);
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
         let (typist, keys, done) = typed(b"\x03", std::sync::Arc::clone(&approval));
@@ -4272,7 +4327,7 @@ mod tests {
         // A stop is answered by the stop, not by waiting for the keyboard to
         // hang up: the calls after it are refused without asking.
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -4318,6 +4373,62 @@ mod tests {
         assert!(results
             .iter()
             .all(|content| matches!(content, ModelContent::ToolResult { is_error: true, .. })));
+    }
+
+    /// A token that expires mid-session is reported after a refresh is
+    /// attempted, not silently swallowed. The endpoint id ("stub") names no
+    /// real provider, so `provider::resolve` cannot actually refresh it —
+    /// this exercises the failure path deterministically: refresh is
+    /// attempted and, failing, the original failure still reaches the
+    /// operator, and no second `stream` call is made on top of it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_stale_oauth_token_mid_session_is_reported_after_a_refresh_attempt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut resolved, scripted) = resolved_failing_first(
+            ProviderError::Auth("token expired".to_owned()),
+            vec![vec![ModelEvent::Completed {
+                stop: arsy_kernel::provider::StopReason::EndTurn,
+            }]],
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "hello".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn.failure.as_deref(),
+            Some("provider authentication failed: token expired")
+        );
+        assert!(matches!(turn.provider_error, Some(ProviderError::Auth(_))));
+        assert_eq!(
+            scripted.seen.lock().unwrap().len(),
+            1,
+            "a failed refresh must not be followed by a second stream call"
+        );
     }
 
     #[cfg(feature = "tui")]
@@ -5248,23 +5359,22 @@ mod tests {
     #[cfg(all(feature = "tui", unix))]
     #[test]
     fn a_follow_up_typed_during_a_provider_turn_is_carried_to_the_next_one() {
-        use std::time::Duration;
         let route = tui::ModelRoute {
             provider: tui::CODEX_PROVIDER.to_owned(),
             model: "default".to_owned(),
         };
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        // Queued on the keyboard before the turn starts rather than typed a
+        // fixed number of milliseconds into it. The loop drains the keyboard on
+        // every pass, so the follow-up is still read while the turn is running
+        // — but which pass reads it no longer depends on how loaded the machine
+        // is, which is what made this case fail inside the full suite and pass
+        // on its own.
         let (sender, keys) = std::sync::mpsc::channel();
-        let typist = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            for byte in b"next thing\r" {
-                let _ = sender.send(*byte);
-            }
-            // The keyboard outlives the turn, so the loop never reads the
-            // follow-up as the operator hanging up.
-            std::thread::sleep(Duration::from_secs(1));
-        });
+        for byte in b"next thing\r" {
+            sender.send(*byte).expect("the keyboard is still open");
+        }
         // Streams for a moment, so there is a turn to type into, then ends.
         let mut command = std::process::Command::new("sh");
         command.args([
@@ -5285,7 +5395,9 @@ mod tests {
             &Redactor::new(),
         )
         .unwrap();
-        typist.join().unwrap();
+        // Held open across the call: a closed keyboard reads as the operator
+        // hanging up rather than as a turn with a follow-up waiting behind it.
+        drop(sender);
 
         // Reported as queued and actually queued: a row that says a follow-up
         // was taken, over a queue that dropped it, is worse than refusing it.

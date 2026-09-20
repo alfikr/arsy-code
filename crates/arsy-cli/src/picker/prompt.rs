@@ -970,7 +970,7 @@ pub(crate) fn resolve_route<'a>(
     provider: &str,
     resolved: &'a mut std::collections::HashMap<String, provider::Resolved>,
     unavailable: &mut std::collections::HashSet<String>,
-) -> Option<&'a provider::Resolved> {
+) -> Option<&'a mut provider::Resolved> {
     if !resolved.contains_key(provider) && !unavailable.contains(provider) {
         let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
         match load_config(workspace, &working, invocation.config.as_deref())
@@ -985,7 +985,7 @@ pub(crate) fn resolve_route<'a>(
             }
         }
     }
-    resolved.get(provider)
+    resolved.get_mut(provider)
 }
 
 /// Ask the operator what to do with the plan a planning turn produced.
@@ -1303,7 +1303,7 @@ pub(crate) struct Running<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn take_turn(
     invocation: &Invocation,
-    resolved: Option<&provider::Resolved>,
+    resolved: Option<&mut provider::Resolved>,
     line: &str,
     footer: &str,
     running: Running<'_>,

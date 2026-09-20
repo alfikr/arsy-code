@@ -2,7 +2,7 @@
 //! with its tool calls and approvals, the external Codex CLI projection, and
 //! the recording of what the turn left behind.
 
-use crate::run::{charge_turn, context_budget, merge, prepare_task};
+use crate::run::{charge_turn, context_budget, is_stale_oauth_token, merge, prepare_task};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -46,6 +46,7 @@ fn record_turn(
             authority: Vec::new(),
             state: TaskState::Pending,
             lease_expires_at_ms: None,
+            runtime: Default::default(),
         })
         .map_err(graph_failed)?;
     graph.ready().map_err(graph_failed)?;
@@ -295,7 +296,7 @@ fn persist_turn(
 pub(crate) fn run_turn(
     invocation: &Invocation,
     session_id: SessionId,
-    native: Option<&provider::Resolved>,
+    mut native: Option<&mut provider::Resolved>,
     task: &str,
     history: &arsy_code::agent::budget::History,
     route: &tui::ModelRoute,
@@ -359,7 +360,7 @@ pub(crate) fn run_turn(
             "mode": approval.get().label(),
         }),
     );
-    let outcome = match native {
+    let outcome = match native.as_deref_mut() {
         Some(resolved) => native_turn(
             resolved,
             &config,
@@ -369,6 +370,7 @@ pub(crate) fn run_turn(
                 true,
                 &session_id.to_string(),
                 Some(session_id),
+                None,
                 Some(session_connector()),
                 emitter,
                 &prompt_skills(&root, &config),
@@ -475,7 +477,7 @@ pub(crate) fn run_turn(
         session_id,
         node,
         route,
-        native,
+        native.as_deref(),
         colour,
         base,
         conversation,
@@ -532,7 +534,7 @@ enum Answer {
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn native_turn(
-    resolved: &provider::Resolved,
+    resolved: &mut provider::Resolved,
     config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
@@ -572,7 +574,7 @@ pub(crate) fn native_turn(
             colour,
             &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
         )?;
-        let mut outcome = native_status(
+        let mut outcome = native_status_with_refresh(
             resolved,
             config,
             runtime,
@@ -1580,7 +1582,7 @@ fn round_request(
 fn spawn_stream(
     provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
     request: CanonicalModelRequest,
-) -> std::sync::mpsc::Receiver<Result<Streamed, String>> {
+) -> std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     let (rows, events) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let stream = match arsy_kernel::provider::stream_with_retry(
@@ -1590,7 +1592,7 @@ fn spawn_stream(
         ) {
             Ok(stream) => stream,
             Err(error) => {
-                let _ = rows.send(Err(error.to_string()));
+                let _ = rows.send(Err(error));
                 return;
             }
         };
@@ -1612,7 +1614,7 @@ fn spawn_stream(
 #[cfg(feature = "tui")]
 fn streamed(
     event: Result<ModelEvent, arsy_kernel::provider::ProviderError>,
-) -> Option<Result<Streamed, String>> {
+) -> Option<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     Some(match event {
         Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
         Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
@@ -1634,7 +1636,7 @@ fn streamed(
             arguments,
         }),
         Ok(_) => return None,
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error),
     })
 }
 
@@ -2420,6 +2422,74 @@ fn erase_live_response(
 /// stalled socket; dropping the receiver is what stops it, because the next
 /// send fails and the stream is dropped with the thread.
 #[cfg(feature = "tui")]
+/// Call `native_status` for one round, and once more if a stale OAuth
+/// access token is why it failed — the interactive-session counterpart to
+/// `dispatch_with_refresh`. A session resolves its provider once and keeps
+/// it for as long as the operator keeps typing (`resolve_route`'s cache),
+/// so a token that expires between turns is never re-checked until this
+/// catches it.
+#[allow(clippy::too_many_arguments)]
+fn native_status_with_refresh(
+    resolved: &mut provider::Resolved,
+    config: &arsy_kernel::config::Config,
+    runtime: &arsy_code::agent::ToolRuntime,
+    conversation: &[ModelMessage],
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    round: usize,
+    colour: bool,
+    footer: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+) -> io::Result<Turn> {
+    let outcome = native_status(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+        colour,
+        footer,
+        keys,
+        decoder,
+        composer,
+        approval,
+    )?;
+    let Some(error) = &outcome.provider_error else {
+        return Ok(outcome);
+    };
+    if !is_stale_oauth_token(error, resolved.source) {
+        return Ok(outcome);
+    }
+    let Ok(refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
+        return Ok(outcome);
+    };
+    *resolved = refreshed;
+    native_status(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+        colour,
+        footer,
+        keys,
+        decoder,
+        composer,
+        approval,
+    )
+}
+
+#[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn native_status(
     resolved: &provider::Resolved,
@@ -2540,7 +2610,8 @@ fn native_status(
                 first_event = true;
             }
             Ok(Err(failure)) => {
-                outcome.failure = Some(failure);
+                outcome.failure = Some(failure.to_string());
+                outcome.provider_error = Some(failure);
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -2820,6 +2891,13 @@ pub(crate) fn drive_provider(
 pub(crate) struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     pub(crate) failure: Option<String>,
+    /// The typed error `failure` was rendered from, when this turn's
+    /// failure came from a provider stream at all — `None` for the
+    /// round-limit and external-CLI failure paths, neither of which is a
+    /// [`ProviderError`]. Kept separately so a caller can tell a stale
+    /// OAuth token apart from anything else without parsing `failure`'s
+    /// display text.
+    pub(crate) provider_error: Option<arsy_kernel::provider::ProviderError>,
     /// The full text of the model's answer, kept so follow-up turns in the
     /// same session know what the model said.
     pub(crate) response: String,
