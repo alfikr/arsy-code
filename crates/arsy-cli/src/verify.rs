@@ -44,15 +44,43 @@ pub fn run(
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
+    // Nothing here creates anything. Opening either store would make the
+    // directories it expects, and a command whose job is to check a claim
+    // must not leave a workspace different from how it found it — least of
+    // all one it was pointed at by mistake.
+    if !root.join(crate::STORE_PATH).is_file() {
+        return Err(no_such_session(
+            session,
+            "this workspace has no session store",
+        ));
+    }
     let store = crate::open_store(&root)?;
     let graph =
         TaskGraph::new(store.clone(), session, Principal::System).map_err(storage_failed)?;
+    if graph
+        .store()
+        .current_version(session)
+        .map_err(storage_failed)?
+        .0
+        == 0
+    {
+        // Reporting `unverified` for a session that is not here would answer
+        // a typo with a verdict about the work.
+        return Err(no_such_session(
+            session,
+            "no session with that id is recorded in this workspace",
+        ));
+    }
     let validations =
         ValidationLog::open(store, session, Principal::System).map_err(storage_failed)?;
-    // Opened read-only in effect: the prover only asks whether an id resolves.
     // A missing store is reported rather than assumed empty, because "no
-    // artifacts here" and "cannot check artifacts" are different answers.
-    let artifacts = FileArtifactStore::open(root.join(ARTIFACT_PATH), 0).ok();
+    // artifacts here" and "cannot check artifacts" are different answers —
+    // and the second one must not become the first by creating it.
+    let artifact_root = root.join(ARTIFACT_PATH);
+    let artifacts = artifact_root
+        .is_dir()
+        .then(|| FileArtifactStore::open(&artifact_root, 0).ok())
+        .flatten();
 
     // The revision the proof answers for is the one the workspace is on now.
     // Evidence recorded against anything else is stale by definition, which
@@ -112,6 +140,14 @@ pub fn run(
             }
             .exit_code()
         }))
+}
+
+fn no_such_session(session: SessionId, why: &str) -> Diagnostic {
+    Diagnostic::error(
+        "ARSY-SCH-1004",
+        format!("cannot verify {session}: {why}"),
+        "list what is recorded with `arsy session list`, and check --workspace",
+    )
 }
 
 fn task_report(graph: &TaskGraph, proof: &CompletionProof) -> Value {

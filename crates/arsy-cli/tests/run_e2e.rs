@@ -1073,6 +1073,26 @@ fn a_turn_that_finishes_without_running_its_own_check_is_not_verified() {
         verdict["tasks"][0]["criteria"][0]["statement"],
         "the suite passes"
     );
+
+    // A session that is not here is a question about the id, not a verdict
+    // about the work: answering a typo with "unverified" reads as a finding.
+    let (missing_code, missing_records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["verify", "00000000-0000-4000-8000-000000000000"],
+    );
+    assert_ne!(missing_code, 0);
+    assert_eq!(result(&missing_records)["code"], "ARSY-SCH-1004");
+
+    // And verifying is read-only: a workspace it was pointed at by mistake
+    // is left exactly as it was found.
+    let untouched = tempfile::tempdir().unwrap();
+    let (fresh_code, _) = arsy(untouched.path(), home.path(), &["verify", session]);
+    assert_ne!(fresh_code, 0);
+    assert!(
+        !untouched.path().join(".arsy").exists(),
+        "verifying created state in a workspace it only read"
+    );
 }
 
 /// A parent reply that asks what its subagents are doing.
