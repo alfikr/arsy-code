@@ -5583,22 +5583,25 @@ fn ecosystem_skill_rows(
     config: &arsy_kernel::config::Config,
     root: &Path,
     importer: &arsy_code::compat::CompatibilityImporter,
-) -> Result<(), Diagnostic> {
+) {
     // A source the operator switched off is not offered here either: its
     // skills reach neither the model nor the dialog, and a switch that showed
     // rows the prompt ignores would be lying about what it controls.
     if !config.compat_enabled(ecosystem.as_str()) {
-        return Ok(());
+        return;
     }
-    let skills = importer.skill_declarations(ecosystem).map_err(|error| {
-        Diagnostic::error(
-            "ARSY-CMP-1001",
-            format!("{} skills could not be read: {error}", ecosystem.as_str()),
-            "fix the source directory; no skill was loaded",
-        )
-    })?;
+    let Ok(skills) = importer.skill_declarations(ecosystem) else {
+        return;
+    };
     for skill in skills {
-        let name = skill["name"].as_str().unwrap_or("?").to_owned();
+        let Some(name) = skill["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        // A workspace skill by the name of one already listed — a user skill,
+        // or another workspace's — is the one the operator means to have.
+        if rows.iter().any(|row| row.name == name) {
+            continue;
+        }
         let key = format!("{}/{name}", ecosystem.as_str());
         rows.push(tui::SkillChoice {
             key: key.clone(),
@@ -5609,7 +5612,6 @@ fn ecosystem_skill_rows(
             disabled: config.skill_disabled().contains(&key).then_some(true),
         });
     }
-    Ok(())
 }
 
 #[cfg(feature = "tui")]
@@ -5620,12 +5622,29 @@ fn skill_choices(
     let config = load_config_for(invocation)?;
     let importer = arsy_code::compat::CompatibilityImporter::new(root);
     let mut rows = Vec::new();
+    // The operator's own home first, in the order the compat switches run.
+    let homes = compat_homes();
+    for skill in arsy_compat::skills::all(
+        &homes,
+        config.compat_enabled("claude"),
+        config.compat_enabled("codex"),
+    ) {
+        let key = format!("{}/{}", skill.ecosystem, skill.name);
+        rows.push(tui::SkillChoice {
+            key: key.clone(),
+            name: skill.name,
+            ecosystem: skill.ecosystem.to_owned(),
+            source: skill.path.display().to_string(),
+            description: skill_description(root, &skill.path.display().to_string()),
+            disabled: config.skill_disabled().contains(&key).then_some(true),
+        });
+    }
     for ecosystem in [
         arsy_code::compat::Ecosystem::Claude,
         arsy_code::compat::Ecosystem::Codex,
         arsy_code::compat::Ecosystem::Omp,
     ] {
-        ecosystem_skill_rows(&mut rows, ecosystem, &config, root, &importer)?;
+        ecosystem_skill_rows(&mut rows, ecosystem, &config, root, &importer);
     }
     Ok(rows)
 }
@@ -10614,31 +10633,69 @@ fn prompt_skills(
     use arsy_code::agent::instructions::Skill;
     use arsy_code::compat::Ecosystem;
     let importer = arsy_code::compat::CompatibilityImporter::new(root);
-    [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp]
+    // The operator's own home offers skills as well as the workspace does:
+    // `~/.claude/skills` and `~/.codex/skills`, the same directories the
+    // ecosystems themselves read. A switch that is off, or a skill switched
+    // off by name, contributes nothing — one rule for every source of skills.
+    let user_skills = {
+        let homes = compat_homes();
+        arsy_compat::skills::all(
+            &homes,
+            config.compat_enabled("claude"),
+            config.compat_enabled("codex"),
+        )
+    };
+    let mut listed: Vec<Skill> = user_skills
         .into_iter()
+        .filter(|skill| {
+            !config
+                .skill_disabled()
+                .contains(&format!("{}/{}", skill.ecosystem, skill.name))
+        })
+        .map(|skill| Skill {
+            name: skill.name,
+            ecosystem: skill.ecosystem.to_owned(),
+            description: skill_description(root, &skill.path.display().to_string()),
+            path: skill.path.display().to_string(),
+        })
+        .collect();
+
+    for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
         // A source the operator switched off contributes nothing, the same as
         // its hooks and its instructions: `compat.<source>.enabled` governs
         // everything that source's files carry.
-        .filter(|ecosystem| config.compat_enabled(ecosystem.as_str()))
-        .filter_map(|ecosystem| {
-            let skills = importer.skill_declarations(ecosystem).ok()?;
-            Some(skills.into_iter().filter_map(move |skill| {
-                let name = skill["name"].as_str()?.to_owned();
-                let key = format!("{}/{}", ecosystem.as_str(), name);
-                if config.skill_disabled().contains(&key) {
-                    return None;
-                }
-                let path = skill["source"].as_str()?.to_owned();
-                Some(Skill {
-                    name,
-                    ecosystem: ecosystem.as_str().to_owned(),
-                    description: skill_description(root, &path),
-                    path,
-                })
-            }))
-        })
-        .flatten()
-        .collect()
+        if !config.compat_enabled(ecosystem.as_str()) {
+            continue;
+        }
+        let Ok(skills) = importer.skill_declarations(ecosystem) else {
+            continue;
+        };
+        for skill in skills {
+            let Some(name) = skill["name"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            let key = format!("{}/{}", ecosystem.as_str(), name);
+            if config.skill_disabled().contains(&key) {
+                continue;
+            }
+            let Some(path) = skill["source"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            // A workspace skill by the same name as a user skill is the one
+            // the workspace means to have: project overrides the operator's
+            // home, the same precedence the ecosystems use.
+            if listed.iter().any(|known| known.name == name) {
+                continue;
+            }
+            listed.push(Skill {
+                name,
+                ecosystem: ecosystem.as_str().to_owned(),
+                description: skill_description(root, &path),
+                path,
+            });
+        }
+    }
+    listed
 }
 
 /// The one line a `SKILL.md` front matter offers as its description.

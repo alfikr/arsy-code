@@ -152,26 +152,9 @@ impl SessionDialogState {
                 let title = " SESSIONS ";
                 let mut lines = vec![dialog_top(title, width, colour)];
 
-                // The session this process is running is always in the list,
-                // even before its first recorded turn: an operator who opened
-                // the dialog to rename what they are doing is not asking
-                // whether anything was recorded.
-                let listed = if self.sessions.iter().any(|s| s.id == self.active_session) {
-                    self.sessions.clone()
-                } else {
-                    let mut listed = self.sessions.clone();
-                    listed.insert(
-                        0,
-                        SessionChoice {
-                            id: self.active_session,
-                            title: None,
-                            events: 0,
-                            last_seen: "this session".to_owned(),
-                        },
-                    );
-                    listed
-                };
-
+                // The session this process is running is a real row: `new`
+                // and `reload` keep it in the list, so rename and delete act
+                // on what the operator sees.
                 for (idx, s) in self.sessions.iter().enumerate() {
                     let is_sel = idx == self.selected;
                     let is_active = s.id == self.active_session;
@@ -633,7 +616,10 @@ mod tests {
         assert_eq!(dialog.sessions.len(), 1);
         assert_eq!(dialog.sessions[0].id, dialog.active_session);
 
-        assert_eq!(dialog.handle_key(Key::Enter), Some(SessionAction::Resume(dialog.active_session)));
+        assert_eq!(
+            dialog.handle_key(Key::Enter),
+            Some(SessionAction::Resume(dialog.active_session))
+        );
         assert_eq!(dialog.handle_key(Key::Char('d')), None);
         assert_eq!(dialog.mode, SessionDialogMode::ConfirmDelete);
         assert_eq!(dialog.handle_key(Key::Interrupt), None);

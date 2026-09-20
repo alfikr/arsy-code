@@ -20,6 +20,7 @@ pub mod mcp;
 mod model;
 mod permissions;
 mod read;
+pub mod skills;
 
 pub use context::Context;
 pub(crate) use context::Scope;
