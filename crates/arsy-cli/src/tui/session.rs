@@ -104,17 +104,42 @@ pub struct SessionDialogState {
 
 impl SessionDialogState {
     pub fn new(sessions: Vec<SessionChoice>, active_session: SessionId) -> Self {
-        let selected = sessions
-            .iter()
-            .position(|s| s.id == active_session)
-            .unwrap_or(0);
         Self {
-            sessions,
-            selected,
+            selected: 0,
+            sessions: Self::including_active(sessions, active_session),
             mode: SessionDialogMode::Select,
             rename_buffer: String::new(),
             active_session,
         }
+    }
+
+    /// The list with the session this process is running as a real row.
+    ///
+    /// A session that has not recorded a turn — plan mode, a refused turn, an
+    /// operator still deciding — is nowhere in the store, but it is the one
+    /// the operator is working in: rename and delete act on rows, so the row
+    /// has to exist rather than be drawn by the renderer alone.
+    fn including_active(
+        sessions: Vec<SessionChoice>,
+        active_session: SessionId,
+    ) -> Vec<SessionChoice> {
+        if sessions.iter().any(|s| s.id == active_session) {
+            return sessions;
+        }
+        let mut listed = vec![SessionChoice {
+            id: active_session,
+            title: None,
+            events: 0,
+            last_seen: "this session".to_owned(),
+        }];
+        listed.extend(sessions);
+        listed
+    }
+
+    /// Replace the list, keeping the active session in it.
+    pub fn reload(&mut self, sessions: Vec<SessionChoice>) {
+        self.sessions = Self::including_active(sessions, self.active_session);
+        self.selected = 0;
     }
 
     pub fn render(&self, width: usize, colour: bool) -> String {
@@ -147,7 +172,7 @@ impl SessionDialogState {
                     listed
                 };
 
-                for (idx, s) in listed.iter().enumerate() {
+                for (idx, s) in self.sessions.iter().enumerate() {
                     let is_sel = idx == self.selected;
                     let is_active = s.id == self.active_session;
                     let radio = if is_sel { "(•)" } else { "( )" };
@@ -429,7 +454,13 @@ mod tests {
     }
 
     fn dialog(sessions: Vec<SessionChoice>) -> SessionDialogState {
-        SessionDialogState::new(sessions, SessionId::new())
+        // The active session is the list's first row, so `new` injects
+        // nothing and the rows are exactly the ones the test passed.
+        let active = sessions
+            .first()
+            .map(|s| s.id)
+            .unwrap_or_else(SessionId::new);
+        SessionDialogState::new(sessions, active)
     }
 
     #[test]
@@ -438,7 +469,8 @@ mod tests {
 
         assert_eq!(dialog.handle_key(Key::Up), None);
         assert_eq!(
-            dialog.selected, 1,
+            dialog.selected,
+            dialog.sessions.len() - 1,
             "Up from the first row wraps to the last"
         );
         assert_eq!(dialog.handle_key(Key::Down), None);
@@ -594,14 +626,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_list_cancels_rather_than_acting() {
-        let mut dialog = dialog(Vec::new());
+    fn a_store_without_this_session_leaves_one_row() {
+        // The list always holds the running session, even when the store has
+        // recorded nothing: it is the row rename and delete act on.
+        let mut dialog = SessionDialogState::new(Vec::new(), SessionId::new());
+        assert_eq!(dialog.sessions.len(), 1);
+        assert_eq!(dialog.sessions[0].id, dialog.active_session);
 
-        assert_eq!(dialog.handle_key(Key::Enter), Some(SessionAction::Cancel));
+        assert_eq!(dialog.handle_key(Key::Enter), Some(SessionAction::Resume(dialog.active_session)));
         assert_eq!(dialog.handle_key(Key::Char('d')), None);
-        assert_eq!(dialog.mode, SessionDialogMode::Select, "nothing to delete");
+        assert_eq!(dialog.mode, SessionDialogMode::ConfirmDelete);
+        assert_eq!(dialog.handle_key(Key::Interrupt), None);
         assert_eq!(dialog.handle_key(Key::Char('r')), None);
-        assert_eq!(dialog.mode, SessionDialogMode::Select, "nothing to rename");
+        assert_eq!(dialog.mode, SessionDialogMode::Rename);
+        assert_eq!(dialog.handle_key(Key::Interrupt), None);
         assert_eq!(dialog.handle_key(Key::Up), None);
         assert_eq!(dialog.selected, 0);
     }

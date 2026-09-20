@@ -5307,10 +5307,14 @@ fn run_session_dialog(
         // session on a list nothing can answer. A lone Escape reaches here as
         // an interrupt only because the key loop flushes it once nothing
         // follows.
-        let Some(action) = next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
-        }) else {
-            break;
+        }) {
+            Keyed::Ended => break,
+            // A key that only moved the marker or opened a mode has already
+            // changed the dialog; the loop's top redraws it.
+            Keyed::Redraw => continue,
+            Keyed::Acted(action) => action,
         };
         let borrowed = Restoring {
             workspace: restoring.workspace,
@@ -5341,6 +5345,11 @@ fn run_session_dialog(
                         changes.push(format!("`{title}` was not written: {}", error.message))
                     }
                 }
+                // Renaming may leave the dialog in its rename mode: the state
+                // below resets it, and a redrawn frame is what shows the
+                // result rather than the mode the key was pressed in.
+                close_dialog(stdout, drawn, &[], "")?;
+                drawn = 0;
             }
             tui::SessionAction::Delete(id) => {
                 close_dialog(stdout, drawn, &[], "")?;
@@ -5356,8 +5365,7 @@ fn run_session_dialog(
         // action left standing.
         dialog.mode = tui::SessionDialogMode::Select;
         dialog.rename_buffer.clear();
-        dialog.sessions = load_workspace_sessions(restoring.workspace);
-        dialog.selected = 0;
+        dialog.reload(load_workspace_sessions(restoring.workspace));
     }
     close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
@@ -5499,14 +5507,15 @@ fn run_hook_dialog(
             drawn,
             &dialog.render(tui::terminal_width(), colour),
         )?;
-        let action = match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
         }) {
-            None => continue,
-            Some(tui::HookAction::Close) => {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::HookAction::Close) => {
                 break;
             }
-            Some(tui::HookAction::Toggle(index)) => index,
+            Keyed::Acted(tui::HookAction::Toggle(index)) => index,
         };
         let choice = dialog.choices[action].clone();
         let enabled = !choice.enabled;
@@ -5641,14 +5650,15 @@ fn run_skill_dialog(
             drawn,
             &dialog.render(tui::terminal_width(), colour),
         )?;
-        match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
         }) {
-            None => continue,
-            Some(tui::SkillAction::Close) => {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::SkillAction::Close) => {
                 break;
             }
-            Some(tui::SkillAction::Toggle(index)) => {
+            Keyed::Acted(tui::SkillAction::Toggle(index)) => {
                 let choice = dialog.choices[index].clone();
                 let offering = choice.disabled == Some(true);
                 match write_config(|config| {
@@ -5671,7 +5681,7 @@ fn run_skill_dialog(
                 dialog.reload(rows);
                 continue;
             }
-            Some(tui::SkillAction::Read(index)) => {
+            Keyed::Acted(tui::SkillAction::Read(index)) => {
                 let choice = dialog.choices[index].clone();
                 match std::fs::read_to_string(root.join(choice.source.trim_start_matches("./"))) {
                     Ok(body) => {
@@ -5745,12 +5755,13 @@ fn run_settings_dialog(
             drawn,
             &dialog.render(tui::terminal_width(), colour),
         )?;
-        match next_dialog_action(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
             dialog.handle_key(key)
         }) {
-            None => continue,
-            Some(tui::SettingsAction::Close) => break,
-            Some(tui::SettingsAction::Reset(index)) => {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::SettingsAction::Close) => break,
+            Keyed::Acted(tui::SettingsAction::Reset(index)) => {
                 let row = dialog.rows[index].clone();
                 let removed = match setting_path(&row.key) {
                     Ok((path, _leaf)) => write_config(|config| {
@@ -5772,7 +5783,7 @@ fn run_settings_dialog(
                 dialog.reload(rows);
                 continue;
             }
-            Some(tui::SettingsAction::Apply(index, pending)) => {
+            Keyed::Acted(tui::SettingsAction::Apply(index, pending)) => {
                 let row = dialog.rows[index].clone();
                 let notice = match apply_edited_setting(&row, &pending) {
                     Ok(None) => format!("`{}` set to {}.", row.key, tui::safe_text(&pending)),
@@ -5879,24 +5890,42 @@ fn close_dialog(
     Ok(())
 }
 
-/// Wait for the next key and let the dialog answer it. A keyboard that hung
-/// up closes the dialog rather than holding the session on it.
+/// What one key did to a dialog.
 #[cfg(feature = "tui")]
-fn next_dialog_action<State, Action>(
+enum Keyed<Action> {
+    /// The dialog answered with an action.
+    Acted(Action),
+    /// The dialog took the key and changed its own state; redraw, keep going.
+    Redraw,
+    /// The keyboard hung up; nothing more will arrive.
+    Ended,
+}
+
+/// Wait for the next key and let the dialog answer it.
+///
+/// `Redraw` and `Ended` are distinct on purpose. A key that only moves the
+/// dialog's own marker — an arrow, `r` on the session list — is answered with
+/// no action, and a driver that read that as "close" would shut the dialog on
+/// the first arrow rather than redraw it.
+#[cfg(feature = "tui")]
+fn next_dialog_key<State, Action>(
     dialog: &mut State,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
     handle: impl Fn(&mut State, tui::Key) -> Option<Action>,
-) -> Option<Action> {
+) -> Keyed<Action> {
     loop {
         // A lone Escape is only known once nothing follows it.
         let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
             Ok(byte) => decoder.feed(byte),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Keyed::Ended,
         };
         if let Some(key) = key {
-            return handle(dialog, key);
+            return match handle(dialog, key) {
+                Some(action) => Keyed::Acted(action),
+                None => Keyed::Redraw,
+            };
         }
     }
 }
