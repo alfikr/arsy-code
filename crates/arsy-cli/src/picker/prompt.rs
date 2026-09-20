@@ -21,6 +21,10 @@ use super::wizard::{
     AuthNext, ProviderNext,
 };
 #[cfg(feature = "tui")]
+use crate::turn::run_turn;
+#[cfg(feature = "tui")]
+use crate::turn::{confirm_plan, Pass};
+#[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
 use arsy_kernel::provider::Effort;
@@ -1682,4 +1686,13 @@ pub(crate) fn set_mode(
         mode.description()
     )
     .map_err(terminal_failed)
+}
+
+#[cfg(feature = "tui")]
+pub(crate) enum TaskPass {
+    /// Carry on at the task prompt.
+    Go,
+    /// Collect the next answer at this prompt instead.
+    Ask(Prompt),
+    Stop,
 }
