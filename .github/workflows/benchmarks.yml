@@ -4,18 +4,27 @@ name: Benchmarks
 #
 # A suite that runs every trial in a fresh checkout is not cheap, and a gate
 # nobody can afford to keep on is a gate that gets turned off. So the tier a
-# suite runs in is chosen by what it costs, and each one carries the estimate
-# it was enabled on:
+# suite runs in is chosen by what it costs.
 #
-#   pull_request  ~2 min/run   × ~200 runs/month  = ~400 min/month
-#   push to main  ~6 min/run   × ~80  runs/month  = ~480 min/month
-#   nightly       ~25 min/run  × 30   runs/month  = ~750 min/month
+# This repository caches nothing, so the build dominates every tier. Measured
+# on a developer machine, cold: `cargo build --release -p arsy-cli --locked`
+# takes ~9 min, and a GitHub runner is slower. The suites themselves are the
+# cheap part — `semantic-navigation` at 10 trials takes ~1.5 min.
 #
-# Roughly 1,600 ubuntu minutes a month. Re-estimate before adding a suite to
-# a tier, and put an expensive suite in a later one rather than widening an
-# earlier one. A release is benchmarked by dispatching this workflow at the
-# tag, which runs every tier; there is no separate release job, because one
-# would duplicate the nightly with a different name.
+#   pull_request  build + ~1 min of suite    × ~200 runs/month
+#   push to main  build + ~2 min of suite    × ~80  runs/month
+#   nightly       build + fresh checkout per trial, the expensive one × 30
+#
+# So the lever is the tier a suite sits in, not the suite. Tier 1 builds
+# without `--release` on purpose: its trials run `cargo test`, not `arsy`, so
+# nothing it measures depends on how fast the runner binary is. Tiers 2 and 3
+# invoke `arsy` inside their trials and therefore need the release binary, or
+# the wall times they report would be debug timings.
+#
+# Re-measure before moving a suite into an earlier tier. A release is
+# benchmarked by dispatching this workflow at the tag, which runs every tier;
+# there is no separate release job, because one would duplicate the nightly
+# with a different name.
 #
 # `arsy eval` exits nonzero when its gate blocks — a safety regression stops
 # a promotion even when the success rate improved — so no step here needs to
@@ -72,11 +81,13 @@ jobs:
           fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      # Not --release: this suite's trials run `cargo test`, so how fast the
+      # runner binary is cannot change what it measures.
+      - run: cargo +1.98.0 build -p arsy-cli --locked
       - name: Smoke
         env:
           CI: "true"
-        run: ./target/release/arsy eval fixtures/eval/smoke.json --out target/eval-smoke.json
+        run: ./target/debug/arsy eval fixtures/eval/smoke.json --out target/eval-smoke.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

@@ -38,6 +38,6 @@
     ]
   ],
   "timeout_seconds": 120,
-  "trials": 3,
+  "trials": 10,
   "isolation": "shared"
 }
