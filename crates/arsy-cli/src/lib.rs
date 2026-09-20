@@ -46,6 +46,7 @@ mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
 mod turn;
+mod verify;
 
 use config_load::{bootstrap_user_config, replace_file};
 pub(crate) use config_load::{load_config, selected_model};
@@ -297,6 +298,10 @@ pub enum Command {
     ConfigExplain {
         key: Option<String>,
     },
+    /// `arsy verify <SESSION>`: rebuild the completion proof and report it.
+    Verify {
+        session: SessionId,
+    },
     SessionList {
         limit: usize,
     },
@@ -513,6 +518,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("compat") => Command::CompatExplain {
             ecosystem: compatibility_kind(parsed.positional)?,
         },
+        Some("verify") => verify::parse(&parsed)?,
         Some("session") => session::parse(&parsed)?,
         Some("artifact") => evidence::parse_artifact(&parsed)?,
         Some("gc") => evidence::parse_gc(&parsed)?,
@@ -1176,6 +1182,7 @@ fn execute_session(
 ) -> Option<Result<i32, Diagnostic>> {
     Some(match &invocation.command {
         Command::SessionList { limit } => session::list(invocation, *limit, emitter),
+        Command::Verify { session } => verify::run(invocation, *session, emitter),
         Command::SessionShow {
             session,
             turns,

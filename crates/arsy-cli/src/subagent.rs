@@ -36,21 +36,25 @@ use arsy_code::{
     },
 };
 use arsy_kernel::{
+    artifact::ArtifactStore,
     capability::{CapabilityAction, CapabilityGrant, ResourcePattern, ResourceScope},
     config::Config,
-    domain::{AgentId, AssignmentId, AttemptId, Principal, SubscriptionId, TaskId},
+    domain::{AgentId, AssignmentId, AttemptId, CriterionId, Principal, SubscriptionId, TaskId},
     observer::{Intervention, ObserverAuthority, ObserverSubscription, RedactedProjection},
     orchestration::{
-        AttemptOutcome, AttemptRequest, AttemptState, Budget, ChildCapabilityRequest,
-        DirtyDisposition, IsolationBackend, JoinPolicy, MessageKind, Retryability, TaskGraph,
-        TaskNode, TaskState, WorkspaceAssignment, WorkspaceRequirement, WriterResult,
+        AcceptanceCriterion, AttemptOutcome, AttemptRequest, AttemptState, Budget,
+        ChildCapabilityRequest, DirtyDisposition, IsolationBackend, JoinPolicy, MessageKind,
+        Retryability, TaskGraph, TaskNode, TaskState, Verifier, WorkspaceAssignment,
+        WorkspaceRequirement, WriterResult,
     },
     policy::{ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance},
+    proof::{Prover, PROOF_MEDIA_TYPE},
     protocol::IdempotencyKey,
     provider::{
         CanonicalModelRequest, ModelContent, ModelKey, ModelMessage, ModelRole, ToolSchema,
     },
     scheduler::{Admission, CancelToken, Scheduler, SchedulerError},
+    validation::ValidationLog,
 };
 use serde_json::{json, Value};
 use std::{
@@ -124,7 +128,7 @@ impl Allowance {
 /// Not a workspace operation: spawning changes no file and runs no command, it
 /// adds a node to the session's own graph. The child's effects each go through
 /// the one path a tool call takes, under the child's own grants.
-pub fn schemas() -> Vec<ToolSchema> {
+pub fn schemas(delegates: bool) -> Vec<ToolSchema> {
     let object = |properties: Value, required: Value| {
         json!({
             "type": "object",
@@ -133,7 +137,37 @@ pub fn schemas() -> Vec<ToolSchema> {
             "additionalProperties": false,
         })
     };
-    vec![
+    // Offered whether or not this workspace delegates anything: committing to
+    // what "done" means is not delegation, and a turn that cannot spawn still
+    // has to be able to say what it is to be held to.
+    let mut schemas = vec![ToolSchema {
+        name: "task.criterion".to_owned(),
+        description:
+            "Commit one acceptance criterion for this task, before doing the work. State it, and \
+             say what decides it: `check` names the exact command whose recorded pass settles it, \
+             `review` means a reviewer must say so, `human` means only a person can. A criterion \
+             with a `check` is met only by a recorded run of that exact command, against this \
+             revision — saying it passed is not evidence."
+                .to_owned(),
+        input_schema: object(
+            json!({
+                "statement": {"type": "string", "description": "What has to hold, stated so it can be checked."},
+                "check": {"type": "string", "description": "The exact command that settles it."},
+                "decided_by": {
+                    "type": "string",
+                    "enum": ["check", "review", "human", "unverifiable"],
+                    "description": "Defaults to `check` when `check` is given, `review` otherwise."
+                },
+                "required": {"type": "boolean", "description": "Defaults to true."},
+                "why_unverifiable": {"type": "string", "description": "Required when `decided_by` is `unverifiable`."}
+            }),
+            json!(["statement"]),
+        ),
+    }];
+    if !delegates {
+        return schemas;
+    }
+    schemas.extend([
         ToolSchema {
             name: "task.spawn".to_owned(),
             description: format!(
@@ -254,11 +288,13 @@ pub fn schemas() -> Vec<ToolSchema> {
                 json!(["task", "message"]),
             ),
         },
-    ]
+    ]);
+    schemas
 }
 
 /// The calls a supervisor answers rather than the workspace runtime.
 pub const OWNED_TOOLS: &[&str] = &[
+    "task.criterion",
     "task.spawn",
     "task.status",
     "task.wait",
@@ -373,6 +409,7 @@ impl<'a> Supervisor<'a> {
     ) -> ToolResult {
         let started = Instant::now();
         let outcome = match name {
+            "task.criterion" => self.declare(arguments, graph),
             "task.spawn" => self.start(arguments, graph),
             "task.status" => self.status(),
             "task.wait" => self.wait(arguments, emitter),
@@ -418,6 +455,76 @@ impl<'a> Supervisor<'a> {
         self.release_views(emitter);
     }
 
+    /// Build this task's completion proof, store it, and promote the task
+    /// only if it holds.
+    ///
+    /// Called at the end of a turn, from outside the model's reach. A turn
+    /// that ran cleanly and met nothing it committed to ends `Completed`,
+    /// which is the whole distinction: execution finished is not verified.
+    pub fn settle_proof(&self, graph: &mut TaskGraph, emitter: &mut Emitter) {
+        if graph.criteria_of(self.parent).is_empty() {
+            return;
+        }
+        let Ok(validations) =
+            ValidationLog::open(graph.store(), graph.session(), Principal::System)
+        else {
+            return;
+        };
+        let artifacts =
+            arsy_kernel::artifact::FileArtifactStore::open(self.root.join(".arsy/artifacts"), 0)
+                .ok();
+        let proof = Prover::new(
+            graph,
+            validations.records(),
+            artifacts
+                .as_ref()
+                .map(|store| store as &dyn arsy_kernel::artifact::ArtifactStore),
+        )
+        .prove(
+            self.parent,
+            arsy_code::git::revision(&self.root),
+            arsy_kernel::artifact::unix_time_ms(),
+        );
+
+        // Stored so a later reader has something to compare a rebuild
+        // against. The verdict never comes from the stored copy.
+        let manifest = serde_json::to_vec(&proof).unwrap_or_default();
+        if let Some(store) = artifacts.as_ref() {
+            let _ = store.put(
+                &manifest,
+                arsy_kernel::artifact::NewArtifact {
+                    media_type: PROOF_MEDIA_TYPE.to_owned(),
+                    creator: Principal::System,
+                    source_revision: proof.revision,
+                    sensitivity: arsy_kernel::artifact::Sensitivity::Internal,
+                    retain_until_ms: u64::MAX,
+                },
+            );
+        }
+        emitter.record(
+            "task.proof",
+            json!({
+                "task": self.parent.to_string(),
+                "state": proof.state,
+                "outstanding": proof
+                    .outstanding()
+                    .iter()
+                    .map(|criterion| json!({
+                        "statement": criterion.statement,
+                        "state": criterion.state,
+                        "why": criterion.why,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        if proof.state.is_verified() {
+            let _ = graph.verify(
+                self.parent,
+                serde_json::to_value(&proof).unwrap_or(Value::Null),
+            );
+        }
+    }
+
     /// Give every view back and delete the ones that hold nothing.
     ///
     /// A writer's branch survives `discard` when it has commits on it, so an
@@ -444,6 +551,74 @@ impl<'a> Supervisor<'a> {
                     .release_workspace(child.assignment, "the turn that cut it ended");
             }
         }
+    }
+
+    /// Commit one acceptance criterion against this turn's task.
+    ///
+    /// Written to the graph, not held here: the point is that it is on record
+    /// before the work, so it cannot be adjusted afterwards to fit whatever
+    /// happened to pass.
+    fn declare(&mut self, arguments: &Value, graph: &mut TaskGraph) -> Result<String, String> {
+        let statement = arguments
+            .get("statement")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if statement.is_empty() {
+            return Err("a criterion needs a statement".into());
+        }
+        let check = arguments
+            .get("check")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|check| !check.is_empty());
+        let decided_by = arguments
+            .get("decided_by")
+            .and_then(Value::as_str)
+            .unwrap_or(if check.is_some() { "check" } else { "review" });
+        let verifier = match (decided_by, check) {
+            ("check", Some(command)) => Verifier::Command {
+                digest: arsy_kernel::validation::command_digest(command),
+            },
+            ("check", None) => {
+                return Err("`decided_by: check` needs the command in `check`".into())
+            }
+            ("review", _) => Verifier::Review,
+            ("human", _) => Verifier::Human,
+            ("unverifiable", _) => Verifier::Unverifiable {
+                why: arguments
+                    .get("why_unverifiable")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+            },
+            (other, _) => return Err(format!("`decided_by` cannot be {other:?}")),
+        };
+        if matches!(&verifier, Verifier::Unverifiable { why } if why.is_empty()) {
+            return Err("say why nothing can decide it".into());
+        }
+        let id = graph
+            .declare_criterion(AcceptanceCriterion {
+                id: CriterionId::new(),
+                task: self.parent,
+                statement: statement.clone(),
+                verifier,
+                required: arguments
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                freshness_ms: None,
+                inapplicable: None,
+            })
+            .map_err(|error| format!("the criterion could not be recorded: {error}"))?;
+        Ok(json!({
+            "criterion": id.to_string(),
+            "statement": statement,
+            "note": "this is now on record; `arsy verify` will hold the work to it",
+        })
+        .to_string())
     }
 
     /// Start one child and return its ids without waiting for its answer.

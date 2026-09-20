@@ -9,8 +9,8 @@
 use crate::{
     capability::{AttenuationError, CapabilityAction, CapabilityGrant, ResourceScope},
     domain::{
-        AgentId, AssignmentId, AttemptId, CorrelationId, MessageId, Principal, SessionId, TaskId,
-        WorkspaceVersion,
+        AgentId, AssignmentId, AttemptId, CorrelationId, CriterionId, MessageId, Principal,
+        SessionId, StateVersion, TaskId, WorkspaceVersion,
     },
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
 };
@@ -477,6 +477,54 @@ pub struct WriterResult {
     pub unresolved: Vec<String>,
 }
 
+/// What decides whether one acceptance criterion is met.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verifier {
+    /// A recorded check. The digest is of the command text, so a pass from a
+    /// different command cannot be offered in its place.
+    Command { digest: StateVersion },
+    /// A reviewer's verdict. Attributed to whoever gave it and never
+    /// described as deterministic, because it is not.
+    Review,
+    /// Only a person can say. Same treatment as a review, and named
+    /// separately so a report can distinguish "nobody has looked" from
+    /// "nobody has run it".
+    Human,
+    /// Nothing available can decide it. Stated rather than left to look
+    /// unchecked: a criterion nobody can verify is a fact about the
+    /// criterion, not a gap in the work.
+    Unverifiable { why: String },
+}
+
+/// One thing that has to hold before work may be called verified.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AcceptanceCriterion {
+    pub id: CriterionId,
+    pub task: TaskId,
+    pub statement: String,
+    pub verifier: Verifier,
+    /// A criterion that is not required may be unmet without blocking.
+    pub required: bool,
+    /// How old its evidence may be. `None` means only the workspace revision
+    /// decides, which is the usual case.
+    pub freshness_ms: Option<u64>,
+    /// Set when the criterion stops applying — a check for a component the
+    /// work removed. Applicability is recorded, never assumed.
+    pub inapplicable: Option<String>,
+}
+
+/// A verdict a person or a reviewing agent gave.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Judgment {
+    pub criterion: CriterionId,
+    pub actor: Principal,
+    pub met: bool,
+    pub note: String,
+    pub workspace_revision: Option<WorkspaceVersion>,
+    pub recorded_at_ms: u64,
+}
+
 pub struct ChildCapabilityRequest {
     pub parent_grant: usize,
     pub action: CapabilityAction,
@@ -526,6 +574,8 @@ pub struct TaskGraph {
     traces: BTreeMap<AttemptId, Vec<Value>>,
     assignments: BTreeMap<AssignmentId, WorkspaceAssignment>,
     writer_results: BTreeMap<AssignmentId, WriterResult>,
+    criteria: BTreeMap<CriterionId, AcceptanceCriterion>,
+    judgments: BTreeMap<CriterionId, Vec<Judgment>>,
 }
 
 impl TaskGraph {
@@ -552,6 +602,8 @@ impl TaskGraph {
             traces: BTreeMap::new(),
             assignments: BTreeMap::new(),
             writer_results: BTreeMap::new(),
+            criteria: BTreeMap::new(),
+            judgments: BTreeMap::new(),
         };
         graph.catch_up()?;
         Ok(graph)
@@ -899,6 +951,78 @@ impl TaskGraph {
         self.start_attempt(id, request)
     }
 
+    /// Commit one acceptance criterion against a task.
+    ///
+    /// Written down before the work is judged against it, so a criterion
+    /// cannot be invented to fit what happened to pass.
+    pub fn declare_criterion(
+        &mut self,
+        criterion: AcceptanceCriterion,
+    ) -> Result<CriterionId, GraphError> {
+        let id = criterion.id;
+        self.commit("task.criterion_declared", |graph| {
+            if !graph.nodes.contains_key(&criterion.task) {
+                return Err(GraphError::Unknown(criterion.task));
+            }
+            if graph.criteria.contains_key(&id) {
+                return Err(GraphError::DuplicateCriterion(id));
+            }
+            Ok(json!({"criterion": &criterion}))
+        })?;
+        Ok(id)
+    }
+
+    /// Record a reviewer's or a person's verdict on one criterion.
+    ///
+    /// Attributed, and never converted into a deterministic result: the
+    /// proof reports it as a judgment by whoever gave it.
+    pub fn judge(&mut self, judgment: Judgment) -> Result<(), GraphError> {
+        self.commit("task.criterion_judged", |graph| {
+            let criterion = graph
+                .criteria
+                .get(&judgment.criterion)
+                .ok_or(GraphError::UnknownCriterion(judgment.criterion))?;
+            if !matches!(criterion.verifier, Verifier::Review | Verifier::Human) {
+                return Err(GraphError::NotAJudgment(judgment.criterion));
+            }
+            Ok(json!({"judgment": &judgment}))
+        })
+    }
+
+    /// Say that a criterion no longer applies, and why.
+    pub fn retire_criterion(
+        &mut self,
+        id: CriterionId,
+        why: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let why = why.into();
+        self.commit("task.criterion_retired", |graph| {
+            if !graph.criteria.contains_key(&id) {
+                return Err(GraphError::UnknownCriterion(id));
+            }
+            Ok(json!({"criterion_id": id, "why": why}))
+        })
+    }
+
+    pub fn criterion(&self, id: CriterionId) -> Option<&AcceptanceCriterion> {
+        self.criteria.get(&id)
+    }
+
+    /// Every criterion committed against one task, in the order declared.
+    pub fn criteria_of(&self, task: TaskId) -> Vec<&AcceptanceCriterion> {
+        self.criteria
+            .values()
+            .filter(|criterion| criterion.task == task)
+            .collect()
+    }
+
+    /// Verdicts given on one criterion, oldest first.
+    pub fn judgments_of(&self, id: CriterionId) -> &[Judgment] {
+        self.judgments
+            .get(&id)
+            .map_or(&[], |verdicts| verdicts.as_slice())
+    }
+
     /// Claim a filesystem view for one attempt.
     ///
     /// Three things are refused here rather than left to whoever cut the
@@ -1232,6 +1356,11 @@ impl TaskGraph {
     ///
     /// Separate from `complete` because they are different claims: the graph
     /// will not let "the child returned" stand in for "the check passed".
+    ///
+    /// The evidence has to be a completion proof for *this* task whose state
+    /// is verified. That is the gate: a caller cannot mark work verified by
+    /// passing a sentence about it, because the only shape this accepts is
+    /// one the prover produces by reading recorded operations.
     pub fn verify(&mut self, id: TaskId, evidence: Value) -> Result<(), GraphError> {
         if self
             .nodes
@@ -1239,6 +1368,27 @@ impl TaskGraph {
             .is_some_and(|node| node.state == TaskState::Verified)
         {
             return Ok(());
+        }
+        let proved_task = evidence
+            .get("task")
+            .and_then(|task| serde_json::from_value::<TaskId>(task.clone()).ok());
+        if proved_task != Some(id) {
+            return Err(GraphError::NotAProof(
+                id,
+                "the evidence is not a completion proof for this task".into(),
+            ));
+        }
+        match evidence.get("state").and_then(Value::as_str) {
+            Some("verified") => {}
+            Some(other) => {
+                return Err(GraphError::NotAProof(id, format!("its proof says {other}")))
+            }
+            None => {
+                return Err(GraphError::NotAProof(
+                    id,
+                    "the evidence carries no proof state".into(),
+                ))
+            }
         }
         self.transition(id, TaskState::Verified, Some(evidence))
     }
@@ -1322,6 +1472,12 @@ impl TaskGraph {
 
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// The stream this graph is a projection of, for a caller that needs to
+    /// build a second projection over the same history.
+    pub fn store(&self) -> Arc<dyn EventStore> {
+        Arc::clone(&self.store)
     }
 
     /// Every task in the graph, in creation order.
@@ -1451,6 +1607,9 @@ impl TaskGraph {
             "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
             "task.attempt_superseded" => self.replay_attempt_superseded(data),
             "task.attempt_trace" => self.replay_trace(data),
+            "task.criterion_declared" => self.replay_criterion(data),
+            "task.criterion_judged" => self.replay_judgment(data),
+            "task.criterion_retired" => self.replay_retired(data),
             "workspace.assigned" => self.replay_assigned(data),
             "workspace.released" => self.replay_released(data),
             "workspace.writer_result" => self.replay_writer_result(data),
@@ -1606,6 +1765,33 @@ impl TaskGraph {
             node.runtime.current_attempt = None;
             node.lease_expires_at_ms = None;
         }
+        Ok(())
+    }
+
+    fn replay_criterion(&mut self, data: &Value) -> Result<(), GraphError> {
+        let criterion: AcceptanceCriterion = field(data, "criterion")
+            .map_err(|_| GraphError::InvalidEvent("criterion event has no criterion".into()))?;
+        self.criteria.insert(criterion.id, criterion);
+        Ok(())
+    }
+
+    fn replay_judgment(&mut self, data: &Value) -> Result<(), GraphError> {
+        let judgment: Judgment = field(data, "judgment")
+            .map_err(|_| GraphError::InvalidEvent("judgment event has no judgment".into()))?;
+        self.judgments
+            .entry(judgment.criterion)
+            .or_default()
+            .push(judgment);
+        Ok(())
+    }
+
+    fn replay_retired(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: CriterionId = field(data, "criterion_id")
+            .map_err(|_| GraphError::InvalidEvent("retire event has no criterion".into()))?;
+        self.criteria
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownCriterion(id))?
+            .inapplicable = data.get("why").and_then(Value::as_str).map(str::to_owned);
         Ok(())
     }
 
@@ -1878,6 +2064,12 @@ pub enum GraphError {
     /// The source had uncommitted work and the policy in force refuses it.
     DirtySource(String),
     NotAWriter(AssignmentId),
+    DuplicateCriterion(CriterionId),
+    UnknownCriterion(CriterionId),
+    /// A verdict on a criterion a check decides, not a person.
+    NotAJudgment(CriterionId),
+    /// Verification was offered something that is not a proof of this task.
+    NotAProof(TaskId, String),
     Cycle(TaskId),
     InvalidTransition(TaskState, TaskState),
     BudgetExhausted(PartialEvidence),
@@ -1956,6 +2148,13 @@ impl fmt::Display for GraphError {
                 formatter,
                 "{path} has uncommitted work and this policy refuses to start from it"
             ),
+            Self::DuplicateCriterion(id) => write!(formatter, "criterion {id} already exists"),
+            Self::UnknownCriterion(id) => write!(formatter, "criterion {id} does not exist"),
+            Self::NotAJudgment(id) => write!(
+                formatter,
+                "criterion {id} is decided by a check, not by a verdict"
+            ),
+            Self::NotAProof(id, why) => write!(formatter, "task {id} cannot be verified: {why}"),
             Self::NotAWriter(id) => {
                 write!(
                     formatter,
@@ -2518,8 +2717,24 @@ mod tests {
         graph.lease(id, AgentId::new(), 100).unwrap();
         graph.complete(id, json!({"answer": "done"})).unwrap();
         assert_eq!(graph.node(id).unwrap().state, TaskState::Completed);
+
+        // A sentence about a check is not a proof, whatever it says.
+        assert!(matches!(
+            graph.verify(id, json!({"validation": "cargo test"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+        // Nor is a proof of some other task, nor one that is not verified.
+        assert!(matches!(
+            graph.verify(id, json!({"task": TaskId::new(), "state": "verified"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+        assert!(matches!(
+            graph.verify(id, json!({"task": id, "state": "partially_verified"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+
         graph
-            .verify(id, json!({"validation": "cargo test"}))
+            .verify(id, json!({"task": id, "state": "verified"}))
             .unwrap();
         assert_eq!(graph.node(id).unwrap().state, TaskState::Verified);
 
@@ -2528,8 +2743,9 @@ mod tests {
         unverifiable
             .add(node(other, Vec::new(), budget(1)))
             .unwrap();
+        // Even a well-formed proof cannot verify work that never ran.
         assert!(matches!(
-            unverifiable.verify(other, json!({})),
+            unverifiable.verify(other, json!({"task": other, "state": "verified"})),
             Err(GraphError::InvalidTransition(
                 TaskState::Pending,
                 TaskState::Verified

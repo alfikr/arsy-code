@@ -1013,6 +1013,68 @@ fn configure_delegating_writers(home: &Path, port: u16) {
     );
 }
 
+/// A reply that commits one acceptance criterion settled by a command.
+fn commits_criterion(statement: &str, check: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-criterion",
+            "type": "function",
+            "function": {
+                "name": "task.criterion",
+                "arguments": serde_json::json!({
+                    "statement": statement,
+                    "check": check,
+                }).to_string()
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn a_turn_that_finishes_without_running_its_own_check_is_not_verified() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // The model commits to a criterion, then answers as if it were done —
+    // which is exactly the claim proof-carrying completion refuses.
+    let provider = FakeProvider::serving(vec![
+        commits_criterion("the suite passes", "cargo test --workspace"),
+        answers("all done, the tests pass."),
+    ]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "fix the parser"]);
+    let ran = result(&records);
+    assert_eq!(code, 0, "{ran:#?}");
+    // The turn itself completed: execution finished is a true statement.
+    assert_eq!(ran["status"], "completed");
+
+    // And the turn reported, in its own records, that nothing proves it.
+    let proof = records
+        .iter()
+        .find(|record| record["type"] == "task.proof")
+        .expect("the turn reports what its criteria say");
+    assert_eq!(proof["payload"]["state"], "unverified");
+    assert_eq!(
+        proof["payload"]["outstanding"][0]["why"],
+        "this check has not been run"
+    );
+
+    // `arsy verify`, run from outside, reaches the same verdict and says so
+    // with a nonzero exit code — which is what a CI job reads.
+    let session = ran["session"].as_str().expect("a session id");
+    let (verify_code, verify_records) = arsy(workspace.path(), home.path(), &["verify", session]);
+    assert_ne!(verify_code, 0, "{verify_records:#?}");
+    let verdict = result(&verify_records);
+    assert_eq!(verdict["state"], "unverified", "{verdict:#?}");
+    assert_eq!(
+        verdict["tasks"][0]["criteria"][0]["statement"],
+        "the suite passes"
+    );
+}
+
 /// A parent reply that asks what its subagents are doing.
 fn status() -> String {
     sse(&[
