@@ -3728,7 +3728,7 @@ fn record_turn(
 fn run_turn(
     invocation: &Invocation,
     session_id: SessionId,
-    native: Option<&provider::Resolved>,
+    mut native: Option<&mut provider::Resolved>,
     task: &str,
     history: &arsy_code::agent::budget::History,
     route: &tui::ModelRoute,
@@ -3791,7 +3791,7 @@ fn run_turn(
             "mode": approval.get().label(),
         }),
     );
-    let outcome = match native {
+    let outcome = match native.as_deref_mut() {
         Some(resolved) => native_turn(
             resolved,
             &config,
@@ -3928,7 +3928,7 @@ fn run_turn(
             // The interactive path records what it spent for the same reason
             // the scripted one does: `arsy session show` reports one session's
             // totals, and totals that skipped every TUI turn would be fiction.
-            let priced = charge_turn(native, &route.model, &turn.usage);
+            let priced = charge_turn(native.as_deref(), &route.model, &turn.usage);
             merge(
                 &mut outcome,
                 json!({
@@ -4041,7 +4041,7 @@ enum Answer {
 #[cfg(feature = "tui")]
 #[allow(clippy::too_many_arguments)]
 fn native_turn(
-    resolved: &provider::Resolved,
+    resolved: &mut provider::Resolved,
     config: &arsy_kernel::config::Config,
     runtime: &arsy_code::agent::ToolRuntime,
     conversation: &mut Vec<ModelMessage>,
@@ -4080,7 +4080,7 @@ fn native_turn(
             colour,
             &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
         )?;
-        let mut outcome = native_status(
+        let mut outcome = native_status_with_refresh(
             resolved,
             config,
             runtime,
@@ -4653,7 +4653,7 @@ struct Running<'a> {
 #[allow(clippy::too_many_arguments)]
 fn take_turn(
     invocation: &Invocation,
-    resolved: Option<&provider::Resolved>,
+    resolved: Option<&mut provider::Resolved>,
     line: &str,
     footer: &str,
     running: Running<'_>,
@@ -5609,7 +5609,7 @@ fn resolve_route<'a>(
     provider: &str,
     resolved: &'a mut std::collections::HashMap<String, provider::Resolved>,
     unavailable: &mut std::collections::HashSet<String>,
-) -> Option<&'a provider::Resolved> {
+) -> Option<&'a mut provider::Resolved> {
     if !resolved.contains_key(provider) && !unavailable.contains(provider) {
         let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
         match load_config(workspace, &working, invocation.config.as_deref())
@@ -5624,7 +5624,7 @@ fn resolve_route<'a>(
             }
         }
     }
-    resolved.get(provider)
+    resolved.get_mut(provider)
 }
 
 /// Ask the operator what to do with the plan a planning turn produced.
@@ -6722,7 +6722,7 @@ fn round_request(
 fn spawn_stream(
     provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
     request: CanonicalModelRequest,
-) -> std::sync::mpsc::Receiver<Result<Streamed, String>> {
+) -> std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     let (rows, events) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let stream = match arsy_kernel::provider::stream_with_retry(
@@ -6732,7 +6732,7 @@ fn spawn_stream(
         ) {
             Ok(stream) => stream,
             Err(error) => {
-                let _ = rows.send(Err(error.to_string()));
+                let _ = rows.send(Err(error));
                 return;
             }
         };
@@ -6754,7 +6754,7 @@ fn spawn_stream(
 #[cfg(feature = "tui")]
 fn streamed(
     event: Result<ModelEvent, arsy_kernel::provider::ProviderError>,
-) -> Option<Result<Streamed, String>> {
+) -> Option<Result<Streamed, arsy_kernel::provider::ProviderError>> {
     Some(match event {
         Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
         Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
@@ -6776,7 +6776,7 @@ fn streamed(
             arguments,
         }),
         Ok(_) => return None,
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error),
     })
 }
 
@@ -7409,6 +7409,74 @@ fn erase_live_response(
     terminal.flush()
 }
 
+#[cfg(feature = "tui")]
+/// Call `native_status` for one round, and once more if a stale OAuth
+/// access token is why it failed — the interactive-session counterpart to
+/// `dispatch_with_refresh`. A session resolves its provider once and keeps
+/// it for as long as the operator keeps typing (`resolve_route`'s cache),
+/// so a token that expires between turns is never re-checked until this
+/// catches it.
+#[allow(clippy::too_many_arguments)]
+fn native_status_with_refresh(
+    resolved: &mut provider::Resolved,
+    config: &arsy_kernel::config::Config,
+    runtime: &arsy_code::agent::ToolRuntime,
+    conversation: &[ModelMessage],
+    route: &tui::ModelRoute,
+    effort: Option<Effort>,
+    turn: arsy_kernel::domain::TurnId,
+    round: usize,
+    colour: bool,
+    footer: &str,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    approval: &approval::ApprovalCell,
+) -> io::Result<Turn> {
+    let outcome = native_status(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+        colour,
+        footer,
+        keys,
+        decoder,
+        composer,
+        approval,
+    )?;
+    let Some(error) = &outcome.provider_error else {
+        return Ok(outcome);
+    };
+    if !is_stale_oauth_token(error, resolved.source) {
+        return Ok(outcome);
+    }
+    let Ok(refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
+        return Ok(outcome);
+    };
+    *resolved = refreshed;
+    native_status(
+        resolved,
+        config,
+        runtime,
+        conversation,
+        route,
+        effort,
+        turn,
+        round,
+        colour,
+        footer,
+        keys,
+        decoder,
+        composer,
+        approval,
+    )
+}
+
 /// Stream one round of a turn from a configured provider, keeping the composer
 /// alive.
 ///
@@ -7539,7 +7607,8 @@ fn native_status(
                 first_event = true;
             }
             Ok(Err(failure)) => {
-                outcome.failure = Some(failure);
+                outcome.failure = Some(failure.to_string());
+                outcome.provider_error = Some(failure);
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -7819,6 +7888,13 @@ fn drive_provider(
 struct Turn {
     /// `None` when the turn succeeded; otherwise why it did not.
     failure: Option<String>,
+    /// The typed error `failure` was rendered from, when this turn's
+    /// failure came from a provider stream at all — `None` for the
+    /// round-limit and external-CLI failure paths, neither of which is a
+    /// [`ProviderError`]. Kept separately so a caller can tell a stale
+    /// OAuth token apart from anything else without parsing `failure`'s
+    /// display text.
+    provider_error: Option<arsy_kernel::provider::ProviderError>,
     /// The full text of the model's answer, kept so follow-up turns in the
     /// same session know what the model said.
     response: String,
@@ -8175,22 +8251,22 @@ impl<'a> TaskRun<'a> {
 
         let started = Instant::now();
         let mut recorder = telemetry::Recorder::new(&self.config, self.actor.clone())?;
-        let mut supervising = delegates.then_some((supervisor, &mut self.graph));
-        let outcome = dispatch(
-            self.resolved.provider.as_ref(),
+        let max_parallel_tools = self.config.max_parallel_tools();
+        let (outcome, interventions) = dispatch_with_refresh(
+            &mut self.resolved,
+            &self.config,
+            self.invocation.provider.as_deref(),
+            &self.root,
+            &self.model,
+            task,
             &agent,
             &request,
             &mut recorder,
-            &mut supervising,
+            &mut self.graph,
             hooks,
-            self.config.max_parallel_tools(),
+            max_parallel_tools,
             emitter,
         );
-        let interventions: Vec<Value> = supervising
-            .as_ref()
-            .map(|(supervisor, _)| supervisor.interventions().to_vec())
-            .unwrap_or_default();
-        drop(supervising);
         let stop = match &outcome {
             Ok(_) => "answered".to_owned(),
             Err(error) => format!("provider:{}", error.code()),
@@ -8363,6 +8439,111 @@ fn context_budget(resolved: &provider::Resolved) -> u32 {
 /// answers every result with another call would otherwise spend the run on its
 /// own loop.
 const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
+
+/// Dispatch a scripted turn, and once more if a stale OAuth access token is
+/// why it failed.
+///
+/// `dispatch` itself never retries a [`ProviderError::Auth`]: an identical
+/// request would fail identically, the way `stream_with_retry`'s own doc
+/// comment says. What is retryable here is not the request but the
+/// credential — `arsy run` resolves a provider once and keeps it for the
+/// whole task (see `TaskRun::open`), so a token that expires mid-task is
+/// never re-checked until this catches it. Re-resolving the same endpoint
+/// exercises the refresh path `provider::stored` already has; a plain API
+/// key is left alone; a refresh that itself fails surfaces the original
+/// error unchanged, asking the operator to sign in again.
+///
+/// A retry rebuilds the delegation supervisor rather than reusing the
+/// first one, which is safe: an auth failure happens on the very first
+/// model call, before any delegation this task's supervisor could lose.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_refresh(
+    resolved: &mut provider::Resolved,
+    config: &Config,
+    requested_provider: Option<&str>,
+    root: &Path,
+    model: &str,
+    task: TaskId,
+    agent: &arsy_code::agent::ToolRuntime,
+    request: &CanonicalModelRequest,
+    recorder: &mut telemetry::Recorder,
+    graph: &mut TaskGraph,
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    max_parallel_tools: usize,
+    emitter: &mut Emitter,
+) -> (Result<Value, ProviderError>, Vec<Value>) {
+    let supervisor = subagent::Supervisor::new(
+        root.to_path_buf(),
+        config,
+        resolved,
+        model.to_owned(),
+        task,
+        agent,
+    );
+    let delegates = supervisor.can_delegate();
+    let mut supervising = delegates.then_some((supervisor, &mut *graph));
+    let outcome = dispatch(
+        resolved.provider.as_ref(),
+        agent,
+        request,
+        recorder,
+        &mut supervising,
+        hooks,
+        max_parallel_tools,
+        emitter,
+    );
+    let interventions: Vec<Value> = supervising
+        .as_ref()
+        .map(|(supervisor, _)| supervisor.interventions().to_vec())
+        .unwrap_or_default();
+    drop(supervising);
+
+    let stale = matches!(&outcome, Err(error) if is_stale_oauth_token(error, resolved.source));
+    if !stale {
+        return (outcome, interventions);
+    }
+    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
+        return (outcome, interventions);
+    };
+    *resolved = refreshed;
+    emitter.trace(
+        "credential.refreshed",
+        json!({"provider": resolved.endpoint.id}),
+    );
+    let supervisor = subagent::Supervisor::new(
+        root.to_path_buf(),
+        config,
+        resolved,
+        model.to_owned(),
+        task,
+        agent,
+    );
+    let delegates = supervisor.can_delegate();
+    let mut supervising = delegates.then_some((supervisor, graph));
+    let outcome = dispatch(
+        resolved.provider.as_ref(),
+        agent,
+        request,
+        recorder,
+        &mut supervising,
+        hooks,
+        max_parallel_tools,
+        emitter,
+    );
+    let interventions = supervising
+        .as_ref()
+        .map(|(supervisor, _)| supervisor.interventions().to_vec())
+        .unwrap_or_default();
+    (outcome, interventions)
+}
+/// Whether a failure is worth resolving a fresh credential and trying
+/// again for: only an authentication failure, and only when the
+/// credential came from an OAuth login. An API key that is rejected will
+/// be rejected identically the second time, and any other error class is
+/// already `stream_with_retry`'s job, not this one's.
+fn is_stale_oauth_token(error: &ProviderError, source: provider::CredentialSource) -> bool {
+    matches!(error, ProviderError::Auth(_)) && source == provider::CredentialSource::OAuth
+}
 
 /// Run one scripted turn to completion, executing the tools the model asks for.
 ///
@@ -9686,6 +9867,31 @@ mod tests {
         std::fs::remove_dir_all(&home).unwrap();
     }
 
+    #[test]
+    fn a_stale_oauth_token_is_the_only_failure_worth_a_fresh_credential() {
+        let auth = ProviderError::Auth("expired".to_owned());
+        assert!(is_stale_oauth_token(
+            &auth,
+            provider::CredentialSource::OAuth
+        ));
+        for other in [
+            provider::CredentialSource::ConfiguredEnv,
+            provider::CredentialSource::Keyring,
+            provider::CredentialSource::File,
+            provider::CredentialSource::DefaultEnv,
+            provider::CredentialSource::None,
+        ] {
+            assert!(
+                !is_stale_oauth_token(&auth, other),
+                "an API key rejected once will be rejected identically again: {other:?}"
+            );
+        }
+        assert!(!is_stale_oauth_token(
+            &ProviderError::RateLimited { retry_after: None },
+            provider::CredentialSource::OAuth
+        ));
+    }
+
     /// A provider that replays a scripted round per request and records what
     /// it was asked, so a test can assert on the conversation the loop built.
     #[cfg(feature = "tui")]
@@ -9693,6 +9899,10 @@ mod tests {
         descriptor: arsy_kernel::provider::ProviderDescriptor,
         rounds: std::sync::Mutex<std::collections::VecDeque<Vec<ModelEvent>>>,
         seen: std::sync::Mutex<Vec<CanonicalModelRequest>>,
+        /// Errors to fail `stream` with before falling through to `rounds`,
+        /// oldest first. Empty for every existing test, which never fails.
+        fail_first:
+            std::sync::Mutex<std::collections::VecDeque<arsy_kernel::provider::ProviderError>>,
     }
 
     #[cfg(feature = "tui")]
@@ -9707,6 +9917,9 @@ mod tests {
         ) -> Result<arsy_kernel::provider::ModelEventStream, arsy_kernel::provider::ProviderError>
         {
             self.seen.lock().unwrap().push(request.clone());
+            if let Some(error) = self.fail_first.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             let events = self.rounds.lock().unwrap().pop_front().unwrap_or_default();
             Ok(Box::new(events.into_iter().map(Ok)))
         }
@@ -9721,6 +9934,7 @@ mod tests {
             },
             rounds: std::sync::Mutex::new(rounds.into()),
             seen: std::sync::Mutex::new(Vec::new()),
+            fail_first: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
         let resolved = provider::Resolved {
             provider: scripted.clone(),
@@ -9739,6 +9953,22 @@ mod tests {
             source: provider::CredentialSource::DefaultEnv,
             route: None,
         };
+        (resolved, scripted)
+    }
+
+    /// Like [`resolved`], but the provider fails its first `stream` call
+    /// with `error` before falling through to the scripted rounds, and its
+    /// credential is sourced from OAuth rather than an environment
+    /// variable — for a test that exercises recovery from a stale token
+    /// mid-session.
+    #[cfg(feature = "tui")]
+    fn resolved_failing_first(
+        error: arsy_kernel::provider::ProviderError,
+        rounds: Vec<Vec<ModelEvent>>,
+    ) -> (provider::Resolved, std::sync::Arc<Scripted>) {
+        let (mut resolved, scripted) = resolved(rounds);
+        scripted.fail_first.lock().unwrap().push_back(error);
+        resolved.source = provider::CredentialSource::OAuth;
         (resolved, scripted)
     }
 
@@ -9841,7 +10071,7 @@ mod tests {
     fn a_hook_that_denies_a_call_stops_it_in_the_interactive_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let patch = "*** Begin Patch\n*** Add File: note.txt\n+blocked\n*** End Patch\n";
-        let (resolved, _) = resolved(vec![
+        let (mut resolved, _) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -9884,7 +10114,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -9924,7 +10154,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let patch =
             "*** Begin Patch\n*** Add File: note.txt\n+written by the tool loop\n*** End Patch\n";
-        let (resolved, scripted) = resolved(vec![
+        let (mut resolved, scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -9963,7 +10193,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -10066,7 +10296,7 @@ mod tests {
     fn a_successful_duplicate_command_runs_once_and_finishes_the_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let command = "printf x >> duplicate-command-marker";
-        let (resolved, scripted) = resolved(vec![
+        let (mut resolved, scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -10100,7 +10330,7 @@ mod tests {
             }],
         }];
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -10140,7 +10370,7 @@ mod tests {
     #[test]
     fn a_declined_tool_call_does_not_run_and_the_model_is_told_so() {
         let workspace = tempfile::tempdir().unwrap();
-        let (resolved, _scripted) = resolved(vec![
+        let (mut resolved, _scripted) = resolved(vec![
             vec![
                 ModelEvent::ToolCallCompleted {
                     index: 0,
@@ -10167,7 +10397,7 @@ mod tests {
         let (typist, keys, done) = typed(b"d", std::sync::Arc::clone(&approval));
         let mut conversation = Vec::new();
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -10229,7 +10459,7 @@ mod tests {
                 },
             ]
         };
-        let (resolved, scripted) = resolved(vec![asking(), asking()]);
+        let (mut resolved, scripted) = resolved(vec![asking(), asking()]);
         let approval =
             std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
         let (typist, keys, done) = typed(b"\x03", std::sync::Arc::clone(&approval));
@@ -10237,7 +10467,7 @@ mod tests {
         // A stop is answered by the stop, not by waiting for the keyboard to
         // hang up: the calls after it are refused without asking.
         let turn = native_turn(
-            &resolved,
+            &mut resolved,
             &arsy_kernel::config::Config::default(),
             &test_runtime(workspace.path()),
             &mut conversation,
@@ -10283,6 +10513,62 @@ mod tests {
         assert!(results
             .iter()
             .all(|content| matches!(content, ModelContent::ToolResult { is_error: true, .. })));
+    }
+
+    /// A token that expires mid-session is reported after a refresh is
+    /// attempted, not silently swallowed. The endpoint id ("stub") names no
+    /// real provider, so `provider::resolve` cannot actually refresh it —
+    /// this exercises the failure path deterministically: refresh is
+    /// attempted and, failing, the original failure still reaches the
+    /// operator, and no second `stream` call is made on top of it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_stale_oauth_token_mid_session_is_reported_after_a_refresh_attempt() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut resolved, scripted) = resolved_failing_first(
+            ProviderError::Auth("token expired".to_owned()),
+            vec![vec![ModelEvent::Completed {
+                stop: arsy_kernel::provider::StopReason::EndTurn,
+            }]],
+        );
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = vec![ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text {
+                text: "hello".to_owned(),
+            }],
+        }];
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn.failure.as_deref(),
+            Some("provider authentication failed: token expired")
+        );
+        assert!(matches!(turn.provider_error, Some(ProviderError::Auth(_))));
+        assert_eq!(
+            scripted.seen.lock().unwrap().len(),
+            1,
+            "a failed refresh must not be followed by a second stream call"
+        );
     }
 
     #[cfg(feature = "tui")]
