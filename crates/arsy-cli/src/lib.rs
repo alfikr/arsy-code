@@ -10660,42 +10660,56 @@ fn prompt_skills(
         })
         .collect();
 
+    let mut taken: std::collections::HashSet<String> =
+        listed.iter().map(|skill| skill.name.clone()).collect();
     for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
-        // A source the operator switched off contributes nothing, the same as
-        // its hooks and its instructions: `compat.<source>.enabled` governs
-        // everything that source's files carry.
-        if !config.compat_enabled(ecosystem.as_str()) {
-            continue;
-        }
-        let Ok(skills) = importer.skill_declarations(ecosystem) else {
-            continue;
-        };
-        for skill in skills {
-            let Some(name) = skill["name"].as_str().map(str::to_owned) else {
-                continue;
-            };
-            let key = format!("{}/{}", ecosystem.as_str(), name);
-            if config.skill_disabled().contains(&key) {
-                continue;
-            }
-            let Some(path) = skill["source"].as_str().map(str::to_owned) else {
-                continue;
-            };
-            // A workspace skill by the same name as a user skill is the one
-            // the workspace means to have: project overrides the operator's
-            // home, the same precedence the ecosystems use.
-            if listed.iter().any(|known| known.name == name) {
-                continue;
-            }
-            listed.push(Skill {
-                name,
-                ecosystem: ecosystem.as_str().to_owned(),
-                description: skill_description(root, &path),
-                path,
-            });
-        }
+        workspace_skills(&mut listed, &mut taken, ecosystem, config, root, &importer);
     }
     listed
+}
+
+/// The workspace skills of one ecosystem, appended to `listed` under their
+/// names.
+///
+/// `taken` holds the names already listed: a workspace skill by the same name
+/// as a user skill is the one the workspace means to have — project overrides
+/// the operator's home, the same precedence the ecosystems use.
+fn workspace_skills(
+    listed: &mut Vec<arsy_code::agent::instructions::Skill>,
+    taken: &mut std::collections::HashSet<String>,
+    ecosystem: arsy_code::compat::Ecosystem,
+    config: &arsy_kernel::config::Config,
+    root: &Path,
+    importer: &arsy_code::compat::CompatibilityImporter,
+) {
+    // A source the operator switched off contributes nothing, the same as its
+    // hooks and its instructions: `compat.<source>.enabled` governs everything
+    // that source's files carry.
+    if !config.compat_enabled(ecosystem.as_str()) {
+        return;
+    }
+    let Ok(skills) = importer.skill_declarations(ecosystem) else {
+        return;
+    };
+    for skill in skills {
+        let Some(name) = skill["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let key = format!("{}/{}", ecosystem.as_str(), name);
+        if config.skill_disabled().contains(&key) || taken.contains(&name) {
+            continue;
+        }
+        let Some(path) = skill["source"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        taken.insert(name.clone());
+        listed.push(arsy_code::agent::instructions::Skill {
+            name,
+            ecosystem: ecosystem.as_str().to_owned(),
+            description: skill_description(root, &path),
+            path,
+        });
+    }
 }
 
 /// The one line a `SKILL.md` front matter offers as its description.
