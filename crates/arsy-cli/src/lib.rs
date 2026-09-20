@@ -2941,6 +2941,13 @@ fn summary_number(record: &Value, key: &str) -> u64 {
 /// `watch` sees a redacted projection of each call: the tool and whether it
 /// worked, never the arguments or what came back. Returning
 /// [`Intervention::Deny`] stops the child there.
+///
+/// `trace` takes the child's own events rather than the parent's emitter,
+/// because a child runs on its own thread and the emitter writes to one
+/// terminal. `cancel` is checked between rounds and between tool calls: those
+/// are the points where stopping leaves the workspace in a state the child can
+/// describe, which is what makes cancellation safe rather than merely fast.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn child_turn(
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
@@ -2948,7 +2955,10 @@ pub(crate) fn child_turn(
     watch: &mut dyn FnMut(
         &arsy_kernel::observer::RedactedProjection,
     ) -> Option<arsy_kernel::observer::Intervention>,
-    emitter: &mut Emitter,
+    trace: &mut dyn FnMut(&str, Value),
+    steer: &mut dyn FnMut() -> Vec<String>,
+    cancel: &arsy_kernel::scheduler::CancelToken,
+    tokens: &mut (u64, u64),
 ) -> Result<String, String> {
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
@@ -2960,6 +2970,20 @@ pub(crate) fn child_turn(
     let mut answer = String::new();
 
     for round in 0..MAX_CHILD_TOOL_ROUNDS {
+        if cancel.is_cancelled() {
+            return Err(CHILD_CANCELLED.to_owned());
+        }
+        // A round boundary is where a child can absorb a new instruction
+        // without abandoning work in progress. Messages narrow what it was
+        // already asked to do; they cannot widen what it may do, because its
+        // grants were fixed when the graph created it.
+        for instruction in steer() {
+            trace("subagent.steered", json!({"instruction": &instruction}));
+            request.messages.push(ModelMessage {
+                role: ModelRole::User,
+                content: vec![ModelContent::Text { text: instruction }],
+            });
+        }
         request.idempotency_key =
             IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
@@ -2976,11 +3000,21 @@ pub(crate) fn child_turn(
                     arguments,
                     ..
                 } => {
-                    emitter.trace(
+                    trace(
                         "model.tool_call",
                         json!({"round": round, "id": id, "name": name, "arguments": arguments}),
                     );
                     calls.push((id, name, arguments));
+                }
+                ModelEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    // Counted here rather than inferred by the parent: what a
+                    // child spent has to settle against the budget its task
+                    // reserved, and only the child sees its own stream.
+                    tokens.0 = tokens.0.saturating_add(input_tokens);
+                    tokens.1 = tokens.1.saturating_add(output_tokens);
                 }
                 _ => {}
             }
@@ -3016,6 +3050,12 @@ pub(crate) fn child_turn(
 
         let mut results = Vec::with_capacity(calls.len());
         for (id, name, arguments) in &calls {
+            // Between calls, not mid-call: a tool that has started is allowed
+            // to finish and say what it did, so a cancelled child still
+            // reports the effects it already had.
+            if cancel.is_cancelled() {
+                return Err(CHILD_CANCELLED.to_owned());
+            }
             let result = runtime.invoke(name, arguments);
             calls_made += 1;
             consecutive_failures = if result.success {
@@ -3046,11 +3086,7 @@ pub(crate) fn child_turn(
                 is_error: !result.success,
             });
             if let Some(arsy_kernel::observer::Intervention::Deny(reason)) = intervened {
-                emitter.diagnostic(&Diagnostic::warning(
-                    "ARSY-RET-1001",
-                    format!("a subagent was stopped: {reason}"),
-                    "the parent keeps whatever the subagent had established before it stopped",
-                ));
+                trace("subagent.stopped", json!({"reason": reason}));
                 return Err(format!("stopped by its supervisor: {reason}"));
             }
         }
@@ -3069,6 +3105,10 @@ pub(crate) fn child_turn(
 /// Fewer than the parent's: a child has one question, and a child that cannot
 /// answer it in this many rounds is one the parent should take back.
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+
+/// What a child says when it was asked to stop. A reason rather than a
+/// silence, so the attempt's terminal record is explicable.
+pub(crate) const CHILD_CANCELLED: &str = "the subagent was cancelled before it answered";
 
 /// What a turn cost, when configuration says what its model charges.
 ///

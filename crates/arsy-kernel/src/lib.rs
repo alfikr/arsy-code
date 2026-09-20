@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod protocol;
 pub mod provider;
 pub mod routing;
+pub mod scheduler;
 pub mod secret;
 pub mod service;
 pub mod sqlite;

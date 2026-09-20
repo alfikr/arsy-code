@@ -32,17 +32,27 @@ use arsy_code::agent::{ExecutionMode, ToolResult, ToolRuntime};
 use arsy_kernel::{
     capability::{CapabilityAction, CapabilityGrant, ResourcePattern, ResourceScope},
     config::Config,
-    domain::{AgentId, Principal, SubscriptionId, TaskId},
+    domain::{AgentId, AttemptId, Principal, SubscriptionId, TaskId},
     observer::{Intervention, ObserverAuthority, ObserverSubscription, RedactedProjection},
-    orchestration::{Budget, ChildCapabilityRequest, TaskGraph, TaskNode, WorkspaceRequirement},
+    orchestration::{
+        AttemptOutcome, AttemptRequest, AttemptState, Budget, ChildCapabilityRequest, JoinPolicy,
+        MessageKind, Retryability, TaskGraph, TaskNode, TaskState, WorkspaceRequirement,
+    },
     policy::{ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance},
     protocol::IdempotencyKey,
     provider::{
         CanonicalModelRequest, ModelContent, ModelKey, ModelMessage, ModelRole, ToolSchema,
     },
+    scheduler::{Admission, CancelToken, Scheduler, SchedulerError},
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::Arc,
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 /// The most children one turn may spawn.
 ///
@@ -103,33 +113,124 @@ impl Allowance {
 /// Not a workspace operation: spawning changes no file and runs no command, it
 /// adds a node to the session's own graph. The child's effects each go through
 /// the one path a tool call takes, under the child's own grants.
-pub fn schema() -> ToolSchema {
-    ToolSchema {
-        name: "task.spawn".to_owned(),
-        description: format!(
-            "Delegate a self-contained question to a subagent that can read and search but \
-             cannot write. The current turn waits for the answer, so use it for bounded \
-             investigations such as \"where is X configured\" or \"what calls Y\", and not for \
-             anything that changes a file. At most {MAX_CHILDREN} per turn."
-        ),
-        input_schema: json!({
+pub fn schemas() -> Vec<ToolSchema> {
+    let object = |properties: Value, required: Value| {
+        json!({
             "type": "object",
-            "properties": {
-                "goal": {
-                    "type": "string",
-                    "description": "What the subagent should find out, stated so its answer is useful on its own."
-                },
-                "capabilities": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": ["fs.read", "process.exec"]},
-                    "description": "What it may do. Defaults to `fs.read`. Never includes writing."
-                }
-            },
-            "required": ["goal"],
+            "properties": properties,
+            "required": required,
             "additionalProperties": false,
-        }),
-    }
+        })
+    };
+    vec![
+        ToolSchema {
+            name: "task.spawn".to_owned(),
+            description: format!(
+                "Start a subagent that can read and search but cannot write, and return its ids \
+                 straight away without waiting for its answer. Start every independent \
+                 investigation you have before reading any of them back, then use `task.wait` or \
+                 `task.result`. At most {MAX_CHILDREN} per turn."
+            ),
+            input_schema: object(
+                json!({
+                    "goal": {
+                        "type": "string",
+                        "description": "What the subagent should find out, stated so its answer is useful on its own."
+                    },
+                    "capabilities": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["fs.read", "process.exec"]},
+                        "description": "What it may do. Defaults to `fs.read`. Never includes writing."
+                    }
+                }),
+                json!(["goal"]),
+            ),
+        },
+        ToolSchema {
+            name: "task.status".to_owned(),
+            description:
+                "Report every subagent this turn started, with its state and whether its answer \
+                 is ready. Takes no arguments."
+                    .to_owned(),
+            input_schema: object(json!({}), json!([])),
+        },
+        ToolSchema {
+            name: "task.wait".to_owned(),
+            description:
+                "Wait for subagents to finish and return their answers. Waits for all of them by \
+                 default; `join` may be \"any\" to return as soon as one answers, or a number for \
+                 that many."
+                    .to_owned(),
+            input_schema: object(
+                json!({
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task ids from `task.spawn`. Defaults to every subagent this turn started."
+                    },
+                    "join": {
+                        "type": "string",
+                        "description": "\"all\" (default), \"any\", or a count such as \"2\"."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "How long to wait before reporting what is still running."
+                    }
+                }),
+                json!([]),
+            ),
+        },
+        ToolSchema {
+            name: "task.result".to_owned(),
+            description:
+                "Read what one subagent produced. Says so rather than waiting when it has not \
+                 finished."
+                    .to_owned(),
+            input_schema: object(
+                json!({"task": {"type": "string", "description": "A task id from `task.spawn`."}}),
+                json!(["task"]),
+            ),
+        },
+        ToolSchema {
+            name: "task.cancel".to_owned(),
+            description:
+                "Stop a subagent whose answer you no longer need. Whatever it already established \
+                 is kept."
+                    .to_owned(),
+            input_schema: object(
+                json!({
+                    "task": {"type": "string", "description": "A task id from `task.spawn`."},
+                    "reason": {"type": "string", "description": "Why it is no longer needed."}
+                }),
+                json!(["task"]),
+            ),
+        },
+        ToolSchema {
+            name: "task.send".to_owned(),
+            description:
+                "Send a running subagent a narrowing instruction or an answer to its question. It \
+                 reaches the subagent between its rounds and cannot give it any new permission."
+                    .to_owned(),
+            input_schema: object(
+                json!({
+                    "task": {"type": "string", "description": "A task id from `task.spawn`."},
+                    "message": {"type": "string", "description": "What to tell it."}
+                }),
+                json!(["task", "message"]),
+            ),
+        },
+    ]
 }
+
+/// The calls a supervisor answers rather than the workspace runtime.
+pub const OWNED_TOOLS: &[&str] = &[
+    "task.spawn",
+    "task.status",
+    "task.wait",
+    "task.result",
+    "task.cancel",
+    "task.send",
+];
 
 /// One turn's authority to create and run children.
 pub struct Supervisor<'a> {
@@ -145,9 +246,30 @@ pub struct Supervisor<'a> {
     /// without this a supervisor in Plan Mode could delegate the write it is
     /// itself refused — authority is attenuated by delegation, never widened.
     mode: ExecutionMode,
-    observer: ObserverSubscription,
     allowance: Allowance,
-    /// What the observer did, for the turn's record.
+    /// What the observers did, for the turn's record.
+    interventions: Vec<Value>,
+    /// Built on the first spawn, over its own view of the session's stream.
+    /// A turn that never delegates pays for nothing.
+    scheduler: Option<Scheduler>,
+    children: Vec<Child>,
+}
+
+/// One child this turn started, and the thread running it.
+struct Child {
+    task: TaskId,
+    attempt: AttemptId,
+    goal: String,
+    cancel: CancelToken,
+    /// Taken when the child is reaped. `None` afterwards.
+    worker: Option<JoinHandle<Report>>,
+    /// What the worker returned, once it has been reaped.
+    report: Option<Report>,
+}
+
+/// What a finished child hands back to the turn that started it.
+struct Report {
+    answer: Result<String, String>,
     interventions: Vec<Value>,
 }
 
@@ -174,21 +296,10 @@ impl<'a> Supervisor<'a> {
             parent,
             delegable,
             mode: runtime.execution_mode(),
-            observer: ObserverSubscription {
-                id: SubscriptionId::new(),
-                observer: AgentId::new(),
-                authority: ObserverAuthority {
-                    // The supervisor may stop a child it is paying for. It may
-                    // not do anything else: an observer that could act would be
-                    // an agent, and this one has no tools.
-                    may_suggest: true,
-                    may_deny: true,
-                },
-                cost_budget_micros: OBSERVER_BUDGET,
-                cost_used_micros: 0,
-            },
             allowance: Allowance::default(),
             interventions: Vec::new(),
+            scheduler: None,
+            children: Vec::new(),
         }
     }
 
@@ -205,21 +316,66 @@ impl<'a> Supervisor<'a> {
         &self.interventions
     }
 
-    /// Run one `task.spawn` call to the child's answer.
-    pub fn spawn(
+    /// Answer one of the calls in [`OWNED_TOOLS`].
+    pub fn call(
         &mut self,
+        name: &str,
         arguments: &Value,
         graph: &mut TaskGraph,
         emitter: &mut Emitter,
     ) -> ToolResult {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        let outcome = match name {
+            "task.spawn" => self.start(arguments, graph),
+            "task.status" => self.status(),
+            "task.wait" => self.wait(arguments, emitter),
+            "task.result" => self.result(arguments, emitter),
+            "task.cancel" => self.stop(arguments),
+            "task.send" => self.steer(arguments),
+            other => Err(format!("{other} is not a supervisor call")),
+        };
+        match outcome {
+            Ok(output) => ToolResult {
+                tool: name.to_owned(),
+                success: true,
+                output,
+                changed_files: Vec::new(),
+                duration: started.elapsed(),
+                metadata: Value::Null,
+                artifact: None,
+            },
+            Err(reason) => ToolResult::refused(name, reason),
+        }
+    }
+
+    /// Stop and reap every child before the turn ends.
+    ///
+    /// A turn that returned while its children were still reading would leave
+    /// threads spending a budget nobody is waiting on, and attempts whose only
+    /// route to a terminal state is their lease running out. So the turn's end
+    /// is where they stop, and what they had is recorded.
+    pub fn finish(&mut self, emitter: &mut Emitter) {
+        for index in 0..self.children.len() {
+            if self.children[index].worker.is_none() {
+                continue;
+            }
+            let (task, attempt) = (self.children[index].task, self.children[index].attempt);
+            if let Some(scheduler) = self.scheduler.as_mut() {
+                let _ = scheduler.cancel(attempt, "the turn that started it ended");
+            }
+            self.children[index].cancel.cancel();
+            self.reap(index, emitter);
+            emitter.trace("subagent.reaped", json!({"task": task.to_string()}));
+        }
+    }
+
+    /// Start one child and return its ids without waiting for its answer.
+    fn start(&mut self, arguments: &Value, graph: &mut TaskGraph) -> Result<String, String> {
         // Taken before anything can go wrong, so a spawn that fails still
         // spends its slot: a bound that only counted the children that worked
         // would let a model spawn failures without end, and each one costs the
         // rounds a child is allowed.
-        if let Err(refusal) = self.allowance.take() {
-            return ToolResult::refused("task.spawn", refusal);
-        }
+        self.allowance.take()?;
         let goal = arguments
             .get("goal")
             .and_then(Value::as_str)
@@ -227,25 +383,125 @@ impl<'a> Supervisor<'a> {
             .trim()
             .to_owned();
         if goal.is_empty() {
-            return ToolResult::refused("task.spawn", "a subagent needs a goal to work towards");
+            return Err("a subagent needs a goal to work towards".into());
         }
-        let asked = match requested(&self.delegable, arguments) {
-            Ok(asked) => asked,
-            Err(reason) => return ToolResult::refused("task.spawn", reason),
-        };
+        let asked = requested(&self.delegable, arguments)?;
+        self.run_child(&goal, &asked, graph)
+    }
 
-        match self.run_child(&goal, &asked, graph, emitter) {
-            Ok(answer) => ToolResult {
-                tool: "task.spawn".to_owned(),
-                success: true,
-                output: answer,
-                changed_files: Vec::new(),
-                duration: started.elapsed(),
-                metadata: Value::Null,
-                artifact: None,
-            },
-            Err(reason) => ToolResult::refused("task.spawn", reason),
+    fn status(&self) -> Result<String, String> {
+        let children: Vec<Value> = self
+            .children
+            .iter()
+            .map(|child| {
+                json!({
+                    "task": child.task.to_string(),
+                    "goal": child.goal,
+                    "state": self.state_of(child),
+                    "answer_ready": child.worker.is_none(),
+                })
+            })
+            .collect();
+        Ok(json!({"subagents": children}).to_string())
+    }
+
+    /// Wait for children, up to a bound, and report what they said.
+    fn wait(&mut self, arguments: &Value, emitter: &mut Emitter) -> Result<String, String> {
+        let wanted = self.selection(arguments)?;
+        let join = join_policy(arguments, wanted.len())?;
+        let deadline = Instant::now()
+            + Duration::from_millis(
+                arguments
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_WAIT_MS)
+                    .min(MAX_WAIT_MS),
+            );
+
+        // Polled rather than blocked on one handle at a time: `join` may be
+        // satisfied by any of them, and waiting on the first would ignore the
+        // second finishing first.
+        loop {
+            for index in self.finished(&wanted) {
+                self.reap(index, emitter);
+            }
+            let states: Vec<TaskState> = wanted
+                .iter()
+                .filter_map(|task| self.child(*task))
+                .map(|child| self.task_state(child))
+                .collect();
+            if join.satisfied(states.iter().copied()) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
+        Ok(json!({"subagents": self.answers(&wanted)}).to_string())
+    }
+
+    fn result(&mut self, arguments: &Value, emitter: &mut Emitter) -> Result<String, String> {
+        let task = self.named(arguments)?;
+        if let Some(index) = self.finished(&[task]).first() {
+            self.reap(*index, emitter);
+        }
+        let child = self.child(task).ok_or_else(|| unknown(task))?;
+        if child.worker.is_some() {
+            return Err(format!(
+                "subagent {task} has not finished; use `task.wait` or ask again later"
+            ));
+        }
+        Ok(json!(self.answers(&[task]).first().cloned()).to_string())
+    }
+
+    fn stop(&mut self, arguments: &Value) -> Result<String, String> {
+        let task = self.named(arguments)?;
+        let reason = arguments
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the parent no longer needs this answer")
+            .to_owned();
+        let (attempt, cancel) = {
+            let child = self.child(task).ok_or_else(|| unknown(task))?;
+            (child.attempt, child.cancel.clone())
+        };
+        // Recorded before the flag, so a process that dies between the two
+        // comes back knowing the attempt was told to stop.
+        if let Some(scheduler) = self.scheduler.as_mut() {
+            scheduler
+                .cancel(attempt, reason.clone())
+                .map_err(|error| format!("the cancellation could not be recorded: {error}"))?;
+        }
+        cancel.cancel();
+        Ok(json!({"task": task.to_string(), "cancelling": reason}).to_string())
+    }
+
+    fn steer(&mut self, arguments: &Value) -> Result<String, String> {
+        let task = self.named(arguments)?;
+        let message = arguments
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if message.is_empty() {
+            return Err("a message needs something in it".into());
+        }
+        let parent = self.parent;
+        let scheduler = self
+            .scheduler
+            .as_mut()
+            .ok_or_else(|| "this turn has no subagents".to_owned())?;
+        let id = scheduler
+            .graph_mut()
+            .send(
+                parent,
+                task,
+                MessageKind::Instruction,
+                json!(message),
+                None,
+                arsy_kernel::artifact::unix_time_ms(),
+            )
+            .map_err(|error| format!("the message could not be recorded: {error}"))?;
+        Ok(json!({"task": task.to_string(), "message": id.to_string()}).to_string())
     }
 }
 
@@ -288,13 +544,12 @@ fn requested(
 }
 
 impl Supervisor<'_> {
-    /// Record the child, attenuate its authority, run it, and close it.
+    /// Record the child, attenuate its authority, and hand it to a worker.
     fn run_child(
         &mut self,
         goal: &str,
         actions: &[CapabilityAction],
         graph: &mut TaskGraph,
-        emitter: &mut Emitter,
     ) -> Result<String, String> {
         let agent = AgentId::new();
         let id = TaskId::new();
@@ -361,42 +616,318 @@ impl Supervisor<'_> {
             .map_err(|error| format!("the subagent could not be recorded: {error}"))?;
         graph
             .ready()
-            .and_then(|_| {
-                graph.lease(
-                    id,
-                    agent,
-                    arsy_kernel::artifact::unix_time_ms() + share(parent_budget).wall_ms,
-                )
-            })
-            .map_err(|error| format!("the subagent could not be started: {error}"))?;
+            .map_err(|error| format!("the subagent could not be queued: {error}"))?;
 
-        let granted = graph
+        // One scheduler per turn, over its own view of the same stream. Built
+        // here rather than in `new` so a turn that never delegates never
+        // replays the session a second time.
+        if self.scheduler.is_none() {
+            let forked = graph
+                .fork(Principal::Agent(agent))
+                .map_err(|error| format!("the subagent runtime could not start: {error}"))?;
+            self.scheduler = Some(Scheduler::new(
+                forked,
+                // Concurrency, not spend: the budget was already reserved
+                // against the parent when the child node was created.
+                Admission::new()
+                    .limit(SUBAGENT_SLOT, MAX_CONCURRENT_CHILDREN)
+                    .limit(
+                        provider_slot(&self.resolved.endpoint.id),
+                        MAX_CONCURRENT_CHILDREN,
+                    ),
+                arsy_kernel::scheduler::RetryPolicy::default(),
+            ));
+        }
+        let budget = share(parent_budget);
+        let scheduler = self.scheduler.as_mut().expect("just built");
+        let admitted = scheduler
+            .start(
+                id,
+                &AttemptRequest {
+                    role: "subagent".to_owned(),
+                    assignee: agent,
+                    model: Some(arsy_kernel::orchestration::ModelDecision {
+                        profile: self.resolved.endpoint.id.clone(),
+                        model: self.model.clone(),
+                    }),
+                    base_revision: None,
+                    started_at_ms: arsy_kernel::artifact::unix_time_ms(),
+                    lease_expires_at_ms: arsy_kernel::artifact::unix_time_ms() + budget.wall_ms,
+                },
+                vec![
+                    SUBAGENT_SLOT.to_owned(),
+                    provider_slot(&self.resolved.endpoint.id),
+                ],
+            )
+            .map_err(|error| match error {
+                SchedulerError::Deferred(key) => format!(
+                    "no free slot for {key}; wait for a running subagent before starting another"
+                ),
+                SchedulerError::Graph(error) => {
+                    format!("the subagent could not be started: {error}")
+                }
+            })?;
+
+        let granted = scheduler
+            .graph()
             .node(id)
             .map(|node| node.authority.clone())
             .unwrap_or_default();
-        let outcome = self.execute(goal, &granted, agent, emitter);
-        match &outcome {
-            Ok(answer) => {
-                let _ = graph.complete(id, json!({"answer_bytes": answer.len()}));
-            }
-            Err(reason) => {
-                let _ = graph.fail(id, json!({"message": reason}));
-            }
+        let worker = Worker {
+            root: self.root.clone(),
+            config: self.config.clone(),
+            provider: Arc::clone(&self.resolved.provider),
+            endpoint: self.resolved.endpoint.id.clone(),
+            max_output_tokens: self.resolved.endpoint.max_output_tokens,
+            model: self.model.clone(),
+            mode: self.mode,
+            goal: goal.to_owned(),
+            agent,
+            task: id,
+            attempt: admitted.attempt,
+            granted,
+            cancel: admitted.cancel.clone(),
+            graph: scheduler
+                .graph()
+                .fork(Principal::Agent(agent))
+                .map_err(|error| format!("the subagent runtime could not start: {error}"))?,
+        };
+        let handle = std::thread::Builder::new()
+            .name(format!("arsy-subagent-{agent}"))
+            .spawn(move || worker.run())
+            .map_err(|error| format!("the subagent thread could not start: {error}"))?;
+
+        self.children.push(Child {
+            task: id,
+            attempt: admitted.attempt,
+            goal: goal.to_owned(),
+            cancel: admitted.cancel,
+            worker: Some(handle),
+            report: None,
+        });
+        Ok(json!({
+            "task": id.to_string(),
+            "attempt": admitted.attempt.to_string(),
+            "started": goal,
+            "note": "running; read it back with `task.wait` or `task.result`",
+        })
+        .to_string())
+    }
+
+    fn child(&self, task: TaskId) -> Option<&Child> {
+        self.children.iter().find(|child| child.task == task)
+    }
+
+    /// The task ids this call is about: those named, or all of them.
+    fn selection(&self, arguments: &Value) -> Result<Vec<TaskId>, String> {
+        let Some(named) = arguments.get("tasks").and_then(Value::as_array) else {
+            return Ok(self.children.iter().map(|child| child.task).collect());
+        };
+        named
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|id| {
+                id.parse::<TaskId>()
+                    .map_err(|_| format!("{id} is not a task id"))
+                    .and_then(|task| self.child(task).map(|_| task).ok_or_else(|| unknown(task)))
+            })
+            .collect()
+    }
+
+    fn named(&self, arguments: &Value) -> Result<TaskId, String> {
+        let id = arguments
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "name the subagent's task id".to_owned())?;
+        let task = id
+            .parse::<TaskId>()
+            .map_err(|_| format!("{id} is not a task id"))?;
+        self.child(task).map(|_| task).ok_or_else(|| unknown(task))
+    }
+
+    /// Indices of children whose worker has finished but not been reaped.
+    fn finished(&self, wanted: &[TaskId]) -> Vec<usize> {
+        self.children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| wanted.contains(&child.task))
+            .filter(|(_, child)| child.worker.as_ref().is_some_and(JoinHandle::is_finished))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Join one finished worker and settle its attempt.
+    ///
+    /// Settling here rather than on the worker keeps the terminal record in
+    /// one place: whatever the thread did — answered, failed, panicked — the
+    /// attempt ends with a reason the parent can explain.
+    fn reap(&mut self, index: usize, emitter: &mut Emitter) {
+        let Some(handle) = self.children[index].worker.take() else {
+            return;
+        };
+        let attempt = self.children[index].attempt;
+        let report = handle.join().unwrap_or_else(|_| Report {
+            answer: Err("the subagent thread stopped unexpectedly".to_owned()),
+            interventions: Vec::new(),
+        });
+        self.interventions.extend(report.interventions.clone());
+        for intervention in &report.interventions {
+            emitter.trace("subagent.intervention", intervention.clone());
         }
-        outcome
+        if let Some(scheduler) = self.scheduler.as_mut() {
+            let now = arsy_kernel::artifact::unix_time_ms();
+            let outcome = match &report.answer {
+                Ok(answer) => AttemptOutcome::completed(Budget::default(), json!(answer), now),
+                Err(reason) if reason == crate::CHILD_CANCELLED => AttemptOutcome {
+                    state: AttemptState::Cancelled,
+                    used: Budget::default(),
+                    reason: Some(reason.clone()),
+                    retryable: Retryability::NotRetryable,
+                    result: None,
+                    evidence: Vec::new(),
+                    ended_at_ms: now,
+                },
+                Err(reason) => AttemptOutcome::failed(Budget::default(), reason.clone(), now),
+            };
+            // Already ended by the worker in the ordinary case; this closes
+            // the ones where the worker could not, such as a panic.
+            let _ = scheduler.finish(attempt, &outcome);
+        }
+        self.children[index].report = Some(report);
+    }
+
+    /// What one child is, as a word the model can act on.
+    fn state_of(&self, child: &Child) -> &'static str {
+        if child.worker.is_some() {
+            return if child.cancel.is_cancelled() {
+                "cancelling"
+            } else {
+                "running"
+            };
+        }
+        match child.report.as_ref().map(|report| &report.answer) {
+            Some(Ok(_)) => "answered",
+            Some(Err(reason)) if reason == crate::CHILD_CANCELLED => "cancelled",
+            Some(Err(_)) => "failed",
+            None => "starting",
+        }
+    }
+
+    /// The same, as the task state a join policy reads.
+    fn task_state(&self, child: &Child) -> TaskState {
+        match self.state_of(child) {
+            "answered" => TaskState::Completed,
+            "failed" => TaskState::Failed,
+            "cancelled" => TaskState::Cancelled,
+            _ => TaskState::Running,
+        }
+    }
+
+    fn answers(&self, wanted: &[TaskId]) -> Vec<Value> {
+        self.children
+            .iter()
+            .filter(|child| wanted.contains(&child.task))
+            .map(|child| {
+                let mut entry = json!({
+                    "task": child.task.to_string(),
+                    "goal": child.goal,
+                    "state": self.state_of(child),
+                });
+                match child.report.as_ref().map(|report| &report.answer) {
+                    Some(Ok(answer)) => entry["answer"] = json!(answer),
+                    Some(Err(reason)) => entry["reason"] = json!(reason),
+                    None => {}
+                }
+                entry
+            })
+            .collect()
+    }
+}
+
+/// Everything one child needs, owned, so it can run on its own thread.
+struct Worker {
+    root: PathBuf,
+    config: Config,
+    provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
+    endpoint: String,
+    max_output_tokens: u32,
+    model: String,
+    mode: ExecutionMode,
+    goal: String,
+    agent: AgentId,
+    task: TaskId,
+    attempt: AttemptId,
+    granted: Vec<CapabilityGrant>,
+    cancel: CancelToken,
+    /// The worker's own view of the session's stream, so what the child did
+    /// is durable as it happens rather than only when the parent reaps it.
+    graph: TaskGraph,
+}
+
+impl Worker {
+    fn run(mut self) -> Report {
+        let mut observer = ObserverSubscription {
+            id: SubscriptionId::new(),
+            observer: AgentId::new(),
+            authority: ObserverAuthority {
+                // The supervisor may stop a child it is paying for. It may not
+                // do anything else: an observer that could act would be an
+                // agent, and this one has no tools.
+                may_suggest: true,
+                may_deny: true,
+            },
+            cost_budget_micros: OBSERVER_BUDGET,
+            cost_used_micros: 0,
+        };
+        let mut interventions = Vec::new();
+        let _ = self
+            .graph
+            .advance_attempt(self.attempt, AttemptState::Running);
+        let mut tokens = (0u64, 0u64);
+        let answer = self.execute(&mut observer, &mut interventions, &mut tokens);
+
+        // Settled by the worker, so a parent that never reaps still leaves a
+        // terminal record rather than a lease waiting to expire.
+        let now = arsy_kernel::artifact::unix_time_ms();
+        let used = Budget {
+            tokens: tokens.0.saturating_add(tokens.1),
+            cost_micros: 0,
+            wall_ms: 0,
+        };
+        let outcome = match &answer {
+            Ok(text) => AttemptOutcome::completed(used, json!(text), now),
+            Err(reason) if reason == crate::CHILD_CANCELLED => AttemptOutcome {
+                state: AttemptState::Cancelled,
+                used,
+                reason: Some(reason.clone()),
+                retryable: Retryability::NotRetryable,
+                result: None,
+                evidence: Vec::new(),
+                ended_at_ms: now,
+            },
+            // A provider fault is the one thing worth trying again; anything
+            // else a child reports is its own answer about the workspace.
+            Err(reason) => {
+                AttemptOutcome::failed(used, reason.clone(), now).retryable(Retryability::Retryable)
+            }
+        };
+        let _ = self.graph.finish_attempt(self.attempt, &outcome);
+        Report {
+            answer,
+            interventions,
+        }
     }
 
     /// One child turn, under a runtime that can do only what the child holds.
     fn execute(
         &mut self,
-        goal: &str,
-        granted: &[CapabilityGrant],
-        agent: AgentId,
-        emitter: &mut Emitter,
+        observer: &mut ObserverSubscription,
+        interventions: &mut Vec<Value>,
+        tokens: &mut (u64, u64),
     ) -> Result<String, String> {
         let workspace =
             arsy_code::resource::Workspace::open(&self.root).map_err(|error| error.to_string())?;
-        let artifacts = std::sync::Arc::new(
+        let artifacts = Arc::new(
             arsy_kernel::artifact::FileArtifactStore::open(self.root.join(".arsy/artifacts"), 0)
                 .map_err(|error| error.to_string())?,
         );
@@ -406,21 +937,21 @@ impl Supervisor<'_> {
             // vocabulary means the child is authorized by the same code path
             // the parent is, rather than by a second implementation that could
             // disagree with it.
-            rules_from(granted),
+            rules_from(&self.granted),
             artifacts,
             arsy_kernel::artifact::unix_time_ms(),
-            Principal::Agent(agent),
+            Principal::Agent(self.agent),
             RiskContext {
                 reversible: false,
                 workspace: arsy_code::git::cleanliness(&self.root)
                     .unwrap_or(arsy_kernel::policy::WorkspaceCleanliness::Unknown),
                 sandbox: crate::installed_sandbox_assurance(),
             },
-            arsy_code::operations::Reachable::from_config(self.config),
+            arsy_code::operations::Reachable::from_config(&self.config),
             // The child's own plan and validation history, not the parent's:
             // a delegated subtask should not inherit or pollute the plan the
             // supervisor is tracking.
-            &agent.to_string(),
+            &self.agent.to_string(),
             // A delegate reports back to its parent; the parent owns the
             // session's checklist, so a child does not get one of its own.
             arsy_code::operations::TurnState::default(),
@@ -434,54 +965,122 @@ impl Supervisor<'_> {
 
         let request = CanonicalModelRequest {
             model: ModelKey {
-                provider: self.resolved.endpoint.id.clone(),
+                provider: self.endpoint.clone(),
                 model: self.model.clone(),
             },
-            system: Some(child_instructions(goal)),
+            system: Some(child_instructions(&self.goal)),
             messages: vec![ModelMessage {
                 role: ModelRole::User,
                 content: vec![ModelContent::Text {
-                    text: goal.to_owned(),
+                    text: self.goal.clone(),
                 }],
             }],
             tools: runtime.schemas(),
-            max_output_tokens: self.resolved.endpoint.max_output_tokens,
+            max_output_tokens: self.max_output_tokens,
             effort: None,
-            idempotency_key: IdempotencyKey::new(agent.to_string())
+            idempotency_key: IdempotencyKey::new(self.agent.to_string())
                 .map_err(|error| error.to_string())?,
         };
 
+        let (attempt, task) = (self.attempt, self.task);
+        // Two callbacks write to one graph, and `child_turn` holds both at
+        // once. They never run nested — one is called between rounds and the
+        // other inside a round — so the check is a formality the borrow
+        // checker cannot see for itself.
+        let graph = std::cell::RefCell::new(&mut self.graph);
         crate::child_turn(
-            self.resolved.provider.as_ref(),
+            self.provider.as_ref(),
             &runtime,
             &request,
-            &mut |projection| self.watch(projection),
-            emitter,
+            &mut |projection| watch(observer, interventions, projection),
+            &mut |kind, data| {
+                let _ = graph.borrow_mut().record(attempt, kind, data);
+            },
+            &mut || {
+                graph
+                    .borrow_mut()
+                    .deliver(task, arsy_kernel::artifact::unix_time_ms())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|message| {
+                        message
+                            .body
+                            .as_str()
+                            .map(|text| format!("Your parent sent you this: {text}"))
+                    })
+                    .collect()
+            },
+            &self.cancel,
+            tokens,
         )
     }
+}
 
-    /// Offer one redacted projection of the child's activity to the observer.
-    ///
-    /// Returns the intervention the observer made, if any. A `Deny` stops the
-    /// child; a `Suggest` is recorded and reaches the parent with the answer.
-    fn watch(&mut self, projection: &RedactedProjection) -> Option<Intervention> {
-        let intervention = warranted(projection)?;
-        match self.observer.intervene(projection, intervention.clone(), 1) {
-            Ok(event) => {
-                self.interventions.push(json!({
-                    "subscription": event.subscription.to_string(),
-                    "at_sequence": event.projection_sequence,
-                    "intervention": event.intervention,
-                    "cost_micros": event.cost_micros,
-                }));
-                Some(intervention)
-            }
-            // Out of budget or out of authority: the observer stops observing
-            // rather than acting beyond what it was given.
-            Err(_) => None,
+/// Offer one redacted projection of the child's activity to its observer.
+///
+/// Returns the intervention the observer made, if any. A `Deny` stops the
+/// child; a `Suggest` is recorded and reaches the parent with the answer.
+fn watch(
+    observer: &mut ObserverSubscription,
+    interventions: &mut Vec<Value>,
+    projection: &RedactedProjection,
+) -> Option<Intervention> {
+    let intervention = warranted(projection)?;
+    match observer.intervene(projection, intervention.clone(), 1) {
+        Ok(event) => {
+            interventions.push(json!({
+                "subscription": event.subscription.to_string(),
+                "at_sequence": event.projection_sequence,
+                "intervention": event.intervention,
+                "cost_micros": event.cost_micros,
+            }));
+            Some(intervention)
         }
+        // Out of budget or out of authority: the observer stops observing
+        // rather than acting beyond what it was given.
+        Err(_) => None,
     }
 }
+
+fn unknown(task: TaskId) -> String {
+    format!("this turn started no subagent {task}")
+}
+
+fn provider_slot(endpoint: &str) -> String {
+    format!("provider:{endpoint}")
+}
+
+/// What `join` asks for, defaulting to every task named.
+fn join_policy(arguments: &Value, tasks: usize) -> Result<JoinPolicy, String> {
+    match arguments.get("join").and_then(Value::as_str) {
+        None | Some("all") => Ok(JoinPolicy::Quorum(tasks.max(1))),
+        Some("any") => Ok(JoinPolicy::Any),
+        Some(count) => count
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .map(JoinPolicy::Quorum)
+            .ok_or_else(|| format!("`join` is \"all\", \"any\", or a count, not {count:?}")),
+    }
+}
+
+/// The slot every child takes, whichever provider it uses.
+const SUBAGENT_SLOT: &str = "subagent";
+
+/// Children that may run at once. The same bound as the per-turn allowance,
+/// so the limit an operator reasons about is one number rather than two.
+const MAX_CONCURRENT_CHILDREN: u64 = MAX_CHILDREN as u64;
+
+/// How long `task.wait` waits when the model does not say.
+const DEFAULT_WAIT_MS: u64 = 60_000;
+
+/// And the longest it will, whatever the model asks for: a turn that blocks
+/// past this is one an operator cannot interrupt.
+const MAX_WAIT_MS: u64 = 300_000;
+
+/// How often a wait looks at its children. Short enough that an answer is not
+/// left sitting, long enough that waiting is not a spin.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// What this projection warrants, if anything.
 ///

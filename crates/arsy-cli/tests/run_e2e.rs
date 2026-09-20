@@ -13,7 +13,7 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{atomic::Ordering, mpsc},
     thread,
 };
 
@@ -22,6 +22,9 @@ use std::{
 struct FakeProvider {
     port: u16,
     bodies: mpsc::Receiver<String>,
+    /// The most subagent requests that were open at once. Zero unless the
+    /// provider was built by [`FakeProvider::delegating`].
+    peak_children: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeProvider {
@@ -62,12 +65,113 @@ impl FakeProvider {
                 let _ = stream.flush();
             }
         });
-        Self { port, bodies }
+        Self {
+            port,
+            bodies,
+            peak_children: std::sync::Arc::default(),
+        }
+    }
+
+    /// Two scripts served concurrently: one for the parent, one for whichever
+    /// subagent asks.
+    ///
+    /// A subagent runs on its own thread now, so the parent and the child
+    /// reach the socket in whatever order they get there. Serving one queue in
+    /// arrival order would make the test depend on that race; picking the
+    /// queue from the request's own system prompt does not.
+    fn delegating(parent: Vec<String>, child: Vec<String>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, bodies) = mpsc::channel();
+        let scripts = std::sync::Arc::new(std::sync::Mutex::new((
+            parent
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+            child.into_iter().collect::<std::collections::VecDeque<_>>(),
+        )));
+        let peak_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (peak_out, peak) = (
+            std::sync::Arc::clone(&peak_children),
+            std::sync::Arc::clone(&peak_children),
+        );
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let request = read_request(&mut stream);
+                let _ = sender.send(request.clone());
+                let child = is_child_request(&request);
+                let mut scripts = scripts.lock().unwrap();
+                let queue = if child {
+                    &mut scripts.1
+                } else {
+                    &mut scripts.0
+                };
+                let Some(body) = queue.pop_front() else {
+                    continue;
+                };
+                drop(scripts);
+                let (peak, open) = (
+                    std::sync::Arc::clone(&peak),
+                    std::sync::Arc::clone(&open_children),
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                thread::spawn(move || {
+                    if !child {
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    // Held briefly so overlapping subagents are observable at
+                    // the socket. A run that answered each child before the
+                    // next one asked would never raise the peak above one,
+                    // which is exactly the failure this measures.
+                    let now_open = 1 + open.fetch_add(1, Ordering::SeqCst);
+                    peak.fetch_max(now_open, Ordering::SeqCst);
+                    thread::sleep(std::time::Duration::from_millis(150));
+                    open.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        Self {
+            port,
+            bodies,
+            peak_children: peak_out,
+        }
+    }
+
+    /// The most subagent requests that were in flight at the same moment.
+    fn peak_children(&self) -> usize {
+        self.peak_children.load(Ordering::SeqCst)
     }
 
     fn request(&self) -> Value {
         serde_json::from_str(&self.bodies.recv().expect("the provider was called")).unwrap()
     }
+
+    /// Every request the provider was sent, once no more are coming.
+    fn requests(&self) -> Vec<Value> {
+        let mut seen = Vec::new();
+        while let Ok(body) = self
+            .bodies
+            .recv_timeout(std::time::Duration::from_millis(500))
+        {
+            seen.push(serde_json::from_str(&body).unwrap());
+        }
+        seen
+    }
+}
+
+/// Whether a request came from a subagent rather than the parent turn.
+///
+/// Read from the instructions the supervisor writes, which is the one thing
+/// only a child's request carries.
+fn is_child_request(body: &str) -> bool {
+    body.contains("You are a subagent")
 }
 
 /// Read one HTTP request and return its body.
@@ -467,6 +571,19 @@ fn spawns(goal: &str, capabilities: &str) -> String {
     ])
 }
 
+/// A parent reply that waits for every subagent it started.
+fn waits() -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-wait",
+            "type": "function",
+            "function": {"name": "task.wait", "arguments": "{}"}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
 /// A child reply that asks to write, which its own grants must refuse.
 fn tries_to_write() -> String {
     sse(&[
@@ -486,22 +603,83 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
 
-    // Parent asks for a subagent; the child reads, then tries to write, then
-    // answers. The parent reports what the child said.
-    let provider = FakeProvider::serving(vec![
-        spawns("what does notes.txt say", "\"fs.read\""),
-        asks_to_read("notes.txt"),
-        tries_to_write(),
-        answers("notes.txt says 42."),
-        answers("the subagent found 42."),
-    ]);
+    // The parent starts a subagent, keeps its turn, and only then waits for
+    // the answer. The child reads, tries to write, and answers — on its own
+    // thread, against its own half of the script.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns("what does notes.txt say", "\"fs.read\""),
+            waits(),
+            answers("the subagent found 42."),
+        ],
+        vec![
+            asks_to_read("notes.txt"),
+            tries_to_write(),
+            answers("notes.txt says 42."),
+        ],
+    );
+    configure_delegating(home.path(), provider.port);
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["run", "find out what notes.txt says"],
+    );
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+    assert_eq!(result["status"], "completed");
+
+    let seen = provider.requests();
+    let (child, parent): (Vec<&Value>, Vec<&Value>) = seen
+        .iter()
+        .partition(|body| is_child_request(&body.to_string()));
+
+    // The parent was offered the whole supervisor surface, because this policy
+    // delegates. Waiting is a separate call now, which is what makes starting
+    // one child and continuing to work possible at all.
+    let tools: Vec<&str> = parent[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"task.spawn"), "{tools:?}");
+    assert!(tools.contains(&"task.wait"), "{tools:?}");
+
+    // What `task.spawn` returned: ids and nothing to wait on, rather than the
+    // child's answer.
+    let spawned = last_tool_result(parent[1]);
+    assert!(
+        !spawned.starts_with("error:"),
+        "the spawn failed: {spawned}"
+    );
+    let spawned: Value = serde_json::from_str(&spawned).unwrap();
+    assert!(spawned["task"].is_string(), "{spawned}");
+    assert!(spawned["attempt"].is_string(), "{spawned}");
+
+    // The child holds only what was delegated: its write was refused by its
+    // own runtime, not by the parent's.
+    let refused = last_tool_result(child.last().expect("the child asked something"));
+    assert!(refused.starts_with("error:"), "{refused}");
+    assert!(
+        !workspace.path().join("escaped.txt").exists(),
+        "a subagent must not be able to write"
+    );
+
+    // And `task.wait` is where the answer reaches the parent.
+    let waited = last_tool_result(parent[2]);
+    assert!(waited.contains("notes.txt says 42."), "{waited}");
+}
+
+/// A workspace whose policy lets the parent write and lets it delegate reads.
+fn configure_delegating(home: &Path, port: u16) {
     write_settings(
-        &settings_path(home.path()),
+        &settings_path(home),
         &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
-             base_url = \"http://127.0.0.1:{}\"\n\
+             base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              # Delegation is off unless a rule says otherwise, so the depth is\n\
@@ -516,65 +694,110 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
              id = \"parent-writes\"\n\
              effect = \"allow\"\n\
              action = \"fs.write\"\n\
-             resource = \"file:**\"\n",
-            provider.port
+             resource = \"file:**\"\n"
         ),
     );
+}
 
-    let (code, records) = arsy(
-        workspace.path(),
-        home.path(),
-        &["run", "find out what notes.txt says"],
+/// Three `task.spawn` calls in one reply, so the parent starts them all
+/// before it reads any of them back.
+fn spawns_three() -> String {
+    let call = |index: usize, goal: &str| {
+        serde_json::json!({
+            "index": index,
+            "id": format!("call-spawn-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.spawn",
+                "arguments": format!("{{\"goal\": \"{goal}\", \"capabilities\": [\"fs.read\"]}}")
+            }
+        })
+    };
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            call(0, "what does one.txt say"),
+            call(1, "what does two.txt say"),
+            call(2, "what does three.txt say"),
+        ]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn three_subagents_investigate_at_once_while_the_parent_keeps_its_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // The parent starts three children in one reply, asks what they are doing
+    // while they work, and only then waits. Each child answers in one round.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns_three(),
+            status(),
+            waits(),
+            answers("all three reported."),
+        ],
+        vec![
+            answers("one says A."),
+            answers("two says B."),
+            answers("three says C."),
+        ],
     );
+    configure_delegating(home.path(), provider.port);
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "survey the repo"]);
     let result = result(&records);
     assert_eq!(code, 0, "{result:#?}");
-    assert_eq!(result["status"], "completed");
 
-    // The parent was offered the spawn tool, because this policy delegates.
-    let first = provider.request();
-    let tools: Vec<&str> = first["tools"]
-        .as_array()
-        .unwrap()
+    let seen = provider.requests();
+    let parent: Vec<&Value> = seen
         .iter()
-        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .filter(|body| !is_child_request(&body.to_string()))
         .collect();
-    assert!(tools.contains(&"task.spawn"), "{tools:?}");
 
-    // What the spawn call actually returned, so a failure here says why.
-    let second = provider.request();
-    let spawn_result = second["messages"]
+    // The claim of the phase: the children overlapped rather than taking
+    // turns, and the parent was still issuing calls while they did.
+    let children = seen.len() - parent.len();
+    assert!(
+        provider.peak_children() > 1,
+        "subagents ran one after another, not at once: {children} child requests, \
+         parent asked {} times, spawn said {}",
+        parent.len(),
+        last_tool_result(parent[1])
+    );
+    let reported = last_tool_result(parent[2]);
+    assert!(reported.contains("\"state\":\"running\""), "{reported}");
+
+    // And every answer reaches the parent through one wait.
+    let waited = last_tool_result(parent[3]);
+    for answer in ["one says A.", "two says B.", "three says C."] {
+        assert!(waited.contains(answer), "{waited}");
+    }
+}
+
+/// A parent reply that asks what its subagents are doing.
+fn status() -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-status",
+            "type": "function",
+            "function": {"name": "task.status", "arguments": "{}"}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// The content of the last tool result in a request's messages.
+fn last_tool_result(body: &Value) -> String {
+    body["messages"]
         .as_array()
         .unwrap()
         .iter()
         .rev()
         .find(|message| message["role"] == "tool")
         .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
-        .unwrap_or_default();
-    assert!(
-        !spawn_result.starts_with("error:"),
-        "the spawn failed: {spawn_result}"
-    );
-
-    // The child was offered the workspace tools but holds only what was
-    // delegated: its write was refused by its own runtime, not by the parent's.
-    drop(provider.request()); // the child has the file and asks to write
-    let refused = provider.request();
-    let messages = refused["messages"].as_array().unwrap();
-    let tool_result = messages
-        .iter()
-        .rev()
-        .find(|message| message["role"] == "tool")
-        .expect("the child was told what happened");
-    let text = tool_result["content"].as_str().unwrap();
-    assert!(text.starts_with("error:"), "{text}");
-    assert!(
-        !workspace.path().join("escaped.txt").exists(),
-        "a subagent must not be able to write"
-    );
-
-    // The parent's last request carries the child's answer as a tool result.
-    let parent = provider.request().to_string();
-    assert!(parent.contains("notes.txt says 42."), "{parent}");
+        .unwrap_or_default()
 }
 
 #[test]

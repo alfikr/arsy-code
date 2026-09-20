@@ -8,7 +8,10 @@
 
 use crate::{
     capability::{AttenuationError, CapabilityAction, CapabilityGrant, ResourceScope},
-    domain::{AgentId, AttemptId, CorrelationId, Principal, SessionId, TaskId, WorkspaceVersion},
+    domain::{
+        AgentId, AttemptId, CorrelationId, MessageId, Principal, SessionId, TaskId,
+        WorkspaceVersion,
+    },
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +78,9 @@ pub enum WorkspaceRequirement {
 pub enum TaskState {
     Pending,
     Ready,
+    /// A dependency ended without completing, so this task can never become
+    /// ready. Distinct from `Failed`: nothing of this task ran.
+    Blocked,
     Running,
     /// Execution finished. That is not the same claim as `Verified`: a model
     /// turn that returned, or a process that exited zero, says the work ran,
@@ -90,19 +96,62 @@ pub enum TaskState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
+    /// Admitted and recorded, but its worker has not reported work yet. A
+    /// start that returns before the child runs has to be distinguishable
+    /// from one whose child is already spending the budget.
+    Starting,
     Running,
+    /// Running, but parked on something outside itself — a dependency, an
+    /// unanswered question to its parent. Still leased, still cancellable.
+    Waiting,
+    /// Cancellation was requested and the holder has not acknowledged it.
+    /// Kept as its own state so a cancel that never lands is visible rather
+    /// than looking like a clean stop.
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
     /// The lease ran out, or the holder was found gone. The attempt keeps its
     /// evidence, but it can no longer commit a result.
     Expired,
+    /// A retry replaced this attempt. Its evidence stays readable; its result
+    /// can no longer satisfy the task.
+    Superseded,
 }
 
 impl AttemptState {
     pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Expired | Self::Superseded
+        )
     }
+
+    /// Whether the holder may still commit a result against this attempt.
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Waiting | Self::Cancelling
+        )
+    }
+}
+
+/// Whether a failed attempt may be tried again without asking anyone.
+///
+/// The holder classifies its own failure because only it knows what actually
+/// happened: a stream that dropped mid-token is not the same event as a denial,
+/// and a write whose outcome is unknown is not the same as one that never ran.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retryability {
+    /// A transient fault: the same request run again is the same request.
+    Retryable,
+    /// A denial, an invalid request, or anything a repeat would only repeat.
+    #[default]
+    NotRetryable,
+    /// The effect may or may not have landed. Never retried automatically,
+    /// because a retry would be a second write nobody asked for.
+    UnknownOutcome,
 }
 
 /// Which model the attempt was routed to, recorded so a replayed attempt is
@@ -157,6 +206,10 @@ pub struct TaskAttempt {
     pub ended_at_ms: Option<u64>,
     pub state: AttemptState,
     pub terminal_reason: Option<String>,
+    /// How its holder classified the failure. Meaningless while the attempt
+    /// is live and for one that completed.
+    #[serde(default)]
+    pub retryable: Retryability,
     /// What the attempt produced, as the caller recorded it.
     pub result: Option<Value>,
     /// Artifact ids and other evidence references produced by this attempt.
@@ -169,6 +222,7 @@ pub struct AttemptOutcome {
     pub state: AttemptState,
     pub used: Budget,
     pub reason: Option<String>,
+    pub retryable: Retryability,
     pub result: Option<Value>,
     pub evidence: Vec<String>,
     pub ended_at_ms: u64,
@@ -180,21 +234,30 @@ impl AttemptOutcome {
             state: AttemptState::Completed,
             used,
             reason: None,
+            retryable: Retryability::NotRetryable,
             result: Some(result),
             evidence: Vec::new(),
             ended_at_ms,
         }
     }
 
+    /// A failure nobody should repeat on its own. `retryable` opts back in.
     pub fn failed(used: Budget, reason: impl Into<String>, ended_at_ms: u64) -> Self {
         Self {
             state: AttemptState::Failed,
             used,
             reason: Some(reason.into()),
+            retryable: Retryability::NotRetryable,
             result: None,
             evidence: Vec::new(),
             ended_at_ms,
         }
+    }
+
+    #[must_use]
+    pub const fn retryable(mut self, retryable: Retryability) -> Self {
+        self.retryable = retryable;
+        self
     }
 }
 
@@ -243,6 +306,112 @@ impl TaskNode {
     }
 }
 
+/// What a task's `required_output` demands of a result.
+///
+/// A task states its required output as text, and text is what most of them
+/// want. When that text is a JSON object schema, the object shape in it is
+/// checked instead, so a child cannot answer a structured request with prose.
+///
+/// ponytail: presence of `required` keys and `type: object`, not full JSON
+/// Schema. A real validator is a dependency; add one when a task actually
+/// needs `oneOf`, formats, or nested constraints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResultContract {
+    Text,
+    Object { required: Vec<String> },
+}
+
+impl ResultContract {
+    /// Read the contract out of a task's `required_output`.
+    pub fn parse(required_output: &str) -> Self {
+        let Ok(schema) = serde_json::from_str::<Value>(required_output) else {
+            return Self::Text;
+        };
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Self::Text;
+        }
+        Self::Object {
+            required: schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Why this result does not meet the contract, if it does not.
+    pub fn violation(&self, result: Option<&Value>) -> Option<String> {
+        let Some(result) = result else {
+            return Some("the attempt completed without a result".into());
+        };
+        match self {
+            Self::Text => match result {
+                Value::Null => Some("the attempt completed without a result".into()),
+                Value::String(text) if text.trim().is_empty() => {
+                    Some("the attempt completed with an empty result".into())
+                }
+                _ => None,
+            },
+            Self::Object { required } => {
+                let Some(object) = result.as_object() else {
+                    return Some(
+                        "the required output is an object and the result is not one".into(),
+                    );
+                };
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|name| !object.contains_key(*name))
+                    .map(String::as_str)
+                    .collect();
+                (!missing.is_empty())
+                    .then(|| format!("the result is missing {}", missing.join(", ")))
+            }
+        }
+    }
+}
+
+/// What one task says to another, durably.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A narrowing of what was already asked. Never a new grant.
+    Instruction,
+    Question,
+    Answer,
+    Progress,
+    PartialResult,
+    ReviewerFeedback,
+    Cancellation,
+    DependencyWakeup,
+}
+
+/// One durable message between tasks.
+///
+/// Messages carry text and structure, never authority: a child's grants are
+/// fixed when it is created, and nothing delivered to it afterwards can add to
+/// them. That is why this record has no capability field to widen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskMessage {
+    pub id: MessageId,
+    pub from: TaskId,
+    pub to: TaskId,
+    pub kind: MessageKind,
+    pub body: Value,
+    /// The message this one answers or follows from.
+    pub causation: Option<MessageId>,
+    pub sent_at_ms: u64,
+    /// When the recipient took it off its inbox. Delivery is recorded rather
+    /// than assumed, so a message lost to a crash is redelivered rather than
+    /// silently dropped.
+    pub delivered_at_ms: Option<u64>,
+}
+
 pub struct ChildCapabilityRequest {
     pub parent_grant: usize,
     pub action: CapabilityAction,
@@ -279,6 +448,17 @@ pub struct TaskGraph {
     version: StreamVersion,
     nodes: BTreeMap<TaskId, TaskNode>,
     attempts: BTreeMap<AttemptId, TaskAttempt>,
+    messages: BTreeMap<MessageId, TaskMessage>,
+    /// Undelivered message ids per recipient, oldest first. Delivery order is
+    /// the order they were appended to the one stream, so two senders cannot
+    /// disagree about what the recipient saw first.
+    inbox: BTreeMap<TaskId, Vec<MessageId>>,
+    /// The tail of what each attempt recorded.
+    ///
+    /// ponytail: the projection keeps the last [`MAX_TRACE_ENTRIES`], not all
+    /// of them — the stream has the rest. Page it from the store if a reader
+    /// ever needs more than the tail.
+    traces: BTreeMap<AttemptId, Vec<Value>>,
 }
 
 impl TaskGraph {
@@ -300,9 +480,22 @@ impl TaskGraph {
             version: StreamVersion(0),
             nodes: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            messages: BTreeMap::new(),
+            inbox: BTreeMap::new(),
+            traces: BTreeMap::new(),
         };
         graph.catch_up()?;
         Ok(graph)
+    }
+
+    /// A second view of the same session, for a worker on another thread.
+    ///
+    /// Not a copy of this projection: it replays the stream for itself, so a
+    /// worker that appends while the parent is busy does not have to reach
+    /// into the parent's state to be seen. Both converge because both read
+    /// the one stream and append against its version.
+    pub fn fork(&self, actor: Principal) -> Result<Self, GraphError> {
+        Self::new(Arc::clone(&self.store), self.session, actor)
     }
 
     pub fn add(&mut self, node: TaskNode) -> Result<(), GraphError> {
@@ -497,8 +690,12 @@ impl TaskGraph {
                 lease_expires_at_ms: request.lease_expires_at_ms,
                 started_at_ms: request.started_at_ms,
                 ended_at_ms: None,
-                state: AttemptState::Running,
+                // Admitted, not yet working. A worker reports `Running` once
+                // it has actually picked the attempt up, so a start that
+                // returns before its child runs is visible as exactly that.
+                state: AttemptState::Starting,
                 terminal_reason: None,
+                retryable: Retryability::default(),
                 result: None,
                 evidence: Vec::new(),
             };
@@ -530,6 +727,245 @@ impl TaskGraph {
         )
     }
 
+    /// Move a live attempt between its non-terminal states.
+    ///
+    /// Terminal states are not reachable from here: ending an attempt settles
+    /// budget and a task state with it, which is [`finish_attempt`]'s job.
+    ///
+    /// [`finish_attempt`]: Self::finish_attempt
+    pub fn advance_attempt(
+        &mut self,
+        attempt: AttemptId,
+        target: AttemptState,
+    ) -> Result<(), GraphError> {
+        if !target.is_live() {
+            return Err(GraphError::NotLive(target));
+        }
+        self.commit("task.attempt_state_changed", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            // Cancellation is one-way: a holder asked to stop does not get to
+            // go back to running and keep spending.
+            if record.state == AttemptState::Cancelling && target != AttemptState::Cancelling {
+                return Err(GraphError::Cancelling(attempt));
+            }
+            Ok(json!({"attempt_id": attempt, "task_id": record.task, "state": target}))
+        })
+    }
+
+    /// Ask a running attempt to stop, without ending it here.
+    ///
+    /// Recorded before the holder acknowledges, because the request is the
+    /// durable part: a process that dies between the ask and the stop must
+    /// come back knowing the attempt was told to end, not resume it.
+    pub fn request_cancel(
+        &mut self,
+        attempt: AttemptId,
+        reason: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let reason = reason.into();
+        self.commit("task.attempt_cancel_requested", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            Ok(json!({
+                "attempt_id": attempt,
+                "task_id": record.task,
+                "reason": reason,
+            }))
+        })
+    }
+
+    /// Retire the task's current attempt and start a fresh one.
+    ///
+    /// Refuses unless the attempt it replaces classified itself retryable: a
+    /// denial repeated is still a denial, and an effect whose outcome is
+    /// unknown must not be applied a second time by a scheduler's initiative.
+    pub fn retry(
+        &mut self,
+        id: TaskId,
+        request: &AttemptRequest,
+        max_attempts: usize,
+    ) -> Result<AttemptId, GraphError> {
+        let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+        if node.runtime.attempts.len() >= max_attempts {
+            return Err(GraphError::RetriesExhausted(id));
+        }
+        let last = node
+            .runtime
+            .attempts
+            .last()
+            .and_then(|attempt| self.attempts.get(attempt))
+            .ok_or(GraphError::NothingToRetry(id))?;
+        if last.state.is_live() {
+            return Err(GraphError::StillRunning(last.id));
+        }
+        if last.retryable != Retryability::Retryable {
+            return Err(GraphError::NotRetryable(last.id, last.retryable));
+        }
+        if node.available() == Budget::default() {
+            return Err(GraphError::BudgetExhausted(PartialEvidence {
+                reason: "budget_exhausted".into(),
+                remaining: Budget::default(),
+            }));
+        }
+        let superseded = last.id;
+        self.commit("task.attempt_superseded", |graph| {
+            let record = graph
+                .attempts
+                .get(&superseded)
+                .ok_or(GraphError::UnknownAttempt(superseded))?;
+            Ok(json!({"attempt_id": superseded, "task_id": record.task}))
+        })?;
+        self.transition(id, TaskState::Ready, None)?;
+        self.start_attempt(id, request)
+    }
+
+    /// Record one thing an attempt did, against the attempt.
+    ///
+    /// This is what makes a child inspectable after the fact: its prompts,
+    /// decisions, and failures land in the same stream as everything else, so
+    /// a restarted process can read what a child was doing without the child
+    /// having a transcript of its own to lose.
+    pub fn record(
+        &mut self,
+        attempt: AttemptId,
+        kind: &str,
+        data: Value,
+    ) -> Result<(), GraphError> {
+        self.commit("task.attempt_trace", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            Ok(json!({
+                "attempt_id": attempt,
+                "task_id": record.task,
+                "kind": kind,
+                "data": data,
+            }))
+        })
+    }
+
+    /// What an attempt recorded, oldest first.
+    pub fn trace_of(&self, attempt: AttemptId) -> &[Value] {
+        self.traces
+            .get(&attempt)
+            .map_or(&[], |entries| entries.as_slice())
+    }
+
+    /// Post a message to a task's inbox.
+    pub fn send(
+        &mut self,
+        from: TaskId,
+        to: TaskId,
+        kind: MessageKind,
+        body: Value,
+        causation: Option<MessageId>,
+        sent_at_ms: u64,
+    ) -> Result<MessageId, GraphError> {
+        let id = MessageId::new();
+        self.commit("task.message_sent", |graph| {
+            if !graph.nodes.contains_key(&from) {
+                return Err(GraphError::Unknown(from));
+            }
+            let recipient = graph.nodes.get(&to).ok_or(GraphError::Unknown(to))?;
+            if matches!(
+                recipient.state,
+                TaskState::Completed | TaskState::Verified | TaskState::Failed
+            ) {
+                return Err(GraphError::Ended(to, recipient.state));
+            }
+            // Backpressure: a sender that outruns a recipient is told so
+            // rather than growing an inbox nobody drains.
+            if graph.inbox.get(&to).map_or(0, Vec::len) >= MAX_INBOX {
+                return Err(GraphError::InboxFull(to));
+            }
+            let message = TaskMessage {
+                id,
+                from,
+                to,
+                kind,
+                body: body.clone(),
+                causation,
+                sent_at_ms,
+                delivered_at_ms: None,
+            };
+            Ok(json!({"message": &message}))
+        })?;
+        Ok(id)
+    }
+
+    /// Take everything waiting for a task, marking it delivered.
+    ///
+    /// Delivery is committed before the caller acts on the messages, so a
+    /// crash mid-handling redelivers nothing it already recorded as seen —
+    /// and the record says what the recipient was given, which is the part an
+    /// audit needs.
+    pub fn deliver(&mut self, to: TaskId, now_ms: u64) -> Result<Vec<TaskMessage>, GraphError> {
+        let waiting: Vec<MessageId> = self.inbox.get(&to).cloned().unwrap_or_default();
+        if waiting.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.commit("task.messages_delivered", |graph| {
+            let waiting: Vec<MessageId> = graph.inbox.get(&to).cloned().unwrap_or_default();
+            Ok(json!({"task_id": to, "message_ids": waiting, "delivered_at_ms": now_ms}))
+        })?;
+        Ok(waiting
+            .iter()
+            .filter_map(|id| self.messages.get(id).cloned())
+            .collect())
+    }
+
+    /// Messages a task has not taken yet, oldest first.
+    pub fn inbox(&self, to: TaskId) -> Vec<&TaskMessage> {
+        self.inbox
+            .get(&to)
+            .map(|ids| ids.iter().filter_map(|id| self.messages.get(id)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn message(&self, id: MessageId) -> Option<&TaskMessage> {
+        self.messages.get(&id)
+    }
+
+    /// Mark every task that can no longer become ready.
+    ///
+    /// A dependency that failed or was cancelled never completes, so the tasks
+    /// behind it are not pending work — leaving them `Pending` would make a
+    /// scheduler wait forever for something that already ended.
+    pub fn block_unreachable(&mut self) -> Result<Vec<TaskId>, GraphError> {
+        let blocked: Vec<TaskId> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| matches!(node.state, TaskState::Pending | TaskState::Ready))
+            .filter(|(_, node)| {
+                node.dependencies.iter().any(|dependency| {
+                    self.nodes.get(dependency).is_some_and(|dependency| {
+                        matches!(
+                            dependency.state,
+                            TaskState::Failed | TaskState::Cancelled | TaskState::Blocked
+                        )
+                    })
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &blocked {
+            self.transition(*id, TaskState::Blocked, None)?;
+        }
+        Ok(blocked)
+    }
+
     /// Close one attempt, settling what it spent.
     ///
     /// Refuses an attempt that is not the task's current one: a lease that
@@ -541,7 +977,13 @@ impl TaskGraph {
         attempt: AttemptId,
         outcome: &AttemptOutcome,
     ) -> Result<(), GraphError> {
-        if !outcome.state.is_terminal() {
+        // `Expired` and `Superseded` are things done *to* an attempt by
+        // recovery and retry; a holder reporting one would be describing a
+        // decision it did not make.
+        if !matches!(
+            outcome.state,
+            AttemptState::Completed | AttemptState::Failed | AttemptState::Cancelled
+        ) {
             return Err(GraphError::NotTerminal(outcome.state));
         }
         self.commit("task.attempt_finished", |graph| {
@@ -549,7 +991,7 @@ impl TaskGraph {
                 .attempts
                 .get(&attempt)
                 .ok_or(GraphError::UnknownAttempt(attempt))?;
-            if record.state != AttemptState::Running {
+            if !record.state.is_live() {
                 return Err(GraphError::FencedAttempt(attempt));
             }
             let node = graph
@@ -561,12 +1003,24 @@ impl TaskGraph {
             {
                 return Err(GraphError::FencedAttempt(attempt));
             }
+            // A completed attempt has to have produced what its task asked
+            // for. Without this, "the child returned" and "the child answered
+            // the question" are the same record, and the parent cannot tell
+            // them apart.
+            if outcome.state == AttemptState::Completed {
+                if let Some(violation) = ResultContract::parse(&record.required_output)
+                    .violation(outcome.result.as_ref())
+                {
+                    return Err(GraphError::ContractViolation(attempt, violation));
+                }
+            }
             Ok(json!({
                 "attempt_id": attempt,
                 "task_id": record.task,
                 "state": outcome.state,
                 "used": outcome.used,
                 "reason": outcome.reason,
+                "retryable": outcome.retryable,
                 "result": outcome.result,
                 "evidence": outcome.evidence,
                 "ended_at_ms": outcome.ended_at_ms,
@@ -689,6 +1143,11 @@ impl TaskGraph {
         self.nodes.get(&id)
     }
 
+    /// Every task in the graph, in creation order.
+    pub fn tasks(&self) -> impl Iterator<Item = &TaskNode> {
+        self.nodes.values()
+    }
+
     pub fn attempt(&self, id: AttemptId) -> Option<&TaskAttempt> {
         self.attempts.get(&id)
     }
@@ -739,6 +1198,7 @@ impl TaskGraph {
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                retryable: Retryability::NotRetryable,
                 result: Some(evidence),
                 evidence: Vec::new(),
                 ended_at_ms: crate::artifact::unix_time_ms(),
@@ -806,6 +1266,12 @@ impl TaskGraph {
             "task.attempt_started" => self.replay_attempt_started(data),
             "task.attempt_finished" => self.replay_attempt_finished(data),
             "task.attempt_expired" => self.replay_attempt_expired(data),
+            "task.attempt_state_changed" => self.replay_attempt_state(data),
+            "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
+            "task.attempt_superseded" => self.replay_attempt_superseded(data),
+            "task.attempt_trace" => self.replay_trace(data),
+            "task.message_sent" => self.replay_message_sent(data),
+            "task.messages_delivered" => self.replay_messages_delivered(data),
             "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
             "task.budget_used" => self.replay_budget_used(data),
             _ => Ok(()),
@@ -878,6 +1344,7 @@ impl TaskGraph {
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        attempt.retryable = field(data, "retryable").unwrap_or_default();
         attempt.result = data.get("result").cloned().filter(|value| !value.is_null());
         attempt.evidence = field(data, "evidence").unwrap_or_default();
         let task = attempt.task;
@@ -912,6 +1379,87 @@ impl TaskGraph {
         node.assignee = None;
         node.lease_expires_at_ms = None;
         node.runtime.current_attempt = None;
+        Ok(())
+    }
+
+    fn replay_attempt_state(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("state event has no attempt".into()))?;
+        let state: AttemptState = field(data, "state")
+            .map_err(|_| GraphError::InvalidEvent("state event has no state".into()))?;
+        self.attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?
+            .state = state;
+        Ok(())
+    }
+
+    fn replay_cancel_requested(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("cancel event has no attempt".into()))?;
+        let attempt = self
+            .attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?;
+        attempt.state = AttemptState::Cancelling;
+        attempt.terminal_reason = data
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(())
+    }
+
+    fn replay_attempt_superseded(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("supersede event has no attempt".into()))?;
+        let attempt = self
+            .attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?;
+        attempt.state = AttemptState::Superseded;
+        let task = attempt.task;
+        if let Some(node) = self.nodes.get_mut(&task) {
+            node.runtime.current_attempt = None;
+            node.lease_expires_at_ms = None;
+        }
+        Ok(())
+    }
+
+    fn replay_trace(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("trace event has no attempt".into()))?;
+        let entries = self.traces.entry(id).or_default();
+        entries.push(json!({
+            "kind": data.get("kind").and_then(Value::as_str).unwrap_or_default(),
+            "data": data.get("data").cloned().unwrap_or(Value::Null),
+        }));
+        if entries.len() > MAX_TRACE_ENTRIES {
+            entries.remove(0);
+        }
+        Ok(())
+    }
+
+    fn replay_message_sent(&mut self, data: &Value) -> Result<(), GraphError> {
+        let message: TaskMessage = field(data, "message")
+            .map_err(|_| GraphError::InvalidEvent("message event has no message".into()))?;
+        self.inbox.entry(message.to).or_default().push(message.id);
+        self.messages.insert(message.id, message);
+        Ok(())
+    }
+
+    fn replay_messages_delivered(&mut self, data: &Value) -> Result<(), GraphError> {
+        let to = event_task_id(data)?;
+        let ids: Vec<MessageId> = field(data, "message_ids")
+            .map_err(|_| GraphError::InvalidEvent("delivery event has no messages".into()))?;
+        let at = data.get("delivered_at_ms").and_then(Value::as_u64);
+        for id in &ids {
+            if let Some(message) = self.messages.get_mut(id) {
+                message.delivered_at_ms = at;
+            }
+        }
+        if let Some(waiting) = self.inbox.get_mut(&to) {
+            waiting.retain(|id| !ids.contains(id));
+        }
         Ok(())
     }
 
@@ -981,6 +1529,13 @@ impl TaskGraph {
         build: impl Fn(&Self) -> Result<Value, GraphError>,
     ) -> Result<(), GraphError> {
         for attempt in 0..COMMIT_ATTEMPTS {
+            // Catch up before building, not only after a conflict. A second
+            // view of the same session — a worker's, a scheduler's — has not
+            // seen what the first one appended, and a command built against
+            // that gap refuses work that does exist rather than conflicting.
+            if self.store.current_version(self.session)?.0 > self.version.0 {
+                self.catch_up()?;
+            }
             let payload = build(self)?;
             let sequence = self.version.0.checked_add(1).ok_or(GraphError::Overflow)?;
             let event = EventEnvelope::new(
@@ -1040,9 +1595,22 @@ const fn transition_allowed(current: TaskState, target: TaskState) -> bool {
             | (TaskState::Ready, TaskState::Running)
             | (TaskState::Running, TaskState::Completed | TaskState::Failed)
             | (TaskState::Completed, TaskState::Verified)
+            // A retry brings a failed task back to the queue. Only a failed
+            // one: cancelling is a decision about the future, so a retry must
+            // not be a way to undo it.
+            | (TaskState::Failed, TaskState::Ready)
+            | (TaskState::Pending | TaskState::Ready, TaskState::Blocked)
             | (_, TaskState::Cancelled)
     )
 }
+
+/// Undelivered messages one task may hold. A sender past this is outrunning
+/// the recipient, which is a thing to report rather than to buffer.
+const MAX_INBOX: usize = 64;
+
+/// Trace entries kept in memory per attempt. The stream keeps every one; this
+/// is only how much of the tail a live reader gets without paging.
+const MAX_TRACE_ENTRIES: usize = 256;
 
 /// Events replayed per catch-up read. The same bound the service uses to page
 /// a stream, for the same reason: a long session must not be read at once.
@@ -1081,6 +1649,19 @@ pub enum GraphError {
     /// A result from an attempt that is no longer the task's current one.
     FencedAttempt(AttemptId),
     NotTerminal(AttemptState),
+    /// A state an attempt cannot be moved to while it is still live.
+    NotLive(AttemptState),
+    /// The holder was already asked to stop.
+    Cancelling(AttemptId),
+    /// A completed attempt produced something its task did not ask for.
+    ContractViolation(AttemptId, String),
+    NotRetryable(AttemptId, Retryability),
+    RetriesExhausted(TaskId),
+    NothingToRetry(TaskId),
+    StillRunning(AttemptId),
+    /// A message for a task that has already ended.
+    Ended(TaskId, TaskState),
+    InboxFull(TaskId),
     Cycle(TaskId),
     InvalidTransition(TaskState, TaskState),
     BudgetExhausted(PartialEvidence),
@@ -1125,6 +1706,26 @@ impl fmt::Display for GraphError {
                 "attempt {id} has been superseded and cannot commit a result"
             ),
             Self::NotTerminal(state) => write!(formatter, "{state:?} does not end an attempt"),
+            Self::NotLive(state) => write!(formatter, "{state:?} is not a live attempt state"),
+            Self::Cancelling(id) => {
+                write!(formatter, "attempt {id} has already been asked to stop")
+            }
+            Self::ContractViolation(id, why) => {
+                write!(
+                    formatter,
+                    "attempt {id} did not meet its required output: {why}"
+                )
+            }
+            Self::NotRetryable(id, how) => {
+                write!(formatter, "attempt {id} is {how:?} and will not be retried")
+            }
+            Self::RetriesExhausted(id) => write!(formatter, "task {id} has no retries left"),
+            Self::NothingToRetry(id) => write!(formatter, "task {id} has no attempt to retry"),
+            Self::StillRunning(id) => write!(formatter, "attempt {id} has not ended"),
+            Self::Ended(id, state) => {
+                write!(formatter, "task {id} is {state:?} and takes no messages")
+            }
+            Self::InboxFull(id) => write!(formatter, "task {id} has too many undelivered messages"),
             Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
             Self::InvalidTransition(from, to) => {
                 write!(formatter, "invalid task transition {from:?} -> {to:?}")
@@ -1184,6 +1785,190 @@ mod tests {
 
     fn open(store: &Arc<dyn EventStore>, session: SessionId) -> TaskGraph {
         TaskGraph::new(Arc::clone(store), session, Principal::System).unwrap()
+    }
+
+    #[test]
+    fn messages_are_ordered_delivered_once_and_survive_a_restart() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+
+        let first = graph
+            .send(
+                parent,
+                child,
+                MessageKind::Instruction,
+                json!({"note": "narrow it to the parser"}),
+                None,
+                1,
+            )
+            .unwrap();
+        let second = graph
+            .send(
+                parent,
+                child,
+                MessageKind::Progress,
+                json!("still here"),
+                Some(first),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            graph.inbox(child).iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+
+        let delivered = graph.deliver(child, 3).unwrap();
+        assert_eq!(delivered.len(), 2);
+        // Taken once: a second read is not a redelivery.
+        assert!(graph.inbox(child).is_empty());
+        assert!(graph.deliver(child, 4).unwrap().is_empty());
+
+        // A message carries no authority, and the record says so by having
+        // nowhere to put one: what survives a restart is what was said.
+        let replayed = open(&store, session);
+        assert_eq!(
+            replayed.message(first).unwrap().kind,
+            MessageKind::Instruction
+        );
+        assert_eq!(replayed.message(second).unwrap().causation, Some(first));
+        assert_eq!(replayed.message(second).unwrap().delivered_at_ms, Some(3));
+        assert!(replayed.inbox(child).is_empty());
+    }
+
+    #[test]
+    fn a_task_that_ended_takes_no_more_messages() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        graph.lease(child, AgentId::new(), 10).unwrap();
+        graph.complete(child, json!("answered")).unwrap();
+        assert!(matches!(
+            graph.send(
+                parent,
+                child,
+                MessageKind::Instruction,
+                json!("more"),
+                None,
+                1
+            ),
+            Err(GraphError::Ended(_, TaskState::Completed))
+        ));
+    }
+
+    #[test]
+    fn a_full_inbox_refuses_rather_than_growing() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+        for index in 0..MAX_INBOX {
+            graph
+                .send(parent, child, MessageKind::Progress, json!(index), None, 1)
+                .unwrap();
+        }
+        assert!(matches!(
+            graph.send(
+                parent,
+                child,
+                MessageKind::Progress,
+                json!("one too many"),
+                None,
+                1
+            ),
+            Err(GraphError::InboxFull(_))
+        ));
+    }
+
+    #[test]
+    fn a_completed_attempt_has_to_produce_what_its_task_asked_for() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph
+            .add(TaskNode {
+                required_output: json!({
+                    "type": "object",
+                    "required": ["finding", "evidence"],
+                })
+                .to_string(),
+                ..node(id, Vec::new(), budget(10))
+            })
+            .unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+        let violation = graph.finish_attempt(
+            attempt,
+            &AttemptOutcome::completed(Budget::default(), json!({"finding": "here"}), 1),
+        );
+        assert!(matches!(
+            violation,
+            Err(GraphError::ContractViolation(_, _))
+        ));
+        // Refused, so the attempt is still the task's to finish properly.
+        graph
+            .finish_attempt(
+                attempt,
+                &AttemptOutcome::completed(
+                    Budget::default(),
+                    json!({"finding": "here", "evidence": ["artifact-1"]}),
+                    2,
+                ),
+            )
+            .unwrap();
+        assert_eq!(graph.node(id).unwrap().state, TaskState::Completed);
+    }
+
+    #[test]
+    fn a_cancelled_attempt_cannot_go_back_to_running() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+        graph
+            .advance_attempt(attempt, AttemptState::Running)
+            .unwrap();
+        graph.request_cancel(attempt, "operator").unwrap();
+        assert!(matches!(
+            graph.advance_attempt(attempt, AttemptState::Running),
+            Err(GraphError::Cancelling(_))
+        ));
+    }
+
+    #[test]
+    fn a_restart_finds_the_cancellation_that_was_requested() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let attempt = {
+            let mut graph = open(&store, session);
+            let id = TaskId::new();
+            graph.add(node(id, Vec::new(), budget(10))).unwrap();
+            graph.ready().unwrap();
+            let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+            graph
+                .request_cancel(attempt, "operator changed their mind")
+                .unwrap();
+            attempt
+        };
+        let replayed = open(&store, session);
+        let record = replayed.attempt(attempt).unwrap();
+        assert_eq!(record.state, AttemptState::Cancelling);
+        assert_eq!(
+            record.terminal_reason.as_deref(),
+            Some("operator changed their mind")
+        );
     }
 
     #[test]

@@ -77,6 +77,9 @@ id_type!(SubscriptionId);
 id_type!(RequestId);
 id_type!(GrantId);
 id_type!(MemoryId);
+id_type!(MessageId);
+id_type!(AssignmentId);
+id_type!(CriterionId);
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
