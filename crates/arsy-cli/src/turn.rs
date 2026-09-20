@@ -408,6 +408,16 @@ pub(crate) fn run_turn(
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
     }
+    // A rule the operator granted is evidence of the turn they granted it in,
+    // whether or not that turn then succeeded — so the cell is drained and
+    // filed before the failure path returns, rather than being left for the
+    // next turn to pick up and attribute to itself.
+    let recorded_rules = approval.take_recorded();
+    if !recorded_rules.is_empty() {
+        service
+            .record_approval(actor.clone(), admission.turn, &recorded_rules)
+            .map_err(storage_failed)?;
+    }
     let mut turn = match outcome {
         Ok(turn) => turn,
         Err(error) => {
@@ -427,13 +437,7 @@ pub(crate) fn run_turn(
             return Ok(Turn::default());
         }
     };
-    let recorded_rules = approval.take_recorded();
     turn.rules_granted = recorded_rules.len();
-    if !recorded_rules.is_empty() {
-        service
-            .record_approval(actor.clone(), admission.turn, &recorded_rules)
-            .map_err(storage_failed)?;
-    }
     if !turn.interrupted && turn.failure.is_none() {
         transcript.push_assistant(&turn.response);
     }
