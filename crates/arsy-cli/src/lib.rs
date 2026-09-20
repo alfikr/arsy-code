@@ -4347,6 +4347,8 @@ fn native_turn(
                             completed: &mut completed_calls,
                             interrupted: &mut outcome.interrupted,
                             hooks,
+                            composer,
+                            footer,
                         },
                     )?
                 }
@@ -7800,6 +7802,10 @@ struct Answering<'a> {
     completed: &'a mut std::collections::HashMap<String, String>,
     interrupted: &'a mut bool,
     hooks: Option<&'a arsy_code::hook::HookEngine>,
+    /// The input line, drawn under a running call's card rather than replaced
+    /// by it: what the operator types while a tool runs is the next turn.
+    composer: &'a mut tui::Composer,
+    footer: &'a str,
 }
 
 #[cfg(feature = "tui")]
@@ -7837,6 +7843,8 @@ fn run_call(
         answering.decoder,
         answering.approval,
         answering.hooks,
+        answering.composer,
+        answering.footer,
     )? {
         Executed::Answered(mut result) => {
             if !result.changed_files.is_empty() {
@@ -7899,6 +7907,8 @@ fn execute_call(
     decoder: &mut tui::Keys,
     approval: &approval::ApprovalCell,
     hooks: Option<&arsy_code::hook::HookEngine>,
+    composer: &mut tui::Composer,
+    footer: &str,
 ) -> io::Result<Executed> {
     let started = std::time::Instant::now();
     let mut notes = Vec::new();
@@ -7945,6 +7955,7 @@ fn execute_call(
     };
     let (mut result, cancelled) = dispatch_tool_live(
         terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
+        composer, footer,
     )?;
     if cancelled {
         return Ok(Executed::Stopped);
@@ -8236,6 +8247,8 @@ fn dispatch_tool_live(
     summary: &str,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    footer: &str,
 ) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let (output_sender, output_receiver) = std::sync::mpsc::channel();
@@ -8269,10 +8282,37 @@ fn dispatch_tool_live(
         live_output: "",
         expanded,
     };
-    let initial = tui::tool_running_box(tui::terminal_width(), colour, &initial_state);
-    write_unwrapped_lines(terminal, &initial)?;
-    terminal.flush()?;
-    let mut last_rendered_lines = initial.len();
+    let mut last_rendered_lines = 0;
+    let draw = |terminal: &mut io::Stdout,
+                composer: &mut tui::Composer,
+                state: &tui::RunningToolState<'_>|
+     -> io::Result<usize> {
+        let card = tui::tool_running_box(tui::terminal_width(), colour, state);
+        // The composer is drawn with the card, not instead of it: the input
+        // line is where the operator types the next turn while this one runs,
+        // and a card that replaced it read as the session being busy at them.
+        let mut frame = composer.clear();
+        frame.push_str(&card.iter().map(|l| format!("{l}\n")).collect::<String>());
+        frame.push_str(&composer.render_turn(
+            tui::terminal_width(),
+            colour,
+            &tui::turn_status(
+                colour,
+                tui::TurnPhase::Working,
+                std::time::Duration::from_millis(
+                    u64::try_from(state.elapsed_ms).unwrap_or(u64::MAX),
+                ),
+                0,
+                0,
+            ),
+            footer,
+        ));
+        write!(terminal, "{frame}")?;
+        terminal.flush()?;
+        Ok(card.len())
+    };
+    let initial_lines = draw(terminal, composer, &initial_state)?;
+    let mut last_rendered_lines = initial_lines;
     loop {
         if absorb_live_keys(
             keys,
@@ -8291,10 +8331,13 @@ fn dispatch_tool_live(
         match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
             Ok(result) => {
                 runtime.set_output_sink(None);
+                // The card is erased; the composer the next frame draws is
+                // positioned above where the card used to be.
                 if last_rendered_lines > 0 {
                     write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
                     terminal.flush()?;
                 }
+                composer.invalidate();
                 return Ok((result, cancelled));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -8308,13 +8351,7 @@ fn dispatch_tool_live(
                     live_output: &live_output,
                     expanded,
                 };
-                let status_lines = tui::tool_running_box(tui::terminal_width(), colour, &state);
-                if last_rendered_lines > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
-                }
-                write_unwrapped_lines(terminal, &status_lines)?;
-                terminal.flush()?;
-                last_rendered_lines = status_lines.len();
+                last_rendered_lines = draw(terminal, composer, &state)?;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(io::Error::other("tool worker disconnected"));
