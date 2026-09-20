@@ -62,7 +62,10 @@ fn scan(directory: PathBuf, ecosystem: &'static str) -> Vec<UserSkill> {
 fn declared_name(path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let body = text.strip_prefix("---")?;
-    let front = body.split("---").next()?;
+    // The block has to close. Without this, a file that opens front matter and
+    // never ends it is searched to its last line, and any prose starting
+    // `name:` becomes the name the model addresses the skill by.
+    let (front, _) = body.split_once("---")?;
     front.lines().find_map(|line| {
         let value = line.strip_prefix("name:")?;
         let name = value.trim().trim_matches('"').trim_matches('\'');
@@ -131,6 +134,28 @@ mod tests {
         assert_eq!(found[1].ecosystem, "claude");
         // The front matter's name wins over the directory it sits in.
         assert!(found[1].path.ends_with("review/SKILL.md"));
+    }
+
+    /// Front matter that never closes is not front matter: the directory name
+    /// stands, rather than the first line of prose that happens to read like a
+    /// key.
+    #[test]
+    fn an_unterminated_front_matter_block_does_not_name_the_skill() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".claude/skills/deploy");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            "---\ndescription: opens with a block it never closes\n\nname: not-the-name\n",
+        )
+        .unwrap();
+        let homes = CompatHomes {
+            claude_dir: Some(home.path().join(".claude")),
+            ..crate::CompatHomes::none()
+        };
+
+        let found = claude(&homes, true);
+        assert_eq!(found[0].name, "deploy");
     }
 
     /// A switch that is off means that home contributes nothing: the same

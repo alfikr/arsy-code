@@ -24,7 +24,11 @@ use arsy_kernel::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{
+    num::NonZeroU32,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// The most one call will read or write. Larger than a source file and smaller
 /// than anything a turn could carry, so the bound is hit by a mistake rather
@@ -258,12 +262,18 @@ impl OperationExecutor for FileExecutor {
                 )
             }
             FileOperation::Read => {
-                let path = string("path");
-                let path = match skill_path(path, &self.skills) {
-                    Some(resolved) => resolved?,
-                    None => path.to_owned(),
+                let requested = string("path");
+                let declared = skill_path(requested, &self.skills).transpose()?;
+                let path = declared.clone().unwrap_or_else(|| requested.to_owned());
+                // A home-declared skill is absolute and outside the workspace;
+                // anything else, including an absolute path the model typed
+                // itself, still goes through confinement.
+                let result = match &declared {
+                    Some(declared) if Path::new(declared).is_absolute() => {
+                        read_declared(declared, number("offset"), number("limit"))?
+                    }
+                    _ => read(&workspace, &path, number("offset"), number("limit"))?,
                 };
-                let result = read(&workspace, &path, number("offset"), number("limit"))?;
                 let digest = result.digest.clone();
                 (
                     self.put(&result, request.actor.clone())?,
@@ -406,6 +416,33 @@ fn read(
     limit: Option<u64>,
 ) -> Result<ReadResult, OperationError> {
     let content = workspace.read(path, MAX_FILE_BYTES).map_err(resolve)?;
+    window(path, content, offset, limit)
+}
+
+/// Read a skill the operator's own home declared.
+///
+/// Its `SKILL.md` is outside the workspace, so [`Workspace`] refuses the
+/// absolute path — but the listing the model read already named that file, and
+/// a skill it can see and cannot open is worse than no listing at all. Only a
+/// path [`skill_path`] resolved reaches here.
+fn read_declared(
+    path: &str,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<ReadResult, OperationError> {
+    let content = crate::resource::read_declared(Path::new(path), MAX_FILE_BYTES)
+        .map_err(|error| OperationError::Execution(error.to_string()))?;
+    window(path, content, offset, limit)
+}
+
+/// The window of a file's content a read returns, shared by both readers so a
+/// skill and a workspace file are reported the same way.
+fn window(
+    path: &str,
+    content: crate::resource::FileContent,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<ReadResult, OperationError> {
     let digest = content.digest.to_string();
     if content.is_binary() {
         // A binary file is reported rather than decoded: lossy UTF-8 would fill

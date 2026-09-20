@@ -83,6 +83,30 @@ impl ResolvedFile {
     }
 }
 
+/// Read a file the harness itself resolved, outside any workspace.
+///
+/// The only caller is a `skill://` reference the session's own listing already
+/// named: the operator's home declared that skill, so its `SKILL.md` lives
+/// outside the workspace and [`Workspace`] would refuse the absolute path. A
+/// path a model supplied never reaches here — confinement still decides every
+/// other read.
+pub fn read_declared(path: &Path, max_bytes: u64) -> io::Result<FileContent> {
+    use io::Read;
+
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "file exceeds read limit",
+        ));
+    }
+    let digest = StateVersion::from_digest(Sha256::digest(&bytes).into());
+    Ok(FileContent { bytes, digest })
+}
+
 /// A capability directory that confines all path resolution to one workspace.
 pub struct Workspace {
     root: Dir,

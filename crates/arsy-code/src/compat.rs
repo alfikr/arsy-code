@@ -156,9 +156,13 @@ impl CompatibilityImporter {
         let local = self.root.join(".claude/settings.local.json");
         // Claude runs the hooks of both files, so both are listed -- the same
         // two the runtime loader reads.
-        let mut hooks = claude_hooks(self, &source, &read_json_or_empty(self, &source)?)?;
+        let mut hooks = claude_hooks(
+            &self.source(&source)?,
+            &source,
+            &read_json_or_empty(self, &source)?,
+        )?;
         hooks.extend(claude_hooks(
-            self,
+            &self.source(&local)?,
             &local,
             &read_json_or_empty(self, &local)?,
         )?);
@@ -217,8 +221,12 @@ impl CompatibilityImporter {
         let local_path = self.root.join(".claude/settings.local.json");
         let mut settings = read_json_or_empty(self, &settings_path)?;
         let local_settings = read_json_or_empty(self, &local_path)?;
-        let mut hooks = claude_hooks(self, &settings_path, &settings)?;
-        hooks.extend(claude_hooks(self, &local_path, &local_settings)?);
+        let mut hooks = claude_hooks(&self.source(&settings_path)?, &settings_path, &settings)?;
+        hooks.extend(claude_hooks(
+            &self.source(&local_path)?,
+            &local_path,
+            &local_settings,
+        )?);
         merge_object(&mut settings, local_settings)?;
         let diagnostics = unknown_keys(
             &settings,
@@ -724,11 +732,7 @@ fn typescript_extensions(
         .collect()
 }
 
-fn claude_hooks(
-    importer: &CompatibilityImporter,
-    source: &Path,
-    settings: &Value,
-) -> Result<Vec<Value>, CompatError> {
+fn claude_hooks(label: &str, source: &Path, settings: &Value) -> Result<Vec<Value>, CompatError> {
     let Some(hooks) = settings.get("hooks") else {
         return Ok(Vec::new());
     };
@@ -737,12 +741,7 @@ fn claude_hooks(
         .ok_or_else(|| CompatError::Parse("hooks must be an object".into()))?;
     let mut mapped = Vec::new();
     for (original_event, entries) in hooks {
-        mapped.extend(claude_hook_event(
-            importer,
-            source,
-            original_event,
-            entries,
-        )?);
+        mapped.extend(claude_hook_event(label, source, original_event, entries)?);
     }
     Ok(mapped)
 }
@@ -751,7 +750,7 @@ fn claude_hooks(
 /// dispatches it, so a declaration reported here as `before_operation` has
 /// to be the one the engine will actually run.
 fn claude_hook_event(
-    importer: &CompatibilityImporter,
+    label: &str,
     source: &Path,
     original_event: &str,
     entries: &Value,
@@ -764,7 +763,7 @@ fn claude_hook_event(
     let mut mapped = Vec::new();
     for (position, entry) in entries.iter().enumerate() {
         mapped.extend(claude_hook_entry(
-            importer,
+            label,
             source,
             original_event,
             event,
@@ -777,7 +776,7 @@ fn claude_hook_event(
 
 /// One entry of one event: read it once, then emit one row per handler.
 fn claude_hook_entry(
-    importer: &CompatibilityImporter,
+    label: &str,
     source: &Path,
     original_event: &str,
     event: &str,
@@ -809,7 +808,7 @@ fn claude_hook_entry(
     let mut mapped = Vec::new();
     for (index, handler) in handlers.iter().enumerate() {
         mapped.push(claude_hook_handler(
-            importer,
+            label,
             source,
             original_event,
             event,
@@ -826,7 +825,7 @@ fn claude_hook_entry(
 /// One handler of one entry, as the single declaration row the engine keys it by.
 #[allow(clippy::too_many_arguments)]
 fn claude_hook_handler(
-    importer: &CompatibilityImporter,
+    label: &str,
     source: &Path,
     original_event: &str,
     event: &str,
@@ -851,7 +850,7 @@ fn claude_hook_handler(
         }
     }
     Ok(json!({
-        "source": importer.source(source)?,
+        "source": label,
         "event": event,
         "original_event": original_event,
         // The key the engine builds for this declaration, so a
@@ -877,6 +876,30 @@ fn claude_hook_handler(
 /// The declarations carry the same shape and the same `untrusted` trust label
 /// as any other: reading a definition is not connecting to it, and the layer
 /// that adopts one decides what it may do.
+/// The hooks the operator declared for Claude in their own home directory.
+///
+/// The engine loads these — `~/.claude/settings.json` carries the operator's
+/// own authority — so a listing that read only the workspace named a subset of
+/// what runs, and the switches in `/hooks` could not reach a home hook at all.
+///
+/// Read by absolute path for the same reason [`user_mcp_declarations`] is: the
+/// workspace importer must stay unable to read outside its root. The
+/// `declaration` key is built from that absolute path, which is the key the
+/// engine builds too, so a switch here names the rule there.
+pub fn user_hook_declarations(path: &Path) -> Result<Vec<Value>, CompatError> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    if fs::metadata(path)?.len() > MAX_COMPAT_SOURCE_BYTES {
+        return Err(CompatError::Parse(format!(
+            "{} is larger than {MAX_COMPAT_SOURCE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let settings: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    claude_hooks(&path.display().to_string(), path, &settings)
+}
+
 pub fn user_mcp_declarations(path: &Path) -> Result<Vec<Value>, CompatError> {
     if !path.is_file() {
         return Ok(Vec::new());
@@ -1312,7 +1335,7 @@ mod tests {
             json!({"hooks": {"Stop": {}}}),
             json!({"hooks": {"Stop": [{"hooks": [{"type": "command"}]}]}}),
         ] {
-            assert!(claude_hooks(&importer, &local, &bad).is_err());
+            assert!(claude_hooks(&importer.source(&local).unwrap(), &local, &bad).is_err());
         }
     }
 
@@ -1335,7 +1358,7 @@ mod tests {
         }});
         let importer = CompatibilityImporter::new(root.path());
 
-        let hooks = claude_hooks(&importer, &source, &settings).unwrap();
+        let hooks = claude_hooks(&importer.source(&source).unwrap(), &source, &settings).unwrap();
         let declarations: Vec<&str> = hooks
             .iter()
             .map(|hook| hook["declaration"].as_str().unwrap())

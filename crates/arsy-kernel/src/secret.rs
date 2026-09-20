@@ -196,7 +196,7 @@ impl FileCredentialStore {
         Err(SecretError::Store {
             handle: Self::handle(&path.display().to_string()),
             message: format!(
-                "the credential file is mode {mode:04o}; make it readable by its owner only                  with `chmod 600 {}`",
+                "the credential file is mode {mode:04o}; make it readable by its owner only with `chmod 600 {}`",
                 path.display()
             ),
         })
@@ -207,20 +207,30 @@ impl FileCredentialStore {
         Ok(())
     }
 
+    /// Refuse a bare name that walks out of the directory it resolves in.
+    ///
+    /// Every entry point checks it, not just the one that writes: a name that
+    /// must not be written to must not be deleted or read back either, or the
+    /// guard only decides which verb reaches outside.
+    fn check_name(name: &str) -> Result<(), SecretError> {
+        if Path::new(name).is_absolute()
+            || !(name.contains("..") || name.contains('/') || name.contains('\\'))
+        {
+            return Ok(());
+        }
+        Err(SecretError::Store {
+            handle: Self::handle(name),
+            message: "credential name must not traverse parent directories".to_owned(),
+        })
+    }
+
     /// Write a secret into a file credential, ensuring owner-only permissions.
     pub fn set(&self, name: &str, value: &str) -> Result<(), SecretError> {
         let path = Self::path(name).ok_or_else(|| SecretError::Store {
             handle: Self::handle(name),
             message: "this platform has no user configuration directory".to_owned(),
         })?;
-        if !Path::new(name).is_absolute()
-            && (name.contains("..") || name.contains('/') || name.contains('\\'))
-        {
-            return Err(SecretError::Store {
-                handle: Self::handle(name),
-                message: "credential name must not traverse parent directories".to_owned(),
-            });
-        }
+        Self::check_name(name)?;
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -228,7 +238,7 @@ impl FileCredentialStore {
         {
             use std::fs::OpenOptions;
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
             let mut file = OpenOptions::new()
                 .write(true)
@@ -236,6 +246,15 @@ impl FileCredentialStore {
                 .truncate(true)
                 .mode(0o600)
                 .open(&path)
+                .map_err(|error| SecretError::Store {
+                    handle: Self::handle(name),
+                    message: error.to_string(),
+                })?;
+            // `mode` only decides the mode of a file this call creates. Writing
+            // over one that already exists keeps whatever mode it had, so a
+            // secret would land in a file the rest of the machine can read —
+            // which `resolve` then refuses, after the value is already on disk.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
                 .map_err(|error| SecretError::Store {
                     handle: Self::handle(name),
                     message: error.to_string(),
@@ -269,6 +288,7 @@ impl FileCredentialStore {
             handle: Self::handle(name),
             message: "this platform has no user configuration directory".to_owned(),
         })?;
+        Self::check_name(name)?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -294,6 +314,7 @@ impl CredentialStore for FileCredentialStore {
                       name has nowhere to resolve; use an absolute path"
                 .to_owned(),
         })?;
+        Self::check_name(name)?;
         let metadata = std::fs::metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 SecretError::NotFound(Self::handle(name))

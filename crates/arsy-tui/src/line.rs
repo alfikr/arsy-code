@@ -167,6 +167,11 @@ impl Line {
         if self.width() <= width {
             return self;
         }
+        // No columns to spend, not even on the ellipsis: a terminal this narrow
+        // gets nothing rather than one column more than it has.
+        if width == 0 {
+            return Self::new();
+        }
         let style = self.spans.last().map_or(Style::PLAIN, |span| span.style);
         self.truncate(width.saturating_sub(1)).push("…", style)
     }
@@ -340,6 +345,10 @@ mod tests {
             "the ellipsis is painted with the text it replaced"
         );
         assert_eq!(line.clone().fit(99), line, "a short row keeps no ellipsis");
+        // A panel narrower than its own lead asks for zero columns, and the
+        // ellipsis would be one column more than the caller has.
+        assert_eq!(line.clone().fit(0).width(), 0);
+        assert_eq!(line.fit(1).text(), "…");
     }
 
     /// How a row was assembled must not be visible: a row built in two pieces
