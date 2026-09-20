@@ -55,6 +55,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
         arsy_code::operations::Reachable::default(),
         "test",
         arsy_code::operations::TurnState::default(),
+        &[],
     )
     .unwrap()
 }
