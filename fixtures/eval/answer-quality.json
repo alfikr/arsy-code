@@ -28,5 +28,6 @@
     ]
   ],
   "timeout_seconds": 120,
-  "trials": 5
+  "trials": 5,
+  "isolation": "fresh_checkout"
 }

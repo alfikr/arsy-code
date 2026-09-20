@@ -1366,8 +1366,12 @@ fn run_eval(
 ) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let report = eval::run(&workspace, suite, trials, strict, out)?;
+    // A blocked gate exits nonzero even when the report is otherwise fine:
+    // that is what makes a safety regression stop a promotion rather than
+    // appear as a line in a document nobody reads.
+    let code = report.exit_code();
     emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
-    Ok(0)
+    Ok(code)
 }
 
 /// Serving ARSY to something else, and running it unattended.

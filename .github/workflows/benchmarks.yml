@@ -1,0 +1,143 @@
+name: Benchmarks
+
+# Competitive and regression benchmarks, in cost tiers.
+#
+# A suite that runs every trial in a fresh checkout is not cheap, and a gate
+# nobody can afford to keep on is a gate that gets turned off. So the tier a
+# suite runs in is chosen by what it costs, and each one carries the estimate
+# it was enabled on:
+#
+#   pull_request  ~2 min/run   × ~200 runs/month  = ~400 min/month
+#   push to main  ~6 min/run   × ~80  runs/month  = ~480 min/month
+#   nightly       ~25 min/run  × 30   runs/month  = ~750 min/month
+#
+# Roughly 1,600 ubuntu minutes a month. Re-estimate before adding a suite to
+# a tier, and put an expensive suite in a later one rather than widening an
+# earlier one. A release is benchmarked by dispatching this workflow at the
+# tag, which runs every tier; there is no separate release job, because one
+# would duplicate the nightly with a different name.
+#
+# `arsy eval` exits nonzero when its gate blocks — a safety regression stops
+# a promotion even when the success rate improved — so no step here needs to
+# parse the report to decide whether it failed.
+
+on:
+  pull_request:
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+      - ".github/CODEOWNERS"
+      - ".github/labeler.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - ".github/workflows/README.md"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
+      - "assets/**"
+      - "LICENSE"
+      - "NOTICE"
+  schedule:
+    # Nightly, offset from the performance workflow so two expensive jobs do
+    # not contend for the same runners.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # Tier 1. Every pull request. Read-only suites only, so no trial cuts a
+  # worktree and the whole job is one build plus a handful of seconds.
+  smoke:
+    name: Smoke suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          # A benchmark pins a revision, and `arsy eval` reports whether the
+          # workspace is at it. A shallow clone cannot answer that.
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      - name: Smoke
+        env:
+          CI: "true"
+        run: ./target/release/arsy eval fixtures/eval/smoke.json --out target/eval-smoke.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: eval-smoke
+          path: target/eval-smoke.json
+
+  # Tier 2. Every push to main. Adds the comparison suites, which have arms
+  # and therefore produce a gate verdict rather than only a pass rate.
+  comparisons:
+    name: Comparison suites
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      - name: Semantic navigation
+        env:
+          ARSY_EVAL: "1"
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+          arsy eval fixtures/eval/semantic-navigation.json \
+            --out target/eval-semantic.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: eval-comparisons
+          path: target/eval-semantic.json
+
+  # Tier 3. Nightly and on demand. Suites whose trials run the agent and
+  # therefore need a checkout each, which is where the minutes go.
+  isolated:
+    name: Isolated agent suites
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install --yes libdbus-1-dev pkg-config
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --release -p arsy-cli --locked
+      - name: Answer quality
+        env:
+          ARSY_EVAL: "1"
+        run: |
+          export PATH="$PWD/target/release:$PATH"
+          # Not --strict: a scheduled run is against whatever main is, and the
+          # report says so. The release tier is where exact comparability is
+          # required.
+          arsy eval fixtures/eval/answer-quality.json \
+            --out target/eval-answer-quality.json
+      - name: Raw events and environment manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: eval-isolated
+          # Durable: a report without its raw events cannot be re-read, and a
+          # comparison nobody can re-read is a number in a document.
+          path: target/eval-answer-quality.json
+          retention-days: 90

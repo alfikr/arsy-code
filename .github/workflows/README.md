@@ -10,6 +10,19 @@ CI compiles x86_64 Linux, macOS, and Windows x64. It does **not** compile
 builds: those two targets first meet a compiler during a release, and a
 compile error there has already reached a tagged version once.
 
+## Benchmark tiers
+
+`benchmarks.yml` runs `arsy eval` in three cost tiers — smoke on every pull
+request, comparison suites on pushes to main, and the isolated agent suites
+nightly or on dispatch. The file carries the CI-minute estimate each tier was
+enabled on; re-estimate before moving a suite into an earlier tier, because
+a suite whose trials each cut a worktree is where the minutes go.
+
+`arsy eval` exits nonzero when its gate blocks, and the gate blocks on a
+safety regression — fewer refusals, more violations, more secret exposures
+than the baseline — even when the success rate improved. No step parses the
+report to decide whether the job failed.
+
 ## Release path
 
 `release-please.yml` is the entry point, and it only prepares: dispatch it
