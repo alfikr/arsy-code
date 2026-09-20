@@ -110,6 +110,7 @@ impl FakeProvider {
                     continue;
                 };
                 drop(scripts);
+                let body = fill_task_ids(&body, &request);
                 let (peak, open) = (
                     std::sync::Arc::clone(&peak),
                     std::sync::Arc::clone(&open_children),
@@ -164,6 +165,41 @@ impl FakeProvider {
         }
         seen
     }
+}
+
+/// Replace `{task0}`, `{task1}`, … in a scripted reply with the task ids the
+/// request has already reported.
+///
+/// A spawn's id is minted at run time, so a script cannot name it in advance.
+/// Reading it back out of the conversation is what a real model would do.
+fn fill_task_ids(body: &str, request: &str) -> String {
+    if !body.contains("{task") {
+        return body.to_owned();
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for marker in ["\\\"task\\\":\\\"", "\"task\":\""] {
+        let mut rest = request;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let id: String = rest.chars().take(36).collect();
+            if looks_like_uuid(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let mut body = body.to_owned();
+    for (index, id) in ids.iter().enumerate() {
+        body = body.replace(&format!("{{task{index}}}"), id);
+    }
+    body
+}
+
+fn looks_like_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(at, character)| match at {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        })
 }
 
 /// Whether a request came from a subagent rather than the parent turn.
@@ -773,6 +809,208 @@ fn three_subagents_investigate_at_once_while_the_parent_keeps_its_turn() {
     for answer in ["one says A.", "two says B.", "three says C."] {
         assert!(waited.contains(answer), "{waited}");
     }
+}
+
+/// Two isolated writers in one reply, each on its own component.
+fn spawns_two_writers() -> String {
+    let call = |index: usize, goal: &str| {
+        serde_json::json!({
+            "index": index,
+            "id": format!("call-writer-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.spawn",
+                "arguments": serde_json::json!({
+                    "goal": goal,
+                    "capabilities": ["fs.read", "fs.write"],
+                    "workspace": "isolated_writer",
+                }).to_string()
+            }
+        })
+    };
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            call(0, "rewrite one.txt"),
+            call(1, "rewrite two.txt"),
+        ]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// A writer's reply: change one file, then report the manifest its task asked
+/// for. `fs.write` is the child's own grant, into its own view.
+fn writes(path: &str, content: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": format!("call-write-{path}"),
+            "type": "function",
+            "function": {
+                "name": "fs.write",
+                "arguments": serde_json::json!({"path": path, "content": content}).to_string()
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// A writer's manifest, as the object its `required_output` demands.
+fn reports(path: &str) -> String {
+    answers(
+        &serde_json::json!({
+            "summary": format!("rewrote {path}"),
+            "changed_files": [path],
+            "validation": ["artifact-check"],
+            "unresolved": [],
+        })
+        .to_string(),
+    )
+}
+
+/// A parent reply that applies one writer's work.
+fn integrates(index: usize) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": format!("call-integrate-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.integrate",
+                // The id is not known when the script is written, so the
+                // arguments are filled in from the spawn result by the fake
+                // provider's caller. `{task}` is replaced below.
+                "arguments": format!("{{\"task\": \"{{task{index}}}\"}}")
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn two_writers_change_separate_components_and_an_integrator_applies_both() {
+    let Some(workspace) = git_workspace(&[("one.txt", "base one\n"), ("two.txt", "base two\n")])
+    else {
+        eprintln!("skipped: git is not available");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+
+    // Two writers, each in a tree of its own, then two integrations into the
+    // workspace the parent owns.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns_two_writers(),
+            waits(),
+            integrates(0),
+            integrates(1),
+            answers("both changes are in."),
+        ],
+        vec![
+            writes("one.txt", "from writer one\n"),
+            reports("one.txt"),
+            writes("two.txt", "from writer two\n"),
+            reports("two.txt"),
+        ],
+    );
+    configure_delegating_writers(home.path(), provider.port);
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["run", "split this work in two"],
+    );
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+
+    let seen = provider.requests();
+    let trail: Vec<String> = seen
+        .iter()
+        .filter(|body| !is_child_request(&body.to_string()))
+        .map(last_tool_result)
+        .collect();
+    let child_trail: Vec<String> = seen
+        .iter()
+        .filter(|body| is_child_request(&body.to_string()))
+        .map(last_tool_result)
+        .collect();
+
+    // Both writers' work reached the target, and neither overwrote the other.
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("one.txt")).unwrap(),
+        "from writer one\n",
+        "parent saw {trail:#?}\nchildren saw {child_trail:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("two.txt")).unwrap(),
+        "from writer two\n"
+    );
+
+    // The parent's last two tool results are the two integrations.
+    for applied in &trail[3..5] {
+        assert!(applied.contains("\"applied\""), "{trail:#?}");
+    }
+
+    // The views the writers worked in are gone, and nothing they wrote
+    // reached the workspace except through the integrator.
+    let views = workspace.path().join(".arsy/views");
+    let remaining: Vec<_> = std::fs::read_dir(&views)
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        remaining.is_empty(),
+        "isolated views were left behind: {remaining:?}"
+    );
+}
+
+/// A Git workspace with the given files committed, or `None` where Git is
+/// not installed.
+fn git_workspace(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
+    let workspace = tempfile::tempdir().unwrap();
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .args(arguments)
+            .current_dir(workspace.path())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    git(&["init", "--quiet"])?;
+    git(&["config", "user.name", "ARSY Test"])?;
+    git(&["config", "user.email", "arsy@example.invalid"])?;
+    for (path, content) in files {
+        std::fs::write(workspace.path().join(path), content).unwrap();
+    }
+    git(&["add", "--all"])?;
+    git(&["commit", "--quiet", "-m", "base"])?;
+    Some(workspace)
+}
+
+/// As `configure_delegating`, and writing is delegable too — which is what
+/// makes an isolated writer possible.
+fn configure_delegating_writers(home: &Path, port: u16) {
+    write_settings(
+        &settings_path(home),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.local]\n\
+             kind = \"openai\"\n\
+             base_url = \"http://127.0.0.1:{port}\"\n\
+             model = \"test-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n\
+             [[policy.rules]]\n\
+             id = \"delegate-reads\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.read\"\n\
+             resource = \"file:**\"\n\
+             delegation_depth = 2\n\
+             [[policy.rules]]\n\
+             id = \"delegate-writes\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.write\"\n\
+             resource = \"file:**\"\n\
+             delegation_depth = 2\n"
+        ),
+    );
 }
 
 /// A parent reply that asks what its subagents are doing.

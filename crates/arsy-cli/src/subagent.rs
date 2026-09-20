@@ -28,15 +28,22 @@
 //! budget it was given. Every intervention is recorded with what it cost.
 
 use crate::{provider, Emitter};
-use arsy_code::agent::{ExecutionMode, ToolResult, ToolRuntime};
+use arsy_code::{
+    agent::{ExecutionMode, ToolResult, ToolRuntime},
+    workspace::{
+        DirtyPolicy, IntegrationRequest, MergeOutcome, ViewOwner, WorkspaceCoordinator,
+        WorkspaceLease,
+    },
+};
 use arsy_kernel::{
     capability::{CapabilityAction, CapabilityGrant, ResourcePattern, ResourceScope},
     config::Config,
-    domain::{AgentId, AttemptId, Principal, SubscriptionId, TaskId},
+    domain::{AgentId, AssignmentId, AttemptId, Principal, SubscriptionId, TaskId},
     observer::{Intervention, ObserverAuthority, ObserverSubscription, RedactedProjection},
     orchestration::{
-        AttemptOutcome, AttemptRequest, AttemptState, Budget, ChildCapabilityRequest, JoinPolicy,
-        MessageKind, Retryability, TaskGraph, TaskNode, TaskState, WorkspaceRequirement,
+        AttemptOutcome, AttemptRequest, AttemptState, Budget, ChildCapabilityRequest,
+        DirtyDisposition, IsolationBackend, JoinPolicy, MessageKind, Retryability, TaskGraph,
+        TaskNode, TaskState, WorkspaceAssignment, WorkspaceRequirement, WriterResult,
     },
     policy::{ActorMatch, PolicyRule, RiskContext, RuleEffect, RuleSet, SandboxAssurance},
     protocol::IdempotencyKey,
@@ -71,6 +78,10 @@ const CHILD_BUDGET_SHARE: u64 = 4;
 const DELEGABLE: &[(&str, CapabilityAction)] = &[
     ("fs.read", CapabilityAction::FsRead),
     ("process.exec", CapabilityAction::ProcessExec),
+    // Only into an isolated view, and only when policy delegates it. The
+    // check that enforces that is in `start`, next to the workspace choice
+    // it depends on.
+    ("fs.write", CapabilityAction::FsWrite),
 ];
 
 /// How many failures in a row mean a child is not working.
@@ -139,11 +150,35 @@ pub fn schemas() -> Vec<ToolSchema> {
                     },
                     "capabilities": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["fs.read", "process.exec"]},
-                        "description": "What it may do. Defaults to `fs.read`. Never includes writing."
+                        "items": {"type": "string", "enum": ["fs.read", "process.exec", "fs.write"]},
+                        "description": "What it may do. Defaults to `fs.read`. `fs.write` needs an isolated writer."
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["read_only_snapshot", "isolated_writer"],
+                        "description": "`read_only_snapshot` (default) pins it to this revision and cannot change anything. `isolated_writer` gives it a tree of its own to change; apply its work with `task.integrate`."
                     }
                 }),
                 json!(["goal"]),
+            ),
+        },
+        ToolSchema {
+            name: "task.integrate".to_owned(),
+            description:
+                "Apply one finished writer's work to this workspace. Refuses a writer that ran no \
+                 checks, left something unresolved, started from a revision this workspace has \
+                 left, or touches a file an earlier integration in this turn already changed. A \
+                 conflict leaves the workspace unchanged."
+                    .to_owned(),
+            input_schema: object(
+                json!({
+                    "task": {"type": "string", "description": "A writer's task id from `task.spawn`."},
+                    "expect_target_revision": {
+                        "type": "string",
+                        "description": "The revision this workspace was on when you decided to apply it."
+                    }
+                }),
+                json!(["task"]),
             ),
         },
         ToolSchema {
@@ -230,6 +265,7 @@ pub const OWNED_TOOLS: &[&str] = &[
     "task.result",
     "task.cancel",
     "task.send",
+    "task.integrate",
 ];
 
 /// One turn's authority to create and run children.
@@ -253,6 +289,11 @@ pub struct Supervisor<'a> {
     /// A turn that never delegates pays for nothing.
     scheduler: Option<Scheduler>,
     children: Vec<Child>,
+    /// Cuts and cleans up the views children run in.
+    coordinator: WorkspaceCoordinator,
+    /// Paths already applied to the target in this turn, so a second writer
+    /// cannot quietly overwrite the first one's file.
+    integrated: Vec<String>,
 }
 
 /// One child this turn started, and the thread running it.
@@ -265,6 +306,10 @@ struct Child {
     worker: Option<JoinHandle<Report>>,
     /// What the worker returned, once it has been reaped.
     report: Option<Report>,
+    /// The view it runs in, kept so it can be cleaned up.
+    lease: Option<WorkspaceLease>,
+    assignment: AssignmentId,
+    writer: bool,
 }
 
 /// What a finished child hands back to the turn that started it.
@@ -300,6 +345,8 @@ impl<'a> Supervisor<'a> {
             interventions: Vec::new(),
             scheduler: None,
             children: Vec::new(),
+            coordinator: WorkspaceCoordinator::default(),
+            integrated: Vec::new(),
         }
     }
 
@@ -332,6 +379,7 @@ impl<'a> Supervisor<'a> {
             "task.result" => self.result(arguments, emitter),
             "task.cancel" => self.stop(arguments),
             "task.send" => self.steer(arguments),
+            "task.integrate" => self.integrate(arguments),
             other => Err(format!("{other} is not a supervisor call")),
         };
         match outcome {
@@ -367,6 +415,35 @@ impl<'a> Supervisor<'a> {
             self.reap(index, emitter);
             emitter.trace("subagent.reaped", json!({"task": task.to_string()}));
         }
+        self.release_views(emitter);
+    }
+
+    /// Give every view back and delete the ones that hold nothing.
+    ///
+    /// A writer's branch survives `discard` when it has commits on it, so an
+    /// integration the operator never ran is still reachable afterwards —
+    /// the directory goes, the work does not.
+    fn release_views(&mut self, emitter: &mut Emitter) {
+        for child in std::mem::take(&mut self.children) {
+            let Some(lease) = child.lease else {
+                continue;
+            };
+            // Readers share one view per revision, so removing it would pull
+            // the tree out from under a sibling still reading it.
+            if lease.mutable {
+                if let Err(error) = self.coordinator.discard(&lease) {
+                    emitter.trace(
+                        "subagent.view_retained",
+                        json!({"view": lease.view.display().to_string(), "reason": error.to_string()}),
+                    );
+                }
+            }
+            if let Some(scheduler) = self.scheduler.as_mut() {
+                let _ = scheduler
+                    .graph_mut()
+                    .release_workspace(child.assignment, "the turn that cut it ended");
+            }
+        }
     }
 
     /// Start one child and return its ids without waiting for its answer.
@@ -385,8 +462,18 @@ impl<'a> Supervisor<'a> {
         if goal.is_empty() {
             return Err("a subagent needs a goal to work towards".into());
         }
+        let writer = match arguments.get("workspace").and_then(Value::as_str) {
+            None | Some("read_only_snapshot") => false,
+            Some("isolated_writer") => true,
+            Some(other) => {
+                return Err(format!(
+                    "`workspace` is \"read_only_snapshot\" or \"isolated_writer\", not {other:?}"
+                ))
+            }
+        };
         let asked = requested(&self.delegable, arguments)?;
-        self.run_child(&goal, &asked, graph)
+        writing_needs_a_tree_of_its_own(writer, &asked)?;
+        self.run_child(&goal, &asked, writer, graph)
     }
 
     fn status(&self) -> Result<String, String> {
@@ -503,6 +590,82 @@ impl<'a> Supervisor<'a> {
             .map_err(|error| format!("the message could not be recorded: {error}"))?;
         Ok(json!({"task": task.to_string(), "message": id.to_string()}).to_string())
     }
+
+    /// Apply one writer's work to the workspace this turn owns.
+    ///
+    /// The integrator is the parent, and only the parent: a writer holds
+    /// authority over its own view and nothing else, so the one agent that
+    /// can change the canonical tree is the one that was never given an
+    /// isolated one.
+    fn integrate(&mut self, arguments: &Value) -> Result<String, String> {
+        let task = self.named(arguments)?;
+        let child = self.child(task).ok_or_else(|| unknown(task))?;
+        if !child.writer {
+            return Err(format!(
+                "subagent {task} is a reader and produced no changes"
+            ));
+        }
+        if child.worker.is_some() {
+            return Err(format!("subagent {task} has not finished"));
+        }
+        let assignment = child.assignment;
+        let authorized = self
+            .delegable
+            .iter()
+            .any(|grant| grant.action == CapabilityAction::FsWrite)
+            || self.mode == ExecutionMode::Normal;
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .ok_or_else(|| "this turn has no subagents".to_owned())?;
+        let result = scheduler
+            .graph()
+            .writer_result(assignment)
+            .cloned()
+            .ok_or_else(|| format!("subagent {task} recorded no writer result"))?;
+        let head = result
+            .head_revision
+            .clone()
+            .ok_or_else(|| format!("subagent {task} committed nothing to integrate"))?;
+
+        let outcome = self
+            .coordinator
+            .integrate(&IntegrationRequest {
+                target: &self.root,
+                writer_revision: &head,
+                base_revision: &result.base_revision,
+                changed_files: &result.changed_files,
+                already_integrated: &self.integrated,
+                validation: &result.validation,
+                unresolved: &result.unresolved,
+                expect_target_revision: arguments
+                    .get("expect_target_revision")
+                    .and_then(Value::as_str),
+                allow_stale_base: false,
+                policy_authorized: authorized,
+            })
+            .map_err(|error| format!("the change was not applied: {error}"))?;
+        match outcome {
+            MergeOutcome::Applied { commit } => {
+                self.integrated.extend(result.changed_files.iter().cloned());
+                Ok(json!({
+                    "task": task.to_string(),
+                    "applied": commit,
+                    "changed_files": result.changed_files,
+                })
+                .to_string())
+            }
+            // The target is untouched: `integrate` aborts a merge it could
+            // not finish, so a conflict is a report rather than a state.
+            MergeOutcome::Conflict { paths, evidence } => Ok(json!({
+                "task": task.to_string(),
+                "conflict": paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "evidence": evidence,
+                "note": "the workspace is unchanged; resolve by respawning the writer from the current revision",
+            })
+            .to_string()),
+        }
+    }
 }
 
 /// The actions asked for, checked against what may be delegated at all.
@@ -549,6 +712,7 @@ impl Supervisor<'_> {
         &mut self,
         goal: &str,
         actions: &[CapabilityAction],
+        writer: bool,
         graph: &mut TaskGraph,
     ) -> Result<String, String> {
         let agent = AgentId::new();
@@ -602,9 +766,12 @@ impl Supervisor<'_> {
                     goal: goal.to_owned(),
                     dependencies: Vec::new(),
                     assignee: Some(agent),
-                    required_output: "an answer the parent can act on".to_owned(),
-                    // The child reads a workspace someone else may be writing.
-                    workspace: WorkspaceRequirement::ReadOnlySnapshot,
+                    required_output: required_output(writer),
+                    workspace: if writer {
+                        WorkspaceRequirement::IsolatedWriter
+                    } else {
+                        WorkspaceRequirement::ReadOnlySnapshot
+                    },
                     budget: share(parent_budget),
                     authority: Vec::new(),
                     state: arsy_kernel::orchestration::TaskState::Pending,
@@ -673,8 +840,67 @@ impl Supervisor<'_> {
             .node(id)
             .map(|node| node.authority.clone())
             .unwrap_or_default();
+        let lease_epoch = scheduler
+            .graph()
+            .attempt(admitted.attempt)
+            .map_or(0, |attempt| attempt.lease_epoch);
+
+        // The view the child actually runs in. A writer gets a tree of its
+        // own; a reader gets an immutable one pinned to a revision, so it is
+        // not reading a workspace someone else is changing underneath it.
+        let owner = ViewOwner {
+            session: scheduler.graph().session(),
+            task: id,
+            attempt: admitted.attempt,
+            agent,
+        };
+        let lease = match self.lease_view(&owner, writer) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let scheduler = self.scheduler.as_mut().expect("just built");
+                let _ = scheduler.cancel(admitted.attempt, "no isolated view could be cut");
+                return Err(format!("the subagent has no workspace to work in: {error}"));
+            }
+        };
+        let scheduler = self.scheduler.as_mut().expect("just built");
+        let assignment = scheduler
+            .graph_mut()
+            .assign_workspace(WorkspaceAssignment {
+                id: AssignmentId::new(),
+                task: id,
+                attempt: admitted.attempt,
+                owner: agent,
+                repository: WorkspaceCoordinator::repository_identity(&self.root)
+                    .unwrap_or_else(|_| self.root.display().to_string()),
+                source: self.root.display().to_string(),
+                base_revision: lease.base_revision.clone(),
+                view: lease.view.display().to_string(),
+                backend: match lease.backend {
+                    arsy_code::workspace::IsolationBackend::GitWorktree => {
+                        IsolationBackend::GitWorktree
+                    }
+                    arsy_code::workspace::IsolationBackend::CopiedSnapshot => {
+                        IsolationBackend::CopiedSnapshot
+                    }
+                },
+                mutable: writer,
+                lease_epoch,
+                expires_at_ms: arsy_kernel::artifact::unix_time_ms() + budget.wall_ms,
+                dirty: match &lease.carried_patch {
+                    None => DirtyDisposition::Clean,
+                    Some(patch) => DirtyDisposition::CapturedPatch {
+                        artifact: format!("inline:{} bytes", patch.len()),
+                    },
+                },
+                released: false,
+            })
+            .map_err(|error| format!("the subagent's workspace could not be recorded: {error}"))?;
+
         let worker = Worker {
-            root: self.root.clone(),
+            lease: lease.clone(),
+            writer,
+            assignment,
+            artifacts_root: self.root.join(".arsy/artifacts"),
             config: self.config.clone(),
             provider: Arc::clone(&self.resolved.provider),
             endpoint: self.resolved.endpoint.id.clone(),
@@ -704,14 +930,41 @@ impl Supervisor<'_> {
             cancel: admitted.cancel,
             worker: Some(handle),
             report: None,
+            lease: Some(lease),
+            assignment,
+            writer,
         });
         Ok(json!({
             "task": id.to_string(),
             "attempt": admitted.attempt.to_string(),
             "started": goal,
+            "workspace": if writer { "isolated_writer" } else { "read_only_snapshot" },
             "note": "running; read it back with `task.wait` or `task.result`",
         })
         .to_string())
+    }
+
+    /// Cut the view this child runs in.
+    fn lease_view(
+        &mut self,
+        owner: &ViewOwner,
+        writer: bool,
+    ) -> Result<WorkspaceLease, arsy_code::workspace::WorkspaceError> {
+        let views = self.root.join(VIEW_DIRECTORY);
+        if writer {
+            self.coordinator.writer_for(
+                &self.root,
+                &views,
+                owner,
+                arsy_kernel::artifact::unix_time_ms() + WRITER_LEASE_MS,
+                // The operator decides what happens to their own uncommitted
+                // work. Carrying it silently into a writer's tree would put
+                // changes nobody delegated into a diff nobody reviewed.
+                DirtyPolicy::Refuse,
+            )
+        } else {
+            self.coordinator.reader(&self.root, &views, owner.agent)
+        }
     }
 
     fn child(&self, task: TaskId) -> Option<&Child> {
@@ -846,7 +1099,15 @@ impl Supervisor<'_> {
 
 /// Everything one child needs, owned, so it can run on its own thread.
 struct Worker {
-    root: PathBuf,
+    /// The view this child runs in. Its path is the runtime root, which is
+    /// what confines every path the child can name.
+    lease: WorkspaceLease,
+    writer: bool,
+    assignment: AssignmentId,
+    /// The canonical workspace's artifact store, not the view's. Evidence has
+    /// to outlive the tree it was produced in, and a read-only reader view
+    /// has nowhere to put it anyway.
+    artifacts_root: PathBuf,
     config: Config,
     provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
     endpoint: String,
@@ -894,8 +1155,36 @@ impl Worker {
             cost_micros: 0,
             wall_ms: 0,
         };
+        // A writer answers with the manifest its task asked for, so its
+        // result is read as structure rather than stored as a sentence that
+        // happens to look like JSON.
+        let structured = answer
+            .as_ref()
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object);
+        if self.writer {
+            // Committed before the result is built, so the revision the
+            // manifest names is one Git can hand to an integrator rather
+            // than a working tree that vanishes with the view.
+            match WorkspaceCoordinator::commit_view(&self.lease, &format!("arsy: {}", self.goal)) {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = self.graph.record(
+                        self.attempt,
+                        "writer.commit_failed",
+                        json!(error.to_string()),
+                    );
+                }
+            }
+            if let Some(result) = structured.as_ref() {
+                let _ = self.graph.record_writer_result(&self.writer_result(result));
+            }
+        }
         let outcome = match &answer {
-            Ok(text) => AttemptOutcome::completed(used, json!(text), now),
+            Ok(text) => {
+                AttemptOutcome::completed(used, structured.unwrap_or_else(|| json!(text)), now)
+            }
             Err(reason) if reason == crate::CHILD_CANCELLED => AttemptOutcome {
                 state: AttemptState::Cancelled,
                 used,
@@ -918,6 +1207,46 @@ impl Worker {
         }
     }
 
+    /// What the writer produced, as the thing an integrator reads.
+    ///
+    /// The revision and the changed files come from Git rather than from the
+    /// answer: a writer naming files it did not touch, or a head it did not
+    /// commit, would be describing work the integrator then applies blind.
+    /// Only the parts Git cannot know — which checks were run, what was left
+    /// unsettled — are taken from what the child said.
+    fn writer_result(&self, answer: &Value) -> WriterResult {
+        let strings = |key: &str| {
+            answer
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let head = arsy_code::git::head_revision(&self.lease.view).ok();
+        let changed = head
+            .as_deref()
+            .and_then(|head| {
+                arsy_code::git::changed_between(&self.lease.view, &self.lease.base_revision, head)
+                    .ok()
+            })
+            .unwrap_or_default();
+        WriterResult {
+            assignment: self.assignment,
+            base_revision: self.lease.base_revision.clone(),
+            head_revision: head,
+            patch_artifact: None,
+            changed_files: changed,
+            validation: strings("validation"),
+            unresolved: strings("unresolved"),
+        }
+    }
+
     /// One child turn, under a runtime that can do only what the child holds.
     fn execute(
         &mut self,
@@ -925,10 +1254,10 @@ impl Worker {
         interventions: &mut Vec<Value>,
         tokens: &mut (u64, u64),
     ) -> Result<String, String> {
-        let workspace =
-            arsy_code::resource::Workspace::open(&self.root).map_err(|error| error.to_string())?;
+        let workspace = arsy_code::resource::Workspace::open(&self.lease.view)
+            .map_err(|error| error.to_string())?;
         let artifacts = Arc::new(
-            arsy_kernel::artifact::FileArtifactStore::open(self.root.join(".arsy/artifacts"), 0)
+            arsy_kernel::artifact::FileArtifactStore::open(self.artifacts_root.clone(), 0)
                 .map_err(|error| error.to_string())?,
         );
         let runtime = arsy_code::agent::runtime(
@@ -943,7 +1272,7 @@ impl Worker {
             Principal::Agent(self.agent),
             RiskContext {
                 reversible: false,
-                workspace: arsy_code::git::cleanliness(&self.root)
+                workspace: arsy_code::git::cleanliness(&self.lease.view)
                     .unwrap_or(arsy_kernel::policy::WorkspaceCleanliness::Unknown),
                 sandbox: crate::installed_sandbox_assurance(),
             },
@@ -1042,6 +1371,22 @@ fn watch(
     }
 }
 
+/// Writing is only ever delegated into a tree of the child's own.
+///
+/// A reader shares the parent's revision — the point of a read-only snapshot
+/// is that it is the same tree the parent is reasoning about — so a reader
+/// that could write would be writing the workspace its parent is working in,
+/// which is the thing isolation exists to prevent.
+fn writing_needs_a_tree_of_its_own(writer: bool, asked: &[CapabilityAction]) -> Result<(), String> {
+    (writer || !asked.contains(&CapabilityAction::FsWrite))
+        .then_some(())
+        .ok_or_else(|| {
+            "`fs.write` needs `\"workspace\": \"isolated_writer\"`; a reader shares the parent's \
+             revision and must not change it"
+                .to_owned()
+        })
+}
+
 fn unknown(task: TaskId) -> String {
     format!("this turn started no subagent {task}")
 }
@@ -1063,6 +1408,28 @@ fn join_policy(arguments: &Value, tasks: usize) -> Result<JoinPolicy, String> {
             .ok_or_else(|| format!("`join` is \"all\", \"any\", or a count, not {count:?}")),
     }
 }
+
+/// What a child has to produce for its attempt to count as completed.
+///
+/// A writer's is a schema rather than a sentence, so the graph can refuse an
+/// implementer that answers prose where an integrator needs a manifest.
+fn required_output(writer: bool) -> String {
+    if !writer {
+        return "an answer the parent can act on".to_owned();
+    }
+    json!({
+        "type": "object",
+        "required": ["summary", "changed_files", "validation", "unresolved"],
+    })
+    .to_string()
+}
+
+/// Where isolated views live, inside the workspace so they share its disk and
+/// its cleanup.
+const VIEW_DIRECTORY: &str = ".arsy/views";
+
+/// How long a writer holds its tree before recovery may reclaim it.
+const WRITER_LEASE_MS: u64 = 30 * 60 * 1_000;
 
 /// The slot every child takes, whichever provider it uses.
 const SUBAGENT_SLOT: &str = "subagent";
@@ -1164,15 +1531,25 @@ mod tests {
         };
         let supervisor = |delegable: Vec<CapabilityGrant>| Requested { delegable };
 
-        // Writing is not on the list at all, whatever the parent holds.
+        // Nothing outside the list, whatever the parent holds.
         let all = supervisor(vec![
             grant(CapabilityAction::FsRead),
             grant(CapabilityAction::FsWrite),
         ]);
         assert!(all
-            .requested(&json!({"capabilities": ["fs.write"]}))
+            .requested(&json!({"capabilities": ["net.fetch"]}))
             .unwrap_err()
             .contains("cannot be delegated"));
+
+        // Writing is delegable, but only into a tree of the child's own: a
+        // reader shares the parent's revision, and must not change it.
+        let write = all
+            .requested(&json!({"capabilities": ["fs.write"]}))
+            .unwrap();
+        assert!(writing_needs_a_tree_of_its_own(false, &write)
+            .unwrap_err()
+            .contains("isolated_writer"));
+        assert!(writing_needs_a_tree_of_its_own(true, &write).is_ok());
 
         // On the list, but this workspace delegates nothing.
         let none = supervisor(Vec::new());

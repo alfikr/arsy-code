@@ -48,6 +48,57 @@ pub fn cleanliness(workspace: &Path) -> Option<WorkspaceCleanliness> {
     })
 }
 
+/// The commit a tree is on, as its full object ID.
+///
+/// Read-only and outside the operation registry, for the same reason as
+/// [`cleanliness`]: an integrator has to name the revision it is applying
+/// before it can ask for authority to apply it.
+pub fn head_revision(workspace: &Path) -> Result<String, io::Error> {
+    plumbing(workspace, &["--no-pager", "rev-parse", "HEAD"]).map(|output| output.trim().to_owned())
+}
+
+/// The files that differ between two revisions, as Git reports them.
+///
+/// What a writer actually changed, rather than what it says it changed: an
+/// integrator checking for overlap needs the first.
+pub fn changed_between(workspace: &Path, base: &str, head: &str) -> Result<Vec<String>, io::Error> {
+    Ok(plumbing(
+        workspace,
+        &[
+            "--no-pager",
+            "diff",
+            "--name-only",
+            base,
+            head,
+            "--",
+            ".",
+            // ARSY's own state, which it writes into every workspace it runs
+            // in. Reporting it as a change the writer made would put the
+            // harness's bookkeeping into an integrator's overlap check.
+            ":(exclude).arsy/**",
+        ],
+    )?
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(str::to_owned)
+    .collect())
+}
+
+fn plumbing(workspace: &Path, arguments: &[&str]) -> Result<String, io::Error> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(workspace)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(io::Error::other)
+}
+
 /// What the workspace currently is, as one digest — or `None` when Git cannot
 /// say, which is not a match with anything.
 ///

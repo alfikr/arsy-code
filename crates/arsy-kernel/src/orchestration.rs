@@ -9,7 +9,7 @@
 use crate::{
     capability::{AttenuationError, CapabilityAction, CapabilityGrant, ResourceScope},
     domain::{
-        AgentId, AttemptId, CorrelationId, MessageId, Principal, SessionId, TaskId,
+        AgentId, AssignmentId, AttemptId, CorrelationId, MessageId, Principal, SessionId, TaskId,
         WorkspaceVersion,
     },
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
@@ -412,6 +412,71 @@ pub struct TaskMessage {
     pub delivered_at_ms: Option<u64>,
 }
 
+/// How an isolated view was made.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationBackend {
+    GitWorktree,
+    CopiedSnapshot,
+}
+
+/// What was done about uncommitted work in the source when a view was cut.
+///
+/// Never absent: a writer that silently started from a tree missing the
+/// operator's uncommitted changes would produce a diff against a base nobody
+/// can reconstruct.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyDisposition {
+    /// The source had nothing uncommitted.
+    Clean,
+    /// The source was dirty and the assignment was refused.
+    Refused,
+    /// The source was dirty and its changes were captured as an artifact the
+    /// view starts from.
+    CapturedPatch { artifact: String },
+}
+
+/// One task's claim on one filesystem view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceAssignment {
+    pub id: AssignmentId,
+    pub task: TaskId,
+    pub attempt: AttemptId,
+    pub owner: AgentId,
+    /// What repository this is, independent of where it happens to be
+    /// checked out — the first commit for a Git repository, so two clones of
+    /// one project are not mistaken for two projects.
+    pub repository: String,
+    /// The canonical checkout the view was cut from.
+    pub source: String,
+    pub base_revision: String,
+    pub view: String,
+    pub backend: IsolationBackend,
+    pub mutable: bool,
+    pub lease_epoch: u64,
+    pub expires_at_ms: u64,
+    pub dirty: DirtyDisposition,
+    pub released: bool,
+}
+
+/// What a writer produced, as the thing an integrator reads.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WriterResult {
+    pub assignment: AssignmentId,
+    pub base_revision: String,
+    /// The revision the writer ended on, when its view was a Git worktree.
+    pub head_revision: Option<String>,
+    /// A patch artifact, for a view with no revisions of its own.
+    pub patch_artifact: Option<String>,
+    pub changed_files: Vec<String>,
+    /// Artifact ids for the checks the writer ran in its own view.
+    pub validation: Vec<String>,
+    /// What the writer knows it did not settle. Stated rather than omitted:
+    /// an integrator has to be able to refuse work that says it is unfinished.
+    pub unresolved: Vec<String>,
+}
+
 pub struct ChildCapabilityRequest {
     pub parent_grant: usize,
     pub action: CapabilityAction,
@@ -459,6 +524,8 @@ pub struct TaskGraph {
     /// of them — the stream has the rest. Page it from the store if a reader
     /// ever needs more than the tail.
     traces: BTreeMap<AttemptId, Vec<Value>>,
+    assignments: BTreeMap<AssignmentId, WorkspaceAssignment>,
+    writer_results: BTreeMap<AssignmentId, WriterResult>,
 }
 
 impl TaskGraph {
@@ -483,6 +550,8 @@ impl TaskGraph {
             messages: BTreeMap::new(),
             inbox: BTreeMap::new(),
             traces: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            writer_results: BTreeMap::new(),
         };
         graph.catch_up()?;
         Ok(graph)
@@ -830,6 +899,114 @@ impl TaskGraph {
         self.start_attempt(id, request)
     }
 
+    /// Claim a filesystem view for one attempt.
+    ///
+    /// Three things are refused here rather than left to whoever cut the
+    /// directory, because they are the invariants the phase exists for:
+    ///
+    /// - a mutable view has exactly one live writer, so two agents cannot be
+    ///   told they own the same tree;
+    /// - a mutable view is never the canonical source, so writer authority
+    ///   cannot reach the workspace an operator is looking at;
+    /// - a refused dirty source produces no claim at all, so nothing runs
+    ///   against a base that quietly dropped uncommitted work.
+    pub fn assign_workspace(
+        &mut self,
+        assignment: WorkspaceAssignment,
+    ) -> Result<AssignmentId, GraphError> {
+        let id = assignment.id;
+        if assignment.dirty == DirtyDisposition::Refused {
+            return Err(GraphError::DirtySource(assignment.source));
+        }
+        if assignment.mutable && assignment.view == assignment.source {
+            return Err(GraphError::WriterOnSource(assignment.source));
+        }
+        self.commit("workspace.assigned", |graph| {
+            if !graph.attempts.contains_key(&assignment.attempt) {
+                return Err(GraphError::UnknownAttempt(assignment.attempt));
+            }
+            if let Some(held) = graph
+                .live_assignments()
+                .find(|held| held.view == assignment.view && (held.mutable || assignment.mutable))
+            {
+                return Err(GraphError::ViewAlreadyOwned(held.owner, held.view.clone()));
+            }
+            Ok(json!({"assignment": &assignment}))
+        })?;
+        Ok(id)
+    }
+
+    /// Give a view back, so the next writer can have it.
+    pub fn release_workspace(
+        &mut self,
+        id: AssignmentId,
+        reason: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let reason = reason.into();
+        self.commit("workspace.released", |graph| {
+            let assignment = graph
+                .assignments
+                .get(&id)
+                .ok_or(GraphError::UnknownAssignment(id))?;
+            Ok(json!({
+                "assignment_id": id,
+                "task_id": assignment.task,
+                "reason": reason,
+            }))
+        })
+    }
+
+    /// Record what a writer produced, against its assignment.
+    pub fn record_writer_result(&mut self, result: &WriterResult) -> Result<(), GraphError> {
+        self.commit("workspace.writer_result", |graph| {
+            let assignment = graph
+                .assignments
+                .get(&result.assignment)
+                .ok_or(GraphError::UnknownAssignment(result.assignment))?;
+            if !assignment.mutable {
+                return Err(GraphError::NotAWriter(result.assignment));
+            }
+            Ok(json!({
+                "assignment_id": result.assignment,
+                "task_id": assignment.task,
+                "result": result,
+            }))
+        })
+    }
+
+    pub fn assignment(&self, id: AssignmentId) -> Option<&WorkspaceAssignment> {
+        self.assignments.get(&id)
+    }
+
+    pub fn writer_result(&self, id: AssignmentId) -> Option<&WriterResult> {
+        self.writer_results.get(&id)
+    }
+
+    /// Every claim that has not been given back, in creation order.
+    pub fn live_assignments(&self) -> impl Iterator<Item = &WorkspaceAssignment> {
+        self.assignments
+            .values()
+            .filter(|assignment| !assignment.released)
+    }
+
+    /// Claims whose owner is gone: the lease has passed, or the attempt that
+    /// held it has ended without the view being given back.
+    ///
+    /// These are what a restarted process has to decide about — reuse, keep
+    /// for inspection, or delete — and leaving them unnamed is how a machine
+    /// fills up with worktrees nobody remembers cutting.
+    pub fn abandoned_assignments(&self, now_ms: u64) -> Vec<&WorkspaceAssignment> {
+        self.live_assignments()
+            .filter(|assignment| {
+                assignment.expires_at_ms <= now_ms
+                    || self
+                        .attempts
+                        .get(&assignment.attempt)
+                        .is_some_and(|attempt| attempt.state.is_terminal())
+            })
+            .collect()
+    }
+
     /// Record one thing an attempt did, against the attempt.
     ///
     /// This is what makes a child inspectable after the fact: its prompts,
@@ -1143,6 +1320,10 @@ impl TaskGraph {
         self.nodes.get(&id)
     }
 
+    pub const fn session(&self) -> SessionId {
+        self.session
+    }
+
     /// Every task in the graph, in creation order.
     pub fn tasks(&self) -> impl Iterator<Item = &TaskNode> {
         self.nodes.values()
@@ -1270,6 +1451,9 @@ impl TaskGraph {
             "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
             "task.attempt_superseded" => self.replay_attempt_superseded(data),
             "task.attempt_trace" => self.replay_trace(data),
+            "workspace.assigned" => self.replay_assigned(data),
+            "workspace.released" => self.replay_released(data),
+            "workspace.writer_result" => self.replay_writer_result(data),
             "task.message_sent" => self.replay_message_sent(data),
             "task.messages_delivered" => self.replay_messages_delivered(data),
             "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
@@ -1422,6 +1606,30 @@ impl TaskGraph {
             node.runtime.current_attempt = None;
             node.lease_expires_at_ms = None;
         }
+        Ok(())
+    }
+
+    fn replay_assigned(&mut self, data: &Value) -> Result<(), GraphError> {
+        let assignment: WorkspaceAssignment = field(data, "assignment")
+            .map_err(|_| GraphError::InvalidEvent("assignment event has no assignment".into()))?;
+        self.assignments.insert(assignment.id, assignment);
+        Ok(())
+    }
+
+    fn replay_released(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AssignmentId = field(data, "assignment_id")
+            .map_err(|_| GraphError::InvalidEvent("release event has no assignment".into()))?;
+        self.assignments
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAssignment(id))?
+            .released = true;
+        Ok(())
+    }
+
+    fn replay_writer_result(&mut self, data: &Value) -> Result<(), GraphError> {
+        let result: WriterResult = field(data, "result")
+            .map_err(|_| GraphError::InvalidEvent("writer event has no result".into()))?;
+        self.writer_results.insert(result.assignment, result);
         Ok(())
     }
 
@@ -1662,6 +1870,14 @@ pub enum GraphError {
     /// A message for a task that has already ended.
     Ended(TaskId, TaskState),
     InboxFull(TaskId),
+    UnknownAssignment(AssignmentId),
+    /// Two writers cannot hold one view.
+    ViewAlreadyOwned(AgentId, String),
+    /// A writer's view is never the workspace an operator is looking at.
+    WriterOnSource(String),
+    /// The source had uncommitted work and the policy in force refuses it.
+    DirtySource(String),
+    NotAWriter(AssignmentId),
     Cycle(TaskId),
     InvalidTransition(TaskState, TaskState),
     BudgetExhausted(PartialEvidence),
@@ -1726,6 +1942,26 @@ impl fmt::Display for GraphError {
                 write!(formatter, "task {id} is {state:?} and takes no messages")
             }
             Self::InboxFull(id) => write!(formatter, "task {id} has too many undelivered messages"),
+            Self::UnknownAssignment(id) => {
+                write!(formatter, "workspace assignment {id} does not exist")
+            }
+            Self::ViewAlreadyOwned(owner, view) => {
+                write!(formatter, "agent {owner} already writes {view}")
+            }
+            Self::WriterOnSource(path) => write!(
+                formatter,
+                "a writer cannot be assigned the canonical workspace {path}"
+            ),
+            Self::DirtySource(path) => write!(
+                formatter,
+                "{path} has uncommitted work and this policy refuses to start from it"
+            ),
+            Self::NotAWriter(id) => {
+                write!(
+                    formatter,
+                    "assignment {id} is read-only and produces no result"
+                )
+            }
             Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
             Self::InvalidTransition(from, to) => {
                 write!(formatter, "invalid task transition {from:?} -> {to:?}")
@@ -1785,6 +2021,147 @@ mod tests {
 
     fn open(store: &Arc<dyn EventStore>, session: SessionId) -> TaskGraph {
         TaskGraph::new(Arc::clone(store), session, Principal::System).unwrap()
+    }
+
+    fn assignment(
+        task: TaskId,
+        attempt: AttemptId,
+        view: &str,
+        mutable: bool,
+    ) -> WorkspaceAssignment {
+        WorkspaceAssignment {
+            id: AssignmentId::new(),
+            task,
+            attempt,
+            owner: AgentId::new(),
+            repository: "root-commit".into(),
+            source: "/repo".into(),
+            base_revision: "a".repeat(40),
+            view: view.into(),
+            backend: IsolationBackend::GitWorktree,
+            mutable,
+            lease_epoch: 1,
+            expires_at_ms: 1_000,
+            dirty: DirtyDisposition::Clean,
+            released: false,
+        }
+    }
+
+    #[test]
+    fn one_mutable_view_has_exactly_one_writer() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let (first, second) = (TaskId::new(), TaskId::new());
+        graph.add(node(first, Vec::new(), budget(10))).unwrap();
+        graph.add(node(second, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let one = graph.lease(first, AgentId::new(), 1_000).unwrap();
+        let two = graph.lease(second, AgentId::new(), 1_000).unwrap();
+
+        let held = graph
+            .assign_workspace(assignment(first, one, "/views/a", true))
+            .unwrap();
+        assert!(matches!(
+            graph.assign_workspace(assignment(second, two, "/views/a", true)),
+            Err(GraphError::ViewAlreadyOwned(_, _))
+        ));
+        // A reader cannot share a view with a writer either: the writer is
+        // changing it underneath them.
+        assert!(matches!(
+            graph.assign_workspace(assignment(second, two, "/views/a", false)),
+            Err(GraphError::ViewAlreadyOwned(_, _))
+        ));
+        // Released, so the next writer may have it.
+        graph.release_workspace(held, "finished").unwrap();
+        graph
+            .assign_workspace(assignment(second, two, "/views/a", true))
+            .unwrap();
+
+        let replayed = open(&store, session);
+        assert_eq!(replayed.live_assignments().count(), 1);
+    }
+
+    #[test]
+    fn writer_authority_never_covers_the_canonical_workspace() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        assert!(matches!(
+            graph.assign_workspace(WorkspaceAssignment {
+                view: "/repo".into(),
+                ..assignment(id, attempt, "/views/a", true)
+            }),
+            Err(GraphError::WriterOnSource(_))
+        ));
+        // A reader may share the canonical path, because it changes nothing.
+        graph
+            .assign_workspace(WorkspaceAssignment {
+                view: "/repo".into(),
+                ..assignment(id, attempt, "/views/a", false)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_dirty_source_produces_no_claim_at_all() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        assert!(matches!(
+            graph.assign_workspace(WorkspaceAssignment {
+                dirty: DirtyDisposition::Refused,
+                ..assignment(id, attempt, "/views/a", true)
+            }),
+            Err(GraphError::DirtySource(_))
+        ));
+        assert_eq!(graph.live_assignments().count(), 0);
+    }
+
+    #[test]
+    fn a_view_whose_attempt_ended_is_reported_as_abandoned() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        let held = graph
+            .assign_workspace(assignment(id, attempt, "/views/a", true))
+            .unwrap();
+        graph
+            .record_writer_result(&WriterResult {
+                assignment: held,
+                base_revision: "a".repeat(40),
+                head_revision: Some("b".repeat(40)),
+                patch_artifact: None,
+                changed_files: vec!["src/lib.rs".into()],
+                validation: vec!["artifact-check".into()],
+                unresolved: Vec::new(),
+            })
+            .unwrap();
+        assert!(graph.abandoned_assignments(0).is_empty());
+        graph.complete(id, json!("done")).unwrap();
+
+        // Restarted: the view is still there, still owned, and nobody is
+        // running it. That is the set a recovery pass has to decide about.
+        let replayed = open(&store, session);
+        let abandoned = replayed.abandoned_assignments(0);
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].id, held);
+        assert_eq!(
+            replayed
+                .writer_result(held)
+                .map(|result| result.changed_files.clone()),
+            Some(vec!["src/lib.rs".to_owned()])
+        );
     }
 
     #[test]
