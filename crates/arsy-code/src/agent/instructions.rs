@@ -233,15 +233,26 @@ fn skill_listing(skills: &[Skill]) -> Option<String> {
     let mut listing = String::from(
         "## Skills\n\n\
          Skills are instructions written for a kind of task. When the task in \
-         front of you matches one, read its file with `fs.read` and follow it \
-         before doing the work. A skill that is not matched is not read.\n\n",
+         front of you matches one, read it with `fs.read` of the `skill://` \
+         reference beside it and follow it before doing the work. A skill that \
+         is not matched is not read. A skill listed without a reference lives \
+         outside this workspace, which this session cannot open: its \
+         description is the whole of what it offers.\n\n",
     );
     for skill in skills {
         let pad = " ".repeat(width.saturating_sub(skill.name.chars().count()));
         let description = skill.description.as_deref().map_or("", str::trim);
+        // Only a workspace-relative skill survives `Workspace::resolve_file`,
+        // so only that one is offered as something to read: naming a file the
+        // read is bound to refuse just spends the turn finding that out.
+        let reference = if std::path::Path::new(&skill.path).is_relative() {
+            format!("  `skill://{}`", skill.name)
+        } else {
+            String::new()
+        };
         listing.push_str(&format!(
-            "- {}{pad}  {}  `{}`\n",
-            skill.name, skill.ecosystem, skill.path
+            "- {}{pad}  {}{reference}\n",
+            skill.name, skill.ecosystem
         ));
         if !description.is_empty() {
             listing.push_str(&format!("  {description}\n"));
