@@ -13,6 +13,7 @@ use crate::picker::remembered::{
 };
 use crate::picker::session::{load_workspace_sessions, reconstruct_session_conversation};
 use crate::picker::wizard::configured_default;
+use crate::run::{charge_turn, context_budget, merge, prepare_task};
 #[cfg(feature = "tui")]
 use crate::*;
 #[cfg(feature = "tui")]
@@ -623,112 +624,23 @@ pub(crate) fn native_turn(
             content,
         });
 
-        let mut results = Vec::with_capacity(calls.len());
         let mut terminal = io::stdout();
-        let mut all_repeated = true;
-        for (id, name, arguments) in &calls {
-            let summary = runtime.summarize(name, arguments);
-            let fingerprint = tool_call_fingerprint(name, arguments);
-            let cached = completed_calls.get(&fingerprint).cloned();
-            let repeated = cached.is_some();
-            // Once the turn is stopped the remaining calls are still answered,
-            // because a call the provider sent needs a result; they are simply
-            // answered without running anything.
-            let result = match (outcome.interrupted, cached) {
-                // Once the turn is stopped the remaining calls are still
-                // answered, because a call the provider sent needs a result;
-                // they are simply answered without running anything.
-                (true, _) => {
-                    all_repeated = false;
-                    CallResult {
-                        output: "The operator declined to run this call.".to_owned(),
-                        is_error: true,
-                        metadata: Value::Null,
-                        changed_files: Vec::new(),
-                        duration: std::time::Duration::ZERO,
-                    }
-                }
-                (false, Some(previous)) => CallResult {
-                    output: format!(
-                        "This exact tool call already completed successfully; skipped duplicate.\n\
-                         {previous}"
-                    ),
-                    is_error: false,
-                    metadata: Value::Null,
-                    changed_files: Vec::new(),
-                    duration: std::time::Duration::ZERO,
-                },
-                (false, None) => {
-                    all_repeated = false;
-                    run_call(
-                        runtime,
-                        &mut terminal,
-                        colour,
-                        &summary,
-                        Call {
-                            name,
-                            arguments,
-                            fingerprint,
-                        },
-                        Answering {
-                            keys,
-                            decoder,
-                            approval,
-                            completed: &mut completed_calls,
-                            interrupted: &mut outcome.interrupted,
-                            hooks,
-                            composer,
-                            footer,
-                        },
-                    )?
-                }
-            };
-            changed_files.extend(result.changed_files.iter().cloned());
-            let todo = (name.starts_with("todo.") || name.starts_with("todo_"))
-                .then(|| tui::todo_block(&result.metadata, colour))
-                .flatten();
-            if !repeated {
-                if todo.is_some() {
-                    transcript.push_todos(&result.metadata);
-                } else {
-                    transcript.push_tool(
-                        name,
-                        &summary,
-                        &result.output,
-                        !result.is_error,
-                        result.duration,
-                    );
-                }
-            }
-            let card = if repeated {
-                tui::tool_result_row(colour, name, true, "duplicate skipped")
-            } else if let Some(todo) = todo {
-                todo
-            } else {
-                tui::tool_card(
-                    tui::terminal_width(),
-                    colour,
-                    name,
-                    &summary,
-                    &result.output,
-                    !result.is_error,
-                    result.duration,
-                )
-            };
-            writeln!(
-                terminal,
-                "{}{}{}",
-                tui::DISABLE_AUTOWRAP,
-                card,
-                tui::ENABLE_AUTOWRAP
-            )?;
-            terminal.flush()?;
-            results.push(ModelContent::ToolResult {
-                id: id.clone(),
-                content: result.output,
-                is_error: result.is_error,
-            });
-        }
+        let (results, all_repeated, newly_changed) = run_round_calls(
+            &calls,
+            runtime,
+            &mut terminal,
+            colour,
+            keys,
+            decoder,
+            approval,
+            hooks,
+            composer,
+            footer,
+            transcript,
+            &mut completed_calls,
+            &mut outcome.interrupted,
+        )?;
+        changed_files.extend(newly_changed);
         conversation.push(ModelMessage {
             role: ModelRole::User,
             content: results,
@@ -2995,4 +2907,132 @@ fn turn_record(emitter: &mut Emitter, payload: Value) {
     if emitter.output != Output::Human {
         emitter.result(payload);
     }
+}
+
+/// Run one round's tool calls and answer each to the model.
+///
+/// Extracted from `native_turn`'s round loop so the loop stays a loop over
+/// rounds; every call is still shown and answered, or reported as skipped.
+/// Returns the results, whether every call was a skipped duplicate, and the
+/// files those calls changed.
+#[allow(clippy::too_many_arguments)]
+fn run_round_calls(
+    calls: &[(String, String, Value)],
+    runtime: &arsy_code::agent::ToolRuntime,
+    terminal: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    approval: &approval::ApprovalCell,
+    hooks: Option<&arsy_code::hook::HookEngine>,
+    composer: &mut tui::Composer,
+    footer: &str,
+    transcript: &mut tui::Transcript,
+    completed_calls: &mut std::collections::HashMap<String, String>,
+    interrupted: &mut bool,
+) -> io::Result<(Vec<ModelContent>, bool, Vec<String>)> {
+    let mut results = Vec::with_capacity(calls.len());
+    let mut all_repeated = true;
+    let mut changed = Vec::new();
+    for (id, name, arguments) in calls {
+        let summary = runtime.summarize(name, arguments);
+        let fingerprint = tool_call_fingerprint(name, arguments);
+        let cached = completed_calls.get(&fingerprint).cloned();
+        let repeated = cached.is_some();
+        let result = match (*interrupted, cached) {
+            // Once the turn is stopped the remaining calls are still answered,
+            // because a call the provider sent needs a result; they are simply
+            // answered without running anything.
+            (true, _) => {
+                all_repeated = false;
+                CallResult {
+                    output: "The operator declined to run this call.".to_owned(),
+                    is_error: true,
+                    metadata: Value::Null,
+                    changed_files: Vec::new(),
+                    duration: std::time::Duration::ZERO,
+                }
+            }
+            (false, Some(previous)) => CallResult {
+                output: format!(
+                    "This exact tool call already completed successfully; skipped duplicate.\n\
+                     {previous}"
+                ),
+                is_error: false,
+                metadata: Value::Null,
+                changed_files: Vec::new(),
+                duration: std::time::Duration::ZERO,
+            },
+            (false, None) => {
+                all_repeated = false;
+                run_call(
+                    runtime,
+                    terminal,
+                    colour,
+                    &summary,
+                    Call {
+                        name,
+                        arguments,
+                        fingerprint,
+                    },
+                    Answering {
+                        keys,
+                        decoder,
+                        approval,
+                        completed: completed_calls,
+                        interrupted,
+                        hooks,
+                        composer,
+                        footer,
+                    },
+                )?
+            }
+        };
+        changed.extend(result.changed_files.iter().cloned());
+        let todo = (name.starts_with("todo.") || name.starts_with("todo_"))
+            .then(|| tui::todo_block(&result.metadata, colour))
+            .flatten();
+        if !repeated {
+            if todo.is_some() {
+                transcript.push_todos(&result.metadata);
+            } else {
+                transcript.push_tool(
+                    name,
+                    &summary,
+                    &result.output,
+                    !result.is_error,
+                    result.duration,
+                );
+            }
+        }
+        let card = if repeated {
+            tui::tool_result_row(colour, name, true, "duplicate skipped")
+        } else if let Some(todo) = todo {
+            todo
+        } else {
+            tui::tool_card(
+                tui::terminal_width(),
+                colour,
+                name,
+                &summary,
+                &result.output,
+                !result.is_error,
+                result.duration,
+            )
+        };
+        writeln!(
+            terminal,
+            "{}{}{}",
+            tui::DISABLE_AUTOWRAP,
+            card,
+            tui::ENABLE_AUTOWRAP
+        )?;
+        terminal.flush()?;
+        results.push(ModelContent::ToolResult {
+            id: id.clone(),
+            content: result.output,
+            is_error: result.is_error,
+        });
+    }
+    Ok((results, all_repeated, changed))
 }
