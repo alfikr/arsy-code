@@ -424,6 +424,10 @@ impl Supervisor<'_> {
             // A delegate reports back to its parent; the parent owns the
             // session's checklist, so a child does not get one of its own.
             arsy_code::operations::TurnState::default(),
+            // The child follows the same prompt its parent was given, so it
+            // reads the same skills — none here, because this registry never
+            // reaches a prompt.
+            &[],
         )
         .map_err(|error| error.to_string())?
         .with_execution_mode(self.mode);

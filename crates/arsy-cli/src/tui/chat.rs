@@ -10,7 +10,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/rename", "rename current session; <TITLE>"),
     (
         "/session",
-        "manage sessions; list | rename <TITLE> | delete [ID]",
+        "sessions; alone opens the manager | list | rename <TITLE> | delete [ID]",
     ),
     (
         "/approval",
@@ -32,10 +32,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/mcp",
         "MCP connections; alone toggles and adopts | list | show NAME, --source claude|codex|omp",
     ),
-    ("/hooks", "inspect Claude hooks; list, --event NAME"),
+    (
+        "/hooks",
+        "lifecycle hooks; alone opens the manager | list, --event NAME",
+    ),
+    (
+        "/skill",
+        "skills; alone opens the manager | list [--source KIND]",
+    ),
     (
         "/settings",
-        "show effective configuration and where each value came from; [KEY]",
+        "settings; alone opens the editor | show effective configuration, [KEY]",
     ),
     ("/doctor", "check workspace, storage, and sandbox assurance"),
     (
@@ -147,14 +154,12 @@ pub const PROVIDER_KINDS: &[(&str, &str)] = &[
     ("anthropic", "Anthropic Messages"),
 ];
 
-/// Where a credential typed into the TUI is put.
-pub const PROVIDER_STORES: &[(&str, &str)] = &[
-    (
-        "file",
-        "a 0600 file beside the configuration; no unlock prompt",
-    ),
-    ("keychain", "the OS credential store"),
-];
+/// Where a credential typed into the TUI is put. One row, because there is one
+/// place: a 0600 file beside the configuration.
+pub const PROVIDER_STORES: &[(&str, &str)] = &[(
+    "file",
+    "a 0600 file beside the configuration; no unlock prompt",
+)];
 
 pub const CONFIRM_ROWS: &[(&str, &str)] = &[("no", "keep it"), ("yes", "remove it")];
 
@@ -612,8 +617,11 @@ impl Composer {
                 self.take();
                 Action::Redraw
             }
-            // Shift+Tab is handled by the session loop immediately. The draft
-            // stays in the composer, and no synthetic task enters history.
+            // Ctrl-O expands the last tool call's output, the way Shift+Tab
+            // changes the mode where it stands: the composer hands the key up
+            // rather than turning it into text. A control byte rather than a
+            // letter, so a prompt that starts with `e` is still typing.
+            Key::Expand if !self.picking && !self.masked => Action::Expand,
             Key::CycleMode if !self.picking && !self.masked => Action::CycleMode,
             Key::Interrupt | Key::Eof if self.buffer.is_empty() => Action::Quit,
             _ => Action::None,
@@ -727,6 +735,9 @@ impl Composer {
     /// Paint the block — pad, input, pad, menu, status — with the status row
     /// at the bottom, so model, effort, directory and branch anchor the prompt.
     pub fn render(&mut self, width: usize, colour: bool, status: &str) -> String {
+        if modern_style() {
+            return self.render_modern(width, colour, None, status);
+        }
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
         let room = width.saturating_sub(3);
@@ -814,6 +825,9 @@ impl Composer {
         status: &str,
         footer: &str,
     ) -> String {
+        if modern_style() {
+            return self.render_modern(width, colour, Some(status), footer);
+        }
         let width = width.max(MIN_WIDTH);
         let status = fit(status, width);
         let footer = fit(footer, width);
@@ -894,6 +908,105 @@ impl Composer {
         frame
     }
 
+    /// The mockup's composer: a quiet outlined field, with transient status
+    /// above it and the session footer below. Multiline input keeps the same
+    /// frame and adds body rows rather than reverting to the old filled slab.
+    fn render_modern(
+        &mut self,
+        width: usize,
+        colour: bool,
+        status: Option<&str>,
+        footer: &str,
+    ) -> String {
+        let width = width.max(MIN_WIDTH);
+        let menu = self.menu_rows(width, colour);
+        let (line_idx, col_offset, total_lines) = self.caret_line_col();
+        let mut frame = String::new();
+        if self.drawn {
+            frame.push_str(RESET);
+            let lines_above = line_idx + if self.top_status { 2 } else { 1 };
+            frame.push_str(&format!("\x1b[{lines_above}A\r{CLEAR_BELOW}"));
+        }
+        self.drawn = true;
+        self.top_status = status.is_some();
+
+        if let Some(status) = status {
+            frame.push_str(&fit(status, width));
+            frame.push('\n');
+        }
+
+        let border = |text: &str| paint(colour, sgr_border(), text);
+        frame.push_str(&border(&format!(
+            "┌{}┐",
+            "─".repeat(width.saturating_sub(2))
+        )));
+        frame.push('\n');
+
+        let room = width.saturating_sub(6);
+        let mut active_caret_col = col_offset;
+        if self.masked {
+            let (text, caret) = self.window(room);
+            active_caret_col = caret;
+            let body = format!(
+                "{} {} {}",
+                border("│"),
+                paint(colour, sgr_accent(), "›"),
+                text,
+            );
+            let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
+            frame.push_str(&format!("{body}{pad}{}\n", border("│")));
+        } else {
+            for (idx, line) in self.buffer.split('\n').enumerate() {
+                let prompt_char = if idx == 0 { "›" } else { "·" };
+                let chars: Vec<char> = line.chars().collect();
+                let is_active = idx == line_idx;
+                let (mut fitted_line, _) = if is_active {
+                    let (text, caret) = Self::window_line(&chars, col_offset, room);
+                    active_caret_col = caret;
+                    (text, caret)
+                } else {
+                    Self::window_line(&chars, 0, room)
+                };
+                let placeholder =
+                    idx == 0 && self.buffer.is_empty() && !self.picking && self.offered.is_none();
+                if placeholder {
+                    fitted_line = "ask for the next change".to_owned();
+                }
+                let text = if placeholder {
+                    paint(colour, sgr_dim(), &fitted_line)
+                } else {
+                    fitted_line
+                };
+                let body = format!(
+                    "{} {} {}",
+                    border("│"),
+                    paint(colour, sgr_accent(), prompt_char),
+                    text,
+                );
+                let pad = " ".repeat(width.saturating_sub(1 + visible_len(&body)));
+                frame.push_str(&format!("{body}{pad}{}\n", border("│")));
+            }
+        }
+
+        frame.push_str(&border(&format!(
+            "└{}┘",
+            "─".repeat(width.saturating_sub(2))
+        )));
+        frame.push('\n');
+        for row in &menu {
+            frame.push_str(row);
+            frame.push('\n');
+        }
+        frame.push_str(&fit(footer, width));
+
+        let lines_below = total_lines.saturating_sub(1 + line_idx) + 1 + menu.len() + 1;
+        frame.push_str(&format!(
+            "\x1b[{lines_below}A\r\x1b[{}C",
+            active_caret_col + 4
+        ));
+        frame
+    }
+
     fn window_line(chars: &[char], caret_in_line: usize, room: usize) -> (String, usize) {
         let budget = room.saturating_sub(1);
         let width = |character: &char| character.width().unwrap_or(0);
@@ -951,6 +1064,13 @@ impl Composer {
     /// submitted line in the scrollback the way a shell would.
     pub fn commit(&mut self, submitted: &str, colour: bool) -> String {
         let mut out = self.clear();
+        if modern_style() && !submitted.trim().is_empty() {
+            // The same strip the repaint path draws, so a prompt does not
+            // change appearance the moment something forces a redraw.
+            out.push_str(&prompt_strip(terminal_width(), colour, submitted));
+            out.push('\n');
+            return out;
+        }
         for (i, line) in submitted.lines().enumerate() {
             let prompt = if i == 0 { "› You" } else { "·" };
             out.push_str(&format!(

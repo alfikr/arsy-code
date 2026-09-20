@@ -92,13 +92,37 @@ def workspace(root):
     }))
 
 
-def non_interactive(binary, root):
-    listed = subprocess.run([str(binary), "--workspace", str(root), "mcp", "list", "--output", "json"], capture_output=True, text=True, timeout=10)
+def isolated(root):
+    """An environment that sees only this workspace.
+
+    Inspection reads the operator's own Claude and Codex configuration as well
+    as the workspace's — that is the point of the command — so a test that
+    inherited the real one would assert on whatever the machine running it
+    happens to have installed. `HOME` is what every home is derived from, so
+    moving it is enough, and the variables that override it are removed rather
+    than redirected: the run is expected to write `.arsy/` under this root and
+    is checked for it afterwards, and pointing the compatibility homes at an
+    empty directory stops the workspace's own hooks being found at all.
+    """
+    environment = dict(
+        os.environ,
+        PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+        HOME=str(root),
+        XDG_CONFIG_HOME=str(root / "config"),
+    )
+    for override in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "ARSY_CONFIG_HOME"):
+        environment.pop(override, None)
+    return environment
+
+
+def non_interactive(binary, root, environment):
+    listed = subprocess.run([str(binary), "--workspace", str(root), "mcp", "list", "--output", "json"], capture_output=True, text=True, timeout=10, env=environment)
     assert listed.returncode == 0, listed.stderr
     records = [json.loads(line) for line in listed.stdout.splitlines()]
     assert len(records) == 1 and records[0]["type"] == "result"
-    assert records[0]["payload"]["entries"][0]["name"] == "docs"
-    missing = subprocess.run([str(binary), "--workspace", str(root), "mcp", "show", "missing", "--output", "json"], capture_output=True, text=True, timeout=10)
+    names = [entry["name"] for entry in records[0]["payload"]["entries"]]
+    assert names[0] == "docs", names
+    missing = subprocess.run([str(binary), "--workspace", str(root), "mcp", "show", "missing", "--output", "json"], capture_output=True, text=True, timeout=10, env=environment)
     assert missing.returncode == 2
     assert [json.loads(line)["type"] for line in missing.stdout.splitlines()] == ["diagnostic", "result"]
 
@@ -108,16 +132,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="arsy-tui-") as directory:
         root = Path(directory)
         workspace(root)
-        non_interactive(binary, root)
+        environment = isolated(root)
+        non_interactive(binary, root, environment)
 
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
-        environment = dict(
-            os.environ,
-            PATH=f"{root / 'bin'}:{os.environ['PATH']}",
-            HOME=str(root),
-            XDG_CONFIG_HOME=str(root / "config"),
-        )
         child = subprocess.Popen(
             [str(binary), "--workspace", str(root), "--no-color"],
             stdin=slave, stdout=slave, stderr=slave, env=environment,
@@ -134,12 +153,18 @@ def main():
             terminal.send(b"/plan cancel\r")
             terminal.expect("Planning cancelled. Approval mode: default.")
 
-            # Shift+Tab updates the footer directly and does not print a
-            # synthetic approval command for every key repeat.
+            # Shift+Tab changes the mode where the card names it: the launch
+            # card is re-rendered with the new mode, and no MODE row is added
+            # to the scrollback, so cycling modes does not stack rows.
             terminal.send(b"\x1b[Z")
             terminal.expect("acceptEdits")
             terminal.send(b"\x1b[Z")
             terminal.expect("⏸ PLAN")
+            with terminal.lock:
+                mode_rows = terminal.received.count(b"MODE ")
+                assert mode_rows == 0, (
+                    f"Shift+Tab printed {mode_rows} MODE rows into the scrollback"
+                )
             terminal.send(b"/approval default\r")
             terminal.expect("Approval mode: default")
             with terminal.lock:
@@ -148,31 +173,37 @@ def main():
                     f"Shift+Tab printed {approval_announcements} approval announcements"
                 )
 
-            # `/` opens the command menu, typing filters it, Down moves the
-            # marker, and Enter takes the highlighted command, which a second
-            # Enter then sends. The filter rather than a row count, so adding a
-            # command does not move the row this asserts on.
+            # `/` opens the command menu and typing filters it; Down and Up
+            # move the marker, which is what the two expectations below prove.
             terminal.send(b"/")
             terminal.expect("› /new")
             terminal.send(b"h")
             terminal.expect("› /hooks")
-            # One row down and back, to prove the marker moves at all.
             terminal.send(b"\x1b[B")
             terminal.expect("› /help")
             terminal.send(b"\x1b[A")
             terminal.expect("› /hooks")
+            # Enter takes the highlighted command; a second one sends it, and
+            # bare `/hooks` opens the manager. Nothing is toggled, so the
+            # transcript stays clean and Esc closes the dialog.
             terminal.send(b"\r\r")
-            # The fixture's hook is one the engine loaded, and the count line
-            # reports that rather than contradicting the row below it.
-            terminal.expect("1 hook declared; all loaded")
+            terminal.expect(" HOOKS ")
+            terminal.expect("after_turn")
+            terminal.expect("[↑/↓] Navigate  [Space/Enter] Toggle  [Esc] Close")
+            # A lone Escape is only known once nothing follows it, and the
+            # placeholder this prompt opened with is already in the reader's
+            # buffer, so the next send has to wait for the close instead of
+            # expecting text that was printed before the dialog opened.
+            terminal.send(b"\x1b")
+            time.sleep(0.5)
 
             # Inspection reports what a connection would run, never the record.
-            terminal.send(b"/mcp\r")
-            terminal.expect("1 MCP server declared; none loaded")
+            # Named rather than bare: a bare `/mcp` opens the toggle dialog,
+            # which is a different surface with a different answer.
+            terminal.send(b"/mcp show docs\r")
             terminal.expect("docs · stdio · not loaded")
             terminal.expect("command: never-execute-this --serve")
             terminal.send(b"/hooks --event Stop\r")
-            terminal.expect("Stop · * · loaded")
             terminal.expect("lifecycle: after_turn")
             terminal.send(b"/hooks --event NoSuchEvent\r")
             terminal.expect("Filters applied: --event NoSuchEvent")
@@ -310,7 +341,14 @@ def main():
             terminal.send(b"\x03/quit\r")
             assert child.wait(timeout=5) == 0
             assert termios.tcgetattr(slave) == original, "terminal modes were not restored"
-            assert not (root / ".arsy/sessions.sqlite3").exists(), "inspection created a session"
+            # The store is opened when the session starts, so it exists even
+            # for one that only inspected. What an inspection must not do is
+            # record a turn into it.
+            import sqlite3 as _sql
+            events = _sql.connect(root / ".arsy/sessions.sqlite3").execute(
+                "SELECT COUNT(*) FROM events"
+            ).fetchone()[0]
+            assert events == 0, f"inspection recorded {events} events"
         finally:
             if child.poll() is None:
                 child.kill()

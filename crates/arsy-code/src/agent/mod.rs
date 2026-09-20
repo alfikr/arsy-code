@@ -2115,6 +2115,7 @@ pub fn runtime(
     reachable: crate::operations::Reachable,
     scope: &str,
     turn: crate::operations::TurnState,
+    skills: &[instructions::Skill],
 ) -> Result<ToolRuntime, arsy_kernel::operation::RegistrationError> {
     let registry = crate::operations::registry(
         workspace,
@@ -2123,6 +2124,7 @@ pub fn runtime(
         reachable,
         scope,
         turn,
+        skills,
     )?;
     Ok(ToolRuntime::new(
         registry,

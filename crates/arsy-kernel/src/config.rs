@@ -49,7 +49,21 @@ pub const LEGACY_CONFIG_FILE: &str = "config.toml";
 /// The catalog holds handles, provider names, and timestamps — no secret value
 /// — so an operator who does not want a keychain unlock on every turn can keep
 /// it in a file without putting a key on disk.
-pub const CREDENTIAL_STORES: &[&str] = &["file", "os"];
+/// How much of an MCP server's own logging an interactive session shows.
+/// `hidden` shows none of it, `summary` one line per server saying how much
+/// there was, `full` every line. A server that fails to connect is reported at
+/// every level: that is a diagnostic, not logging.
+pub const MCP_LOG_LEVELS: &[&str] = &["hidden", "summary", "full"];
+/// Quiet enough that a noisy server cannot bury the transcript, loud enough
+/// that a server saying something is never silently dropped.
+pub const DEFAULT_MCP_LOG: &str = "summary";
+/// Selectable interactive transcript projections.
+pub const UI_STYLES: &[&str] = &["modern", "classic"];
+pub const DEFAULT_UI_STYLE: &str = "modern";
+
+/// The catalog can only be kept in a file. The platform keyring was withdrawn,
+/// so `"os"` is recognised below only to say where it went.
+pub const CREDENTIAL_STORES: &[&str] = &["file"];
 /// What an operator gets without saying: no unlock prompt to read metadata.
 pub const DEFAULT_CREDENTIAL_STORE: &str = "file";
 
@@ -70,17 +84,177 @@ pub const MAX_PARALLEL_TOOLS: usize = 16;
 
 /// Top-level keys this loader accepts and applies nothing from. `schema_version`
 /// is here because `check_schema_version` has already read it.
-const INERT_SECTIONS: &[&str] = &[
-    "schema_version",
-    "context",
-    "git",
-    "sandbox",
-    "storage",
-    "ui",
-];
+const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox", "storage"];
 
 /// Other tools whose configuration can be read as a lower layer.
 pub const COMPAT_SOURCES: &[&str] = &["claude", "codex", "omp"];
+
+/// Names a `[theme] base` may take. The palettes themselves are the CLI's —
+/// they are display, and the kernel has no screen — so the two lists are held
+/// together by a test there rather than by one depending on the other.
+pub const THEME_BASES: &[&str] = &[
+    "dark", "ocean", "sunset", "vivid", "dracula", "nord", "mono",
+];
+/// The theme in force when no layer names one.
+pub const DEFAULT_THEME_BASE: &str = "dark";
+
+/// The value shape of one editable setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingKind {
+    /// Any non-empty text.
+    Text,
+    Bool,
+    /// One of a fixed set, spelled exactly.
+    Choice(&'static [&'static str]),
+    Integer {
+        min: usize,
+        max: usize,
+    },
+}
+
+impl SettingKind {
+    /// Whether `text` is a value this kind accepts, and why not when it is not.
+    ///
+    /// Checked before the write rather than after, because the loader only
+    /// validates a key when it next reads the file: a rejected value written
+    /// anyway would leave a configuration that fails to load, in a session
+    /// that had already been told the write succeeded.
+    pub fn check(self, text: &str) -> Result<(), String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("a setting cannot be set to nothing".to_owned());
+        }
+        match self {
+            Self::Text => Ok(()),
+            Self::Bool => match text {
+                "true" | "false" => Ok(()),
+                other => Err(format!("expected `true` or `false`, not `{other}`")),
+            },
+            Self::Choice(choices) => {
+                if choices.contains(&text) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "expected one of {}, not `{text}`",
+                        choices.join(", ")
+                    ))
+                }
+            }
+            Self::Integer { min, max } => match text.parse::<usize>() {
+                Ok(number) if (min..=max).contains(&number) => Ok(()),
+                Ok(number) => Err(format!("expected {min} to {max}, not {number}")),
+                Err(_) => Err(format!("expected a whole number, not `{text}`")),
+            },
+        }
+    }
+
+    /// The value as JSON, which is what `config_edit` writes into `arsy.json`.
+    pub fn to_json(self, text: &str) -> serde_json::Value {
+        match self {
+            Self::Bool => serde_json::Value::Bool(text.trim() == "true"),
+            Self::Integer { .. } => text
+                .trim()
+                .parse::<usize>()
+                .map_or(serde_json::Value::Null, |number| number.into()),
+            _ => serde_json::Value::String(text.trim().to_owned()),
+        }
+    }
+}
+
+/// One setting an operator may edit from the TUI or `arsy config set`.
+///
+/// This is a registry rather than a list of keys discovered at runtime because
+/// the loader accepts a key by having a match arm for it: without a table there
+/// is nothing to offer an operator, nothing to validate a typed value against,
+/// and nothing to show a default from. It deliberately holds only the keys that
+/// have no other surface of their own — `/provider`, `/model`, `/theme`,
+/// `/mcp`, `/hooks` and `/auth` each own theirs.
+#[derive(Clone, Copy, Debug)]
+pub struct Setting {
+    /// The dotted key, as it is written in `arsy.json`.
+    pub key: &'static str,
+    pub kind: SettingKind,
+    /// What the loader uses when no layer set the key, spelled the way the
+    /// value is written in the file.
+    pub default: &'static str,
+    pub description: &'static str,
+}
+
+/// Every setting this build will write. See [`Setting`].
+pub const SETTINGS: &[Setting] = &[
+    Setting {
+        key: "credentials.store",
+        kind: SettingKind::Choice(CREDENTIAL_STORES),
+        default: DEFAULT_CREDENTIAL_STORE,
+        description: "where the credential catalog is kept",
+    },
+    Setting {
+        key: "ui.style",
+        kind: SettingKind::Choice(UI_STYLES),
+        default: DEFAULT_UI_STYLE,
+        description: "how an interactive transcript is drawn",
+    },
+    Setting {
+        key: "ui.mcp_log",
+        kind: SettingKind::Choice(MCP_LOG_LEVELS),
+        default: DEFAULT_MCP_LOG,
+        description: "how much of an MCP server's own logging is shown",
+    },
+    Setting {
+        key: "execution.max_parallel",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: MAX_PARALLEL_TOOLS,
+        },
+        default: "4",
+        description: "how many tool calls one round may run at once",
+    },
+    Setting {
+        key: "compat.claude.enabled",
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "read Claude's files as a lower layer",
+    },
+    Setting {
+        key: "compat.codex.enabled",
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "read Codex's files as a lower layer",
+    },
+    Setting {
+        key: "compat.omp.enabled",
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "read OMP's files as a lower layer",
+    },
+    Setting {
+        key: "theme.base",
+        kind: SettingKind::Choice(THEME_BASES),
+        default: DEFAULT_THEME_BASE,
+        description: "the palette an interactive transcript is drawn in",
+    },
+];
+
+/// The registry entry for a dotted key.
+pub fn setting(key: &str) -> Option<&'static Setting> {
+    SETTINGS.iter().find(|setting| setting.key == key)
+}
+
+/// One setting as the layers resolved it, for a listing or an editor.
+#[derive(Clone, Debug, Serialize)]
+pub struct SettingView {
+    pub key: String,
+    /// The value in effect: what a layer set, or the built-in default.
+    pub value: String,
+    pub default: String,
+    pub description: String,
+    /// The values a `Choice` accepts; empty for every other kind.
+    pub choices: Vec<String>,
+    /// Whether a layer set this key, as opposed to it standing at its default.
+    pub set: bool,
+    /// The file and layer the effective value came from, when one set it.
+    pub origin: Option<Origin>,
+}
 
 /// How `config explain` shows one connection. The target never includes the
 /// launch env or headers, which may be credentials.
@@ -708,6 +882,10 @@ pub struct Config {
     provider_default: Option<String>,
     model_default: Option<String>,
     credential_store: Option<String>,
+    /// `ui.style`. `None` uses the mockup-oriented projection.
+    ui_style: Option<String>,
+    /// `ui.mcp_log`. `None` is the built-in default.
+    mcp_log: Option<String>,
     /// `execution.max_parallel`. `None` is the built-in default.
     max_parallel_tools: Option<usize>,
     endpoints: BTreeMap<String, Endpoint>,
@@ -729,6 +907,15 @@ pub struct Config {
     mcp_provenance: BTreeMap<String, Provenance>,
     /// `compat.<source>.enabled = false` from any layer.
     compat_disabled: BTreeSet<String>,
+    /// `hook.disabled.<declaration> = true` from any layer: the declarations
+    /// this operator switched off. ARSY's own record of the decision, so
+    /// switching a hook off never means writing another tool's file.
+    hook_disabled: BTreeSet<String>,
+    /// `skill.disabled."<ecosystem>/<name>" = true` from any layer: the
+    /// skills this operator switched off. Like `hook.disabled`, this is
+    /// ARSY's own record of the decision, so switching a skill off never
+    /// edits the directory that carries it.
+    skill_disabled: BTreeSet<String>,
     /// Models other tools name, in seed order.
     compat_models: Vec<ModelHint>,
     /// `[remote.target.<name>]`, from a trusted layer only.
@@ -758,6 +945,169 @@ impl Config {
         self.credential_store
             .as_deref()
             .unwrap_or(DEFAULT_CREDENTIAL_STORE)
+    }
+
+    /// `ui.style`: the interactive transcript projection.
+    pub fn ui_style(&self) -> &str {
+        self.ui_style.as_deref().unwrap_or(DEFAULT_UI_STYLE)
+    }
+
+    /// `ui.mcp_log`: how much of a server's own logging to show.
+    pub fn mcp_log(&self) -> &str {
+        self.mcp_log.as_deref().unwrap_or(DEFAULT_MCP_LOG)
+    }
+
+    /// The hook declarations this operator switched off.
+    ///
+    /// Read by the engine that builds the hook rules, so a declaration listed
+    /// here is one that is read and reported but never registered.
+    pub fn hook_disabled(&self) -> &BTreeSet<String> {
+        &self.hook_disabled
+    }
+
+    /// Every editable setting with the value the layers resolved, in registry
+    /// order, so a listing and an editor show the same set in the same order.
+    pub fn settings(&self) -> Vec<SettingView> {
+        SETTINGS
+            .iter()
+            .map(|setting| SettingView {
+                key: setting.key.to_owned(),
+                value: self.setting_value(setting.key),
+                default: setting.default.to_owned(),
+                description: setting.description.to_owned(),
+                choices: match setting.kind {
+                    SettingKind::Choice(choices) => {
+                        choices.iter().map(|choice| (*choice).to_owned()).collect()
+                    }
+                    _ => Vec::new(),
+                },
+                set: self.trace.contains_key(setting.key),
+                origin: self.trace.get(setting.key).cloned(),
+            })
+            .collect()
+    }
+
+    /// The value in effect for a registry key, or the empty string for a key
+    /// that is not one.
+    fn setting_value(&self, key: &str) -> String {
+        match key {
+            "credentials.store" => self.credential_store().to_owned(),
+            "ui.style" => self.ui_style().to_owned(),
+            "execution.max_parallel" => self.max_parallel_tools().to_string(),
+            "theme.base" => self.theme_base().to_owned(),
+            "ui.mcp_log" => self.mcp_log().to_owned(),
+            _ => match key
+                .strip_prefix("compat.")
+                .and_then(|rest| rest.strip_suffix(".enabled"))
+            {
+                Some(source) => self.compat_enabled(source).to_string(),
+                None => String::new(),
+            },
+        }
+    }
+
+    /// Whether `value` may be written for `key`, and why not when it may not.
+    ///
+    /// The registry is the whole answer to "which keys can be set": a key it
+    /// does not name is refused here rather than written and then rejected by
+    /// the next load, which is the failure an operator would see as a
+    /// configuration that broke overnight.
+    pub fn check_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        let Some(setting) = setting(key) else {
+            return Err(format!("`{key}` is not a setting this build can write"));
+        };
+        setting.kind.check(value)?;
+        // `compat.<source>.enabled = true` cannot undo a `false` from a layer
+        // that outranks this one, so accepting it would promise something the
+        // loader will not do.
+        if let Some(source) = key
+            .strip_prefix("compat.")
+            .and_then(|rest| rest.strip_suffix(".enabled"))
+        {
+            if value.trim() == "true" && !self.compat_enabled(source) {
+                return Err(format!(
+                    "`compat.{source}` is switched off by a layer that outranks this one"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The skills this operator switched off, keyed `<ecosystem>/<name>`.
+    ///
+    /// A listed skill is still discovered and reported, so `arsy skill list`
+    /// can say it is off; it is only left out of what the model is told.
+    pub fn skill_disabled(&self) -> &BTreeSet<String> {
+        &self.skill_disabled
+    }
+
+    /// `[skill] disabled = { "<ecosystem>/<name>" = true }`.
+    ///
+    /// The same ownership rule as `hook.disabled`: ARSY records the decision
+    /// in its own configuration rather than editing the directory that
+    /// carries the skill, because a file an operator did not write is not a
+    /// file ARSY should rewrite. `false` means "not switched off", so a
+    /// layer can state the default without a second spelling for it.
+    fn apply_skill(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let table = as_table(value, "skill", path)?;
+        for (key, value) in table {
+            if key != "disabled" {
+                return Err(reject(format!("unknown key `skill.{key}`")));
+            }
+            self.apply_skill_disabled_table(layer, path, value)?;
+        }
+        Ok(())
+    }
+
+    /// The `skill.disabled` table: every name the operator switched off,
+    /// or explicitly stated the default that it is not.
+    fn apply_skill_disabled_table(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let disabled = as_table(value, "skill.disabled", path)?;
+        for (name, value) in disabled {
+            self.apply_skill_disabled(layer, path, name, value)?;
+        }
+        Ok(())
+    }
+
+    /// One `skill.disabled.<name>` entry: the operator switched that skill
+    /// off, or explicitly stated the default that it is not.
+    fn apply_skill_disabled(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        name: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let off = value.as_bool().ok_or_else(|| ConfigError {
+            path: path.to_path_buf(),
+            message: format!("`skill.disabled.{name}` must be a boolean"),
+        })?;
+        if off {
+            self.skill_disabled.insert(name.to_owned());
+        } else {
+            self.skill_disabled.remove(name);
+        }
+        self.record(
+            layer,
+            path,
+            &format!("skill.disabled.{name}"),
+            off.to_string(),
+        );
+        Ok(())
     }
 
     /// Read every layer in authority order. A missing file is not an error;
@@ -899,14 +1249,19 @@ impl Config {
         self.model_default.as_deref()
     }
 
-    /// How many independent tool calls one round may run at once.
-    pub fn max_parallel_tools(&self) -> usize {
-        self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
-    }
-
     /// The `[theme]` table, empty when the file did not set one.
     pub fn theme(&self) -> &Theme {
         &self.theme
+    }
+
+    /// `theme.base`: the palette an interactive transcript is drawn in.
+    pub fn theme_base(&self) -> &str {
+        self.theme.base.as_deref().unwrap_or(DEFAULT_THEME_BASE)
+    }
+
+    /// How many independent tool calls one round may run at once.
+    pub fn max_parallel_tools(&self) -> usize {
+        self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
@@ -1129,20 +1484,76 @@ impl Config {
         key: &str,
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
+        if INERT_SECTIONS.contains(&key) {
+            return Ok(());
+        }
+        if let Some(()) = self.apply_provider_section(layer, path, key, value)? {
+            return Ok(());
+        }
+        if let Some(()) = self.apply_integration_section(layer, path, key, value)? {
+            return Ok(());
+        }
+        self.apply_operator_section(layer, path, key, value)
+    }
+
+    /// The sections that shape how the model is reached: the endpoint
+    /// catalog, its credentials, the concurrency ceiling, and the tracing
+    /// outlets. A key none of them owns falls through.
+    fn apply_provider_section(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        key: &str,
+        value: &toml::Value,
+    ) -> Result<Option<()>, ConfigError> {
         match key {
-            "provider" => self.apply_provider(layer, path, value),
-            "model" => self.apply_model(layer, path, value),
-            "credentials" => self.apply_credentials(layer, path, value),
-            "execution" => self.apply_execution(layer, path, value),
-            "telemetry" => self.apply_telemetry(layer, path, value),
-            "lsp" => self.apply_lsp(layer, path, value),
-            "mcp" => self.apply_mcp(layer, path, value),
-            "remote" => self.apply_remote(layer, path, value),
-            "project" => self.apply_project(layer, path, value),
-            "policy" => self.apply_policy(layer, path, value),
+            "provider" => self.apply_provider(layer, path, value)?,
+            "model" => self.apply_model(layer, path, value)?,
+            "credentials" => self.apply_credentials(layer, path, value)?,
+            "execution" => self.apply_execution(layer, path, value)?,
+            "telemetry" => self.apply_telemetry(layer, path, value)?,
+            "lsp" => self.apply_lsp(layer, path, value)?,
+            _ => return Ok(None),
+        }
+        Ok(Some(()))
+    }
+
+    /// The sections that connect the outside world: remote control, the
+    /// workspace's own naming, and the tools and external declarations that
+    /// reach it. A key none of them owns falls through.
+    fn apply_integration_section(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        key: &str,
+        value: &toml::Value,
+    ) -> Result<Option<()>, ConfigError> {
+        match key {
+            "mcp" => self.apply_mcp(layer, path, value)?,
+            "remote" => self.apply_remote(layer, path, value)?,
+            "project" => self.apply_project(layer, path, value)?,
+            "policy" => self.apply_policy(layer, path, value)?,
+            "compat" => self.apply_compat(layer, path, value)?,
+            _ => return Ok(None),
+        }
+        Ok(Some(()))
+    }
+
+    /// The sections that record what the operator chose for themselves:
+    /// appearance and the declarations they switched off. Anything still
+    /// unowned is a key this build cannot write.
+    fn apply_operator_section(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        key: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        match key {
             "theme" => self.apply_theme(layer, path, value),
-            "compat" => self.apply_compat(layer, path, value),
-            section if INERT_SECTIONS.contains(&section) => Ok(()),
+            "ui" => self.apply_ui(layer, path, value),
+            "hook" => self.apply_hook(layer, path, value),
+            "skill" => self.apply_skill(layer, path, value),
             other => Err(ConfigError {
                 path: path.to_path_buf(),
                 message: format!("unknown key `{other}`"),
@@ -1182,12 +1593,21 @@ impl Config {
             return Ok(());
         };
         if !CREDENTIAL_STORES.contains(&store.as_str()) {
-            return Err(ConfigError {
-                path: path.to_path_buf(),
-                message: format!(
+            // Named rather than lumped in with the typos: an operator who set
+            // this deliberately is owed the reason it stopped being a choice.
+            let message = if store == "os" {
+                "credentials.store = \"os\" named the platform keyring, which ARSY no longer \
+                 reads; remove the key to keep the catalog beside this file"
+                    .to_owned()
+            } else {
+                format!(
                     "credentials.store must be one of {}, not `{store}`",
                     CREDENTIAL_STORES.join(", ")
-                ),
+                )
+            };
+            return Err(ConfigError {
+                path: path.to_path_buf(),
+                message,
             });
         }
         self.credential_store = Some(store.clone());
@@ -1341,6 +1761,77 @@ impl Config {
                 self.compat_enabled(source).to_string(),
             );
         }
+        Ok(())
+    }
+
+    /// `[hook] disabled = { "<declaration>" = true }`: the declarations the
+    /// operator switched off.
+    ///
+    /// ARSY keeps this itself rather than editing the file that declared the
+    /// hook, for the same reason `/mcp` writes its own configuration: a tool's
+    /// own settings file belongs to that tool, and a declaration this operator
+    /// did not write is not one ARSY should rewrite. A key of `false` is
+    /// accepted and means "not switched off", so a layer can state the
+    /// default without inventing a second spelling for it.
+    fn apply_hook(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let reject = |message: String| ConfigError {
+            path: path.to_path_buf(),
+            message,
+        };
+        let table = as_table(value, "hook", path)?;
+        for (key, value) in table {
+            if key != "disabled" {
+                return Err(reject(format!("unknown key `hook.{key}`")));
+            }
+            self.apply_hook_disabled_table(layer, path, value)?;
+        }
+        Ok(())
+    }
+
+    /// The `hook.disabled` table: every declaration the operator switched
+    /// off, or explicitly stated the default that it is not.
+    fn apply_hook_disabled_table(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let disabled = as_table(value, "hook.disabled", path)?;
+        for (declaration, value) in disabled {
+            self.apply_hook_disabled(layer, path, declaration, value)?;
+        }
+        Ok(())
+    }
+
+    /// One `hook.disabled.<declaration>` entry: the operator switched that
+    /// declaration off, or explicitly stated the default that it is not.
+    fn apply_hook_disabled(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        declaration: &str,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let off = value.as_bool().ok_or_else(|| ConfigError {
+            path: path.to_path_buf(),
+            message: format!("`hook.disabled.{declaration}` must be a boolean"),
+        })?;
+        if off {
+            self.hook_disabled.insert(declaration.to_owned());
+        } else {
+            self.hook_disabled.remove(declaration);
+        }
+        self.record(
+            layer,
+            path,
+            &format!("hook.disabled.{declaration}"),
+            off.to_string(),
+        );
         Ok(())
     }
 
@@ -2001,6 +2492,45 @@ impl Config {
                 minimum_assurance,
             },
         ))
+    }
+
+    /// `ui.mcp_log`: how much of a server's own logging an interactive session
+    /// shows. The rest of `[ui]` is derived from the invocation and the
+    /// terminal, so it is carried without being applied here, as it always was.
+    fn apply_ui(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let table = as_table(value, "ui", path)?;
+        if let Some(style) = string(table, "style", "ui.style", path)?.cloned() {
+            if !UI_STYLES.contains(&style.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.style must be one of {}, not `{style}`",
+                        UI_STYLES.join(", ")
+                    ),
+                });
+            }
+            self.ui_style = Some(style.clone());
+            self.record(layer, path, "ui.style", style);
+        }
+        if let Some(level) = string(table, "mcp_log", "ui.mcp_log", path)?.cloned() {
+            if !MCP_LOG_LEVELS.contains(&level.as_str()) {
+                return Err(ConfigError {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "ui.mcp_log must be one of {}, not `{level}`",
+                        MCP_LOG_LEVELS.join(", ")
+                    ),
+                });
+            }
+            self.mcp_log = Some(level.clone());
+            self.record(layer, path, "ui.mcp_log", level);
+        }
+        Ok(())
     }
 
     fn apply_theme(
@@ -3108,6 +3638,25 @@ mod tests {
             "unexpected: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn ui_style_defaults_to_modern_and_refuses_unknown_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let read = |body: &str| {
+            let path = write(directory.path(), CONFIG_FILE, body);
+            Config::load(&[(Layer::User, path)])
+        };
+
+        assert_eq!(read("schema_version = 1\n").unwrap().ui_style(), "modern");
+        assert_eq!(
+            read("schema_version = 1\n[ui]\nstyle = \"classic\"\n")
+                .unwrap()
+                .ui_style(),
+            "classic"
+        );
+        let error = read("schema_version = 1\n[ui]\nstyle = \"wireframe\"\n").unwrap_err();
+        assert!(error.message.contains("ui.style"), "{error}");
     }
 
     use super::*;

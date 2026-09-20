@@ -14,8 +14,8 @@
 
 use super::{
     wire::{ApiKey, WireRequest, WireResponse, WireTransport},
-    CanonicalModelRequest, ModelContent, ModelEvent, ModelEventStream, ModelMessage, ModelProvider,
-    ModelRole, ProviderDescriptor, ProviderError, StopReason, ToolSchema,
+    CanonicalModelRequest, Effort, ModelContent, ModelEvent, ModelEventStream, ModelMessage,
+    ModelProvider, ModelRole, ProviderDescriptor, ProviderError, StopReason, ToolSchema,
 };
 use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
@@ -321,27 +321,50 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
     }
 }
 
-fn routed_wire_model(model: &str, effort: Option<crate::provider::Effort>) -> &str {
-    use crate::provider::Effort;
-    match (model, effort) {
-        ("gemini-3.8-flash", Some(Effort::Low)) => "gemini-3.8-flash-low",
-        ("gemini-3.8-flash", Some(Effort::Medium)) => "gemini-3.8-flash-medium",
-        ("gemini-3.8-flash", Some(Effort::High)) => "gemini-3.8-flash-high",
+/// The model the API is asked for: flash carries the effort as a suffix, Pro
+/// maps its levels onto two ids, a Claude model asked to think names the
+/// thinking variant, and anything unrecognized passes through untouched
+/// (including the empty model, which is never rewritten).
+fn routed_wire_model(model: &str, effort: Option<Effort>) -> &str {
+    let thinking = matches!(effort, Some(Effort::Medium | Effort::High));
+    match model {
+        "gemini-3.8-flash" => gemini_3_8_flash(effort),
+        "gemini-3.7-flash" => gemini_3_7_flash(effort),
+        "gemini-3.1-pro" => gemini_3_1_pro(effort),
+        "claude-3-7-sonnet" if thinking => "claude-3-7-sonnet-thinking",
+        "claude-sonnet-4-5" if thinking => "claude-sonnet-4-5-thinking",
+        "claude-sonnet-4-6" if thinking => "claude-sonnet-4-6-thinking",
+        "claude-opus-4-5" if thinking => "claude-opus-4-5-thinking",
+        "claude-opus-4-6" if thinking => "claude-opus-4-6-thinking",
+        other => other,
+    }
+}
 
-        ("gemini-3.7-flash", Some(Effort::Low)) => "gemini-3.7-flash-low",
-        ("gemini-3.7-flash", Some(Effort::Medium)) => "gemini-3.7-flash-medium",
-        ("gemini-3.7-flash", Some(Effort::High)) => "gemini-3.7-flash-high",
+/// Flash names its thinking level in the model id, and unset means the default.
+fn gemini_3_8_flash(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.8-flash-low",
+        Some(Effort::Medium) => "gemini-3.8-flash-medium",
+        Some(Effort::High) | None => "gemini-3.8-flash-high",
+    }
+}
 
-        ("gemini-3.1-pro", Some(Effort::Low)) => "gemini-3.1-pro-low",
-        ("gemini-3.1-pro", Some(Effort::High)) => "gemini-pro-agent",
+fn gemini_3_7_flash(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.7-flash-low",
+        Some(Effort::Medium) => "gemini-3.7-flash-medium",
+        Some(Effort::High) | None => "gemini-3.7-flash-high",
+    }
+}
 
-        ("claude-3-7-sonnet", Some(Effort::Medium | Effort::High)) => "claude-3-7-sonnet-thinking",
-        ("claude-sonnet-4-5", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-5-thinking",
-        ("claude-sonnet-4-6", Some(Effort::Medium | Effort::High)) => "claude-sonnet-4-6-thinking",
-        ("claude-opus-4-5", Some(Effort::Medium | Effort::High)) => "claude-opus-4-5-thinking",
-        ("claude-opus-4-6", Some(Effort::Medium | Effort::High)) => "claude-opus-4-6-thinking",
-
-        (other, _) => other,
+/// Pro names only a low variant and an agent model for high; medium and an
+/// unset effort ask for the plain id, which is the only other name the API
+/// was told about.
+fn gemini_3_1_pro(effort: Option<Effort>) -> &'static str {
+    match effort {
+        Some(Effort::Low) => "gemini-3.1-pro-low",
+        Some(Effort::High) => "gemini-pro-agent",
+        Some(Effort::Medium) | None => "gemini-3.1-pro",
     }
 }
 
@@ -409,16 +432,30 @@ fn encode_tool(tool: &ToolSchema) -> Value {
 }
 
 /// Drop the JSON Schema keywords the API rejects (`$schema`, `$ref`, `$defs`,
-/// `default`, `examples`, `const` at any depth), so a schema written for a
-/// stricter validator still goes through.
+/// `default`, `examples`, `exclusiveMinimum`, `exclusiveMaximum`, `propertyNames`,
+/// `patternProperties`, `const` at any depth) and normalize union array types
+/// (`type: ["string", "null"]`) to scalar `type` plus `nullable: true`, so schemas
+/// produced by standard tools (e.g. MCP servers) pass Protobuf validation.
 fn strip_unsupported_schema(schema: &Value) -> Value {
     match schema {
         Value::Object(map) => {
             let mut out = Map::new();
+            let mut is_nullable = false;
             for (key, value) in map {
                 if matches!(
                     key.as_str(),
-                    "$schema" | "$id" | "$ref" | "$defs" | "definitions" | "default" | "examples"
+                    "$schema"
+                        | "$id"
+                        | "$ref"
+                        | "$defs"
+                        | "$comment"
+                        | "definitions"
+                        | "default"
+                        | "examples"
+                        | "exclusiveMinimum"
+                        | "exclusiveMaximum"
+                        | "propertyNames"
+                        | "patternProperties"
                 ) {
                     continue;
                 }
@@ -428,7 +465,35 @@ fn strip_unsupported_schema(schema: &Value) -> Value {
                     out.insert("enum".to_owned(), json!([value.clone()]));
                     continue;
                 }
+                if key == "type" {
+                    match value {
+                        Value::Array(types) => {
+                            if types.iter().any(|t| t.as_str() == Some("null")) {
+                                is_nullable = true;
+                            }
+                            let non_null: Vec<_> = types
+                                .iter()
+                                .filter(|t| t.as_str() != Some("null"))
+                                .collect();
+                            if let Some(first) = non_null.first() {
+                                out.insert("type".to_owned(), (*first).clone());
+                            } else {
+                                out.insert("type".to_owned(), json!("string"));
+                            }
+                            continue;
+                        }
+                        Value::String(s) if s == "null" => {
+                            is_nullable = true;
+                            out.insert("type".to_owned(), json!("string"));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 out.insert(key.clone(), strip_unsupported_schema(value));
+            }
+            if is_nullable && !out.contains_key("nullable") {
+                out.insert("nullable".to_owned(), json!(true));
             }
             Value::Object(out)
         }
@@ -922,11 +987,26 @@ mod tests {
             "properties": {
                 "kind": {"const": "email"},
                 "note": {"type": "string", "default": "none"},
+                "limit": {"type": ["integer", "null"], "exclusiveMinimum": 0},
+                "metadata": {
+                    "type": "object",
+                    "propertyNames": {"pattern": "^[a-z]+$"},
+                    "patternProperties": {
+                        "^[a-z]+$": {"type": "string"}
+                    }
+                }
             },
         });
         let out = strip_unsupported_schema(&schema);
         assert!(out.get("$schema").is_none());
         assert_eq!(out["properties"]["kind"]["enum"], json!(["email"]));
         assert!(out["properties"]["note"].get("default").is_none());
+        assert_eq!(out["properties"]["limit"]["type"], json!("integer"));
+        assert_eq!(out["properties"]["limit"]["nullable"], json!(true));
+        assert!(out["properties"]["limit"].get("exclusiveMinimum").is_none());
+        assert!(out["properties"]["metadata"].get("propertyNames").is_none());
+        assert!(out["properties"]["metadata"]
+            .get("patternProperties")
+            .is_none());
     }
 }

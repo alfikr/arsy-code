@@ -23,6 +23,7 @@ mod acp;
 mod approval;
 mod code;
 mod config_edit;
+mod config_load;
 mod connector;
 mod eval;
 mod evidence;
@@ -30,10 +31,13 @@ mod extensions;
 mod integrations;
 mod mcp;
 mod memory;
+#[cfg(feature = "tui")]
+mod picker;
 mod policy;
 mod progress;
 pub mod provider;
 mod review;
+mod run;
 mod serve;
 mod session;
 mod subagent;
@@ -41,6 +45,32 @@ mod telemetry;
 mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
+mod turn;
+
+use config_load::{bootstrap_user_config, replace_file};
+pub(crate) use config_load::{load_config, selected_model};
+#[cfg(feature = "tui")]
+use picker::prompt::{
+    answer_prompt, cancels_to_task, leave_picker, masked, offer_rows, open_palette, open_route,
+    prompt_status, seed_providers, submitted, Leaving, Opened, Picker, Prompt, Restoring, TaskPass,
+    Typing,
+};
+#[cfg(feature = "tui")]
+use picker::remembered::{endpoint_models, saved_effort, saved_route};
+#[cfg(feature = "tui")]
+use picker::session::configured_providers;
+#[cfg(feature = "tui")]
+use picker::wizard::configured_default;
+#[cfg(feature = "tui")]
+use picker::wizard::write_config;
+use run as run_mod;
+use run::{
+    doctor, graph_failed, merge, prepare_task, resume, TaskRun, CONTEXT_BUDGET_TOKENS, TASK_BUDGET,
+    TASK_LEASE_MS,
+};
+use run_mod::run as run_command;
+#[cfg(feature = "tui")]
+use turn::modern_gap;
 
 use arsy_kernel::{
     artifact::unix_time_ms,
@@ -54,8 +84,8 @@ use arsy_kernel::{
         ModelRole, ProviderError,
     },
     secret::{
-        CredentialStore, FileCredentialStore, OsCredentialStore, Redactor, SecretBroker,
-        SecretError, SecretHandle, FILE_STORE_ID, OS_STORE_ID,
+        CredentialStore, FileCredentialStore, Redactor, SecretBroker, SecretError, SecretHandle,
+        WithdrawnOsStore, FILE_STORE_ID, OS_STORE_ID,
     },
     service::AgentService,
     sqlite::{Durability, SqliteEventStore},
@@ -63,6 +93,7 @@ use arsy_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -960,6 +991,23 @@ impl Emitter {
         }
     }
 
+    /// One line a server logged about itself.
+    ///
+    /// Not a diagnostic: nothing about ARSY went wrong, and a server that
+    /// prints a deprecation notice on every start must not read as a warning
+    /// the operator is meant to act on. It is the server's own untrusted text,
+    /// carried through already scrubbed, and it goes where a trace goes — to
+    /// stderr, so a pipeline reading stdout is unaffected.
+    fn server_log(&mut self, message: &str) {
+        match self.output {
+            Output::Json => self.record("mcp_log", json!({"message": message})),
+            Output::Acp => {}
+            _ => {
+                let _ = writeln!(io::stderr(), "  {}", terminal_text(message));
+            }
+        }
+    }
+
     /// One step of the agent loop, for an operator who is debugging it.
     ///
     /// # Why stderr, and why JSON either way
@@ -1112,11 +1160,11 @@ fn execute_auth(
 ) -> Option<Result<i32, Diagnostic>> {
     Some(match &invocation.command {
         Command::AuthSet { provider, handle } => {
-            auth_set(invocation, provider, handle.as_deref(), tty, emitter)
+            auth_set(provider, handle.as_deref(), tty, emitter)
         }
         Command::AuthLogin { provider } => auth_login(invocation, provider, emitter),
-        Command::AuthList => auth_list(invocation, emitter),
-        Command::AuthRemove { handle, force } => auth_remove(invocation, handle, *force, emitter),
+        Command::AuthList => auth_list(emitter),
+        Command::AuthRemove { handle, force } => auth_remove(handle, *force, emitter),
         _ => return None,
     })
 }
@@ -1370,7 +1418,7 @@ fn execute_core(
             "the interactive TUI is disabled in this build",
             "install a build with the `tui` feature",
         )),
-        Command::Run { task, image } => run(invocation, task, image.as_deref(), emitter),
+        Command::Run { task, image } => run_command(invocation, task, image.as_deref(), emitter),
         Command::Resume { session, follow } => resume(invocation, *session, *follow, emitter),
         Command::Update { check_only } => execute_update(*check_only, emitter),
         Command::Gc {
@@ -1406,19 +1454,14 @@ fn execute_update(check_only: bool, emitter: &mut Emitter) -> Result<i32, Diagno
 /// A redactor that knows every non-interactive credential this workspace has
 /// stored, installed on the emitter so anything it prints goes through the
 /// same pipeline.
-fn redactor(invocation: &Invocation, emitter: &mut Emitter) -> Result<Redactor, Diagnostic> {
+fn redactor(emitter: &mut Emitter) -> Result<Redactor, Diagnostic> {
     let mut broker = SecretBroker::new();
-    broker.register_store(Box::new(OsCredentialStore));
+    // The withdrawn store is registered so a handle left over from an older
+    // build is answered by the store it names. It opens nothing, and preloading
+    // it costs no prompt, so the interactive path no longer has to skip it.
+    broker.register_store(Box::new(WithdrawnOsStore));
     broker.register_store(Box::new(FileCredentialStore));
-    let interactive_tui = matches!(&invocation.command, Command::Tui);
-    for record in catalog(CatalogStore::resolve(invocation))? {
-        // Opening every OS handle just to prepare a TUI task triggers a
-        // keychain prompt before the selected provider or Codex CLI is used.
-        // The interactive provider owns its selected credential; the fallback
-        // Codex CLI owns its login. File credentials remain safe to preload.
-        if interactive_tui && record.handle.store() == OS_STORE_ID {
-            continue;
-        }
+    for record in catalog()? {
         // A handle that will not open — a revoked entry, a record left behind
         // by a provider since removed — has no value that could reach output,
         // so there is nothing for the redactor to miss.
@@ -1567,225 +1610,12 @@ fn human_config(report: &Value, key: Option<&str>) -> Value {
     json!({"configuration": listing})
 }
 
-/// Replace a file's contents in one step.
-///
-/// A `write` truncates before it writes, so anything reading the file in
-/// between sees it empty — and an empty `arsy.json` is a fatal parse error
-/// rather than a missing layer. Staging beside the destination and renaming
-/// over it means a reader sees either the old contents or the new ones.
-fn replace_file(path: &Path, body: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("a settings file needs a directory"))?;
-    std::fs::create_dir_all(parent)?;
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let staged = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("settings"),
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(body)?;
-        file.sync_all()
-    })();
-    if written.is_ok() {
-        // The staged file is new, so it carries the umask rather than whatever
-        // the destination was set to. An operator who tightened a settings
-        // file must not have that undone by the next write that touches it.
-        #[cfg(unix)]
-        if let Ok(existing) = std::fs::metadata(path) {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = existing.permissions().mode();
-            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode));
-        }
-        // Rename replaces on every target ARSY ships for, so nothing is left
-        // half written even when the destination is already there.
-        if let Err(error) = std::fs::rename(&staged, path) {
-            let _ = std::fs::remove_file(&staged);
-            return Err(error);
-        }
-        return Ok(());
-    }
-    let _ = std::fs::remove_file(&staged);
-    written
-}
-
-/// Create `~/.arsy/arsy.json` when it is not there yet, carrying over the
-/// `config.toml` an older ARSY kept in the platform configuration directory.
-///
-/// Run before every load rather than only at install time, because ARSY also
-/// arrives through Homebrew, Scoop, and npm, and a person who deleted the file
-/// should get a working one back rather than a diagnostic.
-///
-/// Every failure here is silent: a home directory that cannot be written is a
-/// run without a user layer, which is exactly what it was before this existed.
-/// Nothing is ever overwritten.
-fn bootstrap_user_config() {
-    let Some(path) = arsy_kernel::config::user_config() else {
-        return;
-    };
-    if path.exists() {
-        return;
-    }
-    // What an older ARSY had, converted once. A file that no longer parses is
-    // left where it is: reporting nothing beats replacing settings with an
-    // empty file the operator did not ask for.
-    //
-    // A run pointed at a throwaway configuration home — a test, a container, a
-    // second account — asked for that home and not for the operator's own
-    // settings copied into it, exactly as the credential catalog treats it.
-    let carried = (!config_home_overridden())
-        .then(arsy_kernel::config::legacy_user_config)
-        .flatten()
-        .and_then(|legacy| std::fs::read_to_string(legacy).ok())
-        .and_then(|raw| arsy_kernel::config::json_from_toml(&raw, &path).ok());
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let body = carried.unwrap_or_else(|| "{}".to_owned());
-    // Staged beside the destination and linked into place, so a second ARSY
-    // starting at the same time reads either nothing or the whole file. A
-    // created-then-written file is visible while it is still empty, and an
-    // empty `arsy.json` is a fatal parse error rather than a missing layer.
-    //
-    // `hard_link` rather than the rename `replace_file` uses: it fails when
-    // the destination exists, so neither process truncates what the other
-    // carried over.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let staged = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        arsy_kernel::config::CONFIG_FILE,
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let Ok(mut file) = std::fs::File::create(&staged) else {
-        return;
-    };
-    let written = file
-        .write_all(body.trim_end().as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all());
-    drop(file);
-    if written.is_ok() {
-        let _ = std::fs::hard_link(&staged, &path);
-    }
-    let _ = std::fs::remove_file(&staged);
-}
-
 /// Read every configuration layer for this workspace.
 ///
 /// An invalid file is fatal rather than skipped: continuing with a partly
 /// applied policy would silently run under something the operator never wrote.
 /// Every discovered configuration layer, plus the one `--config` named.
 ///
-/// The extra file is applied last, so it wins a conflicting value — and only
-/// that: `provider.allowed`, `model.allowed`, and the policy rules all merge
-/// by intersection, so a session file can narrow the run but never widen it.
-fn load_config(
-    workspace: &Path,
-    working: &Path,
-    extra: Option<&Path>,
-) -> Result<arsy_kernel::config::Config, Diagnostic> {
-    bootstrap_user_config();
-    let mut layers = arsy_kernel::config::layers(workspace, working);
-    if let Some(path) = extra {
-        // Unlike a discovered layer, a path the operator typed is theirs to
-        // get right: a missing one is a mistake, not an absent optional file.
-        if !path.exists() {
-            return Err(Diagnostic::error(
-                ARSY_CFG_1000,
-                format!("--config names `{}`, which does not exist", path.display()),
-                "pass the path to an existing arsy.json, or drop --config",
-            ));
-        }
-        layers.push((arsy_kernel::config::Layer::Session, path.to_path_buf()));
-    }
-    let unusable = |error: arsy_kernel::config::ConfigError| {
-        Diagnostic::error(
-            ARSY_CFG_1000,
-            format!("configuration is unusable: {error}"),
-            "fix the reported file, then run `arsy config explain`",
-        )
-    };
-    // Read twice: the first pass says which tools are switched on and whether
-    // this checkout is trusted, and the second places what those tools declare
-    // below every layer.
-    let config = arsy_kernel::config::Config::load(&layers).map_err(unusable)?;
-    let seeds = compat_seeds(workspace, &config);
-    let contributes = |seed: &arsy_kernel::config::CompatSeed| {
-        !(seed.mcp_servers.is_empty()
-            && seed.policy_rules.is_empty()
-            && seed.models.is_empty()
-            && seed.notes.is_empty())
-    };
-    if !seeds.iter().any(contributes) {
-        return Ok(config);
-    }
-    arsy_kernel::config::Config::load_with(&layers, &seeds).map_err(unusable)
-}
-
-/// What Claude Code and Codex declare for this workspace, read live.
-fn compat_seeds(
-    workspace: &Path,
-    config: &arsy_kernel::config::Config,
-) -> Vec<arsy_kernel::config::CompatSeed> {
-    let homes = compat_homes();
-    arsy_compat::seeds(&arsy_compat::Context {
-        homes: &homes,
-        root: workspace,
-        trusted: config.trusts(workspace),
-        claude: config.compat_enabled("claude"),
-        codex: config.compat_enabled("codex"),
-        env: &|name| std::env::var(name).ok(),
-    })
-}
-
-/// The model a turn asks for: `--model` when it was given, otherwise whatever
-/// configuration resolved.
-///
-/// A named model is checked against `model.allowed` before it is used. The
-/// ceiling is the point of the flag being an override and not an escape: an
-/// operator may choose between the models policy permits, and naming one it
-/// does not is refused rather than silently ignored or silently obeyed.
-fn selected_model(
-    config: &Config,
-    endpoint: &arsy_kernel::config::Endpoint,
-    requested: Option<&str>,
-) -> Result<String, Diagnostic> {
-    if let Some(model) = requested {
-        if !config.model_is_allowed(model) {
-            return Err(Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("--model `{model}` is excluded by the model.allowed ceiling"),
-                "run `arsy model list` for the models this configuration permits",
-            ));
-        }
-        return Ok(model.to_owned());
-    }
-    endpoint
-        .model
-        .clone()
-        .or_else(|| config.model_default().map(str::to_owned))
-        // What Claude Code or Codex is set to use, only when arsy.json is silent.
-        .or_else(|| config.compat_model(endpoint).map(str::to_owned))
-        .ok_or_else(|| {
-            Diagnostic::error(
-                ARSY_PRV_1000,
-                format!("provider `{}` does not say which model to use", endpoint.id),
-                "set `model` on the provider endpoint, or `model.default`, in arsy.json, or \
-                 pass --model",
-            )
-        })
-}
-
-const CATALOG_NAME: &str = "__catalog__";
 /// The catalog under the `file` store, beside the user configuration.
 const CATALOG_FILE: &str = "credentials.json";
 
@@ -1814,73 +1644,31 @@ enum CredentialKind {
     OAuth,
 }
 
-/// Where the credential catalog is kept, and how to reach it.
+/// Read the credential catalog.
 ///
 /// The catalog is metadata — handles, provider names, timestamps — and never a
-/// secret value, so keeping it in the platform store costs an unlock prompt for
-/// data that did not need one. `file` is the default for that reason; `os`
-/// stays available for an operator who wants everything in one place, chosen
-/// with `credentials.store`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CatalogStore {
-    File,
-    Os,
+/// secret value. It lives in one place, beside the user configuration, owned by
+/// the operator: there is no second store left to choose between.
+fn read_catalog() -> Result<Option<String>, Diagnostic> {
+    match FileCredentialStore.resolve(CATALOG_FILE) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(SecretError::NotFound(_)) => Ok(None),
+        Err(error) => Err(secret_failed(error)),
+    }
 }
 
-impl CatalogStore {
-    /// The configured store, or the default when configuration cannot be read:
-    /// listing credentials must not depend on a config file being valid.
-    fn resolve(invocation: &Invocation) -> Self {
-        workspace_root(&invocation.workspace)
-            .ok()
-            .and_then(|root| {
-                let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-                load_config(&root, &working, invocation.config.as_deref()).ok()
-            })
-            .map_or(Self::File, |config| Self::named(config.credential_store()))
+fn write_catalog(raw: &str) -> Result<(), Diagnostic> {
+    let path = FileCredentialStore::path(CATALOG_FILE)
+        .ok_or_else(|| secret_failed("this platform has no user configuration directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(storage_failed)?;
     }
-
-    fn named(store: &str) -> Self {
-        if store == OS_STORE_ID {
-            Self::Os
-        } else {
-            Self::File
-        }
-    }
-
-    fn read(self) -> Result<Option<String>, Diagnostic> {
-        let resolved = match self {
-            Self::File => FileCredentialStore.resolve(CATALOG_FILE),
-            Self::Os => OsCredentialStore.resolve(CATALOG_NAME),
-        };
-        match resolved {
-            Ok(raw) => Ok(Some(raw)),
-            Err(SecretError::NotFound(_)) => Ok(None),
-            Err(error) => Err(secret_failed(error)),
-        }
-    }
-
-    fn write(self, raw: &str) -> Result<(), Diagnostic> {
-        match self {
-            Self::File => {
-                let path = FileCredentialStore::path(CATALOG_FILE).ok_or_else(|| {
-                    secret_failed("this platform has no user configuration directory")
-                })?;
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(storage_failed)?;
-                }
-                // Created owner-only rather than created and then narrowed: a
-                // chmod after the write leaves a window where the catalog is
-                // readable by the whole machine.
-                let mut file = owner_only(&path)?;
-                file.write_all(format!("{raw}\n").as_bytes())
-                    .map_err(storage_failed)
-            }
-            Self::Os => OsCredentialStore
-                .set(CATALOG_NAME, raw)
-                .map_err(secret_failed),
-        }
-    }
+    // Created owner-only rather than created and then narrowed: a chmod after
+    // the write leaves a window where the catalog is readable by the whole
+    // machine.
+    let mut file = owner_only(&path)?;
+    file.write_all(format!("{raw}\n").as_bytes())
+        .map_err(storage_failed)
 }
 
 /// A catalog file is not a secret, but it names every provider the operator
@@ -1900,51 +1688,33 @@ fn owner_only(path: &Path) -> Result<std::fs::File, Diagnostic> {
     options.open(path).map_err(storage_failed)
 }
 
-fn config_home_overridden() -> bool {
-    std::env::var_os(arsy_kernel::config::CONFIG_HOME_VAR).is_some_and(|home| !home.is_empty())
-}
-
-fn catalog(store: CatalogStore) -> Result<Vec<AuthRecord>, Diagnostic> {
-    let raw = match store.read()? {
-        Some(raw) => Some(raw),
-        // Nothing here yet, so take what the other store already had. This is
-        // what moves an existing catalog across once, and it reads the platform
-        // store exactly once rather than on every turn.
-        // A run pointed at a throwaway configuration home — a test, a
-        // container, a second account — asked for that home and not for the
-        // operator's own credentials copied into it.
-        None if store == CatalogStore::File && !config_home_overridden() => {
-            // A platform store that is unavailable, or whose prompt was
-            // declined, means there is nothing to migrate — not that every
-            // later turn should fail on a convenience.
-            let migrated = CatalogStore::Os.read().unwrap_or_default();
-            if let Some(raw) = &migrated {
-                store.write(raw)?;
-            }
-            migrated
-        }
-        None => None,
-    };
-    let Some(raw) = raw else {
+fn catalog() -> Result<Vec<AuthRecord>, Diagnostic> {
+    let Some(raw) = read_catalog()? else {
         return Ok(Vec::new());
     };
     serde_json::from_str(&raw).map_err(|_| secret_failed("credential catalog is corrupt"))
 }
 
-fn save_catalog(store: CatalogStore, records: &[AuthRecord]) -> Result<(), Diagnostic> {
+fn save_catalog(records: &[AuthRecord]) -> Result<(), Diagnostic> {
     let raw = serde_json::to_string(records).map_err(|error| secret_failed(error.to_string()))?;
-    store.write(&raw)
+    write_catalog(&raw)
 }
 
 fn auth_set(
-    invocation: &Invocation,
     provider: &str,
     requested: Option<&str>,
     tty: bool,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let name = requested.unwrap_or(provider);
-    let handle = SecretHandle::new(OS_STORE_ID, name).map_err(secret_failed)?;
+    // A requested name is taken as the file the credential lands in, so
+    // `--name gateway.key` and a bare `--name gateway` both name one file.
+    let requested = requested.unwrap_or(provider);
+    let name = if requested.ends_with(".key") {
+        requested.to_owned()
+    } else {
+        format!("{requested}.key")
+    };
+    let handle = SecretHandle::new(FILE_STORE_ID, &name).map_err(secret_failed)?;
     let mut secret = if tty {
         rpassword::prompt_password(format!("Credential for {provider}: ")).map_err(secret_failed)?
     } else {
@@ -1956,17 +1726,14 @@ fn auth_set(
     if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
         return Err(secret_failed("credential is too short to redact safely"));
     }
-    // The value belongs in the platform store; the catalog goes wherever the
-    // operator configured, which is not the same question.
-    let store = OsCredentialStore;
-    let records_store = CatalogStore::resolve(invocation);
-    let previous = match store.resolve(name) {
+    let store = FileCredentialStore;
+    let previous = match store.resolve(&name) {
         Ok(value) => Some(value),
         Err(SecretError::NotFound(_)) => None,
         Err(error) => return Err(secret_failed(error)),
     };
-    store.set(name, &secret).map_err(secret_failed)?;
-    let mut records = catalog(records_store)?;
+    store.set(&name, &secret).map_err(secret_failed)?;
+    let mut records = catalog()?;
     let now = now()?;
     if let Some(record) = records.iter_mut().find(|record| record.handle == handle) {
         record.provider = provider.to_owned();
@@ -1980,11 +1747,11 @@ fn auth_set(
             kind: CredentialKind::ApiKey,
         });
     }
-    if let Err(error) = save_catalog(records_store, &records) {
+    if let Err(error) = save_catalog(&records) {
         if let Some(previous) = previous {
-            let _ = store.set(name, &previous);
+            let _ = store.set(&name, &previous);
         } else {
-            let _ = store.remove(name);
+            let _ = store.remove(&name);
         }
         return Err(error);
     }
@@ -1996,7 +1763,6 @@ fn auth_set(
 /// so both the exchange and the credential-storage step that follows it
 /// share the same view.
 struct OAuthLogin {
-    config: Config,
     configured: Option<arsy_kernel::config::Endpoint>,
     preset: Option<&'static arsy_kernel::oauth::presets::Preset>,
     oauth: arsy_kernel::config::OAuth,
@@ -2051,107 +1817,11 @@ fn resolve_oauth_login(invocation: &Invocation, provider: &str) -> Result<OAuthL
         }
     };
     Ok(OAuthLogin {
-        config,
         configured,
         preset,
         oauth,
         synthesize,
     })
-}
-
-/// Store the token set a login produced, under the same kind of handle an
-/// API key would use, so everything downstream — resolution, redaction,
-/// `auth remove` — treats the two the same.
-fn store_oauth_login(
-    invocation: &Invocation,
-    provider: &str,
-    login: &OAuthLogin,
-    tokens: arsy_kernel::oauth::TokenSet,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
-    let (store_kind, handle_name) = match login
-        .configured
-        .as_ref()
-        .and_then(|e| e.credential.as_ref())
-    {
-        Some(existing) => (existing.store(), existing.name().to_owned()),
-        None => {
-            if login.config.credential_store() == FILE_STORE_ID {
-                (FILE_STORE_ID, format!("{provider}.key"))
-            } else {
-                (OS_STORE_ID, provider.to_owned())
-            }
-        }
-    };
-    let handle = SecretHandle::new(store_kind, &handle_name).map_err(secret_failed)?;
-    let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
-    if store_kind == FILE_STORE_ID {
-        FileCredentialStore
-            .set(&handle_name, &raw)
-            .map_err(secret_failed)?;
-    } else {
-        OsCredentialStore
-            .set(handle.name(), &raw)
-            .map_err(secret_failed)?;
-    }
-    let records_store = CatalogStore::resolve(invocation);
-    let mut records = catalog(records_store)?;
-    let now = now()?;
-    match records.iter_mut().find(|record| record.handle == handle) {
-        Some(record) => {
-            record.provider = provider.to_owned();
-            record.kind = CredentialKind::OAuth;
-        }
-        None => records.push(AuthRecord {
-            provider: provider.to_owned(),
-            handle: handle.clone(),
-            created_at: now,
-            last_used: None,
-            kind: CredentialKind::OAuth,
-        }),
-    }
-    save_catalog(records_store, &records)?;
-
-    // A preset that had no endpoint of its own gets one written now, pointed at
-    // the credential just stored, so `/model` and a turn find it like any other.
-    let mut wrote_endpoint = false;
-    if login.synthesize {
-        let preset = login
-            .preset
-            .expect("synthesize is only set when a preset matched");
-        let endpoint = config_edit::Endpoint {
-            name: provider.to_owned(),
-            kind: preset.dialect.as_str().to_owned(),
-            base_url: preset.base_url.to_owned(),
-            models: preset
-                .models
-                .iter()
-                .map(|model| (*model).to_owned())
-                .collect(),
-            credential: handle.to_string(),
-        };
-        write_config(|config| config_edit::append_endpoint(config, &endpoint)).map_err(
-            |error| {
-                Diagnostic::error(
-                    ARSY_PRV_1000,
-                    format!(
-                    "signed in, but `provider.endpoint.{provider}` could not be written: {error}"
-                ),
-                    "add the endpoint by hand; the credential is already stored",
-                )
-            },
-        )?;
-        wrote_endpoint = true;
-    }
-
-    emitter.result(json!({
-        "provider": provider,
-        "handle": handle,
-        "kind": "oauth",
-        "expires_at": tokens.expires_at,
-        "endpoint_written": wrote_endpoint,
-    }));
-    Ok(0)
 }
 
 /// Sign in to a provider through the OAuth client its configuration names.
@@ -2216,6 +1886,146 @@ fn auth_login(
         tokens.map_err(login_failed)?
     };
     store_oauth_login(invocation, provider, &login, tokens, emitter)
+}
+
+/// Store the token set a login produced, under the same kind of handle an
+/// API key would use, so everything downstream — resolution, redaction,
+/// `auth remove` — treats the two the same.
+///
+/// The catalog is file-only: the OS keyring store was withdrawn, so a handle
+/// that names it is re-pointed at the file the token just went into rather
+/// than honoured.
+fn store_oauth_login(
+    _invocation: &Invocation,
+    provider: &str,
+    login: &OAuthLogin,
+    tokens: arsy_kernel::oauth::TokenSet,
+    emitter: &mut Emitter,
+) -> Result<i32, Diagnostic> {
+    // A configured handle is reused as configured, unless it names the
+    // withdrawn keyring: signing in again is exactly the act that moves such a
+    // credential, so this is where the move happens rather than a failure.
+    let handle_name = match login
+        .configured
+        .as_ref()
+        .and_then(|e| e.credential.as_ref())
+    {
+        Some(existing) if existing.store() == FILE_STORE_ID => existing.name().to_owned(),
+        _ => format!("{provider}.key"),
+    };
+    let handle = SecretHandle::new(FILE_STORE_ID, &handle_name).map_err(secret_failed)?;
+    let raw = serde_json::to_string(&tokens).map_err(|error| secret_failed(error.to_string()))?;
+    FileCredentialStore
+        .set(&handle_name, &raw)
+        .map_err(secret_failed)?;
+    let mut records = catalog()?;
+    let now = now()?;
+    match records.iter_mut().find(|record| record.handle == handle) {
+        Some(record) => {
+            record.provider = provider.to_owned();
+            record.kind = CredentialKind::OAuth;
+        }
+        None => records.push(AuthRecord {
+            provider: provider.to_owned(),
+            handle: handle.clone(),
+            created_at: now,
+            last_used: None,
+            kind: CredentialKind::OAuth,
+        }),
+    }
+    save_catalog(&records)?;
+
+    // An endpoint still pointed at the withdrawn keyring is re-pointed at the
+    // file the token just went into. Signing in again is what moves such a
+    // credential, and a move that left the configuration behind would have
+    // stored a token nothing reads.
+    let stale_keyring = login
+        .configured
+        .as_ref()
+        .and_then(|endpoint| endpoint.credential.as_ref())
+        .is_some_and(|existing| existing.store() == OS_STORE_ID);
+    if stale_keyring {
+        // `write_config` owns the user file and only that one, so an endpoint
+        // a repository or an enterprise layer defined is not ours to edit. Say
+        // so rather than report a move that did not happen: the operator would
+        // otherwise meet the same refusal next turn, told to run the command
+        // they just ran.
+        let mut repointed = false;
+        write_config(|config| {
+            match config_edit::set_existing(
+                config,
+                &["provider", "endpoint", provider],
+                "credential",
+                serde_json::Value::String(handle.to_string()),
+            )? {
+                Some(updated) => {
+                    repointed = true;
+                    Ok(updated)
+                }
+                None => Ok(config.to_owned()),
+            }
+        })
+        .map_err(|error| {
+            Diagnostic::error(
+                ARSY_PRV_1000,
+                format!(
+                    "signed in, but `provider.endpoint.{provider}.credential` still names the \
+                     keyring: {error}"
+                ),
+                format!("set it to `{handle}` by hand; the credential is already stored"),
+            )
+        })?;
+        if !repointed {
+            emitter.diagnostic(&Diagnostic::warning(
+                ARSY_PRV_1000,
+                format!(
+                    "signed in, but `provider.endpoint.{provider}` is not defined in the user \
+                     configuration, so its `credential` still names the withdrawn keyring"
+                ),
+                format!("set it to `{handle}` in the file `arsy config explain` names for it"),
+            ));
+        }
+    }
+    // A preset that had no endpoint of its own gets one written now, pointed at
+    // the credential just stored, so `/model` and a turn find it like any other.
+    let mut wrote_endpoint = false;
+    if login.synthesize {
+        let preset = login
+            .preset
+            .expect("synthesize is only set when a preset matched");
+        let endpoint = config_edit::Endpoint {
+            name: provider.to_owned(),
+            kind: preset.dialect.as_str().to_owned(),
+            base_url: preset.base_url.to_owned(),
+            models: preset
+                .models
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+            credential: handle.to_string(),
+        };
+        write_config(|config| config_edit::append_endpoint(config, &endpoint)).map_err(
+            |error| {
+                Diagnostic::error(
+                    ARSY_PRV_1000,
+                    format!(
+                    "signed in, but `provider.endpoint.{provider}` could not be written: {error}"
+                ),
+                    "add the endpoint by hand; the credential is already stored",
+                )
+            },
+        )?;
+        wrote_endpoint = true;
+    }
+
+    emitter.result(json!({
+        "provider": provider,
+        "handle": handle,
+        "kind": "oauth",
+        "expires_at": tokens.expires_at,
+        "endpoint_written": wrote_endpoint,
+    }));
+    Ok(0)
 }
 
 /// The built-in preset ids, for an error that offers them as an alternative.
@@ -2294,8 +2104,8 @@ fn login_failed(error: arsy_kernel::oauth::OAuthError) -> Diagnostic {
     )
 }
 
-fn auth_list(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
-    let records = catalog(CatalogStore::resolve(invocation))?;
+fn auth_list(emitter: &mut Emitter) -> Result<i32, Diagnostic> {
+    let records = catalog()?;
     emitter.result(if emitter.output == Output::Json {
         json!({"credentials": records})
     } else {
@@ -2353,33 +2163,32 @@ fn human_credentials(records: &[AuthRecord]) -> Value {
 }
 
 fn auth_remove(
-    invocation: &Invocation,
     handle: &SecretHandle,
     _force: bool,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    // Both stores can be removed from, because both can be listed: a catalog
-    // that names a handle no command can delete is a catalog that only grows.
+    // A handle naming the withdrawn keyring can still be removed, because it
+    // can still be listed: a catalog that names a handle no command can delete
+    // is a catalog that only grows. Removing it drops the record and nothing
+    // else — the keyring entry itself is the operator's to delete, and saying
+    // otherwise would be a claim this build cannot make good on.
     if !matches!(handle.store(), OS_STORE_ID | FILE_STORE_ID) {
         return Err(secret_failed(format!(
             "no credential store `{}` to remove from",
             handle.store()
         )));
     }
-    let records_store = CatalogStore::resolve(invocation);
-    let original = catalog(records_store)?;
+    let original = catalog()?;
     let mut records = original.clone();
     records.retain(|record| &record.handle != handle);
-    save_catalog(records_store, &records)?;
-    let removed = match handle.store() {
-        FILE_STORE_ID => FileCredentialStore.remove(handle.name()),
-        _ => OsCredentialStore.remove(handle.name()),
-    };
-    if let Err(error) = removed {
-        // The catalog is written first, so a failed delete has to put it back
-        // rather than leave a stored credential nothing lists.
-        let _ = save_catalog(records_store, &original);
-        return Err(secret_failed(error));
+    save_catalog(&records)?;
+    if handle.store() == FILE_STORE_ID {
+        if let Err(error) = FileCredentialStore.remove(handle.name()) {
+            // The catalog is written first, so a failed delete has to put it
+            // back rather than leave a stored credential nothing lists.
+            let _ = save_catalog(&original);
+            return Err(secret_failed(error));
+        }
     }
     emitter.result(json!({"removed": handle, "referenced_by": []}));
     Ok(0)
@@ -2407,19 +2216,6 @@ fn terminal_failed(error: impl ToString) -> Diagnostic {
         format!("interactive terminal failed: {}", error.to_string()),
         "check the terminal input and output, then retry",
     )
-}
-
-/// What the composer is currently collecting a line for.
-#[cfg(feature = "tui")]
-enum Prompt {
-    Task,
-    Model,
-    Effort,
-    Theme,
-    Provider(tui::ProviderStep),
-    Auth(tui::AuthStep),
-    Resume,
-    Session(tui::SessionDialogState),
 }
 
 #[cfg(feature = "tui")]
@@ -2495,6 +2291,51 @@ fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalM
 }
 
 #[cfg(feature = "tui")]
+fn draw_launch(
+    stdout: &mut io::Stdout,
+    state: &tui::TuiState,
+    colour: bool,
+    provider_available: bool,
+) -> Result<(), Diagnostic> {
+    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+    writeln!(
+        stdout,
+        "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
+        modern_gap(),
+    )
+    .map_err(terminal_failed)?;
+    if tui::modern_style() {
+        writeln!(stdout, "{}", state.approval_hint()).map_err(terminal_failed)?;
+    }
+    if !provider_available {
+        writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn next_tui_action(
+    queued: &mut std::collections::VecDeque<String>,
+    context: ReadLineContext<'_>,
+) -> Result<Option<tui::Action>, Diagnostic> {
+    match queued.pop_front() {
+        Some(line) => Ok(Some(tui::Action::Submit(line))),
+        None => read_line(context),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn cancel_picker(
+    prompt: &Prompt,
+    stdout: &mut io::Stdout,
+    composer: &mut tui::Composer,
+    leaving: Leaving<'_>,
+) -> Result<(), Diagnostic> {
+    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+    writeln!(stdout, "{}", leave_picker(prompt, leaving)).map_err(terminal_failed)
+}
+
+#[cfg(feature = "tui")]
 fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let mut stdout = io::stdout();
@@ -2503,7 +2344,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         native,
         native_requested,
         detected,
-        provider_available,
+        mut provider_available,
     } = open_route(invocation, &workspace)?;
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
@@ -2544,18 +2385,15 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     state.set_effort(effort);
     state.set_model_route(route.clone());
     state.set_approval_mode(approval.get().label());
+    // Opened here rather than at the first recorded turn, because a session
+    // that has not run one — plan mode, a refused turn, an operator still
+    // deciding — is still a session: /session and the status row should name
+    // it, and a turn that comes later finds the store already there.
+    let _store = open_store(&workspace)?;
     // The first drawing of the card, so the loop below does not read it as a
     // change and repaint over the notices printed under it.
     state.card_is_stale();
-    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
-    writeln!(
-        stdout,
-        "Use /help for commands, /mcp and /hooks to inspect integrations."
-    )
-    .map_err(terminal_failed)?;
-    if !provider_available {
-        writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
-    }
+    draw_launch(&mut stdout, &state, colour, provider_available)?;
 
     // ARSY paints the input line from here on, so it owns the terminal modes
     // and is the only reader of stdin.
@@ -2583,8 +2421,13 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
         // cards — including the line that just reported the change.
         if state.card_is_stale() {
             write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-            writeln!(stdout, "{}", state.render(tui::terminal_width(), colour))
-                .map_err(terminal_failed)?;
+            writeln!(
+                stdout,
+                "{}{}",
+                modern_gap(),
+                state.render(tui::terminal_width(), colour)
+            )
+            .map_err(terminal_failed)?;
             composer.invalidate();
         }
         let status = prompt_status(
@@ -2623,7 +2466,6 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 providers: &providers,
                 chosen_provider: chosen_provider.as_deref(),
             },
-            invocation,
         );
         composer.set_masked(masked(&prompt));
         // While the theme picker is open, repaint in whichever theme is
@@ -2633,9 +2475,9 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Prompt::Theme => Some(&preview_theme),
             _ => None,
         };
-        let input = match queued.pop_front() {
-            Some(line) => tui::Action::Submit(line),
-            None => match read_line(ReadLineContext {
+        let Some(input) = next_tui_action(
+            &mut queued,
+            ReadLineContext {
                 keys: &keys,
                 decoder: &mut decoder,
                 composer: &mut composer,
@@ -2645,36 +2487,40 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
                 preview,
                 transcript: &mut transcript,
                 state: &state,
-            })? {
-                Some(input) => input,
-                // Ending input at a picker cancels the picker, not the
-                // session: the setting is unchanged and the task prompt
-                // returns. Ending it at the task prompt ends the session.
-                None if cancels_to_task(&prompt) => {
-                    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-                    let unchanged = leave_picker(
-                        &prompt,
-                        Leaving {
-                            effort,
-                            theme: &theme,
-                            roles: &theme_config.roles,
-                            draft: &mut draft,
-                            auth_draft: &mut auth_draft,
-                            session: state.session_id(),
-                            route: &mut route,
-                        },
-                    );
-                    writeln!(stdout, "{unchanged}").map_err(terminal_failed)?;
-                    prompt = Prompt::Task;
-                    continue;
-                }
-                None => break,
             },
+        )?
+        else {
+            if cancels_to_task(&prompt) {
+                cancel_picker(
+                    &prompt,
+                    &mut stdout,
+                    &mut composer,
+                    Leaving {
+                        effort,
+                        theme: &theme,
+                        roles: &theme_config.roles,
+                        draft: &mut draft,
+                        auth_draft: &mut auth_draft,
+                        session: state.session_id(),
+                        route: &mut route,
+                    },
+                )?;
+                prompt = Prompt::Task;
+                continue;
+            }
+            break;
         };
         // Shift+Tab changes the mode where it stands: it never becomes a line
         // for the prompt to answer. Every other action redraws and nothing
         // more.
-        let Some(line) = submitted(input, &approval, &mut state) else {
+        let Some(line) = submitted(
+            input,
+            &approval,
+            &mut state,
+            &mut transcript,
+            &mut stdout,
+            colour,
+        ) else {
             continue;
         };
         let pass = answer_prompt(
@@ -2684,7 +2530,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
             Typing {
                 workspace: &workspace,
                 colour,
-                provider_available,
+                provider_available: &mut provider_available,
                 route: &mut route,
                 effort: &mut effort,
                 models: &mut models,
@@ -2729,7 +2575,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
 /// `CycleMode` is returned separately from submitted text so Shift+Tab never
 /// becomes a task or a history entry. `None` means the session should end.
 #[cfg(feature = "tui")]
-struct ReadLineContext<'a> {
+pub(crate) struct ReadLineContext<'a> {
     keys: &'a std::sync::mpsc::Receiver<u8>,
     decoder: &'a mut tui::Keys,
     composer: &'a mut tui::Composer,
@@ -2755,20 +2601,27 @@ fn read_line(
     }: ReadLineContext<'_>,
 ) -> Result<Option<tui::Action>, Diagnostic> {
     let mut width = tui::terminal_width();
-    composer.set_height(tui::terminal_rows());
+    let mut composer_height = tui::terminal_rows();
+    composer.set_height(composer_height);
     let mut measured = std::time::Instant::now();
     loop {
         let refreshed = std::time::Instant::now();
         if measured.elapsed() >= std::time::Duration::from_millis(100) {
             let next_width = tui::terminal_width();
-            if next_width != width {
+            let next_rows = tui::terminal_rows();
+            // Rows count too: a taller terminal shows more of the command
+            // menu, and a wider one reflows the transcript. Measuring both is
+            // what makes a terminal dragged between sizes settle rather than
+            // keep the shape it was opened with.
+            if next_width != width || next_rows != composer_height {
                 transcript
                     .repaint(stdout, next_width, colour, state)
                     .map_err(terminal_failed)?;
                 composer.invalidate();
             }
             width = next_width;
-            composer.set_height(tui::terminal_rows());
+            composer_height = next_rows;
+            composer.set_height(next_rows);
             measured = std::time::Instant::now();
         }
         if let (Some(preview), Some(row)) = (preview, composer.highlighted()) {
@@ -2776,6014 +2629,75 @@ fn read_line(
         }
         write!(stdout, "{}", composer.render(width, colour, status)).map_err(terminal_failed)?;
         stdout.flush().map_err(terminal_failed)?;
-        loop {
-            // The timeout is what tells a lone Escape apart from the start of
-            // an arrow-key sequence.
-            let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
-                Ok(byte) => decoder.feed(byte),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let key = decoder.flush_escape();
-                    if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100)
-                    {
-                        break;
-                    }
-                    key
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
-            };
-            let Some(key) = key else { continue };
-            match composer.press(key) {
-                tui::Action::Submit(line) => return Ok(Some(tui::Action::Submit(line))),
-                tui::Action::CycleMode => return Ok(Some(tui::Action::CycleMode)),
-                tui::Action::Quit => return Ok(None),
-                tui::Action::Redraw => break,
-                tui::Action::None => {}
-            }
+        match drain_input_keys(
+            keys, decoder, composer, stdout, colour, width, transcript, state, refreshed,
+        )? {
+            Drain::Refresh => {}
+            Drain::Answer(answer) => return Ok(answer),
         }
     }
 }
 
-/// Persist the picked model, reporting only that persistence failed — the
-/// choice still applies to this session.
-#[cfg(feature = "tui")]
-fn remember_model(route: &tui::ModelRoute, emitter: &mut Emitter) {
-    if let Err(error) = save_route(route) {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-UIX-1001",
-            format!("the model choice was not remembered: {error}"),
-            "check that the ARSY user configuration directory is writable",
-        ));
-    }
+/// What one pass of the key loop asked for.
+enum Drain {
+    /// Redraw and measure the terminal again.
+    Refresh,
+    /// The line ended one way or another; hand the action up.
+    Answer(Option<tui::Action>),
 }
 
-#[cfg(feature = "tui")]
-fn remember_effort(effort: Option<Effort>, emitter: &mut Emitter) {
-    if let Err(error) = save_effort(effort) {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-UIX-1001",
-            format!("the effort choice was not remembered: {error}"),
-            "check that the ARSY user configuration directory is writable",
-        ));
-    }
-}
-
-/// The remembered model lives beside the user configuration layer that
-/// `arsy doctor` already reports.
-#[cfg(feature = "tui")]
-fn model_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("model"))
-}
-
-/// The route chosen last time, as `provider/model`.
+/// Take the keys waiting, ending the line when one of them ends it.
 ///
-/// The model is re-validated on read: a file written by an older build that
-/// accepted anything must not keep selecting an unusable model on every later
-/// start.
-#[cfg(feature = "tui")]
-fn saved_route() -> Option<tui::ModelRoute> {
-    let raw = std::fs::read_to_string(model_store()?).ok()?;
-    let raw = raw.trim();
-    let route = (!raw.is_empty()).then(|| tui::ModelRoute::parse(raw))?;
-    tui::validate_slug(&route.model).ok()?;
-    Some(route)
-}
-
-#[cfg(feature = "tui")]
-fn save_route(route: &tui::ModelRoute) -> io::Result<()> {
-    let path = model_store()
-        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    replace_file(&path, format!("{route}\n").as_bytes())
-}
-
-/// The remembered reasoning effort, beside the remembered model.
-#[cfg(feature = "tui")]
-use arsy_kernel::provider::Effort;
-
-#[cfg(feature = "tui")]
-fn effort_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("effort"))
-}
-
-/// The effort chosen last time, re-validated on read for the same reason the
-/// model is: an unreadable file must not decide what a turn sends.
-#[cfg(feature = "tui")]
-fn saved_effort() -> Option<Effort> {
-    Effort::parse(std::fs::read_to_string(effort_store()?).ok()?.trim())
-}
-
-/// `None` clears the choice, so a turn goes back to carrying no reasoning knob.
-#[cfg(feature = "tui")]
-fn save_effort(effort: Option<Effort>) -> io::Result<()> {
-    let path = effort_store()
-        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    match effort {
-        Some(effort) => replace_file(&path, format!("{effort}\n").as_bytes()),
-        None => match std::fs::remove_file(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            result => result,
-        },
-    }
-}
-
-/// The remembered colour theme, beside the remembered effort.
-#[cfg(feature = "tui")]
-fn theme_store() -> Option<PathBuf> {
-    Some(arsy_kernel::config::user_config()?.with_file_name("theme"))
-}
-
-/// The theme chosen last time, kept only if it is still a built-in name: a
-/// file written by a build that knew a theme this one dropped must not select
-/// nothing.
-#[cfg(feature = "tui")]
-fn saved_theme() -> Option<String> {
-    let raw = std::fs::read_to_string(theme_store()?).ok()?;
-    let name = raw.trim().to_owned();
-    tui::builtin_palette(&name).map(|_| name)
-}
-
-#[cfg(feature = "tui")]
-fn save_theme(name: &str) -> io::Result<()> {
-    let path = theme_store()
-        .ok_or_else(|| io::Error::other("this platform has no user configuration directory"))?;
-    replace_file(&path, format!("{name}\n").as_bytes())
-}
-
-#[cfg(feature = "tui")]
-fn remember_theme(name: &str, emitter: &mut Emitter) {
-    if let Err(error) = save_theme(name) {
-        emitter.diagnostic(&Diagnostic::warning(
-            "ARSY-UIX-1001",
-            format!("the theme choice was not remembered: {error}"),
-            "check that the ARSY user configuration directory is writable",
-        ));
-    }
-}
-
-#[cfg(feature = "tui")]
-fn apply_theme(
-    answer: &str,
-    current: &mut String,
-    roles: &std::collections::BTreeMap<String, String>,
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> io::Result<bool> {
-    let picked = match tui::resolve_theme_answer(answer, current) {
-        Ok(picked) => picked,
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason))?;
-            return Ok(false);
-        }
-    };
-    tui::set_palette(&picked, roles);
-    *current = picked;
-    remember_theme(current, emitter);
-    writeln!(stdout, "Theme: {current}")?;
-    Ok(true)
-}
-
-#[cfg(feature = "tui")]
-fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
-        return Vec::new();
-    };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let mut choices = Vec::new();
-    if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
-        for endpoint in config.endpoints() {
-            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-                provider: endpoint.id.clone(),
-                slug: slug.clone(),
-                name: format!("on {}", endpoint.id),
-            }));
-        }
-    }
-    // Model discovery must be read-only. Probing the macOS keychain here
-    // triggers an unlock prompt every time `/model` opens; auth state is already
-    // represented by the credential catalog.
-    let saved_handles = catalog_handles(invocation);
-    for preset in arsy_kernel::oauth::presets::all() {
-        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
-        if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
-            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
-                provider: preset.id.to_string(),
-                slug: (*slug).to_string(),
-                name: format!("on {}", preset.id),
-            }));
-        }
-    }
-    choices
-}
-
-/// The palette the session paints with: a built-in base — the `[theme]` base,
-/// else the remembered theme, else the default — with any `[theme]` role
-/// overrides on top. Returns the base name (for the `/theme` picker) and the
-/// palette, or the reason an override was rejected.
-#[cfg(feature = "tui")]
-fn resolve_palette(theme: &arsy_kernel::config::Theme) -> (String, Result<tui::Palette, String>) {
-    let base = theme
-        .base
-        .clone()
-        .or_else(saved_theme)
-        .unwrap_or_else(|| tui::DEFAULT_THEME.to_owned());
-    let palette = tui::builtin_palette(&base).unwrap_or_else(|| {
-        tui::builtin_palette(tui::DEFAULT_THEME).expect("the default theme is built in")
-    });
-    let built = if theme.roles.is_empty() {
-        Ok(palette)
-    } else {
-        palette.with_overrides(&theme.roles)
-    };
-    (base, built)
-}
-
-/// Where `/provider` goes after an answer.
-#[cfg(feature = "tui")]
-enum ProviderNext {
-    Ask(tui::ProviderStep),
-    Done(String),
-    Cancelled(String),
-}
-
-/// The provider the configuration names right now.
-#[cfg(feature = "tui")]
-fn configured_default(invocation: &Invocation) -> Option<String> {
-    let root = workspace_root(&invocation.workspace).ok()?;
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    load_config(&root, &working, invocation.config.as_deref())
-        .ok()?
-        .provider_default()
-        .map(str::to_owned)
-}
-
-#[cfg(feature = "tui")]
-fn load_workspace_sessions(workspace: &Path) -> Vec<tui::SessionChoice> {
-    let Ok(store) = open_store(workspace) else {
-        return Vec::new();
-    };
-    let Ok(summaries) = store.sessions(30) else {
-        return Vec::new();
-    };
-    summaries
-        .into_iter()
-        .map(|s| {
-            let ts = s.last_event_at_ms.or(s.started_at_ms).unwrap_or_default();
-            let last_seen = if ts > 0 {
-                let now = arsy_kernel::artifact::unix_time_ms();
-                let diff_secs = now.saturating_sub(ts) / 1000;
-                if diff_secs < 60 {
-                    "just now".to_owned()
-                } else if diff_secs < 3600 {
-                    format!("{}m ago", diff_secs / 60)
-                } else if diff_secs < 86400 {
-                    format!("{}h ago", diff_secs / 3600)
-                } else {
-                    format!("{}d ago", diff_secs / 86400)
-                }
-            } else {
-                "recorded".to_owned()
-            };
-            tui::SessionChoice {
-                id: s.session,
-                title: s.title,
-                events: s.version.0,
-                last_seen,
-            }
-        })
-        .collect()
-}
-
-#[cfg(feature = "tui")]
-/// The conversation a resumed session continues from.
-///
-/// Built from completed turns only. A turn that failed or was interrupted
-/// wrote no completion, so its prompt is not replayed: a question the model
-/// never answered, restored as history, reads as something that happened and
-/// is worse than a gap.
-///
-/// Each completed turn contributes the exchange it recorded — prompt,
-/// replies, tool calls, tool results — or, for a stream written before
-/// transcripts existed, whatever the two ends of it can be reconstructed from.
-fn reconstruct_session_conversation(
-    workspace: &Path,
-    session: SessionId,
-) -> (Vec<ModelMessage>, arsy_code::agent::budget::History) {
-    let mut history = arsy_code::agent::budget::History::default();
-    let Ok(store) = open_store(workspace) else {
-        return (Vec::new(), history);
-    };
-    let Ok(events) = store.read(session, 1, 1000) else {
-        return (Vec::new(), history);
-    };
-    let inline = |event: &arsy_kernel::event::EventEnvelope| {
-        let arsy_kernel::event::EventPayload::Inline { data } = &event.payload else {
-            return None;
-        };
-        Some(data.clone())
-    };
-    let turn_of = |data: &Value| {
-        data.get("turn_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    // Two passes, because a transcript is written just before its turn is
-    // closed and a turn that never closed must contribute nothing. One pass
-    // could not know, at the transcript, whether the completion would come.
-    let mut completed = std::collections::HashSet::new();
-    let mut prompts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for event in &events {
-        let Some(data) = inline(event) else { continue };
-        match event.kind.as_str() {
-            "turn.completed" => {
-                completed.insert(turn_of(&data));
-            }
-            "turn.started" => {
-                if let Some(prompt) = data.get("prompt").and_then(Value::as_str) {
-                    prompts.insert(turn_of(&data), prompt.to_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut messages = Vec::new();
-    let mut transcribed = std::collections::HashSet::new();
-    for event in &events {
-        let Some(data) = inline(event) else { continue };
-        let turn = turn_of(&data);
-        if !completed.contains(&turn) {
-            continue;
-        }
-        match event.kind.as_str() {
-            "turn.transcript" => {
-                let recorded = transcript::restore(data.get("transcript").unwrap_or(&Value::Null));
-                if !recorded.is_empty() {
-                    transcribed.insert(turn);
-                    messages.extend(recorded);
-                    // What a later compaction of this prefix would cite: the
-                    // event that holds the exchange verbatim.
-                    history.citations.push(arsy_kernel::context::EventCitation {
-                        id: event.id,
-                        sequence: event.sequence,
-                    });
-                }
-            }
-            // A stream written before transcripts existed, or one whose
-            // transcript did not survive. The question it was asked is what it
-            // has, and it is better than nothing.
-            "turn.completed" if !transcribed.contains(&turn) => {
-                if let Some(prompt) = prompts.remove(&turn) {
-                    messages.push(ModelMessage {
-                        role: ModelRole::User,
-                        content: vec![ModelContent::Text { text: prompt }],
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    (messages, history)
-}
-
-/// The providers configured right now, in the order the configuration lists
-/// them. Read fresh each time `/provider` opens, so an edit made outside ARSY
-/// is not hidden behind a stale list.
-#[cfg(feature = "tui")]
-fn configured_providers(invocation: &Invocation) -> Vec<String> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
-        return Vec::new();
-    };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) else {
-        return Vec::new();
-    };
-    config.endpoint_ids()
-}
-
-/// Take one answer and say what to ask next.
-///
-/// Every step validates its own answer and nothing is written until the last
-/// one, so abandoning the wizard leaves the configuration exactly as it was.
-#[cfg(feature = "tui")]
-fn provider_step(
-    invocation: &Invocation,
-    step: tui::ProviderStep,
-    line: &str,
-    draft: &mut tui::ProviderDraft,
-    providers: &[String],
-) -> Result<ProviderNext, String> {
-    use tui::ProviderStep as Step;
-
-    let answer = if step.masked() { line } else { line.trim() };
-    if answer.is_empty() {
-        return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
-    }
-    let one_of = |rows: &[(&str, &str)]| {
-        rows.iter()
-            .any(|(name, _)| *name == answer)
-            .then(|| answer.to_owned())
-            .ok_or_else(|| {
-                format!(
-                    "`{}` is not one of {}",
-                    tui::safe_text(answer),
-                    rows.iter()
-                        .map(|(name, _)| *name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-    };
-    let writable = |field: &str| {
-        config_edit::is_writable(answer)
-            .then(|| answer.to_owned())
-            .ok_or_else(|| {
-                format!("a {field} must be plain ASCII with no quotes, backslashes, or padding")
-            })
-    };
-
-    match step {
-        Step::Pick => provider_picked(answer, providers),
-        Step::Name => {
-            draft.name = provider_name(writable("provider name")?, providers)?;
-            Ok(ProviderNext::Ask(Step::Kind))
-        }
-        Step::Kind => {
-            draft.kind = one_of(tui::PROVIDER_KINDS)?;
-            Ok(ProviderNext::Ask(Step::BaseUrl))
-        }
-        Step::BaseUrl => {
-            let url = writable("base URL")?;
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err("a base URL starts with http:// or https://".to_owned());
-            }
-            draft.base_url = url;
-            Ok(ProviderNext::Ask(Step::Model))
-        }
-        Step::Model => {
-            draft.models = model_slugs(answer)?;
-            Ok(ProviderNext::Ask(Step::Store))
-        }
-        Step::Store => {
-            draft.store = one_of(tui::PROVIDER_STORES)?;
-            Ok(ProviderNext::Ask(Step::Key))
-        }
-        Step::Key => provider_added(invocation, draft, answer),
-        Step::Remove => {
-            if !providers.iter().any(|name| name == answer) {
-                return Err(format!(
-                    "`{}` is not a configured provider",
-                    tui::safe_text(answer)
-                ));
-            }
-            draft.name = answer.to_owned();
-            Ok(ProviderNext::Ask(Step::ConfirmRemove))
-        }
-        Step::ConfirmRemove => {
-            if one_of(tui::CONFIRM_ROWS)? == "no" {
-                return Ok(ProviderNext::Cancelled("Provider unchanged.".to_owned()));
-            }
-            provider_removed(invocation, &draft.name.clone())
-        }
-    }
-}
-
-/// The first answer: one of the two wizard rows, or an endpoint to switch to.
-#[cfg(feature = "tui")]
-fn provider_picked(answer: &str, providers: &[String]) -> Result<ProviderNext, String> {
-    match answer {
-        "+new" => Ok(ProviderNext::Ask(tui::ProviderStep::Name)),
-        "-remove" => Ok(ProviderNext::Ask(tui::ProviderStep::Remove)),
-        chosen if providers.iter().any(|name| name == chosen) => {
-            write_config(|config| config_edit::set_default(config, chosen))?;
-            Ok(ProviderNext::Done(format!("Provider: {chosen}")))
-        }
-        other => Err(format!(
-            "`{}` is not a configured provider",
-            tui::safe_text(other)
-        )),
-    }
-}
-
-/// A name for a new endpoint: not one that exists, and not one the picker
-/// would read as its own `+new` or `-remove` row.
-#[cfg(feature = "tui")]
-fn provider_name(name: String, providers: &[String]) -> Result<String, String> {
-    if providers.contains(&name) {
-        return Err(format!("`{name}` is already configured"));
-    }
-    if name.starts_with(['+', '-']) {
-        return Err("a provider name cannot start with `+` or `-`".to_owned());
-    }
-    Ok(name)
-}
-
-/// The last answer of the add wizard: store the credential, write the
-/// endpoint, and make it the default.
-#[cfg(feature = "tui")]
-fn provider_added(
-    invocation: &Invocation,
-    draft: &tui::ProviderDraft,
-    key: &str,
-) -> Result<ProviderNext, String> {
-    let handle = store_credential(invocation, &draft.name, &draft.store, key)?;
-    let endpoint = config_edit::Endpoint {
-        name: draft.name.clone(),
-        kind: draft.kind.clone(),
-        base_url: draft.base_url.clone(),
-        models: draft.models.clone(),
-        credential: handle,
-    };
-    write_config(|config| {
-        let config = config_edit::append_endpoint(config, &endpoint)?;
-        config_edit::set_default(&config, &endpoint.name)
-    })?;
-    Ok(ProviderNext::Done(format!(
-        "Added provider {} with {} model{}, and made it the default. The others are \
-         still configured; `/provider` switches between them.",
-        endpoint.name,
-        endpoint.models.len(),
-        if endpoint.models.len() == 1 { "" } else { "s" },
-    )))
-}
-
-/// Remove the endpoint and every credential stored for it.
-///
-/// The catalog is updated first and the stores after it, so a store that
-/// refuses cannot leave the catalog naming a credential the wizard just said
-/// it removed.
-#[cfg(feature = "tui")]
-fn provider_removed(invocation: &Invocation, name: &str) -> Result<ProviderNext, String> {
-    write_config(|config| config_edit::remove_endpoint(config, name))?;
-    let store = CatalogStore::resolve(invocation);
-    if let Ok(mut records) = catalog(store) {
-        let removed: Vec<SecretHandle> = records
-            .iter()
-            .filter(|record| {
-                record.handle.name() == name || record.handle.name() == format!("endpoint.{name}")
-            })
-            .map(|record| record.handle.clone())
-            .collect();
-        records.retain(|record| !removed.contains(&record.handle));
-        let _ = save_catalog(store, &records);
-        for handle in removed {
-            forget_credential(&handle);
-        }
-    }
-    Ok(ProviderNext::Done(format!(
-        "Removed provider {name} and its credentials."
-    )))
-}
-
-/// Delete one stored credential from whichever store holds it. A store that
-/// refuses is not an error here: the catalog no longer names the handle, and
-/// the wizard has nothing left to undo.
-#[cfg(feature = "tui")]
-fn forget_credential(handle: &SecretHandle) {
-    match handle.store() {
-        OS_STORE_ID => {
-            let _ = OsCredentialStore.remove(handle.name());
-        }
-        FILE_STORE_ID => {
-            let _ = FileCredentialStore.remove(handle.name());
-        }
-        _ => {}
-    }
-}
-#[cfg(feature = "tui")]
-enum AuthNext {
-    Ask(tui::AuthStep),
-    Done(String),
-    Cancelled(String),
-}
-
-#[cfg(feature = "tui")]
-fn catalog_handles(invocation: &Invocation) -> Vec<String> {
-    catalog(CatalogStore::resolve(invocation))
-        .map(|records| records.into_iter().map(|r| r.handle.to_string()).collect())
-        .unwrap_or_default()
-}
-
-#[cfg(feature = "tui")]
-fn auth_step(
-    invocation: &Invocation,
-    step: tui::AuthStep,
-    line: &str,
-    draft_provider: &mut String,
-    providers: &[String],
-    emitter: &mut Emitter,
-) -> Result<AuthNext, String> {
-    let answer = if step.masked() { line } else { line.trim() };
-    if answer.is_empty() {
-        return Ok(AuthNext::Cancelled("Auth unchanged.".to_owned()));
-    }
-    match step {
-        tui::AuthStep::Pick => auth_pick(invocation, answer, providers),
-        tui::AuthStep::LoginProvider => {
-            auth_login_provider(invocation, answer, draft_provider, providers, emitter)
-        }
-        tui::AuthStep::SetProvider => auth_set_provider(answer, draft_provider, providers),
-        tui::AuthStep::SetKey => auth_set_key(invocation, draft_provider, answer),
-        tui::AuthStep::RemoveHandle => auth_remove_handle(invocation, answer),
-        tui::AuthStep::PasteCode => auth_paste_code(invocation, draft_provider, answer, emitter),
-    }
-}
-
-#[cfg(feature = "tui")]
-fn auth_pick(
-    invocation: &Invocation,
-    answer: &str,
-    providers: &[String],
-) -> Result<AuthNext, String> {
-    match answer {
-        // A built-in preset is always an option, so `login` never dead-ends
-        // the way `set` does with nothing configured.
-        "login" => Ok(AuthNext::Ask(tui::AuthStep::LoginProvider)),
-        "list" => {
-            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-            let human = human_credentials(&records);
-            let rendered = human
-                .get("credentials")
-                .and_then(Value::as_str)
-                .unwrap_or("No credentials catalogued.");
-            Ok(AuthNext::Done(rendered.to_owned()))
-        }
-        "set" => {
-            if providers.is_empty() {
-                return Err(
-                    "no providers are configured; configure a provider endpoint first".to_owned(),
-                );
-            }
-            Ok(AuthNext::Ask(tui::AuthStep::SetProvider))
-        }
-        "remove" => {
-            let records = catalog(CatalogStore::resolve(invocation)).map_err(|e| e.message)?;
-            if records.is_empty() {
-                return Err("no credentials are saved in the catalog".to_owned());
-            }
-            Ok(AuthNext::Ask(tui::AuthStep::RemoveHandle))
-        }
-        other => Err(format!(
-            "`{}` is not one of login, list, set, remove",
-            tui::safe_text(other)
-        )),
-    }
-}
-
-#[cfg(feature = "tui")]
-fn auth_login_provider(
-    invocation: &Invocation,
-    answer: &str,
-    draft_provider: &mut String,
-    providers: &[String],
-    emitter: &mut Emitter,
-) -> Result<AuthNext, String> {
-    let known =
-        providers.iter().any(|p| p == answer) || arsy_kernel::oauth::presets::get(answer).is_some();
-    if !known {
-        return Err(format!(
-            "`{}` is not a configured provider or a built-in preset",
-            tui::safe_text(answer)
-        ));
-    }
-    let oauth = resolve_oauth_login(invocation, answer)
-        .map_err(|e| e.message)?
-        .oauth;
-    if arsy_kernel::oauth::uses_manual_grant(&oauth) {
-        // No loopback listener can catch this issuer's redirect, and no
-        // background poll can wait it out either: the operator has to paste
-        // a code back, and that has to arrive through this same line editor
-        // on a later turn — a blocking stdin read here would compete with
-        // it and never see a keystroke.
-        let prompt = arsy_kernel::oauth::begin_manual(&oauth).map_err(|e| e.to_string())?;
-        let opened = emitter.output == Output::Human && open_browser(&prompt.authorize_url);
-        *draft_provider = format!("{answer}\n{}", prompt.verifier);
-        let _ = writeln!(
-            io::stderr(),
-            "{}\n  {}\nThen paste the code it shows you here.",
-            if opened {
-                "Opening your browser to sign in. If it did not open, visit:"
-            } else {
-                "Open this URL to sign in:"
-            },
-            prompt.authorize_url
-        );
-        return Ok(AuthNext::Ask(tui::AuthStep::PasteCode));
-    }
-    auth_login(invocation, answer, emitter).map_err(|e| e.message)?;
-    Ok(AuthNext::Done(format!(
-        "Signed in to `{answer}` with OAuth."
-    )))
-}
-
-#[cfg(feature = "tui")]
-fn auth_set_provider(
-    answer: &str,
-    draft_provider: &mut String,
-    providers: &[String],
-) -> Result<AuthNext, String> {
-    if !providers.iter().any(|p| p == answer) {
-        return Err(format!(
-            "`{}` is not a configured provider",
-            tui::safe_text(answer)
-        ));
-    }
-    *draft_provider = answer.to_owned();
-    Ok(AuthNext::Ask(tui::AuthStep::SetKey))
-}
-
-#[cfg(feature = "tui")]
-fn auth_set_key(
-    invocation: &Invocation,
-    draft_provider: &str,
-    answer: &str,
-) -> Result<AuthNext, String> {
-    store_credential(invocation, draft_provider, "keychain", answer).map_err(|e| e.to_string())?;
-    Ok(AuthNext::Done(format!(
-        "Stored API key for `{draft_provider}` in the credential store."
-    )))
-}
-
-#[cfg(feature = "tui")]
-fn auth_remove_handle(invocation: &Invocation, answer: &str) -> Result<AuthNext, String> {
-    let handle: SecretHandle =
-        SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
-    let store = CatalogStore::resolve(invocation);
-    let mut records = catalog(store).map_err(|e| e.message)?;
-    records.retain(|r| r.handle != handle);
-    save_catalog(store, &records).map_err(|e| e.message)?;
-    match handle.store() {
-        OS_STORE_ID => {
-            let _ = OsCredentialStore.remove(handle.name());
-        }
-        FILE_STORE_ID => {
-            let _ = FileCredentialStore.remove(handle.name());
-        }
-        _ => {}
-    }
-    Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))
-}
-
-#[cfg(feature = "tui")]
-fn auth_paste_code(
-    invocation: &Invocation,
-    draft_provider: &str,
-    answer: &str,
-    emitter: &mut Emitter,
-) -> Result<AuthNext, String> {
-    let (provider, verifier) = draft_provider
-        .split_once('\n')
-        .ok_or_else(|| "the login was interrupted; run `/auth login` again".to_owned())?;
-    let login = resolve_oauth_login(invocation, provider).map_err(|e| e.message)?;
-    let transport = arsy_kernel::provider::http::HttpTransport::default();
-    let tokens = arsy_kernel::oauth::finish_manual(&transport, &login.oauth, verifier, answer)
-        .map_err(|e| e.to_string())?;
-    store_oauth_login(invocation, provider, &login, tokens, emitter).map_err(|e| e.message)?;
-    Ok(AuthNext::Done(format!(
-        "Signed in to `{provider}` with OAuth."
-    )))
-}
-/// One host serves several models, so the model step takes a list. The first is
-/// the endpoint's default; the rest are what `/model` offers beside it.
-#[cfg(feature = "tui")]
-fn model_slugs(answer: &str) -> Result<Vec<String>, String> {
-    let mut models: Vec<String> = Vec::new();
-    for slug in answer
-        .split(',')
-        .map(str::trim)
-        .filter(|slug| !slug.is_empty())
-    {
-        if !config_edit::is_writable(slug) {
-            return Err(format!(
-                "`{}` is not a model slug: plain ASCII, no quotes or backslashes",
-                tui::safe_text(slug)
-            ));
-        }
-        if !models.iter().any(|existing| existing == slug) {
-            models.push(slug.to_owned());
-        }
-    }
-    if models.is_empty() {
-        return Err("name at least one model".to_owned());
-    }
-    Ok(models)
-}
-
-/// Put a typed credential where the operator asked for it, and give back the
-/// handle the configuration should point at.
-#[cfg(feature = "tui")]
-fn store_credential(
-    invocation: &Invocation,
-    name: &str,
-    store: &str,
-    secret: &str,
-) -> Result<String, String> {
-    let secret = secret.trim();
-    if secret.len() < arsy_kernel::secret::MIN_SECRET_BYTES {
-        return Err("that credential is too short to redact safely".to_owned());
-    }
-    let handle = if store == "keychain" {
-        OsCredentialStore
-            .set(name, secret)
-            .map_err(|error| format!("the credential store refused it: {error}"))?;
-        SecretHandle::new(OS_STORE_ID, name)
-    } else {
-        let file = format!("{name}.key");
-        let path = FileCredentialStore::path(&file)
-            .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut written = owner_only(&path).map_err(|error| error.message)?;
-        written
-            .write_all(secret.as_bytes())
-            .map_err(|error| error.to_string())?;
-        SecretHandle::new(FILE_STORE_ID, file)
-    }
-    .map_err(|error| error.to_string())?;
-
-    // Catalogued exactly as `arsy auth set` catalogues one, for two reasons:
-    // `auth list` can show it, and every turn registers the catalogued handles
-    // for redaction — a credential missing from the catalog is one that could
-    // reach output unredacted.
-    let store = CatalogStore::resolve(invocation);
-    let mut records = catalog(store).map_err(|error| error.message)?;
-    // Updated in place when the handle is already known, the way `auth set`
-    // updates it, so re-entering a credential does not reset when it was first
-    // stored.
-    match records.iter_mut().find(|record| record.handle == handle) {
-        Some(record) => {
-            record.provider = name.to_owned();
-            record.kind = CredentialKind::ApiKey;
-        }
-        None => records.push(AuthRecord {
-            provider: name.to_owned(),
-            handle: handle.clone(),
-            created_at: now().map_err(|error| error.message)?,
-            last_used: None,
-            kind: CredentialKind::ApiKey,
-        }),
-    }
-    save_catalog(store, &records).map_err(|error| error.message)?;
-    Ok(handle.to_string())
-}
-
-/// Rewrite the user configuration through `edit`.
-///
-/// The file is read and written whole, so `edit` sees exactly what is on disk
-/// and nothing it did not change can move.
-fn write_config(edit: impl FnOnce(&str) -> Result<String, String>) -> Result<(), String> {
-    let path = arsy_kernel::config::user_config()
-        .ok_or_else(|| "this platform has no user configuration directory".to_owned())?;
-    let original = match std::fs::read_to_string(&path) {
-        Ok(original) => original,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("the configuration could not be read: {error}")),
-    };
-    let updated = edit(&original)?;
-    replace_file(&path, updated.as_bytes())
-        .map_err(|error| format!("the configuration could not be written: {error}"))
-}
-
-/// What to print once an effort answer is accepted.
-#[cfg(feature = "tui")]
-fn effort_line(effort: Option<Effort>) -> String {
-    match effort {
-        Some(effort) => format!("Effort: {effort}"),
-        None => "Effort: off, so no reasoning setting is sent".to_owned(),
-    }
-}
-
-/// One interactive turn's durable state: the session it is recorded in, and
-/// the task it is.
-///
-/// The TUI takes the same shape `arsy run` does — a turn is a leased task in
-/// the session's graph — so an interactive turn that dies with its process is
-/// recoverable by `arsy resume` exactly like a scripted one. What it cannot
-/// share is `TaskRun::execute`, which owns the streaming loop a terminal has
-/// its own version of.
-#[cfg(feature = "tui")]
-struct RecordedTurn {
-    service: AgentService,
-    graph: TaskGraph,
-    actor: Principal,
-    admission: arsy_kernel::service::TurnAdmission,
-    session: SessionId,
-    task: TaskId,
-}
-
-#[cfg(feature = "tui")]
-fn record_turn(
-    invocation: &Invocation,
-    session: SessionId,
-    task: String,
-    emitter: &mut Emitter,
-) -> Result<RecordedTurn, Diagnostic> {
-    let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    emitter.session = Some(session);
-    let actor = actor();
-    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
-        .map_err(storage_failed)?;
-    let mut graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
-    let agent = AgentId::new();
-    let id = TaskId::new();
-    graph
-        .add(TaskNode {
-            id,
-            goal: task.clone(),
-            dependencies: Vec::new(),
-            assignee: Some(agent),
-            required_output: "an answer to the task".to_owned(),
-            workspace: WorkspaceRequirement::IsolatedWriter,
-            budget: TASK_BUDGET,
-            authority: Vec::new(),
-            state: TaskState::Pending,
-            lease_expires_at_ms: None,
-            runtime: Default::default(),
-        })
-        .map_err(graph_failed)?;
-    graph.ready().map_err(graph_failed)?;
-    graph
-        .lease(id, agent, unix_time_ms() + TASK_LEASE_MS)
-        .map_err(graph_failed)?;
-
-    let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
-        session,
-        prompt: task,
-        extensions: Extensions::new(),
-    }));
-    let admission = service
-        .start_turn(actor.clone(), &envelope)
-        .map_err(storage_failed)?;
-    Ok(RecordedTurn {
-        service,
-        graph,
-        actor,
-        admission,
-        session,
-        task: id,
-    })
-}
-
-#[cfg(feature = "tui")]
+/// A helper rather than the body of `read_line`'s inner loop, because the two
+/// loops answer different questions — when to repaint, and what a key means —
+/// and neither should have to hold the other's state.
 #[allow(clippy::too_many_arguments)]
-fn run_turn(
-    invocation: &Invocation,
-    session_id: SessionId,
-    mut native: Option<&mut provider::Resolved>,
-    task: &str,
-    history: &arsy_code::agent::budget::History,
-    route: &tui::ModelRoute,
-    effort: Option<Effort>,
+fn drain_input_keys(
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    composer: &mut tui::Composer,
+    stdout: &mut dyn Write,
     colour: bool,
-    footer: &str,
-    conversation: &mut Vec<ModelMessage>,
+    width: usize,
     transcript: &mut tui::Transcript,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    approval: &approval::ApprovalCell,
-    emitter: &mut Emitter,
-) -> Result<Turn, Diagnostic> {
-    let task = prepare_task(invocation, task, emitter)?;
-    let root = workspace_root(&invocation.workspace)?;
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let config = load_config(&root, &working, invocation.config.as_deref())?;
-    // Loaded once per turn, as `arsy run` loads them: a turn finishes with the
-    // hooks it began with.
-    let loaded = hook_engine(&root, &config);
-    let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
-    let task = turn_boundary(
-        hooks,
-        arsy_code::hook::LifecycleEvent::BeforeTurn,
-        &task,
-        emitter,
-    )
-    .map_err(|reason| {
-        Diagnostic::error(
-            "ARSY-HOK-1001",
-            reason,
-            "the hook that refused it is listed by `/hooks`",
-        )
-    })?;
-    let RecordedTurn {
-        service,
-        mut graph,
-        actor,
-        admission,
-        session,
-        task: node,
-    } = record_turn(invocation, session_id, task.clone(), emitter)?;
-    // Where the conversation stood before this turn. A turn that fails or is
-    // stopped rewinds to here, which is more than one message once the turn
-    // has run tools.
-    let base = conversation.len();
-    conversation.push(ModelMessage {
-        role: ModelRole::User,
-        content: vec![ModelContent::Text { text: task.clone() }],
-    });
-    emitter.trace(
-        "turn.started",
-        json!({
-            "turn": admission.turn.to_string(),
-            "provider": route.provider,
-            "model": route.model,
-            "restored_messages": base,
-            "cited_events": history.citations.len(),
-            "mode": approval.get().label(),
-        }),
-    );
-    let outcome = match native.as_deref_mut() {
-        Some(resolved) => native_turn(
-            resolved,
-            &config,
-            &agent_runtime(
-                &root,
-                &config,
-                true,
-                &session_id.to_string(),
-                Some(session_id),
-                None,
-                Some(session_connector()),
-                emitter,
-            )?
-            .with_execution_mode(approval.get().execution_mode()),
-            conversation,
-            history,
-            route,
-            effort,
-            admission.turn,
-            colour,
-            footer,
-            keys,
-            decoder,
-            composer,
-            transcript,
-            approval,
-            hooks,
-        ),
-        None => external_status(
-            &root,
-            &task,
-            route,
-            approval,
-            colour,
-            footer,
-            keys,
-            decoder,
-            composer,
-            &emitter.redactor,
-        ),
-    };
-    // A turn that never started leaves the composer painted, so it is torn down
-    // here before the diagnostic is written over the input block.
-    if outcome.is_err() {
-        let mut stdout = io::stdout();
-        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
-    }
-    let turn = match outcome {
-        Ok(turn) => turn,
-        Err(error) => {
-            let reason = format!("could not run {route}: {error}");
-            graph
-                .fail(node, json!({"message": reason.clone()}))
-                .map_err(graph_failed)?;
-            fail_turn(
-                &service,
-                actor,
-                admission.turn,
-                session,
-                route,
-                reason,
-                emitter,
-            )?;
-            return Ok(Turn::default());
-        }
-    };
-    if !turn.interrupted && turn.failure.is_none() {
-        transcript.push_assistant(&turn.response);
-    }
-    // Whatever the turn ended as, which is what Codex's `notify` is for.
-    // Nothing it returns can change what already happened.
-    let stop = match (turn.interrupted, &turn.failure) {
-        (true, _) => "interrupted",
-        (false, Some(_)) => "failed",
-        (false, None) => "answered",
-    };
-    let _ = turn_boundary(
-        hooks,
-        arsy_code::hook::LifecycleEvent::AfterTurn,
-        stop,
-        emitter,
-    );
-    emitter.trace(
-        "turn.finished",
-        json!({
-            "turn": admission.turn.to_string(),
-            "interrupted": turn.interrupted,
-            "failed": turn.failure.is_some(),
-            "response_bytes": turn.response.len(),
-            "usage": turn.usage,
-            "messages_added": conversation.len().saturating_sub(base),
-        }),
-    );
-    if turn.interrupted {
-        conversation.truncate(base);
-        // Stopping a turn is a decision, not a fault: the turn is recorded as
-        // failed for the audit trail, but the terminal already said so with an
-        // `Interrupted` row and does not need a diagnostic on top.
-        service
-            .fail_turn(
-                actor,
-                admission.turn,
-                "user_interrupt",
-                format!("{route} was interrupted"),
-            )
-            .map_err(storage_failed)?;
-        // Cancelled rather than failed: the operator stopped it, so nothing
-        // should offer to continue it later.
-        graph
-            .cancel(node, "interrupted by the operator")
-            .map_err(graph_failed)?;
-        turn_record(
-            emitter,
-            json!({
-                "session": session.to_string(),
-                "turn": admission.turn.to_string(),
-                "status": "interrupted",
-            }),
-        );
-        return Ok(turn);
-    }
-    match &turn.failure {
-        None => {
-            if !turn.response.trim().is_empty() {
-                conversation.push(ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: vec![ModelContent::Text {
-                        text: turn.response.clone(),
-                    }],
-                });
-            }
-            let mut outcome = json!({"provider": route.provider, "model": route.model});
-            merge(&mut outcome, turn.usage.clone());
-            // The interactive path records what it spent for the same reason
-            // the scripted one does: `arsy session show` reports one session's
-            // totals, and totals that skipped every TUI turn would be fiction.
-            let priced = charge_turn(native.as_deref(), &route.model, &turn.usage);
-            merge(
-                &mut outcome,
-                json!({
-                    "cost_micros": priced,
-                    "cost_source": if priced.is_some() { "configured" } else { "unknown" },
-                    "response": turn.response.clone(),
-                    // From where this turn began, so a resumed session replays
-                    // the tool calls and results the model actually saw rather
-                    // than only the two ends of the exchange.
-                    "transcript": transcript::persistable(&conversation[base..]),
-                }),
-            );
-            service
-                .record_usage(
-                    actor.clone(),
-                    arsy_kernel::projection::UsageTotals {
-                        input_tokens: summary_number(&turn.usage, "input_tokens"),
-                        output_tokens: summary_number(&turn.usage, "output_tokens"),
-                        cost_micros: priced,
-                    },
-                )
-                .map_err(storage_failed)?;
-            // Before the turn is closed, so a process that dies between the
-            // two leaves a transcript belonging to a turn that never
-            // completed — which the reconstruction ignores — rather than a
-            // completed turn whose exchange was never written.
-            service
-                .record_transcript(
-                    actor.clone(),
-                    admission.turn,
-                    &transcript::persistable(&conversation[base..]),
-                )
-                .map_err(storage_failed)?;
-            service
-                .complete_turn(actor, admission.turn, &outcome)
-                .map_err(storage_failed)?;
-            graph
-                .complete(node, outcome.clone())
-                .map_err(graph_failed)?;
-            turn_record(
-                emitter,
-                json!({
-                    "session": session.to_string(),
-                    "turn": admission.turn.to_string(),
-                    "status": "completed",
-                    "model": route.to_string(),
-                }),
-            );
-        }
-        Some(failure) => {
-            conversation.truncate(base);
-            graph
-                .fail(node, json!({"message": failure.clone()}))
-                .map_err(graph_failed)?;
-            fail_turn(
-                &service,
-                actor,
-                admission.turn,
-                session,
-                route,
-                failure.clone(),
-                emitter,
-            )?;
-        }
-    }
-    Ok(turn)
-}
-
-/// How many times one turn may come back asking to run tools. The bound is
-/// what stops a model that answers every result with another call from
-/// spending a session on its own loop.
-#[cfg(feature = "tui")]
-const MAX_TOOL_ROUNDS: usize = 24;
-
-/// What the operator said about one tool call.
-#[cfg(feature = "tui")]
-fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
-    // A timeout is execution metadata, not command identity. Otherwise a
-    // provider can evade duplicate protection by changing only the deadline.
-    let identity = if name == "bash" {
-        arguments.get("command").cloned().unwrap_or(Value::Null)
-    } else {
-        arguments.clone()
-    };
-    format!("{name}\0{identity}")
-}
-#[cfg(feature = "tui")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum Answer {
-    Yes {
-        note: Option<String>,
-    },
-    /// Refuse this call; the turn carries on and can propose something else.
-    No {
-        note: Option<String>,
-    },
-    /// Refuse this call and end the turn.
-    Stop,
-}
-
-/// Run a turn on a configured provider, executing the tools it asks for.
-///
-/// Each round is one request. A round that ends without tool calls is the
-/// answer; a round that asks for tools runs the confirmed ones, appends the
-/// call and its result to the conversation, and asks again.
-///
-/// Nothing runs unconfirmed: every call is shown and answered from the
-/// keyboard, and a declined call is reported to the model as a failed result
-/// rather than hidden, so it can say what it would do instead.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn native_turn(
-    resolved: &mut provider::Resolved,
-    config: &arsy_kernel::config::Config,
-    runtime: &arsy_code::agent::ToolRuntime,
-    conversation: &mut Vec<ModelMessage>,
-    history: &arsy_code::agent::budget::History,
-    route: &tui::ModelRoute,
-    effort: Option<Effort>,
-    turn: arsy_kernel::domain::TurnId,
-    colour: bool,
-    footer: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    transcript: &mut tui::Transcript,
-    approval: &approval::ApprovalCell,
-    hooks: Option<&arsy_code::hook::HookEngine>,
-) -> io::Result<Turn> {
-    // rather than taken from the last one: an audit that reads a tool-using
-    // turn as the price of its final request under-reports what it cost.
-    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
-    let charge = |outcome: &mut Turn, input: &mut u64, output: &mut u64| {
-        *input += outcome.usage["input_tokens"].as_u64().unwrap_or_default();
-        *output += outcome.usage["output_tokens"].as_u64().unwrap_or_default();
-        if *input > 0 || *output > 0 {
-            outcome.usage = json!({"input_tokens": *input, "output_tokens": *output});
-        }
-    };
-    // Successful calls are memoized within this turn. If a provider asks for
-    // the exact same effect again, return the first result instead of running
-    // it twice or burning all 24 rounds.
-    let mut completed_calls = std::collections::HashMap::<String, String>::new();
-    for round in 0..MAX_TOOL_ROUNDS {
-        // Before the request, not after: a transcript that has outgrown the
-        // window fails at the provider, and the operator is told what was
-        // elided rather than watching the turn shrink invisibly.
-        report_trim(
-            colour,
-            &arsy_code::agent::budget::fit(conversation, context_budget(resolved), Some(history)),
-        )?;
-        let mut outcome = native_status_with_refresh(
-            resolved,
-            config,
-            runtime,
-            conversation,
-            route,
-            effort,
-            turn,
-            round,
-            colour,
-            footer,
-            keys,
-            decoder,
-            composer,
-            approval,
-        )?;
-        charge(&mut outcome, &mut input_tokens, &mut output_tokens);
-        if outcome.calls.is_empty() || outcome.interrupted || outcome.failure.is_some() {
-            return Ok(outcome);
-        }
-        // The calls are history now, whatever the operator decides about them:
-        // a provider that sent a call and never sees its result rejects the
-        // next request.
-        let calls = std::mem::take(&mut outcome.calls);
-        let mut content: Vec<ModelContent> = Vec::new();
-        if !outcome.response.trim().is_empty() {
-            content.push(ModelContent::Text {
-                text: outcome.response.clone(),
-            });
-        }
-        content.extend(
-            calls
-                .iter()
-                .map(|(id, name, arguments)| ModelContent::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                }),
-        );
-        conversation.push(ModelMessage {
-            role: ModelRole::Assistant,
-            content,
-        });
-
-        let mut results = Vec::with_capacity(calls.len());
-        let mut terminal = io::stdout();
-        let mut all_repeated = true;
-        for (id, name, arguments) in &calls {
-            let summary = runtime.summarize(name, arguments);
-            let fingerprint = tool_call_fingerprint(name, arguments);
-            let cached = completed_calls.get(&fingerprint).cloned();
-            let repeated = cached.is_some();
-            // Once the turn is stopped the remaining calls are still answered,
-            // because a call the provider sent needs a result; they are simply
-            // answered without running anything.
-            let (content, is_error) = match (outcome.interrupted, cached) {
-                // Once the turn is stopped the remaining calls are still
-                // answered, because a call the provider sent needs a result;
-                // they are simply answered without running anything.
-                (true, _) => {
-                    all_repeated = false;
-                    ("The operator declined to run this call.".to_owned(), true)
-                }
-                (false, Some(previous)) => (
-                    format!(
-                        "This exact tool call already completed successfully; skipped duplicate.\n\
-                         {previous}"
-                    ),
-                    false,
-                ),
-                (false, None) => {
-                    all_repeated = false;
-                    run_call(
-                        runtime,
-                        &mut terminal,
-                        colour,
-                        &summary,
-                        Call {
-                            name,
-                            arguments,
-                            fingerprint,
-                        },
-                        Answering {
-                            keys,
-                            decoder,
-                            approval,
-                            completed: &mut completed_calls,
-                            interrupted: &mut outcome.interrupted,
-                            hooks,
-                        },
-                    )?
-                }
-            };
-            if !repeated {
-                transcript.push_tool(
-                    name,
-                    &summary,
-                    &content,
-                    !is_error,
-                    std::time::Duration::from_millis(50),
-                );
-            }
-            let card = if repeated {
-                tui::tool_result_row(colour, name, true, "duplicate skipped")
-            } else {
-                tui::tool_card(
-                    tui::terminal_width(),
-                    colour,
-                    name,
-                    &summary,
-                    &content,
-                    !is_error,
-                    std::time::Duration::from_millis(50),
-                )
-            };
-            writeln!(
-                terminal,
-                "{}{}{}",
-                tui::DISABLE_AUTOWRAP,
-                card,
-                tui::ENABLE_AUTOWRAP
-            )?;
-            terminal.flush()?;
-            results.push(ModelContent::ToolResult {
-                id: id.clone(),
-                content,
-                is_error,
-            });
-        }
-        conversation.push(ModelMessage {
-            role: ModelRole::User,
-            content: results,
-        });
-        if all_repeated && !calls.is_empty() {
-            outcome.response =
-                "The requested operation already completed; a repeated tool call was skipped."
-                    .to_owned();
-            return Ok(outcome);
-        }
-        // The response of a round that called tools belongs to the history
-        // above, not to the answer this turn returns.
-        outcome.response.clear();
-        if outcome.interrupted {
-            return Ok(outcome);
-        }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            outcome.failure = Some(format!(
-                "{route} asked for tools {MAX_TOOL_ROUNDS} times without finishing the turn"
-            ));
-            return Ok(outcome);
-        }
-    }
-    Ok(Turn::default())
-}
-
-/// Take the terminal's size again, no more than ten times a second.
-///
-/// Answers whether it was measured on this pass, because the rows on screen
-/// were laid out for the size before it.
-#[cfg(feature = "tui")]
-fn remeasure(
-    painter: &Painter<'_>,
-    composer: &mut tui::Composer,
-    refreshed: &mut std::time::Instant,
-) -> bool {
-    if refreshed.elapsed() < std::time::Duration::from_millis(100) {
-        return false;
-    }
-    painter.width.set(tui::terminal_width());
-    composer.set_height(tui::terminal_rows());
-    *refreshed = std::time::Instant::now();
-    true
-}
-
-/// Start the provider and wire its three streams.
-///
-/// Stderr and the task being written are each read on their own thread, and
-/// the event stream on a third, so the main loop can watch the keyboard while
-/// the provider works — which is what lets Esc stop a turn and keeps the
-/// composer typeable.
-#[cfg(feature = "tui")]
-type ProviderStreams = (
-    tui::ProviderChild,
-    std::sync::mpsc::Receiver<String>,
-    std::sync::mpsc::Receiver<io::Result<()>>,
-    std::sync::mpsc::Receiver<io::Result<String>>,
-);
-
-#[cfg(feature = "tui")]
-fn spawn_provider(mut command: std::process::Command, task: &str) -> io::Result<ProviderStreams> {
-    // A process group of its own, so a signal aimed at the harness does not also
-    // reach the provider child. There is no Windows equivalent to gate on.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let mut child = tui::ProviderChild(child);
-    let mut stderr = child.0.stderr.take().expect("piped stderr is available");
-    let (errors, error_output) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = Read::by_ref(&mut stderr).take(8192).read_to_end(&mut bytes);
-        let _ = io::copy(&mut stderr, &mut io::sink());
-        let _ = errors.send(String::from_utf8_lossy(&bytes).into_owned());
-    });
-    let mut stdin = child.0.stdin.take().expect("piped stdin is available");
-    let task = task.to_owned();
-    let (sent, input) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = sent.send(stdin.write_all(task.as_bytes()));
-    });
-    // The event stream is read on a thread so the main loop can also watch the
-    // key stream: that is what lets Esc or Ctrl-C stop a turn, and what keeps
-    // the composer alive and typeable while the provider works.
-    let stdout = child.0.stdout.take().expect("piped stdout is available");
-    let events = tui::provider_lines(stdout);
-    Ok((child, error_output, input, events))
-}
-
-/// The line an action carries, if it carries one.
-#[cfg(feature = "tui")]
-fn submitted(
-    input: tui::Action,
-    approval: &approval::ApprovalCell,
-    state: &mut tui::TuiState,
-) -> Option<String> {
-    match input {
-        tui::Action::Submit(line) => Some(line),
-        tui::Action::CycleMode => {
-            let mode = cycle_approval_mode(approval);
-            state.set_approval_mode(mode.label());
-            None
-        }
-        tui::Action::Quit | tui::Action::Redraw | tui::Action::None => None,
-    }
-}
-
-/// Whether the answer being typed is a credential, which is shown as bullets,
-/// never painted into the scrollback, and never remembered.
-#[cfg(feature = "tui")]
-fn masked(prompt: &Prompt) -> bool {
-    matches!(prompt, Prompt::Provider(step) if step.masked())
-        || matches!(prompt, Prompt::Auth(step) if step.masked())
-}
-
-/// Whether ending input here closes a picker rather than the session.
-///
-/// Every picker has to be named, or leaving one exits ARSY instead.
-#[cfg(feature = "tui")]
-fn cancels_to_task(prompt: &Prompt) -> bool {
-    matches!(
-        prompt,
-        Prompt::Model
-            | Prompt::Effort
-            | Prompt::Theme
-            | Prompt::Provider(_)
-            | Prompt::Auth(_)
-            | Prompt::Resume
-    )
-}
-
-/// Answer the line at whichever prompt collected it.
-///
-/// Every picker clears the composer rather than committing it, so no answer —
-/// least of all a credential — is painted into the scrollback.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn answer_prompt(
-    prompt: Prompt,
-    line: &str,
-    invocation: &Invocation,
-    typing: Typing<'_>,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    emitter: &mut Emitter,
-) -> Result<TaskPass, Diagnostic> {
-    if matches!(prompt, Prompt::Task) {
-        return answer_task(
-            line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
-        );
-    }
-    write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-    let next = match prompt {
-        Prompt::Provider(step) => take_provider(
-            invocation,
-            step,
-            line,
-            typing.draft,
-            typing.providers,
-            typing.chosen,
-            stdout,
-        )?,
-        Prompt::Effort => take_effort(line, typing.effort, restoring.state, stdout, emitter)?,
-        // On a rejected answer the list stays open so it can be retyped.
-        Prompt::Theme => {
-            if apply_theme(line, typing.theme, typing.roles, stdout, emitter)
-                .map_err(terminal_failed)?
-            {
-                Prompt::Task
-            } else {
-                Prompt::Theme
-            }
-        }
-        Prompt::Model => take_model(
-            line,
-            typing.models,
-            typing.route,
-            restoring.state,
-            stdout,
-            emitter,
-        )?,
-        Prompt::Auth(step) => take_auth(
-            invocation,
-            step,
-            line,
-            typing.auth_draft,
-            typing.providers,
-            stdout,
-            emitter,
-        )?,
-        Prompt::Resume => take_resume(line, typing.sessions, restoring, stdout)?,
-        Prompt::Session(dialog) => {
-            run_session_dialog(dialog, restoring, stdout, typing.colour, keys, decoder)?;
-            Prompt::Task
-        }
-        Prompt::Task => Prompt::Task,
-    };
-    Ok(TaskPass::Ask(next))
-}
-
-/// Open the session the answer names, or leave the list open.
-#[cfg(feature = "tui")]
-fn take_resume(
-    line: &str,
-    sessions: &[tui::SessionChoice],
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-) -> Result<Prompt, Diagnostic> {
-    match tui::resolve_session_answer(line, sessions, restoring.state.session_id()) {
-        Ok(picked) => {
-            let loaded = resume_into(picked, restoring);
-            writeln!(
-                stdout,
-                "Resumed session {picked} ({loaded} message(s) loaded)."
-            )
-            .map_err(terminal_failed)?;
-            Ok(Prompt::Task)
-        }
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-            Ok(Prompt::Resume)
-        }
-    }
-}
-
-/// Where the session goes after a line typed at the task prompt.
-#[cfg(feature = "tui")]
-enum TaskPass {
-    /// Carry on at the task prompt.
-    Go,
-    /// Collect the next answer at this prompt instead.
-    Ask(Prompt),
-    Stop,
-}
-
-/// What a line typed at the task prompt can reach, apart from the session
-/// itself.
-#[cfg(feature = "tui")]
-struct Typing<'a> {
-    workspace: &'a Path,
-    colour: bool,
-    provider_available: bool,
-    route: &'a mut tui::ModelRoute,
-    effort: &'a mut Option<Effort>,
-    models: &'a mut Vec<tui::ModelChoice>,
-    providers: &'a mut Vec<String>,
-    chosen: &'a mut Option<String>,
-    draft: &'a mut tui::ProviderDraft,
-    auth_draft: &'a mut String,
-    theme: &'a mut String,
-    roles: &'a std::collections::BTreeMap<String, String>,
-    sessions: &'a mut Vec<tui::SessionChoice>,
-    resolved_providers: &'a mut std::collections::HashMap<String, provider::Resolved>,
-    unavailable_providers: &'a mut std::collections::HashSet<String>,
-}
-
-/// Answer a line typed at the task prompt.
-///
-/// A slash command is answered here; anything else is the task itself and is
-/// sent to the model.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn answer_task(
-    line: &str,
-    invocation: &Invocation,
-    typing: Typing<'_>,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    emitter: &mut Emitter,
-) -> Result<TaskPass, Diagnostic> {
-    if matches!(line.trim(), ":quit" | "/quit" | "/exit") {
-        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-        return Ok(TaskPass::Stop);
-    }
-    if line.trim().starts_with('/') || line.trim().is_empty() {
-        write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-        // `/mcp` alone opens the dialog, which writes the configuration; with
-        // any argument it is the read-only inspection it always was.
-        if line.trim() == "/mcp" {
-            run_mcp_dialog(invocation, stdout, typing.colour, keys, decoder)?;
-            return Ok(TaskPass::Go);
-        }
-        return slash_command(line, invocation, typing, restoring, stdout, emitter);
-    }
-    run_task(
-        line, invocation, typing, restoring, stdout, keys, decoder, composer, emitter,
-    )
-}
-
-/// Answer a slash command typed at the task prompt.
-#[cfg(feature = "tui")]
-fn slash_command(
-    line: &str,
-    invocation: &Invocation,
-    typing: Typing<'_>,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> Result<TaskPass, Diagnostic> {
-    if manages_session(line) {
-        let next = manage_session(line, restoring, typing.sessions, stdout)?;
-        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
-    }
-    if steers_turn(line) {
-        steer_turn(
-            line,
-            typing.workspace,
-            restoring.approval,
-            restoring.state,
-            restoring.queued,
-            stdout,
-        )?;
-        return Ok(TaskPass::Go);
-    }
-    if opens_picker(line) {
-        let next = open_picker(
-            line,
-            invocation,
-            Opening {
-                models: typing.models,
-                providers: typing.providers,
-                chosen: typing.chosen,
-                draft: typing.draft,
-                auth_draft: typing.auth_draft,
-                effort: typing.effort,
-                theme: typing.theme,
-                roles: typing.roles,
-                state: restoring.state,
-            },
-            stdout,
-            emitter,
-        )?;
-        return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
-    }
-    // An empty line is not a command and not a task: nothing to answer.
-    if !line.trim().is_empty() {
-        inspect_command(line, invocation, stdout, typing.colour, emitter)?;
-    }
-    Ok(TaskPass::Go)
-}
-
-/// Send the line to the model as the task it is.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn run_task(
-    line: &str,
-    invocation: &Invocation,
-    typing: Typing<'_>,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    emitter: &mut Emitter,
-) -> Result<TaskPass, Diagnostic> {
-    restoring.transcript.push_user(line);
-    write!(stdout, "{}", composer.commit(line, typing.colour)).map_err(terminal_failed)?;
-    stdout.flush().map_err(terminal_failed)?;
-    if !typing.provider_available {
-        emitter.diagnostic(&Diagnostic::error(
-            ARSY_PRV_1000,
-            "provider unavailable",
-            "configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or \
-             run codex login, then restart ARSY; /mcp and /hooks remain available",
-        ));
-        return Ok(TaskPass::Go);
-    }
-    let resolved = resolve_route(
-        invocation,
-        typing.workspace,
-        &typing.route.provider,
-        typing.resolved_providers,
-        typing.unavailable_providers,
-    );
-    let footer = restoring.state.status_row(
-        tui::terminal_width(),
-        typing.colour,
-        tui::branch(typing.workspace).as_deref(),
-    );
-    let pass = take_turn(
-        invocation,
-        resolved,
-        line,
-        &footer,
-        Running {
-            workspace: typing.workspace,
-            route: typing.route,
-            effort: *typing.effort,
-            colour: typing.colour,
-            state: restoring.state,
-            conversation: restoring.conversation,
-            transcript: restoring.transcript,
-            history: restoring.history,
-            approval: restoring.approval,
-            queued: restoring.queued,
-        },
-        stdout,
-        keys,
-        decoder,
-        composer,
-        emitter,
-    )?;
-    Ok(match pass {
-        Pass::Stop => TaskPass::Stop,
-        Pass::Go => TaskPass::Go,
-    })
-}
-
-/// What a turn runs against, and what it is allowed to change.
-#[cfg(feature = "tui")]
-struct Running<'a> {
-    workspace: &'a Path,
-    route: &'a tui::ModelRoute,
-    effort: Option<Effort>,
-    colour: bool,
-    state: &'a mut tui::TuiState,
-    conversation: &'a mut Vec<ModelMessage>,
-    transcript: &'a mut tui::Transcript,
-    history: &'a arsy_code::agent::budget::History,
-    approval: &'a approval::ApprovalCell,
-    queued: &'a mut std::collections::VecDeque<String>,
-}
-
-/// Run one turn and settle what it left behind.
-///
-/// Answers whether the session carries on: a turn can end it, and nothing
-/// after that should run.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn take_turn(
-    invocation: &Invocation,
-    resolved: Option<&mut provider::Resolved>,
-    line: &str,
-    footer: &str,
-    running: Running<'_>,
-    stdout: &mut io::Stdout,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    emitter: &mut Emitter,
-) -> Result<Pass, Diagnostic> {
-    let turn = match run_turn(
-        invocation,
-        running.state.session_id(),
-        resolved,
-        line,
-        running.history,
-        running.route,
-        running.effort,
-        running.colour,
-        footer,
-        running.conversation,
-        running.transcript,
-        keys,
-        decoder,
-        composer,
-        running.approval,
-        emitter,
-    ) {
-        Ok(turn) if turn.quit => return Ok(Pass::Stop),
-        Ok(turn) => turn,
-        Err(diagnostic) => {
-            emitter.diagnostic(&diagnostic);
-            return Ok(Pass::Go);
-        }
-    };
-    // A stopped turn takes the queue with it: a follow-up was queued to run
-    // after this one, not instead of the stop.
-    if turn.interrupted {
-        running.queued.clear();
-    }
-    running.queued.extend(turn.queued);
-    // Mode changes made while the provider was streaming happen through the
-    // shared cell; refresh the visible projection before deciding whether a
-    // plan dialog is still appropriate.
-    running
-        .state
-        .set_approval_mode(running.approval.get().label());
-    if running.approval.get() == approval::ApprovalMode::Plan
-        && !turn.interrupted
-        && turn.failure.is_none()
-    {
-        settle_plan(
-            running.workspace,
-            &turn.response,
-            running.approval,
-            running.state,
-            running.queued,
-            stdout,
-            running.colour,
-            keys,
-            decoder,
-        )?;
-    }
-    Ok(Pass::Go)
-}
-
-/// Answer a slash command that only reads: help, or one of the inspections
-/// the CLI already answers.
-///
-/// The inspection runs through the same parser and the same dispatch a typed
-/// `arsy` command does, so the two can never drift apart.
-#[cfg(feature = "tui")]
-fn inspect_command(
-    line: &str,
-    invocation: &Invocation,
-    stdout: &mut io::Stdout,
-    colour: bool,
-    emitter: &mut Emitter,
-) -> Result<(), Diagnostic> {
-    if line.split_whitespace().next() == Some("/help") {
-        return write!(stdout, "{}", tui::help(colour)).map_err(terminal_failed);
-    }
-    let Some(args) = inspection_args(line) else {
-        return writeln!(stdout, "Unknown command. Use /help for available actions.")
-            .map_err(terminal_failed);
-    };
-    match parse(args) {
-        Ok(parsed) => {
-            let inspection = Invocation {
-                command: parsed.command,
-                ..invocation.clone()
-            };
-            if let Err(diagnostic) = execute(&inspection, false, emitter) {
-                emitter.diagnostic(&diagnostic);
-            }
-        }
-        Err(diagnostic) => emitter.diagnostic(&diagnostic),
-    }
-    Ok(())
-}
-
-/// Fix the palette before the first frame.
-///
-/// A rejected `[theme]` override is reported and dropped, never left to blank
-/// the screen.
-#[cfg(feature = "tui")]
-fn open_palette(
-    invocation: &Invocation,
-    workspace: &Path,
-    emitter: &mut Emitter,
-) -> (arsy_kernel::config::Theme, String) {
-    let config = load_config(workspace, workspace, invocation.config.as_deref())
-        .map(|config| config.theme().clone())
-        .unwrap_or_default();
-    let (theme, palette) = resolve_palette(&config);
-    match palette {
-        Ok(palette) => tui::activate_palette(palette),
-        Err(reason) => {
-            emitter.diagnostic(&Diagnostic::warning(
-                "ARSY-UIX-1002",
-                format!("a [theme] override was ignored: {reason}"),
-                "use #rrggbb colours and role names ARSY knows (see /help)",
-            ));
-            if let Some(palette) = tui::builtin_palette(&theme) {
-                tui::activate_palette(palette);
-            }
-        }
-    }
-    (config, theme)
-}
-
-/// What the session already knows about its providers before the first turn.
-///
-/// A failed native resolution is remembered as unavailable so it is not probed
-/// again on every turn while the external Codex login is still working.
-#[cfg(feature = "tui")]
-fn seed_providers(
-    native: Option<provider::Resolved>,
-    requested: Option<&str>,
-    route: &str,
-) -> (
-    std::collections::HashMap<String, provider::Resolved>,
-    std::collections::HashSet<String>,
-) {
-    let mut resolved = std::collections::HashMap::new();
-    let mut unavailable = std::collections::HashSet::new();
-    match native {
-        Some(found) => {
-            resolved.insert(route.to_owned(), found);
-        }
-        None => {
-            if let Some(requested) = requested.filter(|requested| *requested != "auto") {
-                unavailable.insert(requested.to_owned());
-            }
-        }
-    }
-    (resolved, unavailable)
-}
-
-/// The provider and model a session opens with.
-#[cfg(feature = "tui")]
-struct Opened {
-    native: Option<provider::Resolved>,
-    /// What was asked for, which is not always what resolved.
-    native_requested: Option<String>,
-    detected: tui::ModelRoute,
-    provider_available: bool,
-}
-
-/// Resolve which provider and model this session starts on.
-///
-/// A configured endpoint is preferred, because it is the one ARSY talks to
-/// itself. The Codex CLI stays the fallback for an operator who has not
-/// configured anything, so an existing session keeps working as it did.
-///
-/// Nothing configured and no Codex login is not fatal: the session still opens
-/// so `/mcp` and `/hooks` can inspect the workspace, and only a task turn is
-/// refused.
-///
-/// ponytail: resolved once, so an OAuth access token is the one this session
-/// started with; a session outliving the token's lifetime would need
-/// re-resolving per turn, which costs a credential-store read each time. An
-/// API key does not expire, and `arsy run` resolves per invocation, so only a
-/// long interactive OAuth session is affected.
-#[cfg(feature = "tui")]
-fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Opened, Diagnostic> {
-    let native_requested = invocation.provider.clone().or_else(|| {
-        load_config(workspace, workspace, invocation.config.as_deref())
-            .ok()
-            .and_then(|config| config.provider_default().map(str::to_owned))
-    });
-    let native = load_config(workspace, workspace, invocation.config.as_deref())
-        .and_then(|config| {
-            let resolved = provider::resolve(&config, native_requested.as_deref())?;
-            // `--model` is checked here rather than defaulted: a model the
-            // ceiling excludes must not open a session that would dispatch to
-            // it, and falling back to the configured one would obey a flag the
-            // operator did not give.
-            let model = match invocation.model.as_deref() {
-                Some(_) => {
-                    selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?
-                }
-                None => selected_model(&config, &resolved.endpoint, None).unwrap_or_default(),
-            };
-            Ok((resolved, model))
-        })
-        .ok();
-    let detected = match &native {
-        Some((resolved, model)) => Some(tui::ModelRoute {
-            provider: resolved.endpoint.id.clone(),
-            model: model.clone(),
-        }),
-        None => tui::detect_model_route(),
-    };
-    // Nothing configured and no Codex login is not fatal: the session still
-    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
-    // is refused, which `provider_available` gates below.
-    let provider_available = detected.is_some();
-    let detected = detected.unwrap_or_else(|| tui::ModelRoute {
-        provider: tui::CODEX_PROVIDER.to_owned(),
-        model: "default".into(),
-    });
-    Ok(Opened {
-        native: native.map(|(resolved, _)| resolved),
-        native_requested,
-        detected,
-        provider_available,
-    })
-}
-
-/// The slash commands that change how the next turn is allowed to act, or
-/// report what the session has recorded about its work.
-#[cfg(feature = "tui")]
-fn steers_turn(line: &str) -> bool {
-    matches!(
-        line.split_whitespace().next(),
-        Some("/plan" | "/todo" | "/approval")
-    )
-}
-
-#[cfg(feature = "tui")]
-fn steer_turn(
-    line: &str,
-    workspace: &Path,
-    approval: &approval::ApprovalCell,
-    state: &mut tui::TuiState,
-    queued: &mut std::collections::VecDeque<String>,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    match line.split_whitespace().next() {
-        Some("/plan") => plan_step(line, workspace, approval, state, queued, stdout),
-        Some("/todo") => show_todos(workspace, state.session_id(), stdout),
-        Some("/approval") => set_mode(line, approval, state, stdout),
-        _ => Ok(()),
-    }
-}
-
-/// Enter, revise, approve, cancel or show the plan.
-#[cfg(feature = "tui")]
-fn plan_step(
-    line: &str,
-    workspace: &Path,
-    approval: &approval::ApprovalCell,
-    state: &mut tui::TuiState,
-    queued: &mut std::collections::VecDeque<String>,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    match plan_command(line) {
-        PlanCommand::Revise(note) => {
-            approval.enter_plan();
-            state.set_approval_mode(approval.get().label());
-            queued.push_front(revise_instruction(note.as_deref()));
-            Ok(())
-        }
-        PlanCommand::Approve if approval.get() == approval::ApprovalMode::Plan => {
-            let mode = approval.approve_plan();
-            state.set_approval_mode(mode.label());
-            queued.push_front(IMPLEMENT_APPROVED_PLAN.to_owned());
-            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
-                .map_err(terminal_failed)
-        }
-        PlanCommand::Approve => {
-            writeln!(stdout, "No plan is awaiting approval.").map_err(terminal_failed)
-        }
-        PlanCommand::Cancel if approval.get() == approval::ApprovalMode::Plan => {
-            let mode = approval.cancel_plan();
-            state.set_approval_mode(mode.label());
-            writeln!(
-                stdout,
-                "Planning cancelled. Approval mode: {}.",
-                mode.label()
-            )
-            .map_err(terminal_failed)
-        }
-        PlanCommand::Cancel => {
-            writeln!(stdout, "Plan Mode is not active.").map_err(terminal_failed)
-        }
-        // The live plan for this session's scope, which is the one the turn's
-        // `plan_*` tools have been writing to.
-        PlanCommand::Show => {
-            let projection = progress::plan(workspace, &state.session_id().to_string());
-            write!(stdout, "{}", progress::human_plan(&projection)).map_err(terminal_failed)
-        }
-        PlanCommand::Enter(task) => {
-            approval.enter_plan();
-            state.set_approval_mode(approval.get().label());
-            writeln!(
-                stdout,
-                "Plan Mode active — workspace mutations are blocked."
-            )
-            .map_err(terminal_failed)?;
-            if let Some(task) = task {
-                queued.push_front(task);
-            }
-            Ok(())
-        }
-    }
-}
-
-/// The session's durable checklist.
-///
-/// Read from the store rather than from the turn's runtime: the checklist
-/// outlives a turn, so what is on disk is the answer even if this session has
-/// not touched it yet.
-#[cfg(feature = "tui")]
-fn show_todos(
-    workspace: &Path,
-    session: SessionId,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    let projection = open_store(workspace)
-        .ok()
-        .and_then(|store| progress::todos(store as Arc<dyn EventStore>, session));
-    match projection {
-        Some(projection) => {
-            write!(stdout, "{}", progress::human_todos(&projection)).map_err(terminal_failed)
-        }
-        None => {
-            writeln!(stdout, "This session's TODOs could not be read.").map_err(terminal_failed)
-        }
-    }
-}
-
-/// Take the approval mode a command named, or report the one in force.
-#[cfg(feature = "tui")]
-fn set_mode(
-    line: &str,
-    approval: &approval::ApprovalCell,
-    state: &mut tui::TuiState,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    let named = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|argument| match argument {
-            // What Shift+Tab sends. Resolved here so the shortcut and the
-            // typed command take the same path.
-            "cycle" => Some(approval.get().cycle()),
-            _ => approval::ApprovalMode::parse(argument),
-        });
-    let Some(mode) = named else {
-        let current = approval.get();
-        return writeln!(
-            stdout,
-            "Current approval mode: {} — {}\nUsage: /approval default | acceptEdits | plan | auto | dontAsk | bypassPermissions\nShift+Tab steps through default, acceptEdits, plan, and auto.",
-            current.label(),
-            current.description()
-        )
-        .map_err(terminal_failed);
-    };
-    set_approval_mode(approval, state, mode);
-    writeln!(
-        stdout,
-        "Approval mode: {} — {}",
-        mode.label(),
-        mode.description()
-    )
-    .map_err(terminal_failed)
-}
-
-/// Drive the session dialog until it is answered or left.
-///
-/// The dialog owns the keyboard while it is open: it is a list in front of the
-/// reader, and every key belongs to it until it closes.
-#[cfg(feature = "tui")]
-fn run_session_dialog(
-    mut dialog: tui::SessionDialogState,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-    colour: bool,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Result<(), Diagnostic> {
-    let width = tui::terminal_width();
-    writeln!(stdout, "{}", dialog.render(width, colour)).map_err(terminal_failed)?;
-    stdout.flush().map_err(terminal_failed)?;
+    state: &tui::TuiState,
+    refreshed: std::time::Instant,
+) -> Result<Drain, Diagnostic> {
     loop {
-        // A keyboard that hung up leaves the dialog, rather than holding the
-        // session on a list nothing can answer.
-        let Ok(byte) = keys.recv() else {
-            return Ok(());
-        };
-        let Some(action) = decoder.feed(byte).and_then(|key| dialog.handle_key(key)) else {
-            write!(stdout, "\r\x1b[J{}\n", dialog.render(width, colour))
-                .map_err(terminal_failed)?;
-            stdout.flush().map_err(terminal_failed)?;
-            continue;
-        };
-        let borrowed = Restoring {
-            workspace: restoring.workspace,
-            state: restoring.state,
-            conversation: restoring.conversation,
-            transcript: restoring.transcript,
-            history: restoring.history,
-            approval: restoring.approval,
-            queued: restoring.queued,
-        };
-        match action {
-            tui::SessionAction::Resume(id) => {
-                let loaded = resume_into(id, borrowed);
-                writeln!(stdout, "Resumed session {id} ({loaded} message(s) loaded).")
-                    .map_err(terminal_failed)?;
-            }
-            tui::SessionAction::Rename(id, title) => {
-                if let Ok(store) = open_store(borrowed.workspace) {
-                    let _ = store.set_session_title(id, &title);
-                }
-                writeln!(stdout, "Renamed session {id} to \"{title}\".")
-                    .map_err(terminal_failed)?;
-            }
-            tui::SessionAction::Delete(id) => {
-                delete_session(Some(&id.to_string()), borrowed, stdout)?;
-            }
-            tui::SessionAction::Cancel => {}
-        }
-        return Ok(());
-    }
-}
-
-/// Every MCP connection ARSY defines, then every one another tool declares
-/// under a name ARSY does not already use, with the entries they came from.
-#[cfg(feature = "tui")]
-fn mcp_choices(
-    root: &Path,
-    invocation: &Invocation,
-) -> Result<Vec<(Value, tui::McpChoice)>, Diagnostic> {
-    let report =
-        integrations::inspect(root, "mcp", None, None, None, invocation.config.as_deref())?;
-    let mut rows: Vec<(Value, tui::McpChoice)> = Vec::new();
-    for entry in report["entries"].as_array().into_iter().flatten() {
-        let text = |key: &str| entry[key].as_str().unwrap_or_default().to_owned();
-        let name = text("name");
-        // The first row under a name is the one a toggle acts on: ARSY's own
-        // definition is listed first, and it is the one that runs.
-        if rows.iter().any(|(_, choice)| choice.name == name) {
-            continue;
-        }
-        // A row the resolved configuration holds carries its real trust; a
-        // declaration nothing reads live is labelled untrusted and starts
-        // nothing until adopted.
-        let native = entry["trust"] != "untrusted";
-        let detail = match entry["url"].as_str() {
-            Some(url) => url.to_owned(),
-            None => std::iter::once(text("command"))
-                .chain(
-                    entry["args"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned),
-                )
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-        let choice = tui::McpChoice {
-            name,
-            source: text("ecosystem"),
-            trust: if native { text("trust") } else { String::new() },
-            target: integrations::target(entry),
-            detail,
-            enabled: native.then(|| entry["enabled"].as_bool().unwrap_or(false)),
-        };
-        rows.push((entry.clone(), choice));
-    }
-    Ok(rows)
-}
-
-/// Drive the `/mcp` dialog until it is closed.
-///
-/// Each key redraws the frame over the last one rather than under it, and the
-/// frame is erased on close, so moving through the list leaves nothing behind;
-/// only a line per change made stays in the scrollback.
-#[cfg(feature = "tui")]
-fn run_mcp_dialog(
-    invocation: &Invocation,
-    stdout: &mut io::Stdout,
-    colour: bool,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Result<(), Diagnostic> {
-    let root = workspace_root(&invocation.workspace)?;
-    let mut rows = mcp_choices(&root, invocation)?;
-    let mut dialog = tui::McpDialogState::new(rows.iter().map(|(_, c)| c.clone()).collect());
-    let mut changes: Vec<String> = Vec::new();
-    let mut drawn = 0;
-    loop {
-        let frame = dialog.render(tui::terminal_width(), colour);
-        let up = if drawn > 0 {
-            format!("\x1b[{drawn}A")
-        } else {
-            String::new()
-        };
-        write!(stdout, "{up}\r\x1b[J{frame}\n").map_err(terminal_failed)?;
-        stdout.flush().map_err(terminal_failed)?;
-        drawn = frame.lines().count();
-
-        let action = match next_mcp_action(&mut dialog, keys, decoder) {
-            None => continue,
-            Some(tui::McpAction::Close) => {
-                write!(stdout, "\x1b[{drawn}A\r\x1b[J").map_err(terminal_failed)?;
-                if !changes.is_empty() {
-                    changes.push("MCP changes take effect from the next turn.".to_owned());
-                    writeln!(stdout, "{}", tui::safe_text(&changes.join("\n")))
-                        .map_err(terminal_failed)?;
-                }
-                return Ok(());
-            }
-            Some(action) => action,
-        };
-        dialog.notice = Some(match apply_mcp_action(&root, &rows, &dialog, action) {
-            Ok(change) => {
-                changes.push(change.clone());
-                change
-            }
-            Err(diagnostic) => format!("{}: {}", diagnostic.code, diagnostic.message),
-        });
-        rows = mcp_choices(&root, invocation)?;
-        dialog.reload(rows.iter().map(|(_, c)| c.clone()).collect());
-    }
-}
-
-/// Wait for the next key and let the dialog answer it. A keyboard that hung up
-/// closes the dialog rather than holding the session on it.
-#[cfg(feature = "tui")]
-fn next_mcp_action(
-    dialog: &mut tui::McpDialogState,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Option<tui::McpAction> {
-    loop {
-        // A lone Escape is only known once nothing follows it.
+        // The timeout is what tells a lone Escape apart from the start of an
+        // arrow-key sequence.
         let key = match keys.recv_timeout(std::time::Duration::from_millis(40)) {
             Ok(byte) => decoder.feed(byte),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => decoder.flush_escape(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let key = decoder.flush_escape();
+                if key.is_none() && refreshed.elapsed() >= std::time::Duration::from_millis(100) {
+                    return Ok(Drain::Refresh);
+                }
+                key
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Some(tui::McpAction::Close)
+                return Ok(Drain::Answer(None));
             }
         };
-        if let Some(key) = key {
-            return dialog.handle_key(key);
-        }
-    }
-}
-
-/// Write the change a toggle or an adoption asks for, and say what it did.
-#[cfg(feature = "tui")]
-fn apply_mcp_action(
-    root: &Path,
-    rows: &[(Value, tui::McpChoice)],
-    dialog: &tui::McpDialogState,
-    action: tui::McpAction,
-) -> Result<String, Diagnostic> {
-    match action {
-        tui::McpAction::Toggle(index) => {
-            let choice = &dialog.choices[index];
-            let enabled = !choice.enabled.unwrap_or(false);
-            // Claude Code's and Codex's own files are never written: the
-            // choice is kept in the operator's arsy.json, which outranks them.
-            let declared_elsewhere = choice.source != "arsy";
-            let scope = match choice.trust.as_str() {
-                _ if declared_elsewhere => mcp::Scope::User,
-                "user" => mcp::Scope::User,
-                "workspace" => mcp::Scope::Workspace,
-                other => {
-                    return Err(usage(format!(
-                        "`{}` is defined by the {other} configuration; change it there",
-                        choice.name
-                    )))
-                }
-            };
-            mcp::set_enabled_in(root, &choice.name, enabled, scope, declared_elsewhere)?;
-            let state = if enabled { "enabled" } else { "disabled" };
-            Ok(format!("MCP `{}` {state}.", choice.name))
-        }
-        tui::McpAction::Adopt(index) => {
-            let server = mcp::server_from_declaration(&rows[index].0)?;
-            let written = mcp::add_in(root, &server, mcp::Scope::User)?;
-            Ok(format!(
-                "MCP `{}` adopted into {}, enabled.",
-                server.name,
-                written["path"].as_str().unwrap_or("arsy.json")
-            ))
-        }
-        tui::McpAction::Close => Ok(String::new()),
-    }
-}
-
-/// The slash commands that act on the recorded session rather than on the
-/// conversation with the model.
-#[cfg(feature = "tui")]
-fn manages_session(line: &str) -> bool {
-    matches!(
-        line.split_whitespace().next(),
-        Some("/new" | "/clear" | "/resume" | "/update" | "/rename" | "/session")
-    )
-}
-
-/// Start, clear, open, rename or delete a session.
-///
-/// `Some` is the dialog or picker the command opened; `None` means it was
-/// answered on the line and the task prompt stays.
-#[cfg(feature = "tui")]
-fn manage_session(
-    line: &str,
-    restoring: Restoring<'_>,
-    sessions: &mut Vec<tui::SessionChoice>,
-    stdout: &mut io::Stdout,
-) -> Result<Option<Prompt>, Diagnostic> {
-    let mut words = line.split_whitespace();
-    match words.next() {
-        Some("/new") => {
-            let started = start_session(restoring);
-            writeln!(stdout, "Started new session {started}.").map_err(terminal_failed)?;
-            Ok(None)
-        }
-        // The session is kept; only what the model is told about it is
-        // dropped, so the recording stays whole.
-        Some("/clear") => {
-            let session = restoring.state.session_id();
-            restoring.conversation.clear();
-            *restoring.history = arsy_code::agent::budget::History::default();
-            restoring.queued.clear();
-            writeln!(
-                stdout,
-                "Cleared conversation context for session {session}."
-            )
-            .map_err(terminal_failed)?;
-            Ok(None)
-        }
-        Some("/resume") => resume_command(words.next(), restoring, sessions, stdout),
-        Some("/update") => {
-            writeln!(
-                stdout,
-                "arsy-code v{} is up to date.",
-                env!("CARGO_PKG_VERSION")
-            )
-            .map_err(terminal_failed)?;
-            Ok(None)
-        }
-        Some("/rename") => {
-            let title = line.trim_start_matches("/rename").trim();
-            rename_session(title, "/rename <TITLE>", restoring, stdout)?;
-            Ok(None)
-        }
-        Some("/session") => session_command(words, restoring, sessions, stdout),
-        _ => Ok(None),
-    }
-}
-
-/// Open a session by id, or the list of them when none was named.
-#[cfg(feature = "tui")]
-fn resume_command(
-    id: Option<&str>,
-    restoring: Restoring<'_>,
-    sessions: &mut Vec<tui::SessionChoice>,
-    stdout: &mut io::Stdout,
-) -> Result<Option<Prompt>, Diagnostic> {
-    let Some(id) = id else {
-        *sessions = load_workspace_sessions(restoring.workspace);
-        return Ok(Some(Prompt::Resume));
-    };
-    let Ok(parsed) = id.parse::<SessionId>() else {
-        writeln!(stdout, "Invalid session ID `{id}`.").map_err(terminal_failed)?;
-        return Ok(None);
-    };
-    let loaded = resume_into(parsed, restoring);
-    writeln!(
-        stdout,
-        "Resumed session {parsed} ({loaded} message(s) loaded)."
-    )
-    .map_err(terminal_failed)?;
-    Ok(None)
-}
-
-/// `/session`, with or without a word after it.
-#[cfg(feature = "tui")]
-fn session_command<'a>(
-    mut words: impl Iterator<Item = &'a str>,
-    restoring: Restoring<'_>,
-    sessions: &mut Vec<tui::SessionChoice>,
-    stdout: &mut io::Stdout,
-) -> Result<Option<Prompt>, Diagnostic> {
-    match words.next() {
-        None => Ok(Some(Prompt::Session(tui::SessionDialogState::new(
-            load_workspace_sessions(restoring.workspace),
-            restoring.state.session_id(),
-        )))),
-        Some("list") => {
-            *sessions = load_workspace_sessions(restoring.workspace);
-            Ok(Some(Prompt::Resume))
-        }
-        Some("rename") => {
-            let title = words.collect::<Vec<_>>().join(" ");
-            rename_session(&title, "/session rename <TITLE>", restoring, stdout)?;
-            Ok(None)
-        }
-        Some("delete" | "rm" | "remove") => {
-            delete_session(words.next(), restoring, stdout)?;
-            Ok(None)
-        }
-        _ => {
-            writeln!(
-                stdout,
-                "Usage: /session [list | rename <TITLE> | delete [ID]]"
-            )
-            .map_err(terminal_failed)?;
-            Ok(None)
-        }
-    }
-}
-
-/// Give the current session a title, or say how to.
-#[cfg(feature = "tui")]
-fn rename_session(
-    title: &str,
-    usage: &str,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    if title.is_empty() {
-        return writeln!(stdout, "Usage: {usage}").map_err(terminal_failed);
-    }
-    let session = restoring.state.session_id();
-    if let Ok(store) = open_store(restoring.workspace) {
-        let _ = store.set_session_title(session, title);
-    }
-    writeln!(stdout, "Renamed session {session} to \"{title}\".").map_err(terminal_failed)
-}
-
-/// Delete a session, starting a fresh one when it was the open one.
-#[cfg(feature = "tui")]
-fn delete_session(
-    id: Option<&str>,
-    restoring: Restoring<'_>,
-    stdout: &mut io::Stdout,
-) -> Result<(), Diagnostic> {
-    let current = restoring.state.session_id();
-    let target = id
-        .and_then(|id| id.parse::<SessionId>().ok())
-        .unwrap_or(current);
-    if let Ok(store) = open_store(restoring.workspace) {
-        let _ = store.delete_session(target);
-    }
-    if target != current {
-        return writeln!(stdout, "Deleted session {target}.").map_err(terminal_failed);
-    }
-    let started = start_session(restoring);
-    writeln!(
-        stdout,
-        "Deleted current session. Started fresh session {started}."
-    )
-    .map_err(terminal_failed)
-}
-
-/// Begin a session with nothing carried over from the one before it.
-#[cfg(feature = "tui")]
-fn start_session(restoring: Restoring<'_>) -> SessionId {
-    let started = SessionId::new();
-    restoring.state.set_session_id(started);
-    restoring.conversation.clear();
-    restoring.transcript.clear();
-    *restoring.history = arsy_code::agent::budget::History::default();
-    set_approval_mode(
-        restoring.approval,
-        restoring.state,
-        approval::ApprovalMode::Default,
-    );
-    restoring.queued.clear();
-    started
-}
-
-/// The slash commands that choose a setting, by opening its list or by naming
-/// the answer on the same line.
-#[cfg(feature = "tui")]
-fn opens_picker(line: &str) -> bool {
-    matches!(
-        line.split_whitespace().next(),
-        Some("/auth" | "/model" | "/provider" | "/effort" | "/theme")
-    )
-}
-
-/// What opening a picker re-reads or resets.
-#[cfg(feature = "tui")]
-struct Opening<'a> {
-    models: &'a mut Vec<tui::ModelChoice>,
-    providers: &'a mut Vec<String>,
-    chosen: &'a mut Option<String>,
-    draft: &'a mut tui::ProviderDraft,
-    auth_draft: &'a mut String,
-    effort: &'a mut Option<Effort>,
-    theme: &'a mut String,
-    roles: &'a std::collections::BTreeMap<String, String>,
-    state: &'a mut tui::TuiState,
-}
-
-/// Open the picker a slash command names, or take the answer it carried.
-///
-/// `Some` is the prompt that now collects the answer; `None` means the line
-/// answered outright and the task prompt stays.
-#[cfg(feature = "tui")]
-fn open_picker(
-    line: &str,
-    invocation: &Invocation,
-    opening: Opening<'_>,
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> Result<Option<Prompt>, Diagnostic> {
-    let mut words = line.split_whitespace();
-    let (command, answer) = (words.next(), words.next());
-    match command {
-        Some("/auth") => {
-            *opening.providers = configured_providers(invocation);
-            opening.auth_draft.clear();
-            Ok(Some(Prompt::Auth(tui::AuthStep::Pick)))
-        }
-        Some("/model") => {
-            // Re-read, so a model added to any endpoint since startup is
-            // offered without restarting.
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
-            *opening.models = models;
-            Ok(Some(Prompt::Model))
-        }
-        Some("/provider") => {
-            *opening.providers = configured_providers(invocation);
-            *opening.chosen = configured_default(invocation);
-            *opening.draft = tui::ProviderDraft::default();
-            Ok(Some(Prompt::Provider(tui::ProviderStep::Pick)))
-        }
-        // A bare `/effort` opens the list, so the levels can be read before
-        // one is chosen; `/effort high` still sets it outright.
-        Some("/effort") => match answer {
-            None => Ok(Some(Prompt::Effort)),
-            Some(answer) => {
-                take_effort(answer, opening.effort, opening.state, stdout, emitter)?;
-                Ok(None)
-            }
-        },
-        // A bare `/theme` opens the list; `/theme light` sets it outright.
-        Some("/theme") => match answer {
-            None => Ok(Some(Prompt::Theme)),
-            Some(answer) => {
-                apply_theme(answer, opening.theme, opening.roles, stdout, emitter)
-                    .map_err(terminal_failed)?;
-                Ok(None)
-            }
-        },
-        _ => Ok(None),
-    }
-}
-
-/// What a session being opened replaces.
-#[cfg(feature = "tui")]
-struct Restoring<'a> {
-    workspace: &'a Path,
-    state: &'a mut tui::TuiState,
-    conversation: &'a mut Vec<ModelMessage>,
-    transcript: &'a mut tui::Transcript,
-    history: &'a mut arsy_code::agent::budget::History,
-    approval: &'a approval::ApprovalCell,
-    queued: &'a mut std::collections::VecDeque<String>,
-}
-
-/// Open a recorded session, answering how many messages it carried.
-///
-/// The approval mode goes back to default and the queue is dropped: both
-/// belonged to the session being left, and carrying either into another one
-/// would give it authority nobody granted it there.
-#[cfg(feature = "tui")]
-fn resume_into(session: SessionId, restoring: Restoring<'_>) -> usize {
-    let (conversation, history) = reconstruct_session_conversation(restoring.workspace, session);
-    *restoring.conversation = conversation;
-    *restoring.history = history;
-    restoring.transcript.clear();
-    restoring.state.set_session_id(session);
-    set_approval_mode(
-        restoring.approval,
-        restoring.state,
-        approval::ApprovalMode::Default,
-    );
-    restoring.queued.clear();
-    restoring.conversation.len()
-}
-
-/// What a picker leaves behind when it is closed without an answer.
-#[cfg(feature = "tui")]
-struct Leaving<'a> {
-    effort: Option<Effort>,
-    theme: &'a str,
-    roles: &'a std::collections::BTreeMap<String, String>,
-    draft: &'a mut tui::ProviderDraft,
-    auth_draft: &'a mut String,
-    session: SessionId,
-    route: &'a tui::ModelRoute,
-}
-
-/// Close a picker without taking an answer, and say what is still in force.
-///
-/// Ending input at a picker cancels the picker, not the session: the setting
-/// is unchanged and the task prompt returns.
-#[cfg(feature = "tui")]
-fn leave_picker(prompt: &Prompt, leaving: Leaving<'_>) -> String {
-    match prompt {
-        Prompt::Effort => effort_line(leaving.effort),
-        Prompt::Theme => {
-            // The preview left the palette on the last row arrowed onto; put
-            // the committed one back.
-            tui::set_palette(leaving.theme, leaving.roles);
-            format!("Theme unchanged: {}", leaving.theme)
-        }
-        Prompt::Provider(_) => {
-            *leaving.draft = tui::ProviderDraft::default();
-            "Provider unchanged.".to_owned()
-        }
-        Prompt::Auth(_) => {
-            leaving.auth_draft.clear();
-            "Auth unchanged.".to_owned()
-        }
-        Prompt::Resume => format!("Session unchanged: {}.", leaving.session),
-        _ => format!("Model unchanged: {}", leaving.route),
-    }
-}
-
-/// The provider for this route, resolved once and remembered.
-///
-/// A lookup that failed is remembered too: probing a credential store on every
-/// turn is slow, and asks the operating system for a credential the operator
-/// already declined once.
-#[cfg(feature = "tui")]
-fn resolve_route<'a>(
-    invocation: &Invocation,
-    workspace: &Path,
-    provider: &str,
-    resolved: &'a mut std::collections::HashMap<String, provider::Resolved>,
-    unavailable: &mut std::collections::HashSet<String>,
-) -> Option<&'a mut provider::Resolved> {
-    if !resolved.contains_key(provider) && !unavailable.contains(provider) {
-        let working = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
-        match load_config(workspace, &working, invocation.config.as_deref())
-            .ok()
-            .and_then(|config| provider::resolve(&config, Some(provider)).ok())
-        {
-            Some(found) => {
-                resolved.insert(provider.to_owned(), found);
-            }
-            None => {
-                unavailable.insert(provider.to_owned());
-            }
-        }
-    }
-    resolved.get_mut(provider)
-}
-
-/// Ask the operator what to do with the plan a planning turn produced.
-///
-/// The structured plan is preferred over the prose, because that is what the
-/// harness recorded; the prose stands in only when no steps were written.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn settle_plan(
-    workspace: &Path,
-    response: &str,
-    approval: &approval::ApprovalCell,
-    state: &mut tui::TuiState,
-    queued: &mut std::collections::VecDeque<String>,
-    stdout: &mut io::Stdout,
-    colour: bool,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> Result<(), Diagnostic> {
-    let projection = progress::plan(workspace, &state.session_id().to_string());
-    let structured = progress::human_plan(&projection);
-    let has_steps = projection["steps"]
-        .as_array()
-        .is_some_and(|steps| !steps.is_empty());
-    let preview = if has_steps || response.trim().is_empty() {
-        structured
-    } else {
-        response.to_owned()
-    };
-    match confirm_plan(stdout, colour, keys, decoder, &preview).map_err(terminal_failed)? {
-        tui::AskDialogResult::Approve { note } => {
-            let mode = approval.approve_plan();
-            state.set_approval_mode(mode.label());
-            let mut instruction = IMPLEMENT_APPROVED_PLAN.to_owned();
-            if let Some(note) = note {
-                instruction.push_str(&format!(" Operator constraint: {note}"));
-            }
-            queued.push_front(instruction);
-            writeln!(stdout, "Plan approved. Entering {} mode.", mode.label())
-                .map_err(terminal_failed)?;
-        }
-        // The dialog's second choice is "continue planning", so it stays in
-        // Plan Mode and queues another planning turn.
-        tui::AskDialogResult::AlwaysApprove { note } => {
-            queued.push_front(revise_instruction(note.as_deref()));
-        }
-        tui::AskDialogResult::CycleMode => {
-            let mode = cycle_approval_mode(approval);
-            state.set_approval_mode(mode.label());
-            queued.clear();
-            writeln!(
-                stdout,
-                "Approval mode: {} — {}",
-                mode.label(),
-                mode.description()
-            )
-            .map_err(terminal_failed)?;
-        }
-        tui::AskDialogResult::Deny { .. } | tui::AskDialogResult::Cancel => {
-            let mode = approval.cancel_plan();
-            state.set_approval_mode(mode.label());
-            queued.clear();
-            writeln!(
-                stdout,
-                "Planning cancelled. Approval mode: {}.",
-                mode.label()
-            )
-            .map_err(terminal_failed)?;
-        }
-    }
-    Ok(())
-}
-
-/// Carry the provider wizard one step, and say which step comes next.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn take_provider(
-    invocation: &Invocation,
-    step: tui::ProviderStep,
-    line: &str,
-    draft: &mut tui::ProviderDraft,
-    providers: &mut Vec<String>,
-    chosen: &mut Option<String>,
-    stdout: &mut io::Stdout,
-) -> Result<Prompt, Diagnostic> {
-    let message = match provider_step(invocation, step, line, draft, providers) {
-        Ok(ProviderNext::Ask(next)) => return Ok(Prompt::Provider(next)),
-        Ok(ProviderNext::Done(message)) => {
-            writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
-            *providers = configured_providers(invocation);
-            *chosen = configured_default(invocation);
-            *draft = tui::ProviderDraft::default();
-            // Configuration decides the provider, so the session has to be
-            // restarted to pick up a change to it rather than pretend the
-            // running one moved.
-            "Restart ARSY for the change to take effect.".to_owned()
-        }
-        Ok(ProviderNext::Cancelled(message)) => {
-            *draft = tui::ProviderDraft::default();
-            message
-        }
-        // The step stays open so the answer can be retyped against the
-        // question that is still on screen.
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-            return Ok(Prompt::Provider(step));
-        }
-    };
-    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
-    Ok(Prompt::Task)
-}
-
-/// Take the reasoning effort the operator picked.
-///
-/// A rejected answer leaves the list open so it can be retyped against what is
-/// already on screen.
-#[cfg(feature = "tui")]
-fn take_effort(
-    line: &str,
-    effort: &mut Option<Effort>,
-    state: &mut tui::TuiState,
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> Result<Prompt, Diagnostic> {
-    match tui::resolve_effort_answer(line, *effort) {
-        Ok(picked) => {
-            *effort = picked;
-            state.set_effort(*effort);
-            remember_effort(*effort, emitter);
-            writeln!(stdout, "{}", effort_line(*effort)).map_err(terminal_failed)?;
-            Ok(Prompt::Task)
-        }
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-            Ok(Prompt::Effort)
-        }
-    }
-}
-
-/// Take the model the operator picked, and remember it for the next run.
-#[cfg(feature = "tui")]
-fn take_model(
-    line: &str,
-    models: &[tui::ModelChoice],
-    route: &mut tui::ModelRoute,
-    state: &mut tui::TuiState,
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> Result<Prompt, Diagnostic> {
-    match tui::resolve_model(line, models, route) {
-        Ok(picked) => {
-            *route = picked;
-            remember_model(route, emitter);
-            state.set_model_route(route.clone());
-            writeln!(stdout, "Model: {route}").map_err(terminal_failed)?;
-            Ok(Prompt::Task)
-        }
-        Err(reason) => {
-            writeln!(stdout, "{}", tui::safe_text(&reason)).map_err(terminal_failed)?;
-            Ok(Prompt::Model)
-        }
-    }
-}
-
-/// Carry the credential wizard one step, and say which step comes next.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn take_auth(
-    invocation: &Invocation,
-    step: tui::AuthStep,
-    line: &str,
-    draft: &mut String,
-    providers: &[String],
-    stdout: &mut io::Stdout,
-    emitter: &mut Emitter,
-) -> Result<Prompt, Diagnostic> {
-    let (message, next) = match auth_step(invocation, step, line, draft, providers, emitter) {
-        Ok(AuthNext::Ask(next)) => return Ok(Prompt::Auth(next)),
-        // Finished or abandoned, the draft goes either way: a credential is
-        // never left in memory for the next question to pick up.
-        Ok(AuthNext::Done(message) | AuthNext::Cancelled(message)) => {
-            draft.clear();
-            (message, Prompt::Task)
-        }
-        Err(reason) => (reason, Prompt::Auth(step)),
-    };
-    writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
-    Ok(next)
-}
-
-/// What the pickers read to draw themselves.
-#[cfg(feature = "tui")]
-struct Picker<'a> {
-    state: &'a tui::TuiState,
-    workspace: &'a Path,
-    models: &'a [tui::ModelChoice],
-    route: &'a tui::ModelRoute,
-    effort: Option<Effort>,
-    theme: &'a str,
-    draft: &'a tui::ProviderDraft,
-    auth_draft: &'a str,
-    sessions: &'a [tui::SessionChoice],
-    providers: &'a [String],
-    chosen_provider: Option<&'a str>,
-}
-
-/// The line under the composer: the status row, or whatever the open picker
-/// wants said above its rows.
-#[cfg(feature = "tui")]
-fn prompt_status(prompt: &Prompt, picker: Picker<'_>, colour: bool) -> String {
-    match prompt {
-        // The branch is read per line rather than kept, so a checkout made in
-        // another terminal shows up on the next prompt.
-        Prompt::Task => picker.state.status_row(
-            tui::terminal_width(),
-            colour,
-            tui::branch(picker.workspace).as_deref(),
-        ),
-        Prompt::Model => tui::model_prompt(picker.models, picker.route, colour),
-        Prompt::Effort => tui::effort_prompt(picker.effort, colour),
-        Prompt::Theme => tui::theme_prompt(picker.theme, colour),
-        Prompt::Provider(step) => step.prompt(picker.draft, colour),
-        Prompt::Auth(step) => step.prompt(picker.auth_draft, colour),
-        Prompt::Resume => tui::session_prompt(picker.sessions, colour),
-        Prompt::Session(dialog) => dialog.render(tui::terminal_width(), colour),
-    }
-}
-
-/// The rows the open picker offers, and which of them is marked.
-#[cfg(feature = "tui")]
-fn offer_rows(
-    prompt: &Prompt,
-    composer: &mut tui::Composer,
-    picker: Picker<'_>,
-    invocation: &Invocation,
-) {
-    match prompt {
-        Prompt::Model => {
-            let (rows, selected) = tui::model_rows(picker.models, picker.route);
-            composer.offer(rows, selected);
-        }
-        Prompt::Effort => {
-            composer.offer_table(Some(tui::EFFORT_ROWS), tui::effort_row(picker.effort))
-        }
-        Prompt::Theme => composer.offer_table(Some(tui::THEMES), tui::theme_row(picker.theme)),
-        Prompt::Provider(step) => composer.offer(
-            step.rows(
-                picker.providers,
-                &picker.route.provider,
-                picker.chosen_provider,
-            ),
-            0,
-        ),
-        Prompt::Auth(step) => {
-            let handles = catalog_handles(invocation);
-            composer.offer(step.rows(picker.providers, &handles), 0);
-        }
-        Prompt::Resume => {
-            let (rows, selected) =
-                tui::session_rows(picker.sessions, Some(picker.state.session_id()));
-            composer.offer(rows, selected);
-        }
-        _ => composer.offer(None, 0),
-    }
-}
-
-/// The parts of a running turn an event can change.
-#[cfg(feature = "tui")]
-struct Streamlined<'a> {
-    outcome: &'a mut Turn,
-    finished: &'a mut Option<std::time::Instant>,
-    stopped_early: &'a mut bool,
-    seen_git: &'a mut std::collections::HashSet<String>,
-    /// The last row drawn, so an event that renders the same twice is drawn
-    /// once.
-    last_row: &'a mut Option<String>,
-}
-
-/// Read one line from the provider and draw what it says.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn show_event(
-    line: &str,
-    redactor: &Redactor,
-    child: &mut tui::ProviderChild,
-    painter: &Painter<'_>,
-    terminal: &mut io::Stdout,
-    composer: &mut tui::Composer,
-    run: Streamlined<'_>,
-    colour: bool,
-    tick: usize,
-) -> io::Result<()> {
-    let line = redactor.sanitize(line).map_err(io::Error::other)?;
-    let event = serde_json::from_str::<Value>(&line)
-        .map_err(|_| io::Error::other("provider emitted invalid JSON"))?;
-    absorb_event(&event, run.outcome, run.finished);
-    let repeated_git = run.finished.is_none() && repeated_git(&event, run.seen_git);
-    if repeated_git {
-        *run.stopped_early = true;
-        *run.finished = Some(std::time::Instant::now());
-        child.stop(false);
-        note_repeated_git(run.outcome);
-        painter.row(
-            terminal,
-            composer,
-            Some(&tui::tool_result_row(
-                colour,
-                "git",
-                true,
-                "repeated successful command skipped",
-            )),
-            false,
-            run.outcome.queued.len(),
-            tick,
-        )?;
-    }
-    // A killed provider still flushes buffered events; showing them
-    // after the interrupt notice would contradict it.
-    if !run.outcome.interrupted && !repeated_git {
-        if let Some(row) = tui::render_codex_event(&line, colour) {
-            if run.last_row.as_ref() != Some(&row) {
-                painter.row(
-                    terminal,
-                    composer,
-                    Some(&row),
-                    false,
-                    run.outcome.queued.len(),
-                    tick,
-                )?;
-            }
-            *run.last_row = Some(row);
-        }
-    }
-    Ok(())
-}
-
-/// Say in the answer that a repeated Git command was stopped.
-///
-/// The turn ends here, so the reason has to reach the model in the answer
-/// itself: the row on screen is for the operator, not for the next request.
-#[cfg(feature = "tui")]
-fn note_repeated_git(outcome: &mut Turn) {
-    if !outcome.response.is_empty() {
-        outcome.response.push_str("\n\n");
-    }
-    outcome
-        .response
-        .push_str("The provider repeated a successful Git command; the duplicate was skipped.");
-}
-
-/// Take what an event says about the turn.
-///
-/// The provider's own words are the answer; a terminal event settles when the
-/// turn ended, whatever the process does afterwards.
-#[cfg(feature = "tui")]
-fn absorb_event(event: &Value, outcome: &mut Turn, finished: &mut Option<std::time::Instant>) {
-    if finished.is_none()
-        && matches!(
-            event["type"].as_str(),
-            Some("turn.completed" | "turn.failed")
-        )
-    {
-        *finished = Some(std::time::Instant::now());
-    }
-    outcome.provider_failed |= event["type"] == "turn.failed";
-    if event["type"] != "item.completed" || event["item"]["type"] != "agent_message" {
-        return;
-    }
-    if let Some(text) = event["item"]["text"].as_str() {
-        if !outcome.response.is_empty() {
-            outcome.response.push('\n');
-        }
-        outcome.response.push_str(text);
-    }
-}
-
-/// Whether the turn's loop carries on.
-#[cfg(feature = "tui")]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Pass {
-    Go,
-    Stop,
-}
-
-/// The clocks a running provider turn watches.
-#[cfg(feature = "tui")]
-struct Clocks<'a> {
-    started: std::time::Instant,
-    status: &'a mut Option<std::process::ExitStatus>,
-    /// When the process was seen to have left.
-    exited: &'a mut Option<std::time::Instant>,
-    /// When the provider said the turn was over.
-    finished: &'a mut Option<std::time::Instant>,
-    last_event: std::time::Instant,
-    /// When a stop was asked for, so it can be escalated.
-    cancelling: Option<std::time::Instant>,
-    stopped_early: &'a mut bool,
-}
-
-/// Where the provider's process stands at the top of a pass.
-///
-/// The turn is over when the provider says it is over. A CLI that lingers
-/// after its terminal event — cleaning up a session, flushing telemetry —
-/// must not keep the clock running against an answer already on screen.
-#[cfg(feature = "tui")]
-fn lifecycle(child: &mut tui::ProviderChild, clocks: Clocks<'_>) -> io::Result<Pass> {
-    if clocks.status.is_none() {
-        *clocks.status = child.0.try_wait()?;
-        if clocks.status.is_some() {
-            *clocks.exited = Some(std::time::Instant::now());
-            child.stop(true);
-        }
-    }
-    if clocks
-        .exited
-        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-    {
-        return Ok(Pass::Stop);
-    }
-    // The turn is over when the provider says it is over. A CLI that
-    // lingers after its terminal event — cleaning up a session, flushing
-    // telemetry — must not keep the clock running against the answer that
-    // is already on screen.
-    //
-    // Trailing rows still land: the stream drains until it has been quiet
-    // for 250ms, and no longer than 2 seconds however talkative it stays.
-    if clocks.status.is_none()
-        && clocks.finished.is_some_and(|at: std::time::Instant| {
-            clocks.last_event.elapsed() >= std::time::Duration::from_millis(250)
-                || at.elapsed() >= std::time::Duration::from_secs(2)
-        })
-    {
-        *clocks.stopped_early = true;
-        child.stop(false);
-        return Ok(Pass::Stop);
-    }
-    if clocks.started.elapsed() >= std::time::Duration::from_secs(300) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "provider exceeded the 300-second turn deadline",
-        ));
-    }
-    if clocks
-        .cancelling
-        .is_some_and(|at: std::time::Instant| at.elapsed() >= std::time::Duration::from_secs(2))
-    {
-        child.stop(true);
-        *clocks.status = Some(child.0.wait()?);
-        return Ok(Pass::Stop);
-    }
-    Ok(Pass::Go)
-}
-
-/// The call a live view is watching.
-#[cfg(feature = "tui")]
-struct LiveCall<'a> {
-    name: &'a str,
-    /// Only a process can be cancelled part way; everything else runs to its
-    /// own end and Ctrl-C would leave the workspace half changed.
-    cancellable: bool,
-    operation_id: arsy_kernel::domain::OperationId,
-}
-
-/// Take the keys pressed while a call runs, answering whether it was
-/// cancelled.
-///
-/// `e` toggles how much of the output is shown. Every other key belongs to
-/// the composer and is read once the call is done.
-#[cfg(feature = "tui")]
-fn absorb_live_keys(
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    terminal: &mut io::Stdout,
-    call: LiveCall<'_>,
-    drawn_rows: &mut usize,
-    expanded: &mut bool,
-) -> io::Result<bool> {
-    let mut cancelled = false;
-    for key in keys.try_iter().filter_map(|byte| decoder.feed(byte)) {
-        match key {
-            tui::Key::Interrupt if call.cancellable => {
-                arsy_code::process::cancel(call.operation_id);
-                if *drawn_rows > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", drawn_rows)?;
-                    *drawn_rows = 0;
-                }
-                write!(terminal, "\r\x1b[K  ✦ Cancelling {}…\n", call.name)?;
-                terminal.flush()?;
-                cancelled = true;
-            }
-            tui::Key::Char('e' | 'E') => *expanded = !*expanded,
-            _ => {}
-        }
-    }
-    Ok(cancelled)
-}
-
-/// Take whatever a running command has printed since the last pass.
-///
-/// The tail is what a reader needs while it runs, so the buffer is capped and
-/// the oldest output is dropped rather than growing without bound.
-#[cfg(feature = "tui")]
-fn absorb_output(output: &std::sync::mpsc::Receiver<String>, live: &mut String) {
-    /// What is kept of a long-running command's output.
-    const KEEP_BYTES: usize = 16_384;
-
-    live.extend(output.try_iter());
-    if live.len() > KEEP_BYTES {
-        let oldest = live.len() - KEEP_BYTES;
-        live.drain(..oldest);
-    }
-}
-
-/// What a key press during a provider turn can reach.
-#[cfg(feature = "tui")]
-struct Keyboard<'a> {
-    keys: &'a std::sync::mpsc::Receiver<u8>,
-    decoder: &'a mut tui::Keys,
-    composer: &'a mut tui::Composer,
-    approval: &'a approval::ApprovalCell,
-}
-
-/// The turn those keys can change.
-#[cfg(feature = "tui")]
-struct Turning<'a> {
-    outcome: &'a mut Turn,
-    cancelling: &'a mut Option<std::time::Instant>,
-    last_key: &'a mut std::time::Instant,
-}
-
-/// Take the keys waiting, without blocking on the next one.
-///
-/// Bounded per pass so a held key cannot starve the event stream: whatever is
-/// still waiting is read on the pass after this one.
-///
-/// Answers whether anything typed changed what is on screen.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn provider_keys(
-    board: Keyboard<'_>,
-    terminal: &mut io::Stdout,
-    painter: &Painter<'_>,
-    child: &mut tui::ProviderChild,
-    turning: Turning<'_>,
-    colour: bool,
-    tick: usize,
-) -> io::Result<bool> {
-    let mut typed = false;
-    for _ in 0..256 {
-        let byte = match board.keys.try_recv() {
-            Ok(byte) => byte,
-            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                turning.outcome.quit = true;
-                stop_turn(turning.outcome, child, turning.cancelling);
-                break;
-            }
-        };
-        *turning.last_key = std::time::Instant::now();
-        let Some(key) = board.decoder.feed(byte) else {
-            continue;
-        };
-        // While the provider is running, Interrupt always means the turn,
-        // never the composer or the session — and it drops a queued
-        // follow-up, which was only queued to run after this turn.
-        if key == tui::Key::Interrupt {
-            if stop_turn(turning.outcome, child, turning.cancelling) {
-                painter.row(
-                    terminal,
-                    board.composer,
-                    Some(&tui::interrupted_row(colour)),
-                    true,
-                    0,
-                    tick,
-                )?;
-            }
-            continue;
-        }
-        match board.composer.press(key) {
-            // Shift+Tab is an immediate mode change, not a follow-up task.
-            // Keeping it out of the queue prevents a drafted chat line from
-            // being answered as if it were a second user message.
-            tui::Action::CycleMode => {
-                cycle_approval_mode(board.approval);
-                typed = true;
-            }
-            // A line sent while the provider is busy runs as soon as this
-            // turn ends, rather than being dropped or blocking.
-            tui::Action::Submit(line) if !line.trim().is_empty() => {
-                if turning.outcome.queued.len() < 16 {
-                    // Queued, not dropped: the row below says it was
-                    // taken, and the turn that follows this one runs it.
-                    turning.outcome.queued.push_back(line);
-                    painter.row(
-                        terminal,
-                        board.composer,
-                        Some("  Follow-up queued."),
-                        turning.cancelling.is_some(),
-                        turning.outcome.queued.len(),
-                        tick,
-                    )?;
-                } else {
-                    board.composer.restore(line);
-                    painter.row(
-                        terminal,
-                        board.composer,
-                        Some("  Queue full; draft retained."),
-                        turning.cancelling.is_some(),
-                        turning.outcome.queued.len(),
-                        tick,
-                    )?;
-                }
-            }
-            tui::Action::Submit(_) => typed = true,
-            tui::Action::Quit => {
-                turning.outcome.quit = true;
-                stop_turn(turning.outcome, child, turning.cancelling);
-            }
-            tui::Action::Redraw => typed = true,
-            tui::Action::None => {}
-        }
-    }
-    Ok(typed)
-}
-
-/// Draws the rows a provider turn produces, above the live composer.
-#[cfg(feature = "tui")]
-struct Painter<'a> {
-    colour: bool,
-    footer: &'a str,
-    /// Re-measured on the resize tick rather than per row.
-    width: std::cell::Cell<usize>,
-    started: std::time::Instant,
-}
-
-#[cfg(feature = "tui")]
-impl Painter<'_> {
-    /// One row, or none — either way the status under it is repainted.
-    ///
-    /// The composer is torn down and drawn again around each row, so the input
-    /// block is never overwritten by what lands above it.
-    fn row(
-        &self,
-        terminal: &mut io::Stdout,
-        composer: &mut tui::Composer,
-        row: Option<&str>,
-        cancelling: bool,
-        queued: usize,
-        tick: usize,
-    ) -> io::Result<()> {
-        let mut frame = composer.clear();
-        if let Some(row) = row {
-            frame.push_str(row);
-            frame.push('\n');
-        }
-        let phase = if cancelling {
-            tui::TurnPhase::Cancelling
-        } else {
-            tui::TurnPhase::Working
-        };
-        let status = tui::turn_status(self.colour, phase, self.started.elapsed(), tick, queued);
-        frame.push_str(&composer.render_turn(self.width.get(), self.colour, &status, self.footer));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
-    }
-}
-
-/// What the provider's exit says about the turn, once the turn itself is done.
-///
-/// A zero process exit must not mask a turn the provider reported as failed,
-/// so the event stream is read before the exit status.
-#[cfg(feature = "tui")]
-fn verdict(
-    child: &mut tui::ProviderChild,
-    route: &tui::ModelRoute,
-    status: Option<std::process::ExitStatus>,
-    stopped_early: bool,
-    outcome: &Turn,
-) -> io::Result<Option<String>> {
-    let status = match status {
-        Some(status) => status,
-        // The turn ended before the process did, so the process is asked to
-        // leave and then made to: waiting on a CLI that ignores the signal is
-        // the hang this exit was added to avoid.
-        None if stopped_early => reap(child)?,
-        None => child.0.wait()?,
-    };
-    Ok(if outcome.provider_failed {
-        Some(format!("{route} reported a failed turn"))
-    // A signal ARSY sent after a completed turn is its own exit code, not a
-    // verdict on the turn the provider already reported.
-    } else if status.success() || stopped_early {
-        None
-    } else {
-        Some(format!("{route} exited with status {status}"))
-    })
-}
-
-/// Wait briefly for a provider asked to leave, then make it.
-#[cfg(feature = "tui")]
-fn reap(child: &mut tui::ProviderChild) -> io::Result<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    loop {
-        if let Some(status) = child.0.try_wait()? {
-            return Ok(status);
-        }
-        if std::time::Instant::now() >= deadline {
-            child.stop(true);
-            return child.0.wait();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-/// The error for a provider that closed its stream without ever saying the
-/// turn ended, carrying whatever it wrote to stderr.
-#[cfg(feature = "tui")]
-fn silent_provider(
-    errors: &std::sync::mpsc::Receiver<String>,
-    redactor: &Redactor,
-) -> io::Result<io::Error> {
-    let detail = errors
-        .recv_timeout(std::time::Duration::from_millis(100))
-        .unwrap_or_default();
-    let detail = redactor.sanitize(&detail).map_err(io::Error::other)?;
-    Ok(io::Error::other(format!(
-        "provider closed its stream without a terminal turn event: {}",
-        terminal_text(detail.trim())
-    )))
-}
-
-/// Whether this event is a Git command that already succeeded this turn.
-///
-/// A provider that repeats a push or a commit would run it twice, so the
-/// duplicate is caught at its start event — before it gets a second chance —
-/// which means the set is filled by the completions that came before it.
-#[cfg(feature = "tui")]
-fn repeated_git(event: &Value, seen: &mut std::collections::HashSet<String>) -> bool {
-    if event["item"]["type"] != "command_execution" {
-        return false;
-    }
-    let Some(command) = event["item"]
-        .get("command")
-        .and_then(Value::as_str)
-        .filter(|command| command.contains("git "))
-    else {
-        return false;
-    };
-    match event["type"].as_str() {
-        Some("item.started") => seen.contains(command),
-        Some("item.completed") if event["item"]["exit_code"].as_i64() == Some(0) => {
-            !seen.insert(command.to_owned())
-        }
-        _ => false,
-    }
-}
-
-/// Stop the running turn.
-///
-/// The queue goes with it: a follow-up was only queued to run after this turn,
-/// and the operator stopping the turn is not asking for the next one. The
-/// moment the stop began is kept so an unresponsive provider can be escalated
-/// from a polite stop to a kill.
-///
-/// Answers whether this call was the one that started the stop, because that
-/// is when the row saying so is drawn — a second Ctrl-C must not draw it again.
-#[cfg(feature = "tui")]
-fn stop_turn(
-    outcome: &mut Turn,
-    child: &mut tui::ProviderChild,
-    cancelling: &mut Option<std::time::Instant>,
-) -> bool {
-    outcome.queued.clear();
-    outcome.interrupted = true;
-    if cancelling.is_some() {
-        return false;
-    }
-    *cancelling = Some(std::time::Instant::now());
-    child.stop(false);
-    true
-}
-
-/// What a streaming round has put on screen so far.
-///
-/// Reasoning and the answer hold separate buffers and separate boxes, so the
-/// verbose stream reads as distinct parts of the turn rather than one grey
-/// blur. Deltas arrive token by token and a row is drawn per line, so what is
-/// left of an unfinished line is kept here until the rest of it arrives.
-#[cfg(feature = "tui")]
-#[derive(Default)]
-struct Streaming {
-    /// Answer text not yet ended by a line break.
-    pending: String,
-    /// Reasoning not yet ended by a line break.
-    thinking: String,
-    thinking_open: bool,
-    answer_open: bool,
-    /// Rows drawn for `pending`, which a finished line replaces.
-    live_lines: usize,
-}
-
-#[cfg(feature = "tui")]
-impl Streaming {
-    /// Draw reasoning as it streams, opening its box on the first delta.
-    fn reason(
-        &mut self,
-        terminal: &mut dyn Write,
-        composer: &mut tui::Composer,
-        colour: bool,
-        footer: &str,
-        status: &str,
-        text: &str,
-    ) -> io::Result<()> {
-        let width = tui::terminal_width();
-        if !self.thinking_open {
-            self.thinking_open = true;
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_top(width, colour),
-            )?;
-        }
-        self.thinking.push_str(text);
-        for line in drain_lines(&mut self.thinking) {
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Draw the answer as it streams. Answer text closes the reasoning box
-    /// first, so the prose never starts inside it.
-    fn answer(
-        &mut self,
-        terminal: &mut dyn Write,
-        composer: &mut tui::Composer,
-        colour: bool,
-        footer: &str,
-        status: &str,
-        text: &str,
-    ) -> io::Result<()> {
-        self.close_thinking(terminal, composer, colour, footer, status)?;
-        if !self.answer_open {
-            self.answer_open = true;
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::assistant_header(colour),
-            )?;
-        }
-        self.pending.push_str(text);
-        let complete = drain_lines(&mut self.pending);
-        // The live rows held the part of a line still arriving. A finished
-        // line replaces them, so they are erased once before the first.
-        if self.live_lines > 0 && !complete.is_empty() {
-            erase_live_response(terminal, composer, self.live_lines)?;
-            self.live_lines = 0;
-        }
-        for line in complete {
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::assistant_row(colour, &line),
-            )?;
-        }
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        self.live_lines = redraw_live_response(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &self.pending,
-            self.live_lines,
-        )?;
-        Ok(())
-    }
-
-    /// Close the round: finish whatever box is open and settle the last line.
-    fn close(
-        &mut self,
-        terminal: &mut dyn Write,
-        composer: &mut tui::Composer,
-        colour: bool,
-        footer: &str,
-        status: &str,
-    ) -> io::Result<()> {
-        self.close_thinking(terminal, composer, colour, footer, status)?;
-        if self.live_lines > 0 {
-            erase_live_response(terminal, composer, self.live_lines)?;
-            self.live_lines = 0;
-        }
-        if self.pending.trim().is_empty() {
-            return Ok(());
-        }
-        let line = std::mem::take(&mut self.pending);
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::assistant_row(colour, &line),
-        )
-    }
-
-    /// Close the reasoning box if it is open, flushing the line it was part
-    /// way through.
-    fn close_thinking(
-        &mut self,
-        terminal: &mut dyn Write,
-        composer: &mut tui::Composer,
-        colour: bool,
-        footer: &str,
-        status: &str,
-    ) -> io::Result<()> {
-        if !self.thinking_open {
-            return Ok(());
-        }
-        self.thinking_open = false;
-        let width = tui::terminal_width();
-        if !self.thinking.trim().is_empty() {
-            let line = std::mem::take(&mut self.thinking);
-            stream_row(
-                terminal,
-                composer,
-                colour,
-                footer,
-                status,
-                &tui::thinking_box_row(width, colour, &line),
-            )?;
-        }
-        stream_row(
-            terminal,
-            composer,
-            colour,
-            footer,
-            status,
-            &tui::thinking_box_bottom(width, colour),
-        )
-    }
-}
-
-/// Take the finished lines out of a streaming buffer, leaving whatever part of
-/// the next one has arrived.
-///
-/// One scan for the last break rather than one per line: a buffer is appended
-/// to on every delta, and re-scanning it from the front for each line it holds
-/// is quadratic in a long answer.
-#[cfg(feature = "tui")]
-fn drain_lines(buffer: &mut String) -> Vec<String> {
-    let Some(last) = buffer.rfind('\n') else {
-        return Vec::new();
-    };
-    let complete: String = buffer.drain(..=last).collect();
-    complete.split_inclusive('\n').map(str::to_owned).collect()
-}
-
-/// One finished row above the composer, with the status redrawn under it.
-#[cfg(feature = "tui")]
-fn stream_row(
-    terminal: &mut dyn Write,
-    composer: &mut tui::Composer,
-    colour: bool,
-    footer: &str,
-    status: &str,
-    row: &str,
-) -> io::Result<()> {
-    let mut frame = composer.clear();
-    frame.push_str(row);
-    frame.push('\n');
-    frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
-    write!(terminal, "{frame}").and_then(|()| terminal.flush())
-}
-
-/// What the keys pressed while a round streams amount to.
-#[cfg(feature = "tui")]
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Typed {
-    /// Nothing that changes what is on screen.
-    Quiet,
-    Redraw,
-    Interrupted,
-}
-
-/// Take every key waiting, without blocking on the next one.
-///
-/// A turn is streaming while this runs, so the composer stays live: a
-/// follow-up can be queued, the approval mode can change, and the turn can be
-/// stopped, all without waiting for the provider to finish.
-#[cfg(feature = "tui")]
-fn drain_keys(
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    approval: &approval::ApprovalCell,
-    outcome: &mut Turn,
-) -> Typed {
-    let mut typed = Typed::Quiet;
-    while let Ok(byte) = keys.try_recv() {
-        let Some(key) = decoder.feed(byte) else {
-            continue;
-        };
-        if key == tui::Key::Interrupt {
-            outcome.queued.clear();
-            outcome.interrupted = true;
-            return Typed::Interrupted;
-        }
+        let Some(key) = key else { continue };
         match composer.press(key) {
-            // Shift+Tab changes authority immediately; it never becomes a
-            // model prompt or a queued follow-up.
-            tui::Action::CycleMode => {
-                cycle_approval_mode(approval);
-                typed = Typed::Redraw;
-            }
-            // Bounded as on the Codex route, so a held Enter cannot grow the
-            // queue without limit; past the bound the draft is handed back.
-            tui::Action::Submit(line) if !line.trim().is_empty() => {
-                if outcome.queued.len() < 16 {
-                    outcome.queued.push_back(line);
-                } else {
-                    composer.restore(line);
+            tui::Action::Submit(line) => return Ok(Drain::Answer(Some(tui::Action::Submit(line)))),
+            tui::Action::CycleMode => return Ok(Drain::Answer(Some(tui::Action::CycleMode))),
+            tui::Action::Expand => {
+                if transcript.toggle_last_tool() {
+                    transcript
+                        .repaint(stdout, width, colour, state)
+                        .map_err(terminal_failed)?;
                 }
+                return Ok(Drain::Refresh);
             }
-            tui::Action::Submit(_) | tui::Action::Redraw => typed = Typed::Redraw,
-            tui::Action::Quit => outcome.quit = true,
+            tui::Action::Quit => return Ok(Drain::Answer(None)),
+            tui::Action::Redraw => return Ok(Drain::Refresh),
             tui::Action::None => {}
         }
     }
-    typed
 }
-
-/// The request one round of a turn sends.
-///
-/// Built per round rather than captured once: the instructions are discovered
-/// by walking the workspace, and an AGENTS.md the turn just edited is the one
-/// the next round should read.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn round_request(
-    resolved: &provider::Resolved,
-    config: &arsy_kernel::config::Config,
-    runtime: &arsy_code::agent::ToolRuntime,
-    conversation: &[ModelMessage],
-    route: &tui::ModelRoute,
-    effort: Option<Effort>,
-    turn: arsy_kernel::domain::TurnId,
-    round: usize,
-) -> io::Result<CanonicalModelRequest> {
-    Ok(CanonicalModelRequest {
-        model: ModelKey {
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-        },
-        system: system_prompt(
-            runtime.workspace(),
-            config,
-            &route.provider,
-            &route.model,
-            runtime.execution_mode(),
-        ),
-        messages: conversation.to_vec(),
-        tools: runtime.schemas(),
-        max_output_tokens: resolved.endpoint.max_output_tokens,
-        effort,
-        // One turn can take several requests, one per round of tool calls. The
-        // round is part of the key, because a retry must repeat its own
-        // request rather than collapse into the one before it.
-        idempotency_key: arsy_kernel::protocol::IdempotencyKey::new(format!("{turn}-{round}"))
-            .map_err(io::Error::other)?,
-    })
-}
-
-/// Read the provider's stream on its own thread, as the rows the turn draws.
-///
-/// The provider's events are turned into rows here rather than at the far end,
-/// so the drawing loop waits on one channel and nothing else.
-#[cfg(feature = "tui")]
-fn spawn_stream(
-    provider: Arc<dyn arsy_kernel::provider::ModelProvider>,
-    request: CanonicalModelRequest,
-) -> std::sync::mpsc::Receiver<Result<Streamed, arsy_kernel::provider::ProviderError>> {
-    let (rows, events) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stream = match arsy_kernel::provider::stream_with_retry(
-            provider.as_ref(),
-            &request,
-            &mut std::thread::sleep,
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = rows.send(Err(error));
-                return;
-            }
-        };
-        for event in stream {
-            let Some(message) = streamed(event) else {
-                continue;
-            };
-            let failed = message.is_err();
-            if rows.send(message).is_err() || failed {
-                return;
-            }
-        }
-    });
-    events
-}
-
-/// The row a provider event draws, or `None` for an event the turn does not
-/// show.
-#[cfg(feature = "tui")]
-fn streamed(
-    event: Result<ModelEvent, arsy_kernel::provider::ProviderError>,
-) -> Option<Result<Streamed, arsy_kernel::provider::ProviderError>> {
-    Some(match event {
-        Ok(ModelEvent::TextDelta { text }) => Ok(Streamed::Text(text)),
-        Ok(ModelEvent::ThinkingDelta { text }) => Ok(Streamed::Thinking(text)),
-        Ok(ModelEvent::Usage {
-            input_tokens,
-            output_tokens,
-        }) => Ok(Streamed::Usage {
-            input_tokens,
-            output_tokens,
-        }),
-        Ok(ModelEvent::ToolCallCompleted {
-            id,
-            name,
-            arguments,
-            ..
-        }) => Ok(Streamed::Tool {
-            id,
-            name,
-            arguments,
-        }),
-        Ok(_) => return None,
-        Err(error) => Err(error),
-    })
-}
-
-/// Say what a context trim removed, when it removed anything.
-///
-/// A transcript that has outgrown the window fails at the provider, so the
-/// operator is told what was elided rather than watching the turn shrink
-/// invisibly.
-#[cfg(feature = "tui")]
-fn report_trim(colour: bool, trimmed: &arsy_code::agent::budget::Trimmed) -> io::Result<()> {
-    if !trimmed.changed() {
-        return Ok(());
-    }
-    let mut terminal = io::stdout();
-    writeln!(
-        terminal,
-        "{}",
-        tui::tool_result_row(
-            colour,
-            "context",
-            true,
-            &format!(
-                "elided {} tool result(s) and compacted {} earlier message(s) to stay \
-                 within {} tokens",
-                trimmed.elided, trimmed.summarized, trimmed.after
-            )
-        )
-    )?;
-    terminal.flush()
-}
-
-/// The call being answered.
-#[cfg(feature = "tui")]
-struct Call<'a> {
-    name: &'a str,
-    arguments: &'a Value,
-    /// Identifies the effect, so an identical later call can be answered from
-    /// this one's result.
-    fingerprint: String,
-}
-
-/// What answering a call is allowed to touch.
-#[cfg(feature = "tui")]
-struct Answering<'a> {
-    keys: &'a std::sync::mpsc::Receiver<u8>,
-    decoder: &'a mut tui::Keys,
-    approval: &'a approval::ApprovalCell,
-    completed: &'a mut std::collections::HashMap<String, String>,
-    interrupted: &'a mut bool,
-    hooks: Option<&'a arsy_code::hook::HookEngine>,
-}
-
-/// Run one call and turn what happened into the result the provider is sent.
-#[cfg(feature = "tui")]
-fn run_call(
-    runtime: &arsy_code::agent::ToolRuntime,
-    terminal: &mut io::Stdout,
-    colour: bool,
-    summary: &str,
-    call: Call<'_>,
-    answering: Answering<'_>,
-) -> io::Result<(String, bool)> {
-    // A new effect can invalidate an earlier read or command result, so only
-    // reuse calls until the next effectful call.
-    if !runtime.is_observational(call.name, call.arguments) {
-        answering.completed.clear();
-    }
-    match execute_call(
-        runtime,
-        terminal,
-        colour,
-        call.name,
-        call.arguments,
-        summary,
-        answering.keys,
-        answering.decoder,
-        answering.approval,
-        answering.hooks,
-    )? {
-        Executed::Answered(mut result) => {
-            if !result.changed_files.is_empty() {
-                result.output.push_str("\nChanged files:\n");
-                for path in &result.changed_files {
-                    result.output.push_str(&format!("  • {path}\n"));
-                }
-            }
-            if result.success {
-                answering
-                    .completed
-                    .insert(call.fingerprint, result.output.clone());
-            }
-            Ok((result.output, !result.success))
-        }
-        Executed::Stopped => {
-            *answering.interrupted = true;
-            writeln!(terminal, "{}", tui::interrupted_row(colour))?;
-            Ok(("The operator stopped the turn.".to_owned(), true))
-        }
-    }
-}
-
-/// What happened to one tool call.
-#[cfg(feature = "tui")]
-enum Executed {
-    Answered(arsy_code::agent::ToolResult),
-    Stopped,
-}
-
-/// Decide, confirm if the decision says to, and run.
-///
-/// Policy is asked first, so the operator is only interrupted for calls that
-/// actually need a human: a read policy already allows runs without a prompt,
-/// and a call policy denies is refused without one. That is the difference
-/// between an approval and a habit — an operator asked to confirm every read
-/// stops reading the prompts.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn execute_call(
-    runtime: &arsy_code::agent::ToolRuntime,
-    terminal: &mut io::Stdout,
-    colour: bool,
-    name: &str,
-    arguments: &Value,
-    summary: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    approval: &approval::ApprovalCell,
-    hooks: Option<&arsy_code::hook::HookEngine>,
-) -> io::Result<Executed> {
-    let started = std::time::Instant::now();
-    let mut notes = Vec::new();
-    let (arguments, injected) =
-        match hooks.map(|hooks| hook_before_call(hooks, name, arguments, &mut notes)) {
-            None => (arguments.clone(), Vec::new()),
-            Some(hooked) => {
-                let asking = Asking {
-                    name,
-                    arguments,
-                    summary,
-                    keys,
-                    decoder: &mut *decoder,
-                    approval,
-                };
-                match hooked_arguments(terminal, colour, hooked, asking, &notes)? {
-                    Ok(run) => run,
-                    Err(executed) => return Ok(executed),
-                }
-            }
-        };
-    let arguments = &arguments;
-    let request = match runtime.prepare(name, arguments) {
-        Ok(request) => request,
-        Err(failure) => return Ok(Executed::Answered(*failure)),
-    };
-    let authorization = runtime.authorize(&request);
-    let (grants, approval_note) = match authorize(
-        terminal,
-        colour,
-        Asking {
-            name,
-            arguments,
-            summary,
-            keys,
-            decoder,
-            approval,
-        },
-        authorization,
-    )? {
-        Granted::Run { grants, note } => (grants, note),
-        Granted::Refused(result) => return Ok(Executed::Answered(*result)),
-        Granted::Stopped => return Ok(Executed::Stopped),
-    };
-    let (mut result, cancelled) = dispatch_tool_live(
-        terminal, colour, runtime, name, &request, &grants, started, summary, keys, decoder,
-    )?;
-    if cancelled {
-        return Ok(Executed::Stopped);
-    }
-    if let Some(note) = approval_note {
-        result.output = format!("{}\nOperator note: {note}", result.output);
-    }
-    if let Some(hooks) = hooks {
-        notes.clear();
-        hook_after_call(hooks, name, &injected, &mut result, &mut notes);
-        hook_notes(terminal, colour, &notes)?;
-    }
-    Ok(Executed::Answered(result))
-}
-
-/// The arguments a call runs with and what hooks injected for the model.
-#[cfg(feature = "tui")]
-type HookedRun = (Value, Vec<(String, String)>);
-
-/// What `before_operation` leaves the interactive turn to run.
-///
-/// Unlike a scripted run, this surface has an operator, so a hook that wants
-/// one asked gets the approval dialog rather than a refusal.
-#[cfg(feature = "tui")]
-fn hooked_arguments(
-    terminal: &mut io::Stdout,
-    colour: bool,
-    hooked: HookedCall,
-    asking: Asking<'_>,
-    notes: &[String],
-) -> io::Result<Result<HookedRun, Executed>> {
-    hook_notes(terminal, colour, notes)?;
-    let (arguments, injected, reason) = match hooked {
-        HookedCall::Refused(reason) => {
-            return Ok(Err(Executed::Answered(hook_refused(asking.name, reason))))
-        }
-        HookedCall::Run {
-            arguments,
-            injected,
-            approval,
-        } => (arguments, injected, approval),
-    };
-    let Some(reason) = reason else {
-        return Ok(Ok((arguments, injected)));
-    };
-    let answer = confirm_tool(
-        terminal,
-        colour,
-        asking.name,
-        asking.summary,
-        &format!("a hook asks for approval: {reason}"),
-        format_tool_preview(asking.name, &arguments),
-        asking.keys,
-        asking.decoder,
-        asking.approval,
-    )?;
-    Ok(match answer {
-        Answer::Yes { .. } => Ok((arguments, injected)),
-        Answer::No { .. } => Err(Executed::Answered(hook_refused(
-            asking.name,
-            "The operator declined the call a hook asked about.".to_owned(),
-        ))),
-        Answer::Stop => Err(Executed::Stopped),
-    })
-}
-
-/// What the hooks said about a call, as dim rows above it.
-#[cfg(feature = "tui")]
-fn hook_notes(terminal: &mut io::Stdout, colour: bool, notes: &[String]) -> io::Result<()> {
-    notes
-        .iter()
-        .try_for_each(|note| writeln!(terminal, "{}", tui::hook_note_row(colour, note)))
-}
-
-/// What deciding a call needs in order to ask about it.
-#[cfg(feature = "tui")]
-struct Asking<'a> {
-    name: &'a str,
-    arguments: &'a Value,
-    summary: &'a str,
-    keys: &'a std::sync::mpsc::Receiver<u8>,
-    decoder: &'a mut tui::Keys,
-    approval: &'a approval::ApprovalCell,
-}
-
-/// What authorizing a call decided.
-#[cfg(feature = "tui")]
-enum Granted {
-    Run {
-        grants: Vec<arsy_kernel::capability::CapabilityGrant>,
-        /// What the operator said when they approved it, if anything.
-        note: Option<String>,
-    },
-    /// The call does not run, and this is what the provider is told.
-    Refused(Box<arsy_code::agent::ToolResult>),
-    Stopped,
-}
-
-/// Turn an authorization into grants, asking the operator when the mode says
-/// to ask.
-///
-/// Separate from running the call: what a call is allowed to do is decided
-/// before anything happens, and reading that decision should not mean reading
-/// the execution as well.
-#[cfg(feature = "tui")]
-fn authorize(
-    terminal: &mut io::Stdout,
-    colour: bool,
-    asking: Asking<'_>,
-    authorization: arsy_code::agent::Authorization,
-) -> io::Result<Granted> {
-    use arsy_code::agent::Authorization;
-
-    let name = asking.name;
-    let requested = match &authorization {
-        Authorization::Allowed(grants) => {
-            return Ok(Granted::Run {
-                grants: grants.clone(),
-                note: None,
-            })
-        }
-        Authorization::Denied(reason) => return Ok(refused(name, reason.clone())),
-        Authorization::NeedsApproval { .. } => authorization.requested(),
-    };
-    match approval::decide(asking.approval.get(), name) {
-        approval::Decision::Approve => Ok(granted(authorization, name, None)),
-        approval::Decision::Refuse => Ok(refused(
-            name,
-            format!(
-                "the current approval mode ({}) refuses this call without asking: {}",
-                asking.approval.get().label(),
-                requested
-            ),
-        )),
-        approval::Decision::Ask => {
-            let preview = format_tool_preview(name, asking.arguments);
-            match confirm_tool(
-                terminal,
-                colour,
-                name,
-                asking.summary,
-                &requested,
-                preview,
-                asking.keys,
-                asking.decoder,
-                asking.approval,
-            )? {
-                Answer::Yes { note } => Ok(granted(authorization, name, note)),
-                Answer::No { note } => Ok(refused(
-                    name,
-                    note.map_or_else(
-                        || "The operator declined to run this call.".to_owned(),
-                        |note| format!("The operator declined to run this call. Feedback: {note}"),
-                    ),
-                )),
-                Answer::Stop => Ok(Granted::Stopped),
-            }
-        }
-    }
-}
-
-/// Turn an approved authorization into the grants the call runs under.
-#[cfg(feature = "tui")]
-fn granted(
-    authorization: arsy_code::agent::Authorization,
-    name: &str,
-    note: Option<String>,
-) -> Granted {
-    match authorization.approve() {
-        Ok(grants) => Granted::Run { grants, note },
-        Err(error) => refused(
-            name,
-            format!("the approval could not be turned into a grant: {error}"),
-        ),
-    }
-}
-
-/// The answer a call that will not run sends back to the provider.
-#[cfg(feature = "tui")]
-fn refused(name: &str, reason: String) -> Granted {
-    Granted::Refused(Box::new(arsy_code::agent::ToolResult::refused(
-        name, reason,
-    )))
-}
-
-fn write_unwrapped_lines(terminal: &mut impl Write, lines: &[String]) -> io::Result<()> {
-    write!(terminal, "{}", tui::DISABLE_AUTOWRAP)?;
-    for line in lines {
-        writeln!(terminal, "{line}")?;
-    }
-    write!(terminal, "{}", tui::ENABLE_AUTOWRAP)
-}
-
-#[cfg(feature = "tui")]
-// Every argument is one the live view needs and none of them group into a
-// meaningful type: the terminal, the call, and the keyboard are three unrelated
-// things this function happens to hold at once.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_tool_live(
-    terminal: &mut io::Stdout,
-    colour: bool,
-    runtime: &arsy_code::agent::ToolRuntime,
-    name: &str,
-    request: &arsy_kernel::operation::OperationRequest,
-    grants: &[arsy_kernel::capability::CapabilityGrant],
-    started: std::time::Instant,
-    summary: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-) -> io::Result<(arsy_code::agent::ToolResult, bool)> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let (output_sender, output_receiver) = std::sync::mpsc::channel();
-    let output_sink: arsy_kernel::operation::OutputSink = std::sync::Arc::new(move |chunk| {
-        let _ = output_sender.send(chunk);
-    });
-    runtime.set_output_sink(Some(output_sink));
-    let worker_runtime = runtime.clone();
-    let name = name.to_owned();
-    let worker_name = name.clone();
-    let request = request.clone();
-    let operation_id = request.id;
-    let worker_request = request.clone();
-    let grants = grants.to_vec();
-    std::thread::spawn(move || {
-        let result = worker_runtime.dispatch(&worker_name, &worker_request, &grants, started);
-        let _ = sender.send(result);
-    });
-
-    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-    let mut frame = 0usize;
-    let elapsed = std::time::Instant::now();
-    let mut cancelled = false;
-    let mut expanded = false;
-    let mut live_output = String::new();
-    let initial_state = tui::RunningToolState {
-        name: name.as_str(),
-        summary,
-        frame: FRAMES[0],
-        elapsed_ms: 0,
-        live_output: "",
-        expanded,
-    };
-    let initial = tui::tool_running_box(tui::terminal_width(), colour, &initial_state);
-    write_unwrapped_lines(terminal, &initial)?;
-    terminal.flush()?;
-    let mut last_rendered_lines = initial.len();
-    loop {
-        if absorb_live_keys(
-            keys,
-            decoder,
-            terminal,
-            LiveCall {
-                name: &name,
-                cancellable: request.kind.to_string() == "process.exec",
-                operation_id,
-            },
-            &mut last_rendered_lines,
-            &mut expanded,
-        )? {
-            cancelled = true;
-        }
-        match receiver.recv_timeout(std::time::Duration::from_millis(80)) {
-            Ok(result) => {
-                runtime.set_output_sink(None);
-                if last_rendered_lines > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
-                    terminal.flush()?;
-                }
-                return Ok((result, cancelled));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                absorb_output(&output_receiver, &mut live_output);
-                frame = frame.wrapping_add(1);
-                let state = tui::RunningToolState {
-                    name: name.as_str(),
-                    summary,
-                    frame: FRAMES[frame % FRAMES.len()],
-                    elapsed_ms: elapsed.elapsed().as_millis(),
-                    live_output: &live_output,
-                    expanded,
-                };
-                let status_lines = tui::tool_running_box(tui::terminal_width(), colour, &state);
-                if last_rendered_lines > 0 {
-                    write!(terminal, "\x1b[{}A\r\x1b[J", last_rendered_lines)?;
-                }
-                write_unwrapped_lines(terminal, &status_lines)?;
-                terminal.flush()?;
-                last_rendered_lines = status_lines.len();
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("tool worker disconnected"));
-            }
-        }
-    }
-}
-
-#[cfg(feature = "tui")]
-fn format_tool_preview(name: &str, arguments: &Value) -> Option<String> {
-    match name {
-        "apply_patch" | "fs.edit" | "edit" => arguments
-            .get("input")
-            .or_else(|| arguments.get("patch"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        "fs.write" | "write" => {
-            let path = arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("file");
-            let content = arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let preview: Vec<String> = content.lines().take(12).map(|l| format!("+{l}")).collect();
-            let mut text = format!("--- /dev/null\n+++ {path}\n{}", preview.join("\n"));
-            if content.lines().count() > 12 {
-                text.push_str(&format!(
-                    "\n… ({} lines omitted)",
-                    content.lines().count() - 12
-                ));
-            }
-            Some(text)
-        }
-        "bash" | "shell.execute" => arguments
-            .get("command")
-            .and_then(Value::as_str)
-            .map(|cmd| format!("$ {cmd}")),
-        _ => None,
-    }
-}
-
-/// Ask the operator whether one tool call may run.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn confirm_tool(
-    terminal: &mut io::Stdout,
-    colour: bool,
-    name: &str,
-    summary: &str,
-    reason: &str,
-    diff_preview: Option<String>,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    approval: &approval::ApprovalCell,
-) -> io::Result<Answer> {
-    let mut dialog = tui::AskDialogState::for_approval(name, summary, reason, diff_preview);
-    let width = tui::terminal_width();
-    let mut rendered_lines = dialog.render(width, colour).lines().count();
-    writeln!(terminal, "{}", dialog.render(width, colour))?;
-    terminal.flush()?;
-    approval.open();
-    loop {
-        match keys.recv() {
-            Ok(byte) => match decoder.feed(byte) {
-                Some(key) => {
-                    if let Some(result) = dialog.handle_key(key) {
-                        write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-                        terminal.flush()?;
-                        match result {
-                            tui::AskDialogResult::Approve { note } => {
-                                return Ok(Answer::Yes { note })
-                            }
-                            tui::AskDialogResult::AlwaysApprove { note } => {
-                                approval.set(approval::ApprovalMode::Auto);
-                                return Ok(Answer::Yes { note });
-                            }
-                            tui::AskDialogResult::Deny { note } => return Ok(Answer::No { note }),
-                            tui::AskDialogResult::CycleMode => continue,
-                            tui::AskDialogResult::Cancel => return Ok(Answer::Stop),
-                        }
-                    } else {
-                        let frame = dialog.render(width, colour);
-                        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
-                        terminal.flush()?;
-                        rendered_lines = frame.lines().count();
-                    }
-                }
-                None => continue,
-            },
-            Err(_) => return Ok(Answer::Stop),
-        }
-    }
-}
-
-#[cfg(feature = "tui")]
-fn confirm_plan(
-    terminal: &mut io::Stdout,
-    colour: bool,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    preview: &str,
-) -> io::Result<tui::AskDialogResult> {
-    let mut dialog = tui::AskDialogState::for_plan(preview.to_owned());
-    dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
-    let width = tui::terminal_width();
-    let mut frame = dialog.render(width, colour);
-    let mut rendered_lines = frame.lines().count();
-    writeln!(terminal, "{frame}")?;
-    terminal.flush()?;
-    loop {
-        let Ok(byte) = keys.recv() else {
-            return Ok(tui::AskDialogResult::Cancel);
-        };
-        let Some(key) = decoder.feed(byte) else {
-            continue;
-        };
-        if let Some(result) = dialog.handle_key(key) {
-            write!(terminal, "\x1b[{}A\r\x1b[J", rendered_lines)?;
-            terminal.flush()?;
-            return Ok(result);
-        }
-        dialog.set_preview_height(tui::terminal_rows().saturating_sub(16));
-        frame = dialog.render(width, colour);
-        write!(terminal, "\x1b[{}A\r\x1b[J{}\n", rendered_lines, frame)?;
-        terminal.flush()?;
-        rendered_lines = frame.lines().count();
-    }
-}
-
-#[cfg(feature = "tui")]
-fn redraw_live_response(
-    terminal: &mut dyn Write,
-    composer: &mut tui::Composer,
-    colour: bool,
-    footer: &str,
-    status: &str,
-    text: &str,
-    prev_lines: usize,
-) -> io::Result<usize> {
-    let mut frame = composer.clear();
-    for _ in 0..prev_lines {
-        frame.push_str("\x1b[1A\r\x1b[K");
-    }
-    frame.push_str(&tui::assistant_row(colour, text));
-    frame.push('\n');
-    let width = tui::terminal_width();
-    frame.push_str(&composer.render_turn(width, colour, status, footer));
-    write!(terminal, "{frame}")?;
-    terminal.flush()?;
-    let text_len = unicode_width::UnicodeWidthStr::width(text);
-    let lines = text_len.checked_div(width).map_or(1, |div| div + 1);
-    Ok(lines)
-}
-
-#[cfg(feature = "tui")]
-fn erase_live_response(
-    terminal: &mut dyn Write,
-    composer: &mut tui::Composer,
-    lines: usize,
-) -> io::Result<()> {
-    let mut frame = composer.clear();
-    for _ in 0..lines.max(1) {
-        frame.push_str("\x1b[1A\r\x1b[K");
-    }
-    write!(terminal, "{frame}")?;
-    terminal.flush()
-}
-
-#[cfg(feature = "tui")]
-/// Call `native_status` for one round, and once more if a stale OAuth
-/// access token is why it failed — the interactive-session counterpart to
-/// `dispatch_with_refresh`. A session resolves its provider once and keeps
-/// it for as long as the operator keeps typing (`resolve_route`'s cache),
-/// so a token that expires between turns is never re-checked until this
-/// catches it.
-#[allow(clippy::too_many_arguments)]
-fn native_status_with_refresh(
-    resolved: &mut provider::Resolved,
-    config: &arsy_kernel::config::Config,
-    runtime: &arsy_code::agent::ToolRuntime,
-    conversation: &[ModelMessage],
-    route: &tui::ModelRoute,
-    effort: Option<Effort>,
-    turn: arsy_kernel::domain::TurnId,
-    round: usize,
-    colour: bool,
-    footer: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    approval: &approval::ApprovalCell,
-) -> io::Result<Turn> {
-    let outcome = native_status(
-        resolved,
-        config,
-        runtime,
-        conversation,
-        route,
-        effort,
-        turn,
-        round,
-        colour,
-        footer,
-        keys,
-        decoder,
-        composer,
-        approval,
-    )?;
-    let Some(error) = &outcome.provider_error else {
-        return Ok(outcome);
-    };
-    if !is_stale_oauth_token(error, resolved.source) {
-        return Ok(outcome);
-    }
-    let Ok(refreshed) = provider::resolve(config, Some(&resolved.endpoint.id)) else {
-        return Ok(outcome);
-    };
-    *resolved = refreshed;
-    native_status(
-        resolved,
-        config,
-        runtime,
-        conversation,
-        route,
-        effort,
-        turn,
-        round,
-        colour,
-        footer,
-        keys,
-        decoder,
-        composer,
-        approval,
-    )
-}
-
-/// Stream one round of a turn from a configured provider, keeping the composer
-/// alive.
-///
-/// The stream runs on its own thread for the same reason the Codex reader
-/// does: the main loop has to keep watching the key stream, which is what lets
-/// Esc or Ctrl-C stop a turn and keeps the composer typeable meanwhile. The
-/// thread is detached rather than joined, so an interrupt never waits on a
-/// stalled socket; dropping the receiver is what stops it, because the next
-/// send fails and the stream is dropped with the thread.
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn native_status(
-    resolved: &provider::Resolved,
-    config: &arsy_kernel::config::Config,
-    runtime: &arsy_code::agent::ToolRuntime,
-    conversation: &[ModelMessage],
-    route: &tui::ModelRoute,
-    effort: Option<Effort>,
-    turn: arsy_kernel::domain::TurnId,
-    round: usize,
-    colour: bool,
-    footer: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    approval: &approval::ApprovalCell,
-) -> io::Result<Turn> {
-    let request = round_request(
-        resolved,
-        config,
-        runtime,
-        conversation,
-        route,
-        effort,
-        turn,
-        round,
-    )?;
-    let events = spawn_stream(Arc::clone(&resolved.provider), request);
-
-    let mut outcome = Turn::default();
-    let mut terminal = io::stdout();
-    // Deltas arrive token by token; a row is emitted per line so scrollback
-    // reads like the Codex projection rather than one row per token.
-    //
-    // Thinking and the answer hold separate buffers, and each thinking section
-    // is announced once with its own header row, so the verbose stream reads as
-    // distinct parts of the turn rather than one grey blur.
-    let mut live = Streaming::default();
-    let started = std::time::Instant::now();
-    let mut tick = 0usize;
-    // A static `Working…` line cannot tell a slow connect from a hang; the
-    // status is rebuilt on every timer pass instead of captured once.
-    let status_line = |first_event: bool, tick: usize| {
-        tui::turn_status(
-            colour,
-            if first_event {
-                tui::TurnPhase::Answering
-            } else {
-                tui::TurnPhase::Connecting
-            },
-            started.elapsed(),
-            tick,
-            0,
-        )
-    };
-    let mut first_event = false;
-    let draw = |terminal: &mut io::Stdout,
-                composer: &mut tui::Composer,
-                row: Option<&str>,
-                status: &str| {
-        let mut frame = composer.clear();
-        if let Some(row) = row {
-            frame.push_str(row);
-            frame.push('\n');
-        }
-        frame.push_str(&composer.render_turn(tui::terminal_width(), colour, status, footer));
-        write!(terminal, "{frame}").and_then(|()| terminal.flush())
-    };
-    draw(&mut terminal, composer, None, &status_line(false, 0))?;
-    loop {
-        let typed = drain_keys(keys, decoder, composer, approval, &mut outcome);
-        if typed == Typed::Interrupted {
-            draw(
-                &mut terminal,
-                composer,
-                Some(&tui::interrupted_row(colour)),
-                &status_line(first_event, tick),
-            )?;
-            return finish(terminal, composer, outcome);
-        }
-        // The status is alive: the spinner advances and the seconds climb even
-        // while the provider sends nothing, so a silent turn never reads as a
-        // frozen one.
-        tick = tick.wrapping_add(1);
-        if typed == Typed::Redraw {
-            draw(
-                &mut terminal,
-                composer,
-                None,
-                &status_line(first_event, tick),
-            )?;
-        }
-        match events.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(Ok(Streamed::Thinking(text))) => {
-                let status = status_line(first_event, tick);
-                live.reason(&mut terminal, composer, colour, footer, &status, &text)?;
-                first_event = true;
-            }
-            Ok(Ok(Streamed::Text(text))) => {
-                outcome.response.push_str(&text);
-                let status = status_line(first_event, tick);
-                live.answer(&mut terminal, composer, colour, footer, &status, &text)?;
-                first_event = true;
-            }
-            Ok(Ok(Streamed::Usage {
-                input_tokens,
-                output_tokens,
-            })) => {
-                outcome.usage =
-                    json!({"input_tokens": input_tokens, "output_tokens": output_tokens});
-            }
-            Ok(Ok(Streamed::Tool {
-                id,
-                name,
-                arguments,
-            })) => {
-                outcome.calls.push((id, name, arguments));
-                first_event = true;
-            }
-            Ok(Err(failure)) => {
-                outcome.failure = Some(failure.to_string());
-                outcome.provider_error = Some(failure);
-                break;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if decoder.flush_escape() == Some(tui::Key::Interrupt) {
-                    outcome.interrupted = true;
-                    if live.live_lines > 0 {
-                        erase_live_response(&mut terminal, composer, live.live_lines)?;
-                    }
-                    draw(
-                        &mut terminal,
-                        composer,
-                        Some(&tui::interrupted_row(colour)),
-                        &status_line(first_event, tick),
-                    )?;
-                    return finish(terminal, composer, outcome);
-                }
-                // Repaint the live status on every idle pass.
-                draw(
-                    &mut terminal,
-                    composer,
-                    None,
-                    &status_line(first_event, tick),
-                )?;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    live.close(
-        &mut terminal,
-        composer,
-        colour,
-        footer,
-        &status_line(first_event, tick),
-    )?;
-    finish(terminal, composer, outcome)
-}
-
-/// One streamed fact from a provider, as the terminal needs it.
-#[cfg(feature = "tui")]
-enum Streamed {
-    Text(String),
-    Thinking(String),
-    Usage {
-        input_tokens: u64,
-        output_tokens: u64,
-    },
-    /// A complete tool call. The host runs it after the stream ends, so a turn
-    /// is never edited from under a model that is still writing.
-    Tool {
-        id: String,
-        name: String,
-        arguments: Value,
-    },
-}
-
-/// Tear the composer down so the next thing printed starts on its own line.
-#[cfg(feature = "tui")]
-fn finish(mut terminal: io::Stdout, composer: &mut tui::Composer, turn: Turn) -> io::Result<Turn> {
-    write!(terminal, "{}", composer.clear())?;
-    terminal.flush()?;
-    Ok(turn)
-}
-
-#[cfg(feature = "tui")]
-/// Run the task through the logged-in Codex CLI and project its JSONL event
-/// stream as ARSY rows, so the terminal shows one interface, not two.
-#[allow(clippy::too_many_arguments)]
-fn external_status(
-    workspace: &Path,
-    task: &str,
-    route: &tui::ModelRoute,
-    approval: &approval::ApprovalCell,
-    colour: bool,
-    footer: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    redactor: &Redactor,
-) -> io::Result<Turn> {
-    let mode = approval.get();
-    let mut command = std::process::Command::new("codex");
-    command.args([
-        "exec",
-        "--json",
-        "--ephemeral",
-        "--sandbox",
-        if matches!(
-            mode,
-            approval::ApprovalMode::AcceptEdits
-                | approval::ApprovalMode::Auto
-                | approval::ApprovalMode::BypassPermissions
-        ) {
-            "workspace-write"
-        } else {
-            "read-only"
-        },
-        "--cd",
-    ]);
-    command.arg(workspace);
-    if route.model != "default" {
-        command.args(["--model", &route.model]);
-    }
-    command.arg("-");
-    command.current_dir(workspace);
-    let task = if mode == approval::ApprovalMode::Plan {
-        format!(
-            "{}\n\n{}",
-            arsy_code::agent::instructions::PLAN_MODE_INSTRUCTIONS,
-            task
-        )
-    } else {
-        task.to_owned()
-    };
-    drive_provider(
-        command, &task, route, approval, colour, footer, keys, decoder, composer, redactor,
-    )
-}
-
-#[cfg(feature = "tui")]
-#[allow(clippy::too_many_arguments)]
-fn drive_provider(
-    command: std::process::Command,
-    task: &str,
-    route: &tui::ModelRoute,
-    approval: &approval::ApprovalCell,
-    colour: bool,
-    footer: &str,
-    keys: &std::sync::mpsc::Receiver<u8>,
-    decoder: &mut tui::Keys,
-    composer: &mut tui::Composer,
-    redactor: &Redactor,
-) -> io::Result<Turn> {
-    let (mut child, errors, input, events) = spawn_provider(command, task)?;
-    let started = std::time::Instant::now();
-    let mut cancelling = None;
-    let mut stream_closed = false;
-    let mut finished = None;
-    let mut last_event = std::time::Instant::now();
-    let mut stopped_early = false;
-    let mut last_row = None;
-    let mut last_key = std::time::Instant::now();
-    let mut exited = None;
-    let mut status: Option<std::process::ExitStatus> = None;
-    let mut outcome = Turn::default();
-    let mut successful_git_commands = std::collections::HashSet::new();
-    let mut terminal = io::stdout();
-    composer.set_height(tui::terminal_rows());
-    let painter = Painter {
-        colour,
-        footer,
-        width: std::cell::Cell::new(tui::terminal_width()),
-        started,
-    };
-    painter.row(&mut terminal, composer, None, false, 0, 0)?;
-    let mut refreshed = std::time::Instant::now();
-    loop {
-        let tick = (started.elapsed().as_millis() / 100) as usize;
-        if let Ok(result) = input.try_recv() {
-            if !outcome.interrupted {
-                result?;
-            }
-        }
-        match lifecycle(
-            &mut child,
-            Clocks {
-                started,
-                status: &mut status,
-                exited: &mut exited,
-                finished: &mut finished,
-                last_event,
-                cancelling,
-                stopped_early: &mut stopped_early,
-            },
-        )? {
-            Pass::Stop => break,
-            Pass::Go => {}
-        }
-        let typed = provider_keys(
-            Keyboard {
-                keys,
-                decoder,
-                composer,
-                approval,
-            },
-            &mut terminal,
-            &painter,
-            &mut child,
-            Turning {
-                outcome: &mut outcome,
-                cancelling: &mut cancelling,
-                last_key: &mut last_key,
-            },
-            colour,
-            tick,
-        )?;
-        if last_key.elapsed() >= std::time::Duration::from_millis(40)
-            && decoder.flush_escape() == Some(tui::Key::Interrupt)
-            && stop_turn(&mut outcome, &mut child, &mut cancelling)
-        {
-            painter.row(
-                &mut terminal,
-                composer,
-                Some(&tui::interrupted_row(colour)),
-                true,
-                0,
-                tick,
-            )?;
-        }
-        let resize_tick = remeasure(&painter, composer, &mut refreshed);
-        if typed || resize_tick {
-            painter.row(
-                &mut terminal,
-                composer,
-                None,
-                cancelling.is_some(),
-                outcome.queued.len(),
-                tick,
-            )?;
-        }
-        match events.recv_timeout(std::time::Duration::from_millis(40)) {
-            Ok(_) if outcome.interrupted => {}
-            Ok(line) => {
-                last_event = std::time::Instant::now();
-                show_event(
-                    &line?,
-                    redactor,
-                    &mut child,
-                    &painter,
-                    &mut terminal,
-                    composer,
-                    Streamlined {
-                        outcome: &mut outcome,
-                        finished: &mut finished,
-                        stopped_early: &mut stopped_early,
-                        seen_git: &mut successful_git_commands,
-                        last_row: &mut last_row,
-                    },
-                    colour,
-                    tick,
-                )?;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Repaint so the spinner and clock stay alive while the
-                // provider is quiet, not just when an event or a key arrives.
-                painter.row(
-                    &mut terminal,
-                    composer,
-                    None,
-                    cancelling.is_some(),
-                    outcome.queued.len(),
-                    tick,
-                )?;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stream_closed = true,
-        }
-        if stream_closed {
-            if status.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(40));
-        }
-    }
-    write!(terminal, "{}", composer.clear())?;
-    terminal.flush()?;
-    if !outcome.interrupted && finished.is_none() {
-        return Err(silent_provider(&errors, redactor)?);
-    }
-    if !outcome.interrupted {
-        outcome.failure = verdict(&mut child, route, status, stopped_early, &outcome)?;
-    }
-    Ok(outcome)
-}
-
-/// What one interactive turn left behind, whichever route ran it.
-#[cfg(feature = "tui")]
-#[derive(Default)]
-struct Turn {
-    /// `None` when the turn succeeded; otherwise why it did not.
-    failure: Option<String>,
-    /// The typed error `failure` was rendered from, when this turn's
-    /// failure came from a provider stream at all — `None` for the
-    /// round-limit and external-CLI failure paths, neither of which is a
-    /// [`ProviderError`]. Kept separately so a caller can tell a stale
-    /// OAuth token apart from anything else without parsing `failure`'s
-    /// display text.
-    provider_error: Option<arsy_kernel::provider::ProviderError>,
-    /// The full text of the model's answer, kept so follow-up turns in the
-    /// same session know what the model said.
-    response: String,
-    /// Extra facts to record on a completed turn, such as token usage.
-    usage: Value,
-    interrupted: bool,
-    provider_failed: bool,
-    /// A line submitted while this turn was still running.
-    queued: std::collections::VecDeque<String>,
-    quit: bool,
-    /// Tool calls the model made and the host has not run yet: id, name, and
-    /// arguments. Only complete calls land here, so a truncated stream cannot
-    /// leave a half-parsed call to execute.
-    calls: Vec<(String, String, Value)>,
-}
-#[cfg(feature = "tui")]
-/// Record and report a turn the provider did not complete.
-///
-/// The code and the reason follow the route, because "the CLI failed" is not
-/// something to tell an operator whose turn went straight to an endpoint, and
-/// the recorded reason is what a later audit reads.
-fn fail_turn(
-    service: &AgentService,
-    actor: Principal,
-    turn: arsy_kernel::domain::TurnId,
-    session: SessionId,
-    route: &tui::ModelRoute,
-    message: String,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
-    let (code, reason, remediation) = if route.is_codex() {
-        (
-            "ARSY-PRV-1002",
-            "provider_cli",
-            "verify the selected CLI login and model, then retry",
-        )
-    } else {
-        (
-            ARSY_PRV_1000,
-            "provider",
-            "check the provider endpoint, credential, and model in `arsy config explain`",
-        )
-    };
-    let diagnostic = Diagnostic::error(code, message, remediation);
-    service
-        .fail_turn(actor, turn, reason, diagnostic.message.clone())
-        .map_err(storage_failed)?;
-    emitter.diagnostic(&diagnostic);
-    turn_record(
-        emitter,
-        json!({
-            "session": session.to_string(),
-            "turn": turn.to_string(),
-            "status": "failed",
-        }),
-    );
-    Ok(diagnostic.exit_code())
-}
-
-/// Emit the machine record for one interactive turn.
-///
-/// The record is the audit trail machines read, so `--output json` and `ci`
-/// keep it. Printing it after every reply in the interactive terminal only
-/// buries the reply, and the same evidence is already durable in the session
-/// store, reachable with `arsy resume`.
-#[cfg(feature = "tui")]
-fn turn_record(emitter: &mut Emitter, payload: Value) {
-    if emitter.output != Output::Human {
-        emitter.result(payload);
-    }
-}
-
-fn run(
-    invocation: &Invocation,
-    task: &str,
-    image: Option<&Path>,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
-    let task = if task == "-" {
-        read_stdin()?
-    } else {
-        task.to_owned()
-    };
-    let goal = prepare_task(invocation, &task, emitter)?;
-    // Read before the session is opened: a path that is not an image, or is
-    // too large, is the operator's mistake and should not cost a recorded turn.
-    let attached = image.map(read_image).transpose()?;
-    let mut execution = match TaskRun::open(invocation, None) {
-        Ok(execution) => execution,
-        Err(diagnostic) => return Ok(unusable(diagnostic, emitter)),
-    };
-    emitter.session = Some(execution.session);
-    let task = execution.enqueue(&goal)?;
-    execution.attached = attached;
-    execution.execute(task, Value::Null, emitter)
-}
-
-/// The most one attached image may be.
-///
-/// Large enough for a full-resolution screenshot, small enough that a
-/// mis-typed path to a video does not become a request nobody can send. The
-/// encoding grows it by a third, and every endpoint in this family refuses
-/// well below that.
-const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Read an image the operator attached, as canonical model content.
-fn read_image(path: &Path) -> Result<ModelContent, Diagnostic> {
-    let media_type = match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        other => {
-            return Err(usage(format!(
-                "--image accepts png, jpeg, gif, or webp, not `{}`",
-                other.unwrap_or("a file with no extension")
-            )))
-        }
-    };
-    let size = std::fs::metadata(path)
-        .map_err(|error| usage(format!("--image {}: {error}", path.display())))?
-        .len();
-    if size > MAX_IMAGE_BYTES {
-        return Err(usage(format!(
-            "--image {} is {size} bytes; the limit is {MAX_IMAGE_BYTES}",
-            path.display()
-        )));
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|error| usage(format!("--image {}: {error}", path.display())))?;
-    Ok(ModelContent::Image {
-        media_type: media_type.to_owned(),
-        data: arsy_kernel::provider::base64(&bytes),
-    })
-}
-
-/// A misconfiguration is the operator's to fix, not a failed turn in their
-/// session history, so nothing is recorded before it is reported.
-fn unusable(mut diagnostic: Diagnostic, emitter: &mut Emitter) -> i32 {
-    if diagnostic.code == ARSY_PRV_1000 {
-        diagnostic.remediation = format!(
-            "{}; or use the interactive TUI with a logged-in Codex CLI",
-            diagnostic.remediation
-        );
-    }
-    emitter.diagnostic(&diagnostic);
-    diagnostic.exit_code()
-}
-
-/// How long a task's lease runs before another process may take it over.
-///
-/// A turn still in flight has not lost its lease; a process that died halfway
 /// has, and telling those apart is the whole job of `arsy resume`.
-const TASK_LEASE_MS: u64 = 30 * 60 * 1000;
-
-/// What one task may spend before it is stopped rather than continued.
-///
-/// Wall time matches the lease, because a task that outlives its lease is one
-/// another process may already have taken. Tokens are several turns' worth of
-/// transcript: the point is to stop a runaway, not to second-guess a long task.
-const TASK_BUDGET: Budget = Budget {
-    tokens: CONTEXT_BUDGET_TOKENS as u64 * 4,
-    cost_micros: u64::MAX,
-    wall_ms: TASK_LEASE_MS,
-};
-
-/// One session's execution: the store, the provider it dispatches to, and the
-/// durable graph of tasks it is working through.
-///
-/// `arsy run` and `arsy resume` differ only in where the task comes from — a
-/// new one, or one a dead process left behind — so everything after that point
-/// is this, and a resumed task cannot drift from a fresh one by being executed
-/// somewhere else.
-struct TaskRun<'a> {
-    invocation: &'a Invocation,
-    root: PathBuf,
-    config: Config,
-    resolved: provider::Resolved,
-    model: String,
-    service: AgentService,
-    actor: Principal,
-    session: SessionId,
-    graph: TaskGraph,
-    /// This process's identity as a task holder, so an expired lease can be
-    /// told from one this process still holds.
-    agent: AgentId,
-    /// An image `--image` attached to the prompt, sent with the first message.
-    attached: Option<ModelContent>,
-}
-
-impl<'a> TaskRun<'a> {
-    /// Resolve everything a turn needs, then attach to the session.
-    ///
-    /// Configuration is resolved first and on its own: a provider that cannot
-    /// be reached is a diagnostic before anything is recorded.
-    fn open(invocation: &'a Invocation, session: Option<SessionId>) -> Result<Self, Diagnostic> {
-        let root = workspace_root(&invocation.workspace)?;
-        let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-        let config = load_config(&root, &working, invocation.config.as_deref())?;
-        let resolved = provider::resolve(&config, invocation.provider.as_deref())?;
-        let model = selected_model(&config, &resolved.endpoint, invocation.model.as_deref())?;
-
-        let store = open_store(&root)?;
-        let session = session.unwrap_or_default();
-        let actor = actor();
-        let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
-            .map_err(storage_failed)?;
-        let graph = TaskGraph::new(store, session, actor.clone()).map_err(graph_failed)?;
-        Ok(Self {
-            invocation,
-            root,
-            config,
-            resolved,
-            model,
-            service,
-            actor,
-            session,
-            graph,
-            agent: AgentId::new(),
-            attached: None,
-        })
-    }
-
-    /// Record a new task in the graph and take it.
-    fn enqueue(&mut self, goal: &str) -> Result<TaskId, Diagnostic> {
-        let id = TaskId::new();
-        self.graph
-            .add(TaskNode {
-                id,
-                goal: goal.to_owned(),
-                dependencies: Vec::new(),
-                assignee: Some(self.agent),
-                required_output: "an answer to the task".to_owned(),
-                // One process, one working tree: a scripted run edits the
-                // workspace it was pointed at.
-                workspace: WorkspaceRequirement::IsolatedWriter,
-                budget: TASK_BUDGET,
-                // Authority comes from policy at dispatch, not from the node:
-                // a grant recorded here would be a second, stale answer to the
-                // question `RuleSet::evaluate` already answers per call.
-                authority: Vec::new(),
-                state: TaskState::Pending,
-                lease_expires_at_ms: None,
-                runtime: Default::default(),
-            })
-            .map_err(graph_failed)?;
-        Ok(id)
-    }
-
-    /// Run one task to a terminal state, recording what it spent on the way.
-    ///
-    /// `context` is folded into the result: a resumed task reports what its
-    /// recovery found in the same record as its outcome, so one invocation
-    /// still produces exactly one result.
-    fn execute(
-        &mut self,
-        task: TaskId,
-        context: Value,
-        emitter: &mut Emitter,
-    ) -> Result<i32, Diagnostic> {
-        self.graph.ready().map_err(graph_failed)?;
-        self.graph
-            .lease(task, self.agent, unix_time_ms() + TASK_LEASE_MS)
-            .map_err(graph_failed)?;
-        let goal = self
-            .graph
-            .node(task)
-            .map(|node| node.goal.clone())
-            .ok_or_else(|| storage_failed("the task disappeared from its own graph"))?;
-
-        // No operator is present, so nothing can be confirmed mid-run: the risk
-        // context says so, and a call that needs an approval is refused by
-        // policy rather than waiting on a keyboard that is not there.
-        let agent = agent_runtime(
-            &self.root,
-            &self.config,
-            false,
-            &task.to_string(),
-            Some(self.session),
-            Some((
-                task,
-                self.graph
-                    .node(task)
-                    .and_then(|node| node.runtime.current_attempt),
-            )),
-            None,
-            emitter,
-        )?;
-        // A supervisor exists only when policy actually delegates something,
-        // so a workspace that grants nothing sees no spawn tool rather than one
-        // that always refuses.
-        let supervisor = subagent::Supervisor::new(
-            self.root.clone(),
-            &self.config,
-            &self.resolved,
-            self.model.clone(),
-            task,
-            &agent,
-        );
-        let delegates = supervisor.can_delegate();
-        // Loaded once, before the turn starts: a turn finishes with the hooks
-        // it began with, so a file edited mid-run cannot change the rules under
-        // an agent already applying them.
-        let loaded = hook_engine(&self.root, &self.config);
-        let hooks = (!loaded.is_empty()).then_some(&loaded.engine);
-        let goal = match turn_boundary(
-            hooks,
-            arsy_code::hook::LifecycleEvent::BeforeTurn,
-            &goal,
-            emitter,
-        ) {
-            Ok(goal) => goal,
-            Err(reason) => {
-                return Err(Diagnostic::error(
-                    "ARSY-HOK-1001",
-                    reason,
-                    "the hook that refused it is listed by `arsy hook list`",
-                ))
-            }
-        };
-        let admission = self.start_turn(&goal)?;
-        let request = CanonicalModelRequest {
-            model: ModelKey {
-                provider: self.resolved.endpoint.id.clone(),
-                model: self.model.clone(),
-            },
-            system: system_prompt(
-                &self.root,
-                &self.config,
-                &self.resolved.endpoint.id,
-                &self.model,
-                arsy_code::agent::ExecutionMode::Normal,
-            ),
-            messages: vec![ModelMessage {
-                role: ModelRole::User,
-                content: std::iter::once(ModelContent::Text { text: goal })
-                    .chain(self.attached.clone())
-                    .collect(),
-            }],
-            tools: {
-                let mut tools = agent.schemas();
-                if delegates {
-                    tools.push(subagent::schema());
-                }
-                tools
-            },
-            max_output_tokens: self.resolved.endpoint.max_output_tokens,
-            // Reasoning effort is chosen in the TUI with `/effort`. A scripted
-            // run takes the request it always took, so a remembered interactive
-            // choice cannot quietly change what a pipeline sends.
-            effort: None,
-            // The turn id, so a retried attempt is provably the same request.
-            idempotency_key: IdempotencyKey::new(admission.turn.to_string())
-                .map_err(|error| storage_failed(error.to_string()))?,
-        };
-
-        let started = Instant::now();
-        let mut recorder = telemetry::Recorder::new(&self.config, self.actor.clone())?;
-        let max_parallel_tools = self.config.max_parallel_tools();
-        let (outcome, interventions) = dispatch_with_refresh(
-            &mut self.resolved,
-            &self.config,
-            self.invocation.provider.as_deref(),
-            &self.root,
-            &self.model,
-            task,
-            &agent,
-            &request,
-            &mut recorder,
-            &mut self.graph,
-            hooks,
-            max_parallel_tools,
-            emitter,
-        );
-        let stop = match &outcome {
-            Ok(_) => "answered".to_owned(),
-            Err(error) => format!("provider:{}", error.code()),
-        };
-        // The turn has ended whatever it ended as, which is what Codex's own
-        // `notify` is for. Nothing it returns can change what already happened.
-        let _ = turn_boundary(
-            hooks,
-            arsy_code::hook::LifecycleEvent::AfterTurn,
-            &stop,
-            emitter,
-        );
-        let summary = recorder.finish(&stop, &redactor(self.invocation, emitter)?, emitter);
-        let mut record = json!({
-            "session": self.session.to_string(),
-            "task": task.to_string(),
-            "turn": admission.turn.to_string(),
-            "provider": self.resolved.endpoint.id,
-            "model": request.model.model,
-            "telemetry": summary,
-            "interventions": interventions,
-            // The same projection `/plan` and `/todo` draw, so a pipeline can
-            // read where the work stands without replaying raw events — and
-            // sees exactly what an operator watching the TUI would have seen.
-            "plan": progress::plan(&self.root, &task.to_string()),
-            "todos": open_store(&self.root)
-                .ok()
-                .and_then(|store| progress::todos(store as Arc<dyn EventStore>, self.session)),
-        });
-        merge(&mut record, context);
-        let input_tokens = summary_number(&record, "input_tokens");
-        let output_tokens = summary_number(&record, "output_tokens");
-        // What the turn cost, when configuration says what the model charges.
-        // `None` is reported as unknown rather than as zero: a session that
-        // claims it spent nothing is worse than one that admits it cannot say.
-        let priced = charge(
-            Some(&self.resolved.endpoint),
-            &self.model,
-            input_tokens,
-            output_tokens,
-        );
-        merge(
-            &mut record,
-            json!({
-                "cost_micros": priced,
-                "cost_source": if priced.is_some() { "configured" } else { "unknown" },
-            }),
-        );
-        // Recorded whether the turn completed or failed: a turn that died
-        // halfway still spent the tokens it spent, and a session's totals are
-        // wrong if the failures are missing from them.
-        self.service
-            .record_usage(
-                self.actor.clone(),
-                arsy_kernel::projection::UsageTotals {
-                    input_tokens,
-                    output_tokens,
-                    cost_micros: priced,
-                },
-            )
-            .map_err(storage_failed)?;
-        // Charged before the task is closed, so an exhausted budget is on the
-        // record even when the turn it exhausted answered anyway.
-        if let Err(error) = self.graph.consume(
-            task,
-            Budget {
-                tokens: input_tokens + output_tokens,
-                cost_micros: priced.unwrap_or(0),
-                wall_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            },
-        ) {
-            emitter.diagnostic(&Diagnostic::warning(
-                "ARSY-RET-1000",
-                error.to_string(),
-                "split the task, or raise what one task may spend",
-            ));
-        }
-
-        match outcome {
-            Ok(usage) => {
-                let mut outcome = record.clone();
-                merge(&mut outcome, usage);
-                self.service
-                    .record_transcript(
-                        self.actor.clone(),
-                        admission.turn,
-                        outcome.get("transcript").unwrap_or(&Value::Null),
-                    )
-                    .map_err(storage_failed)?;
-                self.service
-                    .complete_turn(self.actor.clone(), admission.turn, &outcome)
-                    .map_err(storage_failed)?;
-                self.graph
-                    .complete(task, outcome.clone())
-                    .map_err(graph_failed)?;
-                let mut result = outcome;
-                merge(&mut result, json!({"status": "completed"}));
-                emitter.result(result);
-                Ok(0)
-            }
-            Err(error) => {
-                let diagnostic = Diagnostic::error(
-                    ARSY_PRV_1000,
-                    error.to_string(),
-                    "check the provider endpoint, credential, and model in `arsy config explain`",
-                );
-                // The turn is durable before dispatch, so a failure here stays
-                // recoverable through `arsy resume`.
-                self.service
-                    .fail_turn(
-                        self.actor.clone(),
-                        admission.turn,
-                        error.code(),
-                        error.to_string(),
-                    )
-                    .map_err(storage_failed)?;
-                self.graph
-                    .fail(
-                        task,
-                        json!({"code": error.code(), "message": error.to_string()}),
-                    )
-                    .map_err(graph_failed)?;
-                emitter.diagnostic(&diagnostic);
-                let mut result = record;
-                merge(&mut result, json!({"status": "failed"}));
-                emitter.result(result);
-                Ok(diagnostic.exit_code())
-            }
-        }
-    }
-
-    fn start_turn(&self, goal: &str) -> Result<arsy_kernel::service::TurnAdmission, Diagnostic> {
-        let envelope = ProtocolEnvelope::new(ClientRequest::TurnStart(TurnStart {
-            session: self.session,
-            prompt: goal.to_owned(),
-            extensions: Extensions::new(),
-        }));
-        self.service
-            .start_turn(self.actor.clone(), &envelope)
-            .map_err(storage_failed)
-    }
-}
-
-fn graph_failed(error: arsy_kernel::orchestration::GraphError) -> Diagnostic {
-    Diagnostic::error(
-        "ARSY-STL-1000",
-        format!("the task graph refused the change: {error}"),
-        "inspect the session with `arsy session show --turns`",
-    )
-}
-
-/// The transcript budget, in tokens, before the model's own output is reserved.
-///
-/// Deliberately below the smallest window the supported models offer rather
-/// than read from configuration: the cost of being wrong low is a re-read, and
-/// the cost of being wrong high is a rejected request in the middle of a turn.
-/// A per-model window belongs in `provider.endpoint` when a model that needs a
-/// different number actually appears.
-const CONTEXT_BUDGET_TOKENS: u32 = 96_000;
-
-/// What one turn's transcript may grow to on this endpoint.
-#[cfg(feature = "tui")]
-fn context_budget(resolved: &provider::Resolved) -> u32 {
-    CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
-}
-
-/// How many rounds of tool calls one scripted turn may take.
-///
-/// The same bound the interactive loop uses, for the same reason: a model that
-/// answers every result with another call would otherwise spend the run on its
-/// own loop.
-const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
-
-/// Dispatch a scripted turn, and once more if a stale OAuth access token is
-/// why it failed.
-///
-/// `dispatch` itself never retries a [`ProviderError::Auth`]: an identical
-/// request would fail identically, the way `stream_with_retry`'s own doc
-/// comment says. What is retryable here is not the request but the
-/// credential — `arsy run` resolves a provider once and keeps it for the
-/// whole task (see `TaskRun::open`), so a token that expires mid-task is
-/// never re-checked until this catches it. Re-resolving the same endpoint
-/// exercises the refresh path `provider::stored` already has; a plain API
-/// key is left alone; a refresh that itself fails surfaces the original
-/// error unchanged, asking the operator to sign in again.
-///
-/// A retry rebuilds the delegation supervisor rather than reusing the
-/// first one, which is safe: an auth failure happens on the very first
-/// model call, before any delegation this task's supervisor could lose.
-#[allow(clippy::too_many_arguments)]
-fn dispatch_with_refresh(
-    resolved: &mut provider::Resolved,
-    config: &Config,
-    requested_provider: Option<&str>,
-    root: &Path,
-    model: &str,
-    task: TaskId,
-    agent: &arsy_code::agent::ToolRuntime,
-    request: &CanonicalModelRequest,
-    recorder: &mut telemetry::Recorder,
-    graph: &mut TaskGraph,
-    hooks: Option<&arsy_code::hook::HookEngine>,
-    max_parallel_tools: usize,
-    emitter: &mut Emitter,
-) -> (Result<Value, ProviderError>, Vec<Value>) {
-    let supervisor = subagent::Supervisor::new(
-        root.to_path_buf(),
-        config,
-        resolved,
-        model.to_owned(),
-        task,
-        agent,
-    );
-    let delegates = supervisor.can_delegate();
-    let mut supervising = delegates.then_some((supervisor, &mut *graph));
-    let outcome = dispatch(
-        resolved.provider.as_ref(),
-        agent,
-        request,
-        recorder,
-        &mut supervising,
-        hooks,
-        max_parallel_tools,
-        emitter,
-    );
-    let interventions: Vec<Value> = supervising
-        .as_ref()
-        .map(|(supervisor, _)| supervisor.interventions().to_vec())
-        .unwrap_or_default();
-    drop(supervising);
-
-    let stale = matches!(&outcome, Err(error) if is_stale_oauth_token(error, resolved.source));
-    if !stale {
-        return (outcome, interventions);
-    }
-    let Ok(refreshed) = provider::resolve(config, requested_provider) else {
-        return (outcome, interventions);
-    };
-    *resolved = refreshed;
-    emitter.trace(
-        "credential.refreshed",
-        json!({"provider": resolved.endpoint.id}),
-    );
-    let supervisor = subagent::Supervisor::new(
-        root.to_path_buf(),
-        config,
-        resolved,
-        model.to_owned(),
-        task,
-        agent,
-    );
-    let delegates = supervisor.can_delegate();
-    let mut supervising = delegates.then_some((supervisor, graph));
-    let outcome = dispatch(
-        resolved.provider.as_ref(),
-        agent,
-        request,
-        recorder,
-        &mut supervising,
-        hooks,
-        max_parallel_tools,
-        emitter,
-    );
-    let interventions = supervising
-        .as_ref()
-        .map(|(supervisor, _)| supervisor.interventions().to_vec())
-        .unwrap_or_default();
-    (outcome, interventions)
-}
-/// Whether a failure is worth resolving a fresh credential and trying
-/// again for: only an authentication failure, and only when the
-/// credential came from an OAuth login. An API key that is rejected will
-/// be rejected identically the second time, and any other error class is
-/// already `stream_with_retry`'s job, not this one's.
-fn is_stale_oauth_token(error: &ProviderError, source: provider::CredentialSource) -> bool {
-    matches!(error, ProviderError::Auth(_)) && source == provider::CredentialSource::OAuth
-}
-
-/// Run one scripted turn to completion, executing the tools the model asks for.
-///
-/// Nobody is at the keyboard, so authority comes from policy alone: a call
-/// policy allows runs, and a call that needs an approval is reported to the
-/// model as a failed result rather than silently skipped. That is what makes a
-/// pipeline's behaviour a property of its configuration instead of a property
-/// of who happened to be watching.
-#[allow(clippy::too_many_arguments)]
-fn dispatch(
-    provider: &dyn ModelProvider,
-    runtime: &arsy_code::agent::ToolRuntime,
-    request: &CanonicalModelRequest,
-    recorder: &mut telemetry::Recorder,
-    supervisor: &mut Option<(subagent::Supervisor<'_>, &mut TaskGraph)>,
-    hooks: Option<&arsy_code::hook::HookEngine>,
-    parallel: usize,
-    emitter: &mut Emitter,
-) -> Result<Value, ProviderError> {
-    let mut request = request.clone();
-    let base = request.idempotency_key.as_str().to_owned();
-    let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
-    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
-    for round in 0..MAX_SCRIPTED_TOOL_ROUNDS {
-        // Each round is its own request, so a retry repeats that round rather
-        // than collapsing into the one before it.
-        request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
-            .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
-        emitter.trace(
-            "request",
-            json!({
-                "round": round,
-                "provider": request.model.provider,
-                "model": request.model.model,
-                "idempotency_key": request.idempotency_key.as_str(),
-                "messages": request.messages.len(),
-                "tools": request.tools.len(),
-                "max_output_tokens": request.max_output_tokens,
-                "context_budget_tokens": budget,
-            }),
-        );
-        let mut answer = String::new();
-        let mut calls: Vec<(String, String, Value)> = Vec::new();
-        // Each sleep the retry loop asks for is one attempt that failed, which
-        // is the only place a retry is observable from outside the provider.
-        let mut retries = 0;
-        let started = Instant::now();
-        let stream = arsy_kernel::provider::stream_with_retry(provider, &request, &mut |delay| {
-            retries += 1;
-            // The only place a retry is observable from outside the provider,
-            // and the question an operator debugging a slow turn is asking.
-            emitter.trace(
-                "retry",
-                json!({"round": round, "attempt": retries, "delay_ms": delay.as_millis() as u64}),
-            );
-            std::thread::sleep(delay);
-        })
-        .inspect_err(|error| {
-            recorder.model_call(
-                &request.model.model,
-                started.elapsed(),
-                0,
-                0,
-                retries,
-                error.code(),
-            );
-        })?;
-        let (mut round_input, mut round_output) = (0u64, 0u64);
-        for event in stream {
-            match event? {
-                ModelEvent::TextDelta { text } => {
-                    emitter.delta(&text);
-                    answer.push_str(&text);
-                }
-                ModelEvent::Usage {
-                    input_tokens: input,
-                    output_tokens: output,
-                } => {
-                    round_input += input;
-                    round_output += output;
-                    input_tokens += input;
-                    output_tokens += output;
-                }
-                ModelEvent::ToolCallCompleted {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    emitter.trace(
-                        "model.tool_call",
-                        json!({"round": round, "id": id, "name": name, "arguments": arguments}),
-                    );
-                    calls.push((id, name, arguments));
-                }
-                ModelEvent::Completed { .. }
-                | ModelEvent::ToolCallStarted { .. }
-                | ModelEvent::ToolCallDelta { .. }
-                // `arsy run` is a scriptable surface: reasoning is for the
-                // operator watching a stream, not for a pipeline's stdout.
-                | ModelEvent::ThinkingDelta { .. } => {}
-            }
-        }
-        recorder.model_call(
-            &request.model.model,
-            started.elapsed(),
-            round_input,
-            round_output,
-            retries,
-            "ok",
-        );
-        emitter.trace(
-            "round.finished",
-            json!({
-                "round": round,
-                "input_tokens": round_input,
-                "output_tokens": round_output,
-                "retries": retries,
-                "tool_calls": calls.len(),
-                "answer_bytes": answer.len(),
-            }),
-        );
-        if calls.is_empty() {
-            emitter.end_deltas();
-            if !answer.trim().is_empty() {
-                request.messages.push(ModelMessage {
-                    role: ModelRole::Assistant,
-                    content: vec![ModelContent::Text {
-                        text: answer.clone(),
-                    }],
-                });
-            }
-            let mut usage = token_usage(input_tokens, output_tokens);
-            merge(
-                &mut usage,
-                json!({
-                    "response": answer,
-                    // Everything after the system prompt's own message: the
-                    // turn's exchange, which is what a resume replays.
-                    "transcript": transcript::persistable(&request.messages),
-                }),
-            );
-            return Ok(usage);
-        }
-        arsy_code::agent::budget::fit(&mut request.messages, budget, None);
-
-        // The calls are history now, whatever running them produced: a provider
-        // that sent a call and never sees its result rejects the next request.
-        let mut content: Vec<ModelContent> = Vec::new();
-        if !answer.trim().is_empty() {
-            content.push(ModelContent::Text { text: answer });
-        }
-        content.extend(
-            calls
-                .iter()
-                .map(|(id, name, arguments)| ModelContent::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                }),
-        );
-        request.messages.push(ModelMessage {
-            role: ModelRole::Assistant,
-            content,
-        });
-        // Independent reads run together; anything that writes, runs a
-        // command, or spawns a child still runs alone and in order. `hooks`
-        // are the exception: a hook engine is one interpreter with its own
-        // recursion guard, so a workspace that loads hooks keeps the
-        // sequential path rather than racing them.
-        let batched = if hooks.is_none() && supervisor.is_none() && parallel > 1 {
-            let batch: Vec<(String, Value)> = calls
-                .iter()
-                .map(|(_, name, arguments)| (name.clone(), arguments.clone()))
-                .collect();
-            runtime.invoke_batch(&batch, parallel)
-        } else {
-            Vec::new()
-        };
-        let results = calls
-            .iter()
-            .enumerate()
-            .map(|(position, (id, name, arguments))| {
-                // Spawning is the one call the tool runtime does not own: it
-                // adds a node to this session's graph rather than touching the
-                // workspace, and the child's own calls go through the runtime
-                // under the authority the graph attenuated for it.
-                let result = match (batched.get(position), name.as_str(), supervisor.as_mut()) {
-                    // Already run, in whatever order the batch chose; the
-                    // position is what pairs it back to this call's id.
-                    (Some(result), _, _) => result.clone(),
-                    (None, "task.spawn", Some((supervisor, graph))) => {
-                        supervisor.spawn(arguments, graph, emitter)
-                    }
-                    _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
-                };
-                recorder.tool_call(&result);
-                emitter.trace(
-                    "tool.result",
-                    json!({
-                        "round": round,
-                        "id": id,
-                        "name": name,
-                        "success": result.success,
-                        "duration_ms": result.duration.as_millis() as u64,
-                        "output_bytes": result.output.len(),
-                        "changed_files": result.changed_files,
-                        "artifact": result.artifact.map(|id| id.to_string()),
-                    }),
-                );
-                ModelContent::ToolResult {
-                    id: id.clone(),
-                    content: result.output,
-                    is_error: !result.success,
-                }
-            })
-            .collect();
-        request.messages.push(ModelMessage {
-            role: ModelRole::User,
-            content: results,
-        });
-    }
-    emitter.end_deltas();
-    Err(ProviderError::InvalidRequest(format!(
-        "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
-    )))
-}
-
-/// Where Claude Code and Codex keep the operator's files.
-///
-/// A unit test gets none at all, so what it asserts cannot depend on the
 /// Claude or Codex setup of the machine it happens to run on.
 fn compat_homes() -> arsy_compat::CompatHomes {
     if cfg!(test) {
@@ -8803,6 +2717,7 @@ fn hook_engine(root: &Path, config: &arsy_kernel::config::Config) -> arsy_code::
             .map(PathBuf::from),
         claude: config.compat_enabled("claude"),
         codex: config.compat_enabled("codex"),
+        disabled: config.hook_disabled().clone(),
         root: root.to_path_buf(),
         trusted: config.trusts(root),
         // One means hooks run and nothing they do dispatches again.
@@ -9161,261 +3076,6 @@ const MAX_CHILD_TOOL_ROUNDS: usize = 8;
 /// zero, because a running total that silently treats every unpriced turn as
 /// free is worse than one that admits the gap: the first is wrong and looks
 /// right, the second is right about what it does not know.
-fn charge_turn(resolved: Option<&provider::Resolved>, model: &str, usage: &Value) -> Option<u64> {
-    charge(
-        resolved.map(|resolved| &resolved.endpoint),
-        model,
-        summary_number(usage, "input_tokens"),
-        summary_number(usage, "output_tokens"),
-    )
-}
-
-/// As above, from the parts. A turn that spent no tokens cost nothing at any
-/// price, so it is known to be free rather than unknown — otherwise a failed
-/// turn would make a whole session's total unknowable.
-fn charge(
-    endpoint: Option<&arsy_kernel::config::Endpoint>,
-    model: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-) -> Option<u64> {
-    if input_tokens == 0 && output_tokens == 0 {
-        return Some(0);
-    }
-    Some(
-        endpoint?
-            .pricing
-            .get(model)?
-            .cost_micros(input_tokens, output_tokens),
-    )
-}
-
-fn token_usage(input_tokens: u64, output_tokens: u64) -> Value {
-    if input_tokens == 0 && output_tokens == 0 {
-        json!({})
-    } else {
-        json!({"input_tokens": input_tokens, "output_tokens": output_tokens})
-    }
-}
-
-/// Fold `extra`'s fields into `target`, which is always an object here.
-fn merge(target: &mut Value, extra: Value) {
-    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
-        for (key, value) in extra {
-            target.insert(key.clone(), value.clone());
-        }
-    }
-}
-
-fn prepare_task(
-    invocation: &Invocation,
-    task: &str,
-    emitter: &mut Emitter,
-) -> Result<String, Diagnostic> {
-    if task.trim().is_empty() {
-        return Err(usage("run requires a non-empty task"));
-    }
-    redactor(invocation, emitter)?
-        .sanitize(task)
-        .map_err(secret_failed)
-}
-
-fn resume(
-    invocation: &Invocation,
-    session: SessionId,
-    follow: bool,
-    emitter: &mut Emitter,
-) -> Result<i32, Diagnostic> {
-    let store = open_store(&workspace_root(&invocation.workspace)?)?;
-    emitter.session = Some(session);
-    if store
-        .current_version(session)
-        .map_err(|error| storage_failed(error.to_string()))?
-        .0
-        == 0
-    {
-        return Err(Diagnostic::error(
-            "ARSY-SCH-1004",
-            format!("session {session} has no recorded events in this workspace"),
-            "check the ID, or run `arsy run` with the workspace that recorded it",
-        ));
-    }
-
-    // Recovery needs no provider: closing what a dead process left open is
-    // worth doing even in a workspace that could not dispatch a turn today.
-    let actor = actor();
-    let service = AgentService::attach(Arc::clone(&store) as Arc<dyn EventStore>, session)
-        .map_err(storage_failed)?;
-    // History is never truncated: a turn that was running when the process
-    // died is closed by appending `turn.failed` after the events it already
-    // wrote.
-    let interrupted = service.unfinished_turns().map_err(storage_failed)?;
-    for turn in &interrupted {
-        service
-            .fail_turn(
-                actor.clone(),
-                *turn,
-                "interrupted",
-                "the process exited before the turn finished",
-            )
-            .map_err(storage_failed)?;
-    }
-    let version = service.committed_version().map_err(storage_failed)?;
-    drop(service);
-
-    // A task whose lease has run out is one nobody is working on, whatever the
-    // process that took it intended.
-    let mut graph = TaskGraph::new(store, session, actor).map_err(graph_failed)?;
-    let mut recovered = graph
-        .recover_expired(unix_time_ms())
-        .map_err(graph_failed)?;
-    // A turn found open is proof its process is gone, so whatever task it held
-    // is handed back now rather than when the lease would have run out.
-    if !interrupted.is_empty() {
-        recovered.extend(graph.reclaim_running().map_err(graph_failed)?);
-    }
-    let waiting = graph.pending().first().map(|node| node.id);
-    drop(graph);
-
-    let mut report = json!({
-        "session": session.to_string(),
-        "events": version.0,
-        "closed_turns": interrupted.len(),
-        "recovered_tasks": recovered.len(),
-        "continuing": Value::Null,
-        // ponytail: following live events needs the serve loop; the flag is
-        // accepted and reports the committed head instead of hanging.
-        "following": follow,
-    });
-
-    let Some(task) = waiting else {
-        emitter.result(report);
-        return Ok(0);
-    };
-    // The session has unfinished work. Continuing it needs a provider, so a
-    // workspace that cannot dispatch reports the task as still waiting rather
-    // than losing it.
-    let mut execution = match TaskRun::open(invocation, Some(session)) {
-        Ok(execution) => execution,
-        Err(diagnostic) => {
-            let code = unusable(diagnostic, emitter);
-            merge(&mut report, json!({"blocked": task.to_string()}));
-            emitter.result(report);
-            return Ok(code);
-        }
-    };
-    merge(&mut report, json!({"continuing": task.to_string()}));
-    execution.execute(task, report, emitter)
-}
-
-fn doctor(invocation: &Invocation, strict: bool, emitter: &mut Emitter) -> i32 {
-    let mut warnings: Vec<Diagnostic> = Vec::new();
-    let workspace = workspace_root(&invocation.workspace);
-    let storage = match &workspace {
-        Ok(root) => match open_store(root) {
-            Ok(_) => "openable".to_owned(),
-            Err(error) => {
-                warnings.push(error.clone());
-                error.message
-            }
-        },
-        Err(error) => {
-            warnings.push(error.clone());
-            error.message.clone()
-        }
-    };
-
-    // ponytail: layer discovery only. Merged values and their source trace
-    // arrive with `arsy config explain`.
-    //
-    // Bootstrapped first, so the user layer is reported as it will be for
-    // every later command rather than as absent on the run that creates it.
-    bootstrap_user_config();
-    let root = workspace.as_deref().unwrap_or(Path::new("."));
-    let config: Vec<Value> = arsy_kernel::config::layers(root, root)
-        .into_iter()
-        .map(|(layer, path)| {
-            json!({
-                "layer": layer,
-                "path": path.display().to_string(),
-                "present": path.is_file(),
-            })
-        })
-        .collect();
-
-    // A configured endpoint with a reachable credential is what decides
-    // whether a turn can dispatch, so report it as one fact rather than
-    // leaving an operator to infer it from the credential count.
-    let provider = match load_config(root, root, invocation.config.as_deref()) {
-        Err(diagnostic) => {
-            let value = json!({"status": "unusable", "detail": diagnostic.message});
-            warnings.push(diagnostic);
-            value
-        }
-        Ok(config) => match provider::resolve(&config, None) {
-            Ok(resolved) => json!({
-                "status": "ready",
-                "id": resolved.endpoint.id,
-                "kind": resolved.endpoint.kind.as_str(),
-                "base_url": resolved.endpoint.base_url,
-                "credential_source": resolved.source.as_str(),
-                // Present only when `provider.default = "auto"` left the choice
-                // to routing; naming the criterion is what makes the choice
-                // reviewable rather than surprising.
-                "routing": resolved.route.as_ref().map(|decision| match decision {
-                    arsy_kernel::routing::Decision::Routed { key, reasons, excluded } => json!({
-                        "model": key.to_string(),
-                        "reasons": reasons,
-                        "excluded": excluded.len(),
-                    }),
-                    other => serde_json::to_value(other).unwrap_or(Value::Null),
-                }),
-            }),
-            Err(diagnostic) => json!({"status": "unavailable", "detail": diagnostic.message}),
-        },
-    };
-
-    let sandbox_assurance = installed_sandbox_assurance();
-    if sandbox_assurance == arsy_kernel::policy::SandboxAssurance::None {
-        warnings.push(Diagnostic::warning(
-            "ARSY-SBX-1000",
-            "no complete sandbox worker is available, so achieved assurance is `none`",
-            "install arsy-sandbox-worker and the platform controls before running effects",
-        ));
-    }
-    let credentials = catalog(CatalogStore::resolve(invocation))
-        .unwrap_or_default()
-        .len();
-    if credentials == 0 {
-        warnings.push(Diagnostic::warning(
-            "ARSY-PRV-1001",
-            "no provider credential is stored",
-            "store a credential with `arsy auth set <PROVIDER>`",
-        ));
-    }
-
-    for warning in &warnings {
-        emitter.diagnostic(warning);
-    }
-    emitter.result(json!({
-        "platform": platform(),
-        "version": arsy_code::VERSION,
-        "sandbox_assurance": sandbox_assurance.as_str(),
-        "provider_auth": if credentials == 0 { "none" } else { "configured" },
-        "provider": provider,
-        "storage": storage,
-        "config_layers": config,
-        "warnings": warnings.len(),
-    }));
-
-    // Warnings return 0 unless --strict; then the first reported one is
-    // terminal and selects the code.
-    match (strict, warnings.first()) {
-        (true, Some(terminal)) => terminal.exit_code(),
-        _ => 0,
-    }
-}
-
 fn installed_sandbox_assurance() -> arsy_kernel::policy::SandboxAssurance {
     let Ok(executable) = std::env::current_exe() else {
         return arsy_kernel::policy::SandboxAssurance::None;
@@ -9510,6 +3170,7 @@ fn agent_runtime(
     lineage: Option<(TaskId, Option<arsy_kernel::domain::AttemptId>)>,
     connector: Option<&connector::McpConnector>,
     emitter: &mut Emitter,
+    skills: &[arsy_code::agent::instructions::Skill],
 ) -> Result<arsy_code::agent::ToolRuntime, Diagnostic> {
     let workspace = arsy_code::resource::Workspace::open(root)
         .map_err(|error| storage_failed(error.to_string()))?;
@@ -9561,6 +3222,7 @@ fn agent_runtime(
             mcp: connections,
             mcp_pending: pending,
         },
+        skills,
     )
     .map(|runtime| runtime.with_dynamic_tools(discovered))
     .map_err(|error| storage_failed(error.to_string()))
@@ -9584,8 +3246,65 @@ fn session_mcp(
             "check it with `arsy mcp test <NAME>`, or switch it off in /mcp",
         ));
     }
+    show_mcp_logs(connector.logs(), config.mcp_log(), emitter);
     let (connections, pending) = connector.session();
     (Some(connections), pending, discovered)
+}
+
+/// Show what the servers logged since the last turn boundary, as much of it as
+/// `ui.mcp_log` asks for.
+///
+/// Drained here rather than written by the forwarding threads: those run while
+/// a frame is being painted, and a write from one lands wherever the cursor
+/// happens to be. This is a point in the loop where nothing else is drawing.
+///
+/// The lines are a server's own output — untrusted content — so they are shown
+/// as notes and never as diagnostics an operator could mistake for ARSY's.
+fn show_mcp_logs(logs: Vec<(String, String)>, level: &str, emitter: &mut Emitter) {
+    for line in mcp_log_rows(logs, level) {
+        emitter.server_log(&line);
+    }
+}
+
+/// What `ui.mcp_log` leaves of a turn's server logging.
+///
+/// Separate from the writing so the level and the counting can be tested
+/// without a terminal: this is the part that can be wrong.
+fn mcp_log_rows(logs: Vec<(String, String)>, level: &str) -> Vec<String> {
+    if logs.is_empty() || level == "hidden" {
+        return Vec::new();
+    }
+    if level == "full" {
+        return logs
+            .into_iter()
+            .map(|(server, line)| format!("mcp {server}: {line}"))
+            .collect();
+    }
+    // `summary`: one line for the turn, because a workspace with four servers
+    // that each say something on connect would otherwise spend four rows of
+    // the transcript saying nothing an operator can act on. The map holds
+    // each server's slot so counting stays linear in the logs, not quadratic
+    // in servers × lines.
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    for (server, _) in logs {
+        if let Some(&index) = slots.get(server.as_str()) {
+            counts[index].1 += 1;
+        } else {
+            let index = counts.len();
+            counts.push((server, 1));
+            slots.insert(counts[index].0.clone(), index);
+        }
+    }
+    let lines: usize = counts.iter().map(|(_, count)| count).sum();
+    let word = if lines == 1 { "line" } else { "lines" };
+    let what = match counts.as_slice() {
+        [(server, _)] => server.clone(),
+        servers => format!("{} servers", servers.len()),
+    };
+    vec![format!(
+        "mcp {what} · {lines} log {word} · `ui.mcp_log = \"full\"` to read them"
+    )]
 }
 
 /// The MCP connections of this interactive session, held until it ends.
@@ -9646,12 +3365,6 @@ fn installed_extensions(root: &Path) -> Vec<arsy_code::agent::instructions::Exte
         .collect()
 }
 
-/// A build without the WASM host can install nothing, so it lists nothing.
-#[cfg(not(feature = "wasm"))]
-fn installed_extensions(_root: &Path) -> Vec<arsy_code::agent::instructions::ExtensionTool> {
-    Vec::new()
-}
-
 fn system_prompt(
     root: &Path,
     config: &arsy_kernel::config::Config,
@@ -9667,6 +3380,7 @@ fn system_prompt(
         family,
         &instructions,
         &installed_extensions(root),
+        &prompt_skills(root, config),
         memory::recalled(root, MAX_RECALLED_MEMORY_BYTES).as_deref(),
         mode,
         &arsy_kernel::secret::Redactor::new(),
@@ -9674,6 +3388,120 @@ fn system_prompt(
     )
     .ok()?;
     Some(arsy_code::agent::instructions::render(&compiled))
+}
+
+/// Every declared skill the operator has not switched off, with the
+/// description its front matter declares.
+///
+/// Off beats discovered: a skill in `skill.disabled` is still listed by
+/// `arsy skill list`, which is where an operator goes to find out what they
+/// switched off, but the model is not told about it at all.
+fn prompt_skills(
+    root: &Path,
+    config: &arsy_kernel::config::Config,
+) -> Vec<arsy_code::agent::instructions::Skill> {
+    use arsy_code::agent::instructions::Skill;
+    use arsy_code::compat::Ecosystem;
+    let importer = arsy_code::compat::CompatibilityImporter::new(root);
+    // The operator's own home offers skills as well as the workspace does:
+    // `~/.claude/skills` and `~/.codex/skills`, the same directories the
+    // ecosystems themselves read. A switch that is off, or a skill switched
+    // off by name, contributes nothing — one rule for every source of skills.
+    let user_skills = {
+        let homes = compat_homes();
+        arsy_compat::skills::all(
+            &homes,
+            config.compat_enabled("claude"),
+            config.compat_enabled("codex"),
+        )
+    };
+    // The workspace is listed first and claims its names, so a repository that
+    // ships a skill by the same name as one of the operator's own is the one
+    // that skill means: project overrides home, the precedence the ecosystems
+    // use.
+    let mut listed: Vec<Skill> = Vec::new();
+    let mut taken = std::collections::HashSet::new();
+    for ecosystem in [Ecosystem::Claude, Ecosystem::Codex, Ecosystem::Omp] {
+        workspace_skills(&mut listed, &mut taken, ecosystem, config, root, &importer);
+    }
+    listed.extend(
+        user_skills
+            .into_iter()
+            .filter(|skill| {
+                !config
+                    .skill_disabled()
+                    .contains(&format!("{}/{}", skill.ecosystem, skill.name))
+                    && !taken.contains(&skill.name)
+            })
+            .map(|skill| Skill {
+                name: skill.name,
+                ecosystem: skill.ecosystem.to_owned(),
+                description: skill_description(root, &skill.path.display().to_string()),
+                path: skill.path.display().to_string(),
+            }),
+    );
+    listed
+}
+
+/// The workspace skills of one ecosystem, appended to `listed` under their
+/// names.
+///
+/// `taken` collects the names as they are listed, and the workspace is listed
+/// before the operator's home: a name claimed here is the one the home copy
+/// then yields to.
+fn workspace_skills(
+    listed: &mut Vec<arsy_code::agent::instructions::Skill>,
+    taken: &mut std::collections::HashSet<String>,
+    ecosystem: arsy_code::compat::Ecosystem,
+    config: &arsy_kernel::config::Config,
+    root: &Path,
+    importer: &arsy_code::compat::CompatibilityImporter,
+) {
+    // A source the operator switched off contributes nothing, the same as its
+    // hooks and its instructions: `compat.<source>.enabled` governs everything
+    // that source's files carry.
+    if !config.compat_enabled(ecosystem.as_str()) {
+        return;
+    }
+    let Ok(skills) = importer.skill_declarations(ecosystem) else {
+        return;
+    };
+    for skill in skills {
+        let Some(name) = skill["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        let key = format!("{}/{}", ecosystem.as_str(), name);
+        if config.skill_disabled().contains(&key) || taken.contains(&name) {
+            continue;
+        }
+        let Some(path) = skill["source"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        taken.insert(name.clone());
+        listed.push(arsy_code::agent::instructions::Skill {
+            name,
+            ecosystem: ecosystem.as_str().to_owned(),
+            description: skill_description(root, &path),
+            path,
+        });
+    }
+}
+
+/// The one line a `SKILL.md` front matter offers as its description.
+///
+/// `fs.read` can carry the whole file to the model, so a body that fails to
+/// read costs the skill its description and nothing more: the name and the
+/// path are still enough for the model to find it when it wants to.
+fn skill_description(root: &Path, relative: &str) -> Option<String> {
+    let path = root.join(relative.trim_start_matches("./"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let body = text.strip_prefix("---")?;
+    let front = body.split("---").next()?;
+    front.lines().find_map(|line| {
+        let value = line.strip_prefix("description:")?;
+        let description = value.trim().trim_matches('"').trim_matches('\'');
+        (!description.is_empty()).then(|| description.to_owned())
+    })
 }
 
 /// The operator's own Claude Code and Codex instructions, then the
@@ -9716,6 +3544,14 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::picker::session::reconstruct_session_conversation;
+    use crate::picker::wizard::effort_line;
+    use crate::picker::wizard::{auth_step, provider_step, AuthNext, ProviderNext};
+    use crate::run::{charge, is_stale_oauth_token, read_image, MAX_IMAGE_BYTES};
+    #[cfg(all(feature = "tui", unix))]
+    use crate::turn::drive_provider;
+    use crate::turn::{block_gap, native_turn, stream_row, Painter, Streaming};
+    use arsy_kernel::provider::Effort;
     use arsy_kernel::{
         event::{EventPayload, EventStore},
         protocol::{ClientRequest, ProtocolEnvelope, TurnStart},
@@ -9777,8 +3613,15 @@ mod tests {
         )])
         .is_ok());
 
-        // What is there already is never replaced.
-        std::fs::write(&path, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        // What is there already is never replaced. Staged and renamed rather
+        // than written in place: `ARSY_CONFIG_HOME` is process-global, so a
+        // test running beside this one resolves configuration from this very
+        // file, and a truncating write is visible while it is still empty —
+        // the hazard `bootstrap_user_config` stages against for the same
+        // reason.
+        let staged = home.join("arsy.json.test-tmp");
+        std::fs::write(&staged, "{\"model\": {\"default\": \"m1\"}}\n").unwrap();
+        std::fs::rename(&staged, &path).unwrap();
         bootstrap_user_config();
         assert!(std::fs::read_to_string(&path).unwrap().contains("m1"));
 
@@ -9832,13 +3675,23 @@ mod tests {
         std::fs::write(path, json).unwrap();
     }
 
-    /// Two things a stored credential must not do to a turn that never asks
-    /// for it: abort the turn because it will not open, and follow a run that
-    /// was pointed at a throwaway configuration home into that home.
+    /// A credential the catalog names but nothing can open — here a handle
+    /// left behind by a build that still read the platform keyring — must not
+    /// abort a turn that never asks for it.
     #[test]
-    fn a_credential_that_will_not_open_neither_fails_the_turn_nor_follows_a_throwaway_home() {
+    fn a_credential_that_will_not_open_does_not_fail_the_turn() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|held| held.into_inner());
-        let home = std::env::temp_dir().join(format!("arsy-catalog-{}", std::process::id()));
+        // Unique per run, not per process: every test in this binary shares
+        // the process id, and one that writes into the configuration home
+        // while this one is tearing it down would fail the teardown rather
+        // than the assertion it came for.
+        let home = std::env::temp_dir().join(format!(
+            "arsy-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos())
+        ));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var(arsy_kernel::config::CONFIG_HOME_VAR, &home);
         let path = home.join(CATALOG_FILE);
@@ -9855,31 +3708,21 @@ mod tests {
             .write_all(raw.as_bytes())
             .unwrap();
 
-        let invocation = Invocation {
-            debug: false,
-            config: None,
-            provider: None,
-            model: None,
-            workspace: PathBuf::from("."),
-            output: None,
-            no_color: true,
-            command: Command::Tui,
-        };
-        redactor(&invocation, &mut Emitter::new(Output::Ci))
+        redactor(&mut Emitter::new(Output::Ci))
             .expect("a handle that will not open leaves the turn alone");
 
-        std::fs::remove_file(&path).unwrap();
-        assert!(
-            catalog(CatalogStore::File).unwrap().is_empty(),
-            "an explicit config home is not backfilled from the operator's platform store"
-        );
-        assert!(
-            !path.exists(),
-            "nothing was migrated into the throwaway home"
+        assert_eq!(
+            arsy_kernel::secret::WithdrawnOsStore.resolve("arsy-no-such-credential"),
+            Err(arsy_kernel::secret::SecretError::WithdrawnStore(
+                SecretHandle::new(OS_STORE_ID, "arsy-no-such-credential").unwrap()
+            )),
+            "the withdrawn store answers for its own handles rather than reading as a typo"
         );
 
         std::env::remove_var(arsy_kernel::config::CONFIG_HOME_VAR);
-        std::fs::remove_dir_all(&home).unwrap();
+        // Best-effort: the subject of this test is the resolution above, not
+        // whether the temporary directory could be swept up afterwards.
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -9891,7 +3734,6 @@ mod tests {
         ));
         for other in [
             provider::CredentialSource::ConfiguredEnv,
-            provider::CredentialSource::Keyring,
             provider::CredentialSource::File,
             provider::CredentialSource::DefaultEnv,
             provider::CredentialSource::None,
@@ -10008,6 +3850,7 @@ mod tests {
             None,
             None,
             &mut Emitter::new(Output::Json),
+            &[],
         )
         .unwrap()
     }
@@ -10112,6 +3955,7 @@ mod tests {
         hooks.register(
             arsy_code::hook::HookRule {
                 id: "deny".to_owned(),
+                declaration: "test#PreToolUse[0].0".to_owned(),
                 event: arsy_code::hook::LifecycleEvent::BeforeOperation,
                 matcher: "*".to_owned(),
                 effect: arsy_code::hook::EffectClass::Gate,
@@ -10722,20 +4566,10 @@ mod tests {
     fn the_provider_wizard_validates_each_answer_before_it_moves_on() {
         use tui::ProviderStep as Step;
 
-        let invocation = Invocation {
-            debug: false,
-            config: None,
-            provider: None,
-            model: None,
-            workspace: PathBuf::from("."),
-            output: None,
-            no_color: true,
-            command: Command::Tui,
-        };
         let providers = vec!["myai".to_owned()];
         let mut draft = tui::ProviderDraft::default();
         let step = |step: Step, line: &str, draft: &mut tui::ProviderDraft| {
-            provider_step(&invocation, step, line, draft, &providers)
+            provider_step(step, line, draft, &providers)
         };
 
         // An empty answer leaves the wizard rather than writing a blank field.
@@ -10980,10 +4814,62 @@ mod tests {
         assert_eq!(verifier.len(), 43, "a 32-byte PKCE verifier, unpadded");
     }
 
-    /// The catalog is metadata, so where it lives is the operator's choice and
-    /// the default costs no unlock prompt.
+    /// `ui.mcp_log` decides how much of a server's own logging survives to the
+    /// transcript. A server that said something is never silently dropped at
+    /// `summary`, and `hidden` means hidden.
     #[test]
-    fn the_credential_catalog_store_is_configurable_and_defaults_to_a_file() {
+    fn ui_mcp_log_keeps_every_server_visible_at_summary_and_none_at_hidden() {
+        let logs = || {
+            vec![
+                ("mongodb".to_owned(), "[MCP Info] no tools file".to_owned()),
+                ("mongodb".to_owned(), "npm warn deprecated".to_owned()),
+                (
+                    "postgres".to_owned(),
+                    "Warning: deprecated argument".to_owned(),
+                ),
+            ]
+        };
+
+        assert!(mcp_log_rows(logs(), "hidden").is_empty());
+        assert!(
+            mcp_log_rows(Vec::new(), "full").is_empty(),
+            "a quiet turn prints nothing whatever the level says"
+        );
+
+        let full = mcp_log_rows(logs(), "full");
+        assert_eq!(full.len(), 3, "{full:?}");
+        assert_eq!(full[0], "mcp mongodb: [MCP Info] no tools file");
+
+        let summary = mcp_log_rows(logs(), "summary");
+        assert_eq!(
+            summary.len(),
+            1,
+            "one row for the turn, not one per server or per line: {summary:?}"
+        );
+        assert!(
+            summary[0].contains("3 log lines"),
+            "the row counts every line the servers wrote: {summary:?}"
+        );
+        assert!(
+            summary[0].contains("2 servers"),
+            "the row says how many servers spoke: {summary:?}"
+        );
+        assert!(
+            summary[0].contains("ui.mcp_log"),
+            "the summary says how to read the rest: {summary:?}"
+        );
+
+        // An unknown level is read as `summary` rather than as `full`: the
+        // configuration refuses one at load, so this is only reachable by a
+        // caller passing something odd, and the quiet reading is the safe one.
+        assert_eq!(mcp_log_rows(logs(), "whatever").len(), 1);
+    }
+
+    /// The catalog lives beside the user configuration and nowhere else, and a
+    /// file that still asks for the withdrawn keyring says so rather than being
+    /// silently defaulted.
+    #[test]
+    fn the_credential_catalog_lives_in_a_file_and_the_keyring_is_refused_by_name() {
         use arsy_kernel::config::{Config, Layer, CREDENTIAL_STORES, DEFAULT_CREDENTIAL_STORE};
 
         let directory = tempfile::tempdir().unwrap();
@@ -11016,14 +4902,21 @@ mod tests {
             );
         }
 
-        // A name that is neither is refused at load, not silently defaulted:
-        // a typo must not quietly send credentials somewhere else.
+        // A name that is not a store is refused at load, not silently
+        // defaulted: a typo must not quietly send credentials somewhere else.
         let error = write("schema_version = 1\n[credentials]\nstore = \"vault\"\n").unwrap_err();
         assert!(format!("{error}").contains("vault"), "{error}");
 
-        // The two names match the `secret://` stores, so one vocabulary covers
-        // both the handle and the catalog.
-        assert_eq!(CREDENTIAL_STORES, ["file", "os"]);
+        // `os` is refused by name, with where it went, because an operator who
+        // set it deliberately is owed more than "not one of: file".
+        let error = write("schema_version = 1\n[credentials]\nstore = \"os\"\n").unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("keyring"), "{message}");
+        assert!(message.contains("remove the key"), "{message}");
+
+        // One store, and it is the one the `secret://` handles name, so one
+        // vocabulary covers both the handle and the catalog.
+        assert_eq!(CREDENTIAL_STORES, ["file"]);
     }
 
     /// `/settings` and `/auth` print to a reader, not to a parser: the machine
@@ -11264,6 +5157,7 @@ mod tests {
                     | "/approval"
                     | "/plan"
                     | "/todo"
+                    | "/skill"
             ) || INSPECTIONS.iter().any(|(slash, _, _)| slash == name);
             assert!(handled, "{name} is offered but never dispatched");
         }
@@ -11347,6 +5241,73 @@ mod tests {
     }
 
     /// Reasoning is framed apart from the answer it precedes, so the box has
+    /// Blocks breathe and single rows do not.
+    ///
+    /// The first cut of the modern style wrote every block flush against the
+    /// one before it, so a turn came out as one wall of borders and text with
+    /// nothing to tell the steps apart.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_block_gets_one_blank_line_above_it_and_a_single_row_gets_none() {
+        let card = "╭── $ cargo check ──╮\n│ ok │\n╰── ✓ done ──╯";
+        let bullet = "  • fs.read AGENTS.md";
+
+        tui::set_render_style(tui::RenderStyle::Modern);
+        assert_eq!(block_gap(card), "\n", "a block is separated");
+        assert_eq!(block_gap(bullet), "", "a single row stays tight");
+        assert_eq!(modern_gap(), "\n");
+
+        // Through the writer: the gap lands between the composer's erase
+        // sequence and the card, so the card is reached across a blank line.
+        // Asserted on the card rather than on a run of newlines, because the
+        // composer's own chrome carries newlines of its own.
+        let drawn = |row: &str| {
+            let mut screen: Vec<u8> = Vec::new();
+            let mut composer = tui::Composer::default();
+            stream_row(&mut screen, &mut composer, false, "", "", row).unwrap();
+            String::from_utf8(screen).expect("UTF-8 terminal output")
+        };
+        assert!(
+            drawn(card).contains("\n╭── $ cargo check"),
+            "a block is reached across a blank line"
+        );
+        assert!(
+            !drawn(bullet).contains("\n  • fs.read"),
+            "a single row is not"
+        );
+
+        // And through the other writer, which is the one the external Codex
+        // route uses — the route this was reported from. Both writers have to
+        // agree or the spacing depends on which provider is answering.
+        let painted = |row: &str| {
+            let mut screen: Vec<u8> = Vec::new();
+            let mut composer = tui::Composer::default();
+            let painter = Painter {
+                colour: false,
+                footer: "",
+                width: std::cell::Cell::new(80),
+                started: std::time::Instant::now(),
+            };
+            painter
+                .row(&mut screen, &mut composer, Some(row), false, 0, 0)
+                .unwrap();
+            String::from_utf8(screen).expect("UTF-8 terminal output")
+        };
+        assert!(
+            painted(card).contains("\n╭── $ cargo check"),
+            "the Codex route separates a block too"
+        );
+        assert!(
+            !painted(bullet).contains("\n  • fs.read"),
+            "and leaves a single row tight"
+        );
+
+        // Classic keeps the spacing an operator who chose it already has.
+        tui::set_render_style(tui::RenderStyle::Classic);
+        assert_eq!(block_gap(card), "", "classic spacing is unchanged");
+        assert_eq!(modern_gap(), "");
+    }
+
     /// to be finished before the answer's header opens. ARSY drew the header
     /// first, which left it between the box's last line and its bottom border.
     #[cfg(feature = "tui")]
@@ -11376,12 +5337,18 @@ mod tests {
         .unwrap();
 
         let drawn = String::from_utf8(screen).unwrap();
-        let closed = drawn.find('╰').expect("the reasoning box is closed");
+        // Ordering rather than the closing glyph: the classic style ends the
+        // reasoning block with `╰`, the modern one leaves it unboxed, and what
+        // this is actually about is that the reasoning is finished with before
+        // the answer starts — true of both.
+        let reasoning = drawn
+            .find("weighing it up")
+            .expect("the reasoning is drawn");
         let header = drawn.find("Response").expect("the answer announces itself");
         let prose = drawn.find("the answer").expect("the answer is drawn");
         assert!(
-            closed < header,
-            "the box closes before the header:\n{drawn}"
+            reasoning < header,
+            "the reasoning is finished with before the header:\n{drawn}"
         );
         assert!(
             header < prose,
@@ -12136,5 +6103,25 @@ mod tests {
 
         drop(store);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod theme_registry_tests {
+    /// `/settings` offers `theme.base` from the kernel's registry, while the
+    /// palettes themselves are arsy-tui's. Neither can depend on the other, so
+    /// this test is what holds the two lists together: a theme added to one
+    /// and not the other is either offered and unrenderable, or renderable and
+    /// unreachable from the editor.
+    #[test]
+    fn the_settings_registry_names_exactly_the_built_in_themes() {
+        let registry: Vec<&str> = arsy_kernel::config::THEME_BASES.to_vec();
+        let rendered: Vec<&str> = crate::tui::THEMES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(registry, rendered, "the two theme lists have drifted");
+        assert_eq!(
+            arsy_kernel::config::DEFAULT_THEME_BASE,
+            crate::tui::DEFAULT_THEME,
+            "the two defaults are different themes"
+        );
     }
 }

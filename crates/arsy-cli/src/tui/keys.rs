@@ -25,6 +25,8 @@ pub enum Key {
     Interrupt,
     /// Ctrl-D on an empty line.
     Eof,
+    /// Ctrl-O: show or hide the last tool call's whole output.
+    Expand,
 }
 
 /// Turns the raw byte stream into keys, holding back partial UTF-8 characters
@@ -143,6 +145,8 @@ pub enum Action {
     Submit(String),
     /// Change approval mode without submitting or queueing the draft.
     CycleMode,
+    /// Show or hide the last tool call's whole output.
+    Expand,
     Quit,
     Redraw,
     None,
@@ -155,6 +159,7 @@ fn control_key(byte: u8) -> Option<Key> {
         0x03 => Some(Key::Interrupt),
         0x04 => Some(Key::Eof),
         0x05 => Some(Key::End),
+        0x0f => Some(Key::Expand),
         0x17 => Some(Key::WordBackspace),
         b'\r' | b'\n' => Some(Key::Enter),
         0x7f | 0x08 => Some(Key::Backspace),

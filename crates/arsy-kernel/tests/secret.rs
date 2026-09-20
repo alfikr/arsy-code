@@ -239,3 +239,53 @@ fn a_file_credential_resolves_only_when_its_owner_alone_can_read_it() {
 
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// `file` is the only store now, so the guards around it carry the whole
+/// weight: a name may not walk out of the directory it resolves in, whichever
+/// verb carries it, and a write may not leave a secret in a file the rest of
+/// the machine can read.
+#[test]
+fn a_file_credential_is_guarded_the_same_way_whatever_the_verb() {
+    use arsy_kernel::secret::FileCredentialStore;
+
+    // Set already refused a traversing name. Remove and resolve are the same
+    // question: a name that must not be written must not delete or read a file
+    // outside either.
+    for name in ["../escape.key", "nested/escape.key"] {
+        for error in [
+            FileCredentialStore.set(name, "x").unwrap_err(),
+            FileCredentialStore.remove(name).unwrap_err(),
+            FileCredentialStore.resolve(name).unwrap_err(),
+        ] {
+            assert!(
+                format!("{error}").contains("traverse"),
+                "`{name}` was not refused: {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Writing over a file that already exists: `OpenOptions::mode` only
+        // decides the mode of a file the call creates, so without a second
+        // check the secret lands in whatever mode was there before.
+        let root = std::env::temp_dir().join(format!("arsy-file-cred-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("reused.key");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let name = path.display().to_string();
+        FileCredentialStore.set(&name, "sk-rewritten").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the rewritten credential is still world-readable"
+        );
+        assert_eq!(FileCredentialStore.resolve(&name).unwrap(), "sk-rewritten");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

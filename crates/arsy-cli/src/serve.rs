@@ -66,6 +66,9 @@ pub fn run(invocation: &Invocation, _emitter: &mut Emitter) -> Result<i32, Diagn
         // The embedding client owns the conversation, so there is no ARSY
         // session stream here to hang a durable checklist from.
         arsy_code::operations::TurnState::default(),
+        // The MCP server's tool schemas are its contract with the embedding
+        // client; skills are a prompt concern and reach the prompt elsewhere.
+        &[],
     )
     .map_err(|error| storage_failed(error.to_string()))?;
 

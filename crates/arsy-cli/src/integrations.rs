@@ -58,7 +58,7 @@ pub fn inspect(
         source,
         event,
         extra_config,
-        &user_declarations(),
+        &user_declarations(kind),
     )
 }
 
@@ -120,7 +120,14 @@ pub fn inspect_with(
                     in_workspace
                 })
         } else {
-            importer.hook_declarations()
+            importer.hook_declarations().map(|mut in_workspace| {
+                // The engine loads the operator's own `~/.claude/settings.json`
+                // too, so a listing of the workspace alone named a subset of
+                // what runs — and the `/hooks` switches could not reach a home
+                // hook to turn it off.
+                in_workspace.extend(user.iter().cloned());
+                in_workspace
+            })
         }
         .map_err(|error| {
             Diagnostic::error(
@@ -638,9 +645,19 @@ fn details(kind: &str, entry: &Value) -> Vec<String> {
 /// failing the listing: it is not this workspace's file, and a listing that
 /// refuses to show the workspace's own connections because of it is worse
 /// than one that is short.
-fn user_declarations() -> Vec<serde_json::Value> {
-    arsy_kernel::config::home_config_file(".claude.json")
-        .map(|path| arsy_code::compat::user_mcp_declarations(&path).unwrap_or_default())
+fn user_declarations(kind: &str) -> Vec<serde_json::Value> {
+    // Both kinds live in the operator's home and both are loaded from there:
+    // MCP connections in `~/.claude.json`, hooks in `~/.claude/settings.json`.
+    let (file, read): (&str, fn(&Path) -> Vec<serde_json::Value>) = match kind {
+        "hook" => (".claude/settings.json", |path| {
+            arsy_code::compat::user_hook_declarations(path).unwrap_or_default()
+        }),
+        _ => (".claude.json", |path| {
+            arsy_code::compat::user_mcp_declarations(path).unwrap_or_default()
+        }),
+    };
+    arsy_kernel::config::home_config_file(file)
+        .map(|path| read(&path))
         .unwrap_or_default()
 }
 
@@ -691,6 +708,60 @@ mod tests {
         extra: Option<&Path>,
     ) -> Result<Value, Diagnostic> {
         inspect_with(root, kind, name, source, event, extra, &[])
+    }
+
+    /// The engine loads the operator's own `~/.claude/settings.json`, so the
+    /// listing has to name those hooks too: a hook that runs and cannot be
+    /// switched off is a switch that lies.
+    #[test]
+    fn a_hook_listing_names_the_operators_own_hooks_beside_the_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".claude")).unwrap();
+        std::fs::write(
+            root.path().join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"repo.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let operators = home.path().join("settings.json");
+        std::fs::write(
+            &operators,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"mine.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let user = arsy_code::compat::user_hook_declarations(&operators).unwrap();
+
+        let report = inspect_with(root.path(), "hook", None, None, None, None, &user).unwrap();
+        let entries = report["entries"].as_array().unwrap();
+        let sources: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry["source"].as_str())
+            .collect();
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.contains("settings.json")),
+            "{sources:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|source| *source == operators.display().to_string()),
+            "the operator's own file is listed: {sources:?}"
+        );
+
+        // The key a switch would write is the one the engine builds for that
+        // file, so turning it off reaches the rule rather than nothing.
+        let declaration = entries
+            .iter()
+            .find(|entry| entry["source"].as_str() == Some(&operators.display().to_string()))
+            .and_then(|entry| entry["declaration"].as_str())
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            declaration,
+            format!("{}#PreToolUse[0].0", operators.display())
+        );
     }
 
     #[test]

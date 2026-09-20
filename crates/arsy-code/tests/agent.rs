@@ -55,6 +55,7 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
         arsy_code::operations::Reachable::default(),
         "test",
         arsy_code::operations::TurnState::default(),
+        &[],
     )
     .unwrap()
 }
@@ -63,6 +64,31 @@ fn runtime(root: &std::path::Path, rules: RuleSet) -> ToolRuntime {
 /// authority.
 fn permissive(root: &std::path::Path) -> ToolRuntime {
     runtime(root, rules(CapabilityAction::ALL))
+}
+
+/// A permissive runtime that was handed a skill listing, the way a session
+/// hands it the skills the prompt named.
+fn with_skills(root: &std::path::Path, skills: &[agent::instructions::Skill]) -> ToolRuntime {
+    let workspace = Workspace::open(root).unwrap();
+    let artifacts: Arc<dyn ArtifactStore> =
+        Arc::new(FileArtifactStore::open(root.join(".arsy/artifacts"), 0).unwrap());
+    agent::runtime(
+        &workspace,
+        rules(CapabilityAction::ALL),
+        artifacts,
+        0,
+        Principal::System,
+        RiskContext {
+            reversible: true,
+            workspace: WorkspaceCleanliness::Clean,
+            sandbox: SandboxAssurance::None,
+        },
+        arsy_code::operations::Reachable::default(),
+        "test",
+        arsy_code::operations::TurnState::default(),
+        skills,
+    )
+    .unwrap()
 }
 
 /// Run a call the way an operator at a keyboard would: whatever policy asks
@@ -341,6 +367,43 @@ fn reading_returns_text_line_windows_and_reports_binary_without_decoding_it() {
         json!({"path": "src/lib.rs", "offset": 900}),
     );
     assert_eq!(past, "(offset 900 is past the end; the file has 4 lines)");
+}
+
+/// The operator's own home declares skills too, and their `SKILL.md` is
+/// absolute. The prompt lists them, so `skill://` has to open one — a listing
+/// naming a file the model cannot read is worse than no listing.
+#[test]
+fn a_skill_declared_outside_the_workspace_is_read_where_it_lives() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let declared = home.path().join("skills/review/SKILL.md");
+    std::fs::create_dir_all(declared.parent().unwrap()).unwrap();
+    std::fs::write(&declared, "---\nname: review\n---\nhow to review").unwrap();
+    let runtime = with_skills(
+        root.path(),
+        &[agent::instructions::Skill {
+            name: "review".to_owned(),
+            ecosystem: "claude".to_owned(),
+            path: declared.display().to_string(),
+            description: None,
+        }],
+    );
+
+    let body = ok(&runtime, "fs.read", json!({"path": "skill://review"}));
+    assert!(body.contains("how to review"), "{body}");
+
+    // The reference is what opens it, not the path: the same file named
+    // directly is outside the workspace and stays refused.
+    let direct = err(
+        &runtime,
+        "fs.read",
+        json!({"path": declared.display().to_string()}),
+    );
+    assert!(!direct.is_empty());
+
+    // A name nothing declared is an error, not a read of the literal string.
+    let unknown = err(&runtime, "fs.read", json!({"path": "skill://nothing"}));
+    assert!(unknown.contains("nothing"), "{unknown}");
 }
 
 #[test]
@@ -891,6 +954,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
         &[],
+        &[],
         None,
         ExecutionMode::Normal,
         &arsy_kernel::secret::Redactor::new(),
@@ -914,6 +978,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
         arsy_kernel::prompt::ModelFamily::Claude,
         &found,
         &[],
+        &[],
         None,
         ExecutionMode::Plan,
         &arsy_kernel::secret::Redactor::new(),
@@ -934,6 +999,7 @@ fn instructions_are_discovered_root_first_and_only_where_they_belong() {
             version: "1.2.0".to_owned(),
             capabilities: vec!["fs.read".to_owned()],
         }],
+        &[],
         None,
         ExecutionMode::Normal,
         &arsy_kernel::secret::Redactor::new(),

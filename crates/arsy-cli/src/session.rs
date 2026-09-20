@@ -265,8 +265,8 @@ fn human_list(report: &Value) -> Value {
         report["workspace"].as_str().unwrap_or(".")
     );
     for session in sessions {
-        listing.push_str(&format!(
-            "\n  {} · {} · {} turn(s) · {} event(s)\n    tokens: {} in / {} out · cost: {} · started {}\n",
+        let mut row = format!(
+            "\n  {} · {} · {} turn(s) · {} event(s)\n    tokens: {} in / {} out · cost: {} · started {}",
             session["session"].as_str().unwrap_or("?"),
             session["status"].as_str().unwrap_or("?"),
             session["turns"],
@@ -275,7 +275,14 @@ fn human_list(report: &Value) -> Value {
             session["output_tokens"],
             money(&session["cost_micros"]),
             timestamp(&session["started_at_ms"]),
-        ));
+        );
+        // `rename` is only visible here when the title it set is shown, so a
+        // titled session says so and an untitled one stays as it was.
+        if let Some(title) = session["title"].as_str() {
+            row.push_str(&format!(" · title: \"{title}\""));
+        }
+        row.push('\n');
+        listing.push_str(&row);
         if let Some(parent) = session["branched_from"].as_object() {
             listing.push_str(&format!(
                 "    branched from {} ({} at sequence {})\n",
@@ -703,5 +710,37 @@ mod tests {
         ] {
             assert!(crate::parse(args.clone()).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_listing_shows_the_title_a_session_was_given() {
+        let row = |session: &str, title: Value| {
+            json!({
+                "session": session,
+                "title": title,
+                "status": "completed",
+                "turns": 2,
+                "events": 9,
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cost_micros": 1_000,
+                "started_at_ms": 0,
+            })
+        };
+        let report = json!({
+            "workspace": "/w",
+            "sessions": [
+                row("11111111-1111-1111-1111-111111111111", json!("feature work")),
+                row("22222222-2222-2222-2222-222222222222", Value::Null),
+            ],
+        });
+        let listing = human_list(&report)["sessions"].as_str().unwrap().to_owned();
+
+        assert!(listing.contains("title: \"feature work\""), "{listing}");
+        assert_eq!(
+            listing.matches("title:").count(),
+            1,
+            "an untitled session says nothing about a title: {listing}"
+        );
     }
 }

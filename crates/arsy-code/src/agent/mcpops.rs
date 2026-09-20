@@ -608,6 +608,7 @@ mod tests {
                 mcp: Some(connections),
                 ..crate::operations::TurnState::default()
             },
+            &[],
         )
         .unwrap()
         .with_dynamic_tools(discovered);
@@ -675,6 +676,7 @@ mod tests {
             crate::operations::Reachable::default(),
             "test",
             crate::operations::TurnState::default(),
+            &[],
         )
         .unwrap()
         .with_dynamic_tools(vec![super::super::DynamicTool {

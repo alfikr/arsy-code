@@ -198,6 +198,69 @@ fn extension_listing(extensions: &[ExtensionTool]) -> Option<String> {
     Some(listing)
 }
 
+/// One declared skill the model may read.
+///
+/// A skill is instructions the model loads when a task looks like one, which
+/// is why the prompt carries the name, when it applies, and the path to
+/// read — not the body. Carrying every body would spend the turn's budget on
+/// instructions for work this turn is not doing, which is the same mistake
+/// `discover` exists to avoid for the repository's Markdown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Skill {
+    /// The directory name, which is also how the operator addresses it.
+    pub name: String,
+    /// Where the skill came from, as it is written in `arsy skill list`.
+    pub ecosystem: String,
+    /// The `SKILL.md` this skill is, as a path the model can pass to
+    /// `fs.read`. Relative where it is inside the workspace, absolute when
+    /// the operator's own home declares it.
+    pub path: String,
+    /// One line on what the skill is for, from its front matter.
+    pub description: Option<String>,
+}
+
+/// The prompt's listing of the skills a turn may reach, or `None` when there
+/// are none, so an empty list costs nothing.
+fn skill_listing(skills: &[Skill]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let width = skills
+        .iter()
+        .map(|skill| skill.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut listing = String::from(
+        "## Skills\n\n\
+         Skills are instructions written for a kind of task. When the task in \
+         front of you matches one, read it with `fs.read` of the `skill://` \
+         reference beside it and follow it before doing the work. A skill that \
+         is not matched is not read. A skill listed without a reference lives \
+         outside this workspace, which this session cannot open: its \
+         description is the whole of what it offers.\n\n",
+    );
+    for skill in skills {
+        let pad = " ".repeat(width.saturating_sub(skill.name.chars().count()));
+        let description = skill.description.as_deref().map_or("", str::trim);
+        // Only a workspace-relative skill survives `Workspace::resolve_file`,
+        // so only that one is offered as something to read: naming a file the
+        // read is bound to refuse just spends the turn finding that out.
+        let reference = if std::path::Path::new(&skill.path).is_relative() {
+            format!("  `skill://{}`", skill.name)
+        } else {
+            String::new()
+        };
+        listing.push_str(&format!(
+            "- {}{pad}  {}{reference}\n",
+            skill.name, skill.ecosystem
+        ));
+        if !description.is_empty() {
+            listing.push_str(&format!("  {description}\n"));
+        }
+    }
+    Some(listing)
+}
+
 /// Build the system prompt for one turn.
 ///
 /// `recalled` is context the caller retrieved — what this workspace remembers,
@@ -208,10 +271,12 @@ fn extension_listing(extensions: &[ExtensionTool]) -> Option<String> {
 /// Compilation goes through the kernel's prompt compiler rather than string
 /// concatenation, so ordering is the family's, secrets are redacted on the way
 /// out, and every segment is traceable to the fragment it came from.
+#[allow(clippy::too_many_arguments)]
 pub fn system_prompt(
     family: ModelFamily,
     instructions: &[Instruction],
     extensions: &[ExtensionTool],
+    skills: &[Skill],
     recalled: Option<&str>,
     mode: super::ExecutionMode,
     redactor: &Redactor,
@@ -258,6 +323,16 @@ pub fn system_prompt(
             id: FragmentId::new(),
             kind: PromptFragmentKind::PermissionState,
             content: PLAN_MODE_INSTRUCTIONS.to_owned(),
+        });
+    }
+    if let Some(listing) = skill_listing(skills) {
+        // A permission-state fragment, for the same reason the extension
+        // listing is: the set of skills changes at a turn boundary, and a
+        // prefix a provider is caching must not be the thing that moves.
+        fragments.push(PromptFragment {
+            id: FragmentId::new(),
+            kind: PromptFragmentKind::PermissionState,
+            content: listing,
         });
     }
     if let Some(context) = recalled.filter(|text| !text.trim().is_empty()) {
