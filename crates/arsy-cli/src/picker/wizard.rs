@@ -242,7 +242,9 @@ pub(crate) fn auth_step(
         tui::AuthStep::SetProvider => auth_set_provider_answer(answer, providers, draft_provider),
         tui::AuthStep::SetKey => auth_set_key_answer(draft_provider, answer),
         tui::AuthStep::RemoveHandle => auth_remove_handle_answer(answer),
-        tui::AuthStep::PasteCode => auth_paste_code_answer(invocation, draft_provider, answer, emitter),
+        tui::AuthStep::PasteCode => {
+            auth_paste_code_answer(invocation, draft_provider, answer, emitter)
+        }
     }
 }
 /// The answer `Pick` accepts: exactly the verbs the `/auth` menu offers.
