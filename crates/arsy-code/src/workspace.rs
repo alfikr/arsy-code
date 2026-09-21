@@ -791,6 +791,11 @@ mod tests {
             ["config", "user.email", "arsy@example.invalid"],
         )
         .unwrap();
+        // Windows runners default `core.autocrlf` to true, which rewrites
+        // line endings on checkout. These tests compare file contents byte
+        // for byte to say whether a writer's work arrived, and that question
+        // has nothing to do with Git's line-ending policy.
+        git(source.path(), ["config", "core.autocrlf", "false"]).unwrap();
         fs::write(source.path().join("file.txt"), "base\n").unwrap();
         git(source.path(), ["add", "file.txt"]).unwrap();
         git(source.path(), ["commit", "--quiet", "-m", "base"]).unwrap();

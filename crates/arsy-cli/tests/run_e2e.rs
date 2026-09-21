@@ -79,21 +79,28 @@ impl FakeProvider {
     /// reach the socket in whatever order they get there. Serving one queue in
     /// arrival order would make the test depend on that race; picking the
     /// queue from the request's own system prompt does not.
-    fn delegating(parent: Vec<String>, child: Vec<String>) -> Self {
+    /// `children` is one script per subagent, keyed by a phrase that appears
+    /// in that subagent's own request — its goal.
+    ///
+    /// Keyed rather than a single queue because subagents run at once, so
+    /// which of them reaches the socket first is a race. One shared queue
+    /// hands whichever child got there first the reply meant for another,
+    /// and the test then measures the race instead of the runtime.
+    fn delegating(parent: Vec<String>, children: Vec<(&str, Vec<String>)>) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, bodies) = mpsc::channel();
-        // Two queues, and the last reply served from each: a retry has to be
-        // answered with what the request before it got, not with the entry
-        // after it.
-        let scripts = std::sync::Arc::new(std::sync::Mutex::new((
-            parent
+        // Every queue remembers the reply it last served: a dropped
+        // connection reads to the client as the peer disconnecting, which
+        // `stream_with_retry` retries, and the retry must get the reply the
+        // request before it got rather than the entry after it.
+        let scripts = std::sync::Arc::new(std::sync::Mutex::new(Scripts {
+            parent: Script::new(parent),
+            children: children
                 .into_iter()
-                .collect::<std::collections::VecDeque<_>>(),
-            child.into_iter().collect::<std::collections::VecDeque<_>>(),
-            None::<String>,
-            None::<String>,
-        )));
+                .map(|(marker, script)| (marker.to_owned(), Script::new(script)))
+                .collect(),
+        }));
         let peak_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let open_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (peak_out, peak) = (
@@ -106,27 +113,8 @@ impl FakeProvider {
                 let _ = sender.send(request.clone());
                 let child = is_child_request(&request);
                 let mut held = scripts.lock().unwrap();
-                let scripts = &mut *held;
-                let (queue, last) = if child {
-                    (&mut scripts.1, &mut scripts.3)
-                } else {
-                    (&mut scripts.0, &mut scripts.2)
-                };
-                // A reply the script has already used, rather than a dropped
-                // connection, when the queue runs dry. A dropped one reads
-                // to the client as the peer disconnecting, which
-                // `stream_with_retry` retries — and the retry takes the next
-                // script entry, so one transient hiccup cascades into some
-                // later request finding nothing and failing for real.
-                let body = match queue.pop_front() {
-                    Some(body) => {
-                        *last = Some(body.clone());
-                        body
-                    }
-                    None => match last.clone() {
-                        Some(body) => body,
-                        None => continue,
-                    },
+                let Some(body) = held.next_reply(child, &request) else {
+                    continue;
                 };
                 drop(held);
                 let body = fill_task_ids(&body, &request);
@@ -183,6 +171,50 @@ impl FakeProvider {
             seen.push(serde_json::from_str(&body).unwrap());
         }
         seen
+    }
+}
+
+/// One correspondent's replies, in order, and the last one served.
+struct Script {
+    remaining: std::collections::VecDeque<String>,
+    last: Option<String>,
+}
+
+impl Script {
+    fn new(replies: Vec<String>) -> Self {
+        Self {
+            remaining: replies.into_iter().collect(),
+            last: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<String> {
+        match self.remaining.pop_front() {
+            Some(reply) => {
+                self.last = Some(reply.clone());
+                Some(reply)
+            }
+            // A retry of the request this already answered.
+            None => self.last.clone(),
+        }
+    }
+}
+
+/// The parent's script, and one per subagent keyed by its goal.
+struct Scripts {
+    parent: Script,
+    children: Vec<(String, Script)>,
+}
+
+impl Scripts {
+    fn next_reply(&mut self, child: bool, request: &str) -> Option<String> {
+        if !child {
+            return self.parent.next();
+        }
+        self.children
+            .iter_mut()
+            .find(|(marker, _)| request.contains(marker.as_str()))
+            .and_then(|(_, script)| script.next())
     }
 }
 
@@ -667,11 +699,14 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
             waits(),
             answers("the subagent found 42."),
         ],
-        vec![
-            asks_to_read("notes.txt"),
-            tries_to_write(),
-            answers("notes.txt says 42."),
-        ],
+        vec![(
+            "what does notes.txt say",
+            vec![
+                asks_to_read("notes.txt"),
+                tries_to_write(),
+                answers("notes.txt says 42."),
+            ],
+        )],
     );
     configure_delegating(home.path(), provider.port);
 
@@ -793,9 +828,9 @@ fn three_subagents_investigate_at_once_while_the_parent_keeps_its_turn() {
             answers("all three reported."),
         ],
         vec![
-            answers("one says A."),
-            answers("two says B."),
-            answers("three says C."),
+            ("what does one.txt say", vec![answers("one says A.")]),
+            ("what does two.txt say", vec![answers("two says B.")]),
+            ("what does three.txt say", vec![answers("three says C.")]),
         ],
     );
     configure_delegating(home.path(), provider.port);
@@ -925,10 +960,14 @@ fn two_writers_change_separate_components_and_an_integrator_applies_both() {
             answers("both changes are in."),
         ],
         vec![
-            writes("one.txt", "from writer one\n"),
-            reports("one.txt"),
-            writes("two.txt", "from writer two\n"),
-            reports("two.txt"),
+            (
+                "rewrite one.txt",
+                vec![writes("one.txt", "from writer one\n"), reports("one.txt")],
+            ),
+            (
+                "rewrite two.txt",
+                vec![writes("two.txt", "from writer two\n"), reports("two.txt")],
+            ),
         ],
     );
     configure_delegating_writers(home.path(), provider.port);
@@ -996,6 +1035,10 @@ fn git_workspace(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
     git(&["init", "--quiet"])?;
     git(&["config", "user.name", "ARSY Test"])?;
     git(&["config", "user.email", "arsy@example.invalid"])?;
+    // Windows runners rewrite line endings on checkout by default, and this
+    // test compares a writer's file byte for byte to say whether its work
+    // arrived. That question is not about Git's line-ending policy.
+    git(&["config", "core.autocrlf", "false"])?;
     for (path, content) in files {
         std::fs::write(workspace.path().join(path), content).unwrap();
     }
