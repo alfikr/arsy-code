@@ -21,6 +21,22 @@ use crate::secret::Redactor;
 use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
 
+/// Tool names on the Google Code Assist / Antigravity wire must match
+/// `^[a-zA-Z0-9_-]{1,128}$`, the same pattern Anthropic enforces. ARSY's
+/// canonical names are dotted (`fs.read`, `search.text`, ...), so they need
+/// to be sanitized before they are sent and mapped back when the reply arrives.
+fn wire_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
 /// Antigravity User-Agent matching official antigravity/hub client.
@@ -393,7 +409,7 @@ fn encode_message(
                 name,
                 arguments,
             } => parts.push(json!({
-                "functionCall": {"name": name, "args": arguments, "id": id},
+                "functionCall": {"name": wire_tool_name(name), "args": arguments, "id": id},
                 "thoughtSignature": "skip_thought_signature_validator",
             })),
             ModelContent::ToolResult {
@@ -402,7 +418,7 @@ fn encode_message(
                 is_error,
             } => responses.push(json!({
                 "functionResponse": {
-                    "name": names.get(id.as_str()).copied().unwrap_or(id.as_str()),
+                    "name": wire_tool_name(names.get(id.as_str()).copied().unwrap_or(id.as_str())),
                     "id": id,
                     "response": {
                         "output": content,
@@ -425,7 +441,7 @@ fn encode_message(
 
 fn encode_tool(tool: &ToolSchema) -> Value {
     json!({
-        "name": tool.name,
+        "name": wire_tool_name(&tool.name),
         "description": tool.description,
         "parameters": strip_unsupported_schema(&tool.input_schema),
     })
@@ -518,7 +534,15 @@ impl<T: WireTransport> ModelProvider for GoogleCodeAssistProvider<T> {
         if response.status != 200 {
             return Err(normalize_status(response));
         }
-        Ok(Box::new(EventDecoder::new(response.lines)))
+        let tool_names: std::collections::HashMap<String, String> = request
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                let mapped = wire_tool_name(&tool.name);
+                (mapped != tool.name).then(|| (mapped, tool.name.clone()))
+            })
+            .collect();
+        Ok(Box::new(EventDecoder::new(response.lines, tool_names)))
     }
 }
 
@@ -563,12 +587,19 @@ struct EventDecoder {
     next_call: usize,
     stop: Option<StopReason>,
     done: bool,
+    /// Maps sanitized wire tool names back to their canonical names when they
+    /// were transformed before sending (e.g. `fs.read` → `fs_read`).
+    tool_names: std::collections::HashMap<String, String>,
 }
 
 impl EventDecoder {
-    fn new(lines: Box<dyn Iterator<Item = Result<String, String>> + Send>) -> Self {
+    fn new(
+        lines: Box<dyn Iterator<Item = Result<String, String>> + Send>,
+        tool_names: std::collections::HashMap<String, String>,
+    ) -> Self {
         Self {
             lines,
+            tool_names,
             queue: VecDeque::new(),
             next_call: 0,
             stop: None,
@@ -637,16 +668,22 @@ impl EventDecoder {
                     "a functionCall part named no function".to_owned(),
                 ));
             }
+            let canonical = self
+                .tool_names
+                .get(&name)
+                .map(String::as_str)
+                .unwrap_or(&name)
+                .to_owned();
             let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
             self.queue.push_back(ModelEvent::ToolCallStarted {
                 index,
                 id: id.clone(),
-                name: name.clone(),
+                name: canonical.clone(),
             });
             self.queue.push_back(ModelEvent::ToolCallCompleted {
                 index,
                 id,
-                name,
+                name: canonical,
                 arguments,
             });
             return Ok(());
@@ -910,6 +947,49 @@ mod tests {
             .expect("a functionResponse part");
         assert_eq!(response["name"], json!("read_file"));
         assert_eq!(response["id"], json!("call-7"));
+
+        assert_eq!(response["name"], json!("read_file"));
+        assert_eq!(response["id"], json!("call-7"));
+    }
+
+    #[test]
+    fn a_dotted_tool_result_is_labelled_with_the_sanitized_name() {
+        let mut req = request();
+        req.messages.push(ModelMessage {
+            role: ModelRole::Assistant,
+            content: vec![ModelContent::ToolCall {
+                id: "call-8".to_owned(),
+                name: "fs.read".to_owned(),
+                arguments: json!({"path": "x"}),
+            }],
+        });
+        req.messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::ToolResult {
+                id: "call-8".to_owned(),
+                content: "contents".to_owned(),
+                is_error: false,
+            }],
+        });
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[]),
+        )
+        .with_project("p");
+        let body: Value = serde_json::from_str(&provider.encode(&req, "p").body).unwrap();
+        let contents = body["request"]["contents"].as_array().unwrap();
+        let response = contents
+            .iter()
+            .find_map(|content| {
+                content["parts"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|part| part.get("functionResponse"))
+            })
+            .expect("a functionResponse part");
+        assert_eq!(response["name"], json!("fs_read"));
+        assert_eq!(response["id"], json!("call-8"));
     }
 
     #[test]
@@ -1008,5 +1088,45 @@ mod tests {
         assert!(out["properties"]["metadata"]
             .get("patternProperties")
             .is_none());
+    }
+
+    #[test]
+    fn a_dotted_tool_name_is_sanitized_and_mapped_back() {
+        let mut req = request();
+        req.tools.push(ToolSchema {
+            name: "fs.read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: json!({"type": "object"}),
+        });
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[]),
+        )
+        .with_project("p");
+        let body: Value = serde_json::from_str(&provider.encode(&req, "p").body).unwrap();
+        let declaration = body["request"]["tools"][0]["functionDeclarations"][0].clone();
+        assert_eq!(
+            declaration["name"],
+            json!("fs_read"),
+            "dotted tool names are sanitized to match the wire-name pattern"
+        );
+
+        let turn = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"fs_read\",\"args\":{\"path\":\"Cargo.toml\"},\"id\":\"call-1\"}}]},\"finishReason\":\"OTHER\"}]}}\n";
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            canned(&[(200, turn)]),
+        )
+        .with_project("p");
+        let events: Vec<ModelEvent> = provider.stream(&req).unwrap().map(Result::unwrap).collect();
+        assert!(matches!(
+            &events[0],
+            ModelEvent::ToolCallStarted { name, .. } if name == "fs.read"
+        ));
+        assert!(matches!(
+            &events[1],
+            ModelEvent::ToolCallCompleted { name, .. } if name == "fs.read"
+        ));
     }
 }
