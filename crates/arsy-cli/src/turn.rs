@@ -487,12 +487,6 @@ pub(crate) fn run_turn(
     Ok(turn)
 }
 
-/// How many times one turn may come back asking to run tools. The bound is
-/// what stops a model that answers every result with another call from
-/// spending a session on its own loop.
-#[cfg(feature = "tui")]
-const MAX_TOOL_ROUNDS: usize = 24;
-
 /// What the operator said about one tool call.
 #[cfg(feature = "tui")]
 fn tool_call_fingerprint(name: &str, arguments: &Value) -> String {
@@ -566,7 +560,15 @@ pub(crate) fn native_turn(
     // it twice or burning all 24 rounds.
     let mut completed_calls = std::collections::HashMap::<String, String>::new();
     let mut changed_files = std::collections::BTreeSet::new();
-    for round in 0..MAX_TOOL_ROUNDS {
+    let max_rounds = config.max_tool_rounds();
+    // Repeating a call that already succeeded is wasted budget, but repeating
+    // one that just *failed* is a loop the operator cannot see past the tool
+    // cards. Three identical failures in a row is the line: past it the model
+    // is told to change approach rather than spend the rest of its budget
+    // failing identically.
+    const FAILURE_LOOP_LIMIT: usize = 3;
+    let mut identical_failures: Option<(String, usize)> = None;
+    for round in 0..max_rounds {
         // Before the request, not after: a transcript that has outgrown the
         // window fails at the provider, and the operator is told what was
         // elided rather than watching the turn shrink invisibly.
@@ -636,6 +638,16 @@ pub(crate) fn native_turn(
             &mut outcome.interrupted,
         )?;
         changed_files.extend(newly_changed);
+        // Read the last failing fingerprint before `results` moves into the
+        // conversation below.
+        let failed_fingerprint =
+            calls
+                .iter()
+                .zip(results.iter())
+                .find_map(|((_, name, arguments), result)| {
+                    matches!(result, ModelContent::ToolResult { is_error: true, .. })
+                        .then(|| tool_call_fingerprint(name, arguments))
+                });
         conversation.push(ModelMessage {
             role: ModelRole::User,
             content: results,
@@ -654,16 +666,48 @@ pub(crate) fn native_turn(
             outcome.changed_files = changed_files;
             return Ok(outcome);
         }
-        if round + 1 == MAX_TOOL_ROUNDS {
-            outcome.failure = Some(format!(
-                "{route} asked for tools {MAX_TOOL_ROUNDS} times without finishing the turn"
-            ));
-            outcome.changed_files = changed_files;
-            return Ok(outcome);
+        // Three identical failures in a row is a loop, not work: stop the
+        // turn with a message that names the loop rather than the provider.
+        identical_failures = match (identical_failures, failed_fingerprint) {
+            (Some((fingerprint, count)), Some(same)) if fingerprint == same => {
+                Some((fingerprint, count + 1))
+            }
+            (_, Some(fingerprint)) => Some((fingerprint, 1)),
+            (_, None) => None,
+        };
+        if let Some((_, count)) = &identical_failures {
+            if *count >= FAILURE_LOOP_LIMIT {
+                outcome.failure = Some(format!(
+                    "{route} repeated the same failing tool call {count} times — it is stuck in a \
+                     loop rather than out of budget; continue with a narrower task"
+                ));
+                outcome.changed_files = changed_files;
+                return Ok(outcome);
+            }
+        }
+        let remaining = max_rounds - (round + 1);
+        if remaining > 0 && remaining <= 3 {
+            // Told before the budget is gone, not after: a model that knows
+            // one round is left can wrap up, while one stopped dead can only
+            // be rewound. The note rides on the result just pushed.
+            let note = format!(
+                "\n\n[SYSTEM: {remaining} tool round(s) remain in this turn. Finish up and give \
+                 your final answer now.]"
+            );
+            if let Some(ModelContent::ToolResult { content, .. }) = conversation
+                .last_mut()
+                .and_then(|message| message.content.last_mut())
+            {
+                content.push_str(&note);
+            }
         }
     }
     Ok(Turn {
         changed_files,
+        failure: Some(format!(
+            "{route} asked for tools {max_rounds} times without finishing the turn — the budget \
+             is `execution.max_tool_rounds`; raise it, or continue with a narrower task"
+        )),
         ..Turn::default()
     })
 }
@@ -2930,7 +2974,18 @@ fn fail_turn(
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
-    let (code, reason, remediation) = if route.is_codex() {
+    let (code, reason, remediation) = if message.contains("asked for tools")
+        || message.contains("repeated the same failing tool call")
+    {
+        // The harness stopped the turn, not the provider: misreporting a
+        // local budget as ARSY-PRV-1000 sends an operator chasing endpoint
+        // and credential problems that do not exist.
+        (
+            ARSY_TRN_1000,
+            "turn",
+            "raise `execution.max_tool_rounds`, or continue with a narrower task",
+        )
+    } else if route.is_codex() {
         (
             "ARSY-PRV-1002",
             "provider_cli",

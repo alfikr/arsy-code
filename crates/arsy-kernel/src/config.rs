@@ -82,6 +82,19 @@ pub const DEFAULT_PARALLEL_TOOLS: usize = 4;
 /// describing a fork bomb.
 pub const MAX_PARALLEL_TOOLS: usize = 16;
 
+/// `execution.max_tool_rounds`: how many times one turn may come back asking
+/// to run tools before the harness stops it.
+///
+/// The default covers a real development task — reading, editing, building,
+/// and testing — rather than a single-shot reply. The number is the schema's,
+/// in `docs/35-configuration.md`; this is where it is enforced.
+pub const DEFAULT_TOOL_ROUNDS: usize = 100;
+
+/// The most any layer may ask for. A ceiling rather than a preference: a
+/// turn that loops a thousand times without finishing is a bug to be diagnosed,
+/// not work to be funded.
+pub const MAX_TOOL_ROUNDS: usize = 200;
+
 /// Top-level keys this loader accepts and applies nothing from. `schema_version`
 /// is here because `check_schema_version` has already read it.
 const INERT_SECTIONS: &[&str] = &["schema_version", "context", "git", "sandbox", "storage"];
@@ -208,6 +221,15 @@ pub const SETTINGS: &[Setting] = &[
         },
         default: "4",
         description: "how many tool calls one round may run at once",
+    },
+    Setting {
+        key: "execution.max_tool_rounds",
+        kind: SettingKind::Integer {
+            min: 1,
+            max: MAX_TOOL_ROUNDS,
+        },
+        default: "100",
+        description: "how many tool rounds one turn may run before giving up",
     },
     Setting {
         key: "compat.claude.enabled",
@@ -895,6 +917,8 @@ pub struct Config {
     provider_allowed: Option<BTreeSet<String>>,
     model_allowed: Option<BTreeSet<String>>,
     theme: Theme,
+    /// `execution.max_tool_rounds`. `None` is the built-in default.
+    max_tool_rounds: Option<usize>,
     /// Policy rules keyed by their stable `id`, so a later layer amends a rule
     /// rather than appending a second one with the same meaning.
     policy_rules: BTreeMap<String, PolicyRule>,
@@ -994,6 +1018,7 @@ impl Config {
             "credentials.store" => self.credential_store().to_owned(),
             "ui.style" => self.ui_style().to_owned(),
             "execution.max_parallel" => self.max_parallel_tools().to_string(),
+            "execution.max_tool_rounds" => self.max_tool_rounds().to_string(),
             "theme.base" => self.theme_base().to_owned(),
             "ui.mcp_log" => self.mcp_log().to_owned(),
             _ => match key
@@ -1262,6 +1287,11 @@ impl Config {
     /// How many independent tool calls one round may run at once.
     pub fn max_parallel_tools(&self) -> usize {
         self.max_parallel_tools.unwrap_or(DEFAULT_PARALLEL_TOOLS)
+    }
+
+    /// How many tool rounds one turn may run before giving up.
+    pub fn max_tool_rounds(&self) -> usize {
+        self.max_tool_rounds.unwrap_or(DEFAULT_TOOL_ROUNDS)
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
@@ -1625,9 +1655,22 @@ impl Config {
         value: &toml::Value,
     ) -> Result<(), ConfigError> {
         let table = as_table(value, "execution", path)?;
-        let Some(value) = table.get("max_parallel") else {
-            return Ok(());
-        };
+        for (key, value) in table {
+            match key.as_str() {
+                "max_parallel" => self.apply_max_parallel(layer, path, value)?,
+                "max_tool_rounds" => self.apply_max_tool_rounds(layer, path, value)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_max_parallel(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
         let key = "execution.max_parallel";
         let limit = value
             .as_integer()
@@ -1644,6 +1687,26 @@ impl Config {
             self.max_parallel_tools
                 .map_or(limit, |held| held.min(limit)),
         );
+        Ok(())
+    }
+
+    fn apply_max_tool_rounds(
+        &mut self,
+        layer: Layer,
+        path: &Path,
+        value: &toml::Value,
+    ) -> Result<(), ConfigError> {
+        let key = "execution.max_tool_rounds";
+        let limit = value
+            .as_integer()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| (1..=MAX_TOOL_ROUNDS).contains(limit))
+            .ok_or_else(|| ConfigError {
+                path: path.to_path_buf(),
+                message: format!("`{key}` must be between 1 and {MAX_TOOL_ROUNDS}"),
+            })?;
+        self.record(layer, path, key, limit.to_string());
+        self.max_tool_rounds = Some(self.max_tool_rounds.map_or(limit, |held| held.min(limit)));
         Ok(())
     }
 
@@ -3811,6 +3874,66 @@ default_effect = \"allow\"\n",
             assert!(
                 Config::load(&[(Layer::User, path)]).is_err(),
                 "max_parallel = {bad} was accepted"
+            );
+        }
+    }
+
+    /// `execution.max_tool_rounds` is the key `docs/35-configuration.md`
+    /// documents, with the default and the `min` merge it specifies. Same
+    /// shape as `execution.max_parallel`: narrowest layer wins.
+    #[test]
+    fn the_tool_round_budget_uses_the_documented_key_and_only_ever_narrows() {
+        let directory = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            load(&[]).max_tool_rounds(),
+            DEFAULT_TOOL_ROUNDS,
+            "an unset key is the schema's default, not zero"
+        );
+
+        let enterprise = write(
+            directory.path(),
+            "enterprise.json",
+            "schema_version = 1\n\n[execution]\nmax_tool_rounds = 80\n",
+        );
+        let user = write(
+            directory.path(),
+            "user.json",
+            "schema_version = 1\n\n[execution]\nmax_tool_rounds = 20\n",
+        );
+        let greedy = write(
+            directory.path(),
+            "greedy.json",
+            "schema_version = 1\n\n[execution]\nmax_tool_rounds = 150\n",
+        );
+
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise.clone())]).max_tool_rounds(),
+            80
+        );
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise.clone()), (Layer::User, user),])
+                .max_tool_rounds(),
+            20,
+            "a lower layer may ask for less"
+        );
+        assert_eq!(
+            load(&[(Layer::Enterprise, enterprise), (Layer::Workspace, greedy)]).max_tool_rounds(),
+            80,
+            "and never for more, whatever it writes"
+        );
+
+        // Outside the range is refused rather than clamped: a typo that meant
+        // `40` and wrote `4000` should be a diagnostic, not a runaway turn.
+        for bad in ["0", "1000", "\"forty\""] {
+            let path = write(
+                directory.path(),
+                "bad.json",
+                &format!("schema_version = 1\n\n[execution]\nmax_tool_rounds = {bad}\n"),
+            );
+            assert!(
+                Config::load(&[(Layer::User, path)]).is_err(),
+                "max_tool_rounds = {bad} was accepted"
             );
         }
     }
