@@ -485,13 +485,6 @@ pub(crate) fn context_budget(resolved: &provider::Resolved) -> u32 {
     CONTEXT_BUDGET_TOKENS.saturating_sub(resolved.endpoint.max_output_tokens)
 }
 
-/// How many rounds of tool calls one scripted turn may take.
-///
-/// The same bound the interactive loop uses, for the same reason: a model that
-/// answers every result with another call would otherwise spend the run on its
-/// own loop.
-const MAX_SCRIPTED_TOOL_ROUNDS: usize = 24;
-
 /// Dispatch a scripted turn, and once more if a stale OAuth access token is
 /// why it failed.
 ///
@@ -535,6 +528,7 @@ pub(crate) fn dispatch_with_refresh(
     let delegates = supervisor.can_delegate();
     let mut supervising = delegates.then_some((supervisor, &mut *graph));
     let outcome = dispatch(
+        config,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -573,6 +567,7 @@ pub(crate) fn dispatch_with_refresh(
     let delegates = supervisor.can_delegate();
     let mut supervising = delegates.then_some((supervisor, graph));
     let outcome = dispatch(
+        config,
         resolved.provider.as_ref(),
         agent,
         request,
@@ -610,6 +605,7 @@ pub(crate) fn is_stale_oauth_token(
 /// of who happened to be watching.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch(
+    config: &Config,
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
     request: &CanonicalModelRequest,
@@ -619,11 +615,12 @@ pub(crate) fn dispatch(
     parallel: usize,
     emitter: &mut Emitter,
 ) -> Result<Value, ProviderError> {
+    let max_rounds = config.max_tool_rounds();
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
     let budget = CONTEXT_BUDGET_TOKENS.saturating_sub(request.max_output_tokens);
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
-    for round in 0..MAX_SCRIPTED_TOOL_ROUNDS {
+    for round in 0..max_rounds {
         // Each round is its own request, so a retry repeats that round rather
         // than collapsing into the one before it.
         request.idempotency_key = IdempotencyKey::new(format!("{base}-{round}"))
@@ -800,7 +797,8 @@ pub(crate) fn dispatch(
     }
     emitter.end_deltas();
     Err(ProviderError::InvalidRequest(format!(
-        "the model asked for tools {MAX_SCRIPTED_TOOL_ROUNDS} times without finishing the turn"
+        "the model asked for tools {max_rounds} times without finishing the turn — the budget is \
+         `execution.max_tool_rounds`; raise it, or continue with a narrower task"
     )))
 }
 

@@ -13,6 +13,7 @@
 //! | `ARSY-CMP-1000` | the session store could not be opened or written |
 //! | `ARSY-CFG-1000` | a configuration layer could not be read or does not parse |
 //! | `ARSY-PRV-1000` | no provider credential is available, so the turn cannot dispatch |
+//! | `ARSY-TRN-1000` | the turn's tool-round budget ran out or looped |
 //! | `ARSY-PRV-1002` | an installed provider CLI failed |
 //! | `ARSY-SBX-1000` | no sandbox worker is available on this build |
 //! | `ARSY-PRV-1001` | no credential store is registered |
@@ -105,6 +106,9 @@ const STORE_PATH: &str = ".arsy/sessions.sqlite3";
 
 /// No provider credential is available, so the turn cannot dispatch.
 pub const ARSY_PRV_1000: &str = "ARSY-PRV-1000";
+/// The turn's tool-round budget ran out, or the model looped on one failing
+/// call. The harness stopped the turn; the provider is not at fault.
+pub const ARSY_TRN_1000: &str = "ARSY-TRN-1000";
 /// A configuration layer could not be read or does not parse.
 pub const ARSY_CFG_1000: &str = "ARSY-CFG-1000";
 /// Machine records carry the protocol's schema version.
@@ -238,7 +242,7 @@ impl Diagnostic {
             "EXE" | "TLS" | "EDT" | "STL" => 6,
             "VER" => 7,
             "CMP" | "CRD" => 8,
-            "RET" | "CTX" | "PLN" | "MDL" => 9,
+            "RET" | "CTX" | "PLN" | "MDL" | "TRN" => 9,
             "UIX" => 10,
             _ => 2,
         }
@@ -4281,6 +4285,123 @@ mod tests {
             seen_count, 2,
             "the duplicate was stopped before another provider round"
         );
+    }
+
+    /// A model that calls the same failing tool forever is stopped after
+    /// three identical failures — with a message that names the loop, not
+    /// the provider — instead of burning the whole round budget on it.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn a_model_repeating_one_failing_call_is_stopped_as_a_loop() {
+        let workspace = tempfile::tempdir().unwrap();
+        // The same denied call, round after round: policy refuses it in
+        // `arsy run`, but here the operator denies it — the `d` answer.
+        let denied = vec![ModelEvent::ToolCallCompleted {
+            index: 0,
+            id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"command": "touch looped"}),
+        }];
+        let mut rounds = Vec::new();
+        for _ in 0..4 {
+            let mut round = denied.clone();
+            round.push(ModelEvent::Completed {
+                stop: arsy_kernel::provider::StopReason::ToolUse,
+            });
+            rounds.push(round);
+        }
+        let (mut resolved, _scripted) = resolved(rounds);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Default));
+        let (typist, keys, done) = typed(b"ddd", std::sync::Arc::clone(&approval));
+        let mut conversation = Vec::new();
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        typist.join().unwrap();
+
+        let failure = turn.failure.as_deref().unwrap_or_default();
+        assert!(
+            failure.contains("repeated the same failing tool call"),
+            "{failure}"
+        );
+        assert!(
+            !workspace.path().join("looped").exists(),
+            "the denied call never ran"
+        );
+    }
+
+    /// A model told the round budget is nearly gone hears it before the turn
+    /// is cut: the last tool result carries the wrap-up note.
+    #[cfg(feature = "tui")]
+    #[test]
+    fn the_wrap_up_warning_reaches_the_model_before_the_budget_ends() {
+        let workspace = tempfile::tempdir().unwrap();
+        // One tool round, then the answer. The default budget is far larger
+        // than two rounds, so this only checks the plumbing, not the
+        // threshold: the note appears when the *configured* budget is small.
+        let (mut resolved, _scripted) = resolved(vec![
+            vec![
+                ModelEvent::ToolCallCompleted {
+                    index: 0,
+                    id: "call-1".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: json!({"command": "printf x"}),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::ToolUse,
+                },
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "done\n".to_owned(),
+                },
+                ModelEvent::Completed {
+                    stop: arsy_kernel::provider::StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let approval =
+            std::sync::Arc::new(approval::ApprovalCell::new(approval::ApprovalMode::Auto));
+        let (_keys_sender, keys) = std::sync::mpsc::channel();
+        let mut conversation = Vec::new();
+        let turn = native_turn(
+            &mut resolved,
+            &arsy_kernel::config::Config::default(),
+            &test_runtime(workspace.path()),
+            &mut conversation,
+            &arsy_code::agent::budget::History::default(),
+            &route(),
+            None,
+            arsy_kernel::domain::TurnId::new(),
+            false,
+            "  footer",
+            &keys,
+            &mut tui::Keys::default(),
+            &mut tui::Composer::default(),
+            &mut tui::Transcript::default(),
+            &approval,
+            None,
+        )
+        .unwrap();
+        assert_eq!(turn.response.trim(), "done");
     }
 
     #[cfg(feature = "tui")]
