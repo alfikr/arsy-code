@@ -2988,38 +2988,10 @@ pub(crate) fn child_turn(
         request.idempotency_key =
             IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
-        let mut calls: Vec<(String, String, Value)> = Vec::new();
         let stream =
             arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)
                 .map_err(|error| error.to_string())?;
-        for event in stream {
-            match event.map_err(|error| error.to_string())? {
-                ModelEvent::TextDelta { text } => answer.push_str(&text),
-                ModelEvent::ToolCallCompleted {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    trace(
-                        "model.tool_call",
-                        json!({"round": round, "id": id, "name": name, "arguments": arguments}),
-                    );
-                    calls.push((id, name, arguments));
-                }
-                ModelEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                } => {
-                    // Counted here rather than inferred by the parent: what a
-                    // child spent has to settle against the budget its task
-                    // reserved, and only the child sees its own stream.
-                    tokens.0 = tokens.0.saturating_add(input_tokens);
-                    tokens.1 = tokens.1.saturating_add(output_tokens);
-                }
-                _ => {}
-            }
-        }
+        let calls = absorb_child_stream(stream, round, &mut answer, tokens, trace)?;
         if calls.is_empty() {
             return Ok(if answer.trim().is_empty() {
                 "the subagent finished without an answer".to_owned()
@@ -3106,6 +3078,50 @@ pub(crate) fn child_turn(
 /// Fewer than the parent's: a child has one question, and a child that cannot
 /// answer it in this many rounds is one the parent should take back.
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+
+/// Read one round of a child's stream into its answer, its usage, and the
+/// calls it asked for.
+///
+/// The same split the parent's loop already has: what a stream said is one
+/// question, and what to do about it is another.
+fn absorb_child_stream(
+    stream: arsy_kernel::provider::ModelEventStream,
+    round: usize,
+    answer: &mut String,
+    tokens: &mut (u64, u64),
+    trace: &mut dyn FnMut(&str, Value),
+) -> Result<Vec<(String, String, Value)>, String> {
+    let mut calls = Vec::new();
+    for event in stream {
+        match event.map_err(|error| error.to_string())? {
+            ModelEvent::TextDelta { text } => answer.push_str(&text),
+            ModelEvent::ToolCallCompleted {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                trace(
+                    "model.tool_call",
+                    json!({"round": round, "id": id, "name": name, "arguments": arguments}),
+                );
+                calls.push((id, name, arguments));
+            }
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                // Counted here rather than inferred by the parent: what a
+                // child spent has to settle against the budget its task
+                // reserved, and only the child sees its own stream.
+                tokens.0 = tokens.0.saturating_add(input_tokens);
+                tokens.1 = tokens.1.saturating_add(output_tokens);
+            }
+            _ => {}
+        }
+    }
+    Ok(calls)
+}
 
 /// Put what the parent said into the child's next round.
 ///
