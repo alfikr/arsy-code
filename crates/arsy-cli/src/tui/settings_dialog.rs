@@ -289,6 +289,8 @@ impl SettingsDialogState {
 
         if let Some(hint_text) = row_allowed_hint(row) {
             lines.push(paint(colour, sgr_dim(), &format!("allowed: {hint_text}")));
+        } else if row.kind == SettingKind::Text {
+            lines.push(paint(colour, sgr_dim(), "free text; set it in arsy.json"));
         }
 
         if let Some(p) = pending {
@@ -491,7 +493,7 @@ fn row_allowed_hint(row: &SettingRow) -> Option<String> {
         SettingKind::Choice => None,
         SettingKind::Bool => Some("true or false".to_owned()),
         SettingKind::Integer { min, max } => Some(format!("from {min} to {max}")),
-        SettingKind::Text => Some(format!("`{}` is free text; set it in arsy.json", row.key)),
+        SettingKind::Text => None,
     }
 }
 
@@ -740,8 +742,11 @@ mod tests {
         }]);
         assert_eq!(dialog.handle_key(Key::Enter), None);
         assert_eq!(dialog.editing, None);
-        let notice = dialog.notice.expect("a notice");
+        let notice = dialog.notice.as_ref().expect("a notice");
         assert!(notice.contains("arsy.json"), "{notice}");
+        let frame = dialog.render(80, false);
+        assert!(frame.contains("free text; set it in arsy.json"), "{frame}");
+        assert!(!frame.contains("allowed:"), "{frame}");
     }
 
     #[test]

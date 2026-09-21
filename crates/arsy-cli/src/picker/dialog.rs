@@ -347,11 +347,15 @@ pub(crate) fn setting_rows(invocation: &Invocation) -> Result<Vec<tui::SettingRo
                 Some(arsy_kernel::config::SettingKind::Text) | None => tui::SettingKind::Text,
             };
             tui::SettingRow {
-                key: view.key,
-                value: view.value,
-                default: view.default,
-                description: view.description,
-                choices: view.choices,
+                key: tui::safe_text(&view.key),
+                value: tui::safe_text(&view.value),
+                default: tui::safe_text(&view.default),
+                description: tui::safe_text(&view.description),
+                choices: view
+                    .choices
+                    .iter()
+                    .map(|choice| tui::safe_text(choice))
+                    .collect(),
                 kind,
                 set: view.set,
             }
