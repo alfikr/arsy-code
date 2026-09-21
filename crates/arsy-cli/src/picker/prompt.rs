@@ -4,7 +4,7 @@
 #[cfg(feature = "tui")]
 use super::dialog::{
     close_dialog, next_dialog_key, repaint_dialog, run_hook_dialog, run_mcp_dialog,
-    run_settings_dialog, run_skill_dialog, Keyed,
+    run_model_dialog, run_settings_dialog, run_skill_dialog, Keyed,
 };
 #[cfg(feature = "tui")]
 use super::remembered::{
@@ -591,18 +591,17 @@ pub(crate) fn run_session_dialog(
 pub(crate) fn run_dialog(
     dialog: Dialog,
     invocation: &Invocation,
+    typing: &mut Typing<'_>,
     restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
-    colour: bool,
     keys: &std::sync::mpsc::Receiver<u8>,
     decoder: &mut tui::Keys,
-    theme: &mut String,
-    roles: &std::collections::BTreeMap<String, String>,
+    emitter: &mut Emitter,
 ) -> Result<(), Diagnostic> {
     match dialog {
-        Dialog::Mcp => run_mcp_dialog(invocation, stdout, colour, keys, decoder),
-        Dialog::Hooks => run_hook_dialog(invocation, stdout, colour, keys, decoder),
-        Dialog::Skill => run_skill_dialog(invocation, stdout, colour, keys, decoder),
+        Dialog::Mcp => run_mcp_dialog(invocation, stdout, typing.colour, keys, decoder),
+        Dialog::Hooks => run_hook_dialog(invocation, stdout, typing.colour, keys, decoder),
+        Dialog::Skill => run_skill_dialog(invocation, stdout, typing.colour, keys, decoder),
         Dialog::Session => run_session_dialog(
             tui::SessionDialogState::new(
                 load_workspace_sessions(restoring.workspace),
@@ -610,12 +609,35 @@ pub(crate) fn run_dialog(
             ),
             restoring,
             stdout,
-            colour,
+            typing.colour,
             keys,
             decoder,
         ),
-        Dialog::Settings => {
-            run_settings_dialog(invocation, stdout, colour, keys, decoder, theme, roles)
+        Dialog::Settings => run_settings_dialog(
+            invocation,
+            stdout,
+            typing.colour,
+            keys,
+            decoder,
+            typing.theme,
+            typing.roles,
+        ),
+        Dialog::Model => {
+            let mut models = endpoint_models(invocation);
+            models.extend(tui::available_models());
+            *typing.models = models;
+            run_model_dialog(
+                invocation,
+                typing.models,
+                typing.route,
+                typing.effort,
+                restoring.state,
+                stdout,
+                typing.colour,
+                keys,
+                decoder,
+                emitter,
+            )
         }
     }
 }
@@ -827,6 +849,7 @@ pub(crate) struct Opening<'a> {
     pub(crate) theme: &'a mut String,
     pub(crate) roles: &'a std::collections::BTreeMap<String, String>,
     pub(crate) state: &'a mut tui::TuiState,
+    pub(crate) route: &'a mut tui::ModelRoute,
 }
 
 /// Open the picker a slash command names, or take the answer it carried.
@@ -849,14 +872,33 @@ pub(crate) fn open_picker(
             opening.auth_draft.clear();
             Ok(Some(Prompt::Auth(tui::AuthStep::Pick)))
         }
-        Some("/model") => {
-            // Re-read, so a model added to any endpoint since startup is
-            // offered without restarting.
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
-            *opening.models = models;
-            Ok(Some(Prompt::Model))
-        }
+        Some("/model") => match answer {
+            None => {
+                // Re-read, so a model added to any endpoint since startup is
+                // offered without restarting.
+                let mut models = endpoint_models(invocation);
+                models.extend(tui::available_models());
+                *opening.models = models;
+                Ok(Some(Prompt::Model))
+            }
+            Some(answer) => {
+                let mut models = endpoint_models(invocation);
+                models.extend(tui::available_models());
+                *opening.models = models;
+                let next = take_model(
+                    answer,
+                    opening.models,
+                    opening.route,
+                    opening.state,
+                    stdout,
+                    emitter,
+                )?;
+                match next {
+                    Prompt::Task => Ok(None),
+                    other => Ok(Some(other)),
+                }
+            }
+        },
         Some("/provider") => {
             *opening.providers = configured_providers(invocation);
             *opening.chosen = configured_default(invocation);
@@ -1091,7 +1133,7 @@ pub(crate) struct Typing<'a> {
 pub(crate) fn answer_task(
     line: &str,
     invocation: &Invocation,
-    typing: Typing<'_>,
+    mut typing: Typing<'_>,
     restoring: Restoring<'_>,
     stdout: &mut io::Stdout,
     keys: &std::sync::mpsc::Receiver<u8>,
@@ -1105,8 +1147,8 @@ pub(crate) fn answer_task(
     }
     if line.trim().starts_with('/') || line.trim().is_empty() {
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
-        // `/mcp`, `/hooks`, `/skill`, `/session` and `/settings` alone open
-        // their dialog, which writes the operator's configuration; with any
+        // `/mcp`, `/hooks`, `/skill`, `/session`, `/settings` and `/model` alone
+        // open their dialog, which writes the operator's configuration; with any
         // argument each is the read-only inspection it always was.
         let dialog = match line.trim() {
             "/mcp" => Some(Dialog::Mcp),
@@ -1114,19 +1156,19 @@ pub(crate) fn answer_task(
             "/skill" => Some(Dialog::Skill),
             "/session" => Some(Dialog::Session),
             "/settings" => Some(Dialog::Settings),
+            "/model" => Some(Dialog::Model),
             _ => None,
         };
         if let Some(dialog) = dialog {
             run_dialog(
                 dialog,
                 invocation,
+                &mut typing,
                 restoring,
                 stdout,
-                typing.colour,
                 keys,
                 decoder,
-                typing.theme,
-                typing.roles,
+                emitter,
             )?;
             return Ok(TaskPass::Go);
         }
@@ -1159,6 +1201,7 @@ pub(crate) enum Dialog {
     Skill,
     Session,
     Settings,
+    Model,
 }
 
 /// Answer a slash command typed at the task prompt.
@@ -1200,6 +1243,7 @@ pub(crate) fn slash_command(
                 theme: typing.theme,
                 roles: typing.roles,
                 state: restoring.state,
+                route: typing.route,
             },
             stdout,
             emitter,

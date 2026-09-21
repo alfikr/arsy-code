@@ -18,6 +18,8 @@ pub enum Key {
     Newline,
     /// Shift+Tab: step to the next approval mode without leaving the line.
     CycleMode,
+    /// Tab to cycle focus between panes or fields.
+    Tab,
     /// Page up/down scroll a long plan preview.
     PageUp,
     PageDown,
@@ -159,6 +161,7 @@ fn control_key(byte: u8) -> Option<Key> {
         0x03 => Some(Key::Interrupt),
         0x04 => Some(Key::Eof),
         0x05 => Some(Key::End),
+        0x09 => Some(Key::Tab),
         0x0f => Some(Key::Expand),
         0x17 => Some(Key::WordBackspace),
         b'\r' | b'\n' => Some(Key::Enter),
