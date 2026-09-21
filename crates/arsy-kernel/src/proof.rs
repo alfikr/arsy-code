@@ -38,7 +38,6 @@ use crate::{
     validation::{ValidationOutcome, ValidationRecord},
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// Wire version of [`CompletionProof`].
 pub const PROOF_SCHEMA_VERSION: u32 = 1;
@@ -395,32 +394,6 @@ fn overall(criteria: &[CriterionProof]) -> ProofState {
     }
     worst
 }
-
-#[derive(Debug)]
-pub enum ProofError {
-    NotVerified(ProofState),
-    /// The stored manifest and the rebuilt one disagree.
-    Disagrees {
-        stored: ProofState,
-        rebuilt: ProofState,
-    },
-}
-
-impl fmt::Display for ProofError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotVerified(state) => {
-                write!(formatter, "the work is {state:?}, not verified")
-            }
-            Self::Disagrees { stored, rebuilt } => write!(
-                formatter,
-                "the recorded proof says {stored:?} and rebuilding it says {rebuilt:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProofError {}
 
 #[cfg(test)]
 mod tests {

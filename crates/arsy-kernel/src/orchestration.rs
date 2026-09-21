@@ -2364,6 +2364,42 @@ mod tests {
     }
 
     #[test]
+    fn an_attempts_trace_survives_a_restart_and_keeps_its_tail() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let attempt = {
+            let mut graph = open(&store, session);
+            let id = TaskId::new();
+            graph.add(node(id, Vec::new(), budget(10))).unwrap();
+            graph.ready().unwrap();
+            let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+            // More than the projection keeps, so the trimming is exercised
+            // rather than assumed.
+            for index in 0..MAX_TRACE_ENTRIES + 3 {
+                graph
+                    .record(attempt, "model.tool_call", json!({"call": index}))
+                    .unwrap();
+            }
+            attempt
+        };
+
+        let replayed = open(&store, session);
+        let trace = replayed.trace_of(attempt);
+        assert_eq!(trace.len(), MAX_TRACE_ENTRIES);
+        // The tail, not the head: what a child did last is what explains
+        // where it stopped.
+        assert_eq!(trace[0]["data"]["call"], json!(3));
+        assert_eq!(
+            trace[MAX_TRACE_ENTRIES - 1]["data"]["call"],
+            json!(MAX_TRACE_ENTRIES + 2)
+        );
+        assert_eq!(trace[0]["kind"], json!("model.tool_call"));
+        // An attempt nobody recorded against has nothing, rather than a gap
+        // that has to be told from an empty one.
+        assert!(replayed.trace_of(AttemptId::new()).is_empty());
+    }
+
+    #[test]
     fn messages_are_ordered_delivered_once_and_survive_a_restart() {
         let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
         let session = SessionId::new();

@@ -207,11 +207,6 @@ impl Scheduler {
         self.graph.advance_attempt(attempt, AttemptState::Running)
     }
 
-    /// Record that the attempt is parked on something outside itself.
-    pub fn waiting(&mut self, attempt: AttemptId) -> Result<(), GraphError> {
-        self.graph.advance_attempt(attempt, AttemptState::Waiting)
-    }
-
     /// End an attempt and give its slots back.
     ///
     /// The slots are released whatever the graph says, because they describe
@@ -248,11 +243,6 @@ impl Scheduler {
             token.cancel();
         }
         Ok(())
-    }
-
-    /// The stop signal for an attempt this process started.
-    pub fn cancel_token(&self, attempt: AttemptId) -> Option<CancelToken> {
-        self.cancels.get(&attempt).cloned()
     }
 
     /// Whether a set of tasks has reached what the join asked for.
@@ -313,17 +303,6 @@ impl Scheduler {
         self.held.insert(attempt, slots);
         self.cancels.insert(attempt, cancel.clone());
         Ok(Admitted { attempt, cancel })
-    }
-
-    /// Reclaim what a dead process left behind, and mark what can never run.
-    ///
-    /// Called when a scheduler takes over a session: attempts whose leases
-    /// have passed go back to the queue with their evidence, and tasks behind
-    /// a dependency that ended badly stop being counted as pending work.
-    pub fn recover(&mut self, now_ms: u64) -> Result<Vec<TaskId>, GraphError> {
-        let reclaimed = self.graph.recover_expired(now_ms)?;
-        self.graph.block_unreachable()?;
-        Ok(reclaimed)
     }
 
     pub fn admission(&self) -> &Admission {
