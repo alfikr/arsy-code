@@ -2984,17 +2984,7 @@ pub(crate) fn child_turn(
         if cancel.is_cancelled() {
             return Err(CHILD_CANCELLED.to_owned());
         }
-        // A round boundary is where a child can absorb a new instruction
-        // without abandoning work in progress. Messages narrow what it was
-        // already asked to do; they cannot widen what it may do, because its
-        // grants were fixed when the graph created it.
-        for instruction in steer() {
-            trace("subagent.steered", json!({"instruction": &instruction}));
-            request.messages.push(ModelMessage {
-                role: ModelRole::User,
-                content: vec![ModelContent::Text { text: instruction }],
-            });
-        }
+        absorb_steering(&mut request.messages, steer(), trace);
         request.idempotency_key =
             IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
@@ -3116,6 +3106,26 @@ pub(crate) fn child_turn(
 /// Fewer than the parent's: a child has one question, and a child that cannot
 /// answer it in this many rounds is one the parent should take back.
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+
+/// Put what the parent said into the child's next round.
+///
+/// A round boundary is where a child can absorb a new instruction without
+/// abandoning work in progress. Messages narrow what it was already asked to
+/// do; they cannot widen what it may do, because its grants were fixed when
+/// the graph created it — there is nothing in a message to widen them with.
+fn absorb_steering(
+    messages: &mut Vec<ModelMessage>,
+    instructions: Vec<String>,
+    trace: &mut dyn FnMut(&str, Value),
+) {
+    for instruction in instructions {
+        trace("subagent.steered", json!({"instruction": &instruction}));
+        messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text { text: instruction }],
+        });
+    }
+}
 
 /// What a child says when it was asked to stop. A reason rather than a
 /// silence, so the attempt's terminal record is explicable.
