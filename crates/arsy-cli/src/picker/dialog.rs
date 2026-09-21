@@ -4,6 +4,7 @@
 use super::wizard::write_config;
 #[cfg(feature = "tui")]
 use crate::*;
+use arsy_kernel::provider::Effort;
 use serde_json::Value;
 use std::io::{self, Write};
 use std::path::Path;
@@ -436,6 +437,59 @@ pub(crate) fn run_settings_dialog(
     Ok(())
 }
 
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_model_dialog(
+    invocation: &Invocation,
+    models: &[tui::ModelChoice],
+    route: &mut tui::ModelRoute,
+    effort: &mut Option<Effort>,
+    state: &mut tui::TuiState,
+    stdout: &mut io::Stdout,
+    colour: bool,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    emitter: &mut Emitter,
+) -> Result<(), Diagnostic> {
+    let providers = super::session::configured_providers(invocation);
+    let mut dialog = tui::ModelDialogState::new(providers, models.to_vec(), route.clone(), *effort);
+    let mut changes = Vec::new();
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), colour),
+        )?;
+        match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(tui::ModelDialogAction::Close) => break,
+            Keyed::Acted(tui::ModelDialogAction::Apply {
+                route: new_route,
+                effort: new_effort,
+            }) => {
+                *route = new_route;
+                super::remembered::remember_model(route, emitter);
+                state.set_model_route(route.clone());
+
+                *effort = new_effort;
+                state.set_effort(*effort);
+                super::remembered::remember_effort(*effort, emitter);
+
+                let eff_str = effort.map_or("off".to_owned(), |e| e.to_string());
+                changes.push(format!("Model: {route} (effort: {eff_str})"));
+                break;
+            }
+        }
+    }
+    close_dialog(stdout, drawn, &changes, "")?;
+    Ok(())
+}
+
 /// Apply the two settings that change what is on the screen right now, and
 /// answer with the line to show, or `None` for one that waits for a restart.
 ///
@@ -484,7 +538,6 @@ pub(crate) fn load_config_for(
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     load_config(&root, &working, invocation.config.as_deref())
 }
-
 /// Erase and redraw a dialog frame, returning the rows it now occupies.
 #[cfg(feature = "tui")]
 pub(crate) fn repaint_dialog(
