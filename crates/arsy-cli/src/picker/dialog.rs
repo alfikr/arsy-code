@@ -449,6 +449,7 @@ pub(crate) fn run_model_dialog(
 ) -> Result<(), Diagnostic> {
     let providers = super::session::configured_providers(invocation);
     let mut dialog = tui::ModelDialogState::new(providers, models.to_vec(), route.clone(), *effort);
+    let mut changes = Vec::new();
     let mut drawn = 0;
     loop {
         drawn = repaint_dialog(
@@ -476,11 +477,12 @@ pub(crate) fn run_model_dialog(
                 super::remembered::remember_effort(*effort, emitter);
 
                 let eff_str = effort.map_or("off".to_owned(), |e| e.to_string());
-                writeln!(stdout, "Model: {route} (effort: {eff_str})").map_err(terminal_failed)?;
+                changes.push(format!("Model: {route} (effort: {eff_str})"));
                 break;
             }
         }
     }
+    close_dialog(stdout, drawn, &changes, "")?;
     Ok(())
 }
 
@@ -532,7 +534,6 @@ pub(crate) fn load_config_for(
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     load_config(&root, &working, invocation.config.as_deref())
 }
-
 /// Erase and redraw a dialog frame, returning the rows it now occupies.
 #[cfg(feature = "tui")]
 pub(crate) fn repaint_dialog(

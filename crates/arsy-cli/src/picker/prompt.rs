@@ -872,33 +872,26 @@ pub(crate) fn open_picker(
             opening.auth_draft.clear();
             Ok(Some(Prompt::Auth(tui::AuthStep::Pick)))
         }
-        Some("/model") => match answer {
-            None => {
-                // Re-read, so a model added to any endpoint since startup is
-                // offered without restarting.
-                let mut models = endpoint_models(invocation);
-                models.extend(tui::available_models());
-                *opening.models = models;
-                Ok(Some(Prompt::Model))
+        Some("/model") => {
+            let Some(answer) = answer else {
+                return Ok(None);
+            };
+            let mut models = endpoint_models(invocation);
+            models.extend(tui::available_models());
+            *opening.models = models;
+            let next = take_model(
+                answer,
+                opening.models,
+                opening.route,
+                opening.state,
+                stdout,
+                emitter,
+            )?;
+            match next {
+                Prompt::Task => Ok(None),
+                other => Ok(Some(other)),
             }
-            Some(answer) => {
-                let mut models = endpoint_models(invocation);
-                models.extend(tui::available_models());
-                *opening.models = models;
-                let next = take_model(
-                    answer,
-                    opening.models,
-                    opening.route,
-                    opening.state,
-                    stdout,
-                    emitter,
-                )?;
-                match next {
-                    Prompt::Task => Ok(None),
-                    other => Ok(Some(other)),
-                }
-            }
-        },
+        }
         Some("/provider") => {
             *opening.providers = configured_providers(invocation);
             *opening.chosen = configured_default(invocation);

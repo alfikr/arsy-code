@@ -141,10 +141,10 @@ impl ModelDialogState {
                     .cloned()
                     .unwrap_or_else(|| self.current_route.provider.clone());
                 let filtered = self.filtered_models();
-                let model = filtered
-                    .get(self.selected_model)
-                    .map(|m| m.slug.clone())
-                    .unwrap_or_else(|| self.current_route.model.clone());
+                let Some(model) = filtered.get(self.selected_model) else {
+                    self.notice = Some(format!("no models listed for {provider}"));
+                    return None;
+                };
                 let effort = self
                     .effort_choices
                     .get(self.selected_effort)
@@ -152,7 +152,10 @@ impl ModelDialogState {
                     .flatten();
 
                 Some(ModelDialogAction::Apply {
-                    route: ModelRoute { provider, model },
+                    route: ModelRoute {
+                        provider,
+                        model: model.slug.clone(),
+                    },
                     effort,
                 })
             }
@@ -411,22 +414,31 @@ impl ModelDialogState {
             .get(self.selected_provider)
             .map(String::as_str)
             .unwrap_or("?");
+        let provider_marker = if self.active_pane == ModelPane::Provider {
+            "›"
+        } else {
+            "·"
+        };
         lines.push(paint(
             colour,
             sgr_dim(),
-            &format!("provider: {prov} ([Tab] to switch)"),
+            &format!("{provider_marker} provider: {prov}  [Tab] switch pane"),
         ));
         if filtered.is_empty() {
             lines.push(paint(colour, sgr_dim(), "  (no models listed)"));
         } else {
             for (index, choice) in filtered.iter().enumerate() {
                 let marked = index == self.selected_model;
-                let prefix = if marked { "› " } else { "  " };
+                let prefix = match (self.active_pane == ModelPane::Model, marked) {
+                    (true, true) => "› ",
+                    (false, true) => "· ",
+                    _ => "  ",
+                };
                 let is_current = choice.provider == self.current_route.provider
                     && choice.slug == self.current_route.model;
                 let badge = if is_current { " [set]" } else { "" };
                 let line = format!("{prefix}[{}] {}{badge}", choice.provider, choice.slug);
-                if marked {
+                if self.active_pane == ModelPane::Model && marked {
                     lines.push(paint(colour, sgr_accent(), &line));
                 } else {
                     lines.push(paint(colour, sgr_dim(), &line));
@@ -439,7 +451,16 @@ impl ModelDialogState {
             .copied()
             .flatten()
             .map_or("off", Effort::as_str);
-        lines.push(paint(colour, sgr_dim(), &format!("effort: {eff}")));
+        let effort_marker = if self.active_pane == ModelPane::Effort {
+            "›"
+        } else {
+            "·"
+        };
+        lines.push(paint(
+            colour,
+            sgr_dim(),
+            &format!("{effort_marker} effort: {eff}"),
+        ));
         lines
             .into_iter()
             .map(|l| border_line(&l, inner, colour))
@@ -587,6 +608,28 @@ mod tests {
             }
             _ => panic!("expected ModelDialogAction::Apply, got {action:?}"),
         }
+    }
+
+    #[test]
+    fn enter_on_provider_without_models_reports_notice_without_applying() {
+        let mut state = ModelDialogState::new(
+            vec!["anthropic".to_owned(), "codex".to_owned()],
+            vec![sample_model("codex", "gpt-5.6-mini")],
+            ModelRoute {
+                provider: "codex".to_owned(),
+                model: "gpt-5.6-mini".to_owned(),
+            },
+            None,
+        );
+        state.handle_key(Key::Left);
+        state.handle_key(Key::Up);
+
+        assert_eq!(state.filtered_models().len(), 0);
+        assert_eq!(state.handle_key(Key::Enter), None);
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("no models listed for anthropic")
+        );
     }
 
     #[test]
