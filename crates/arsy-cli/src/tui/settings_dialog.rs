@@ -107,34 +107,227 @@ impl SettingsDialogState {
                 colour,
                 sgr_dim(),
             ));
-        }
-        let key_width = self
-            .rows
-            .iter()
-            .map(|row| visible_len(&row.key))
-            .max()
-            .unwrap_or(0);
-        lines.extend(self.rows.iter().enumerate().map(|(index, row)| {
-            let marked = index == self.selected;
-            let pending = self
-                .editing
-                .as_ref()
-                .filter(|edit| edit.index == index)
-                .map(|edit| edit.pending.as_str());
-            let style = match (marked, row.set) {
-                (true, _) => sgr_accent(),
-                (false, true) => "",
-                _ => sgr_dim(),
+        } else if inner < 48 {
+            let key_width = self
+                .rows
+                .iter()
+                .map(|row| visible_len(&row.key))
+                .max()
+                .unwrap_or(0);
+            lines.extend(self.rows.iter().enumerate().map(|(index, row)| {
+                let marked = index == self.selected;
+                let pending = self
+                    .editing
+                    .as_ref()
+                    .filter(|edit| edit.index == index)
+                    .map(|edit| edit.pending.as_str());
+                let style = match (marked, row.set) {
+                    (true, _) => sgr_accent(),
+                    (false, true) => "",
+                    _ => sgr_dim(),
+                };
+                dialog_line(
+                    &setting_row(row, marked, key_width, pending),
+                    inner,
+                    colour,
+                    style,
+                )
+            }));
+            if let Some(hint) = self.choices_hint() {
+                lines.push(dialog_line(&hint, inner, colour, sgr_dim()));
+            }
+        } else {
+            let key_max = self
+                .rows
+                .iter()
+                .map(|row| visible_len(&row.key))
+                .max()
+                .unwrap_or(0);
+            let left_width = (key_max + 4)
+                .max((inner * 35 / 100).clamp(24, 32))
+                .min(inner.saturating_sub(24));
+            let right_width = inner.saturating_sub(left_width + 3);
+            let divider = if colour {
+                format!(" {} ", paint(true, sgr_border(), "│"))
+            } else {
+                " │ ".to_owned()
             };
-            dialog_line(
-                &setting_row(row, marked, key_width, pending),
+
+            let left_hdr = paint(colour, sgr_dim(), "SETTING");
+            let right_hdr = paint(colour, sgr_dim(), "DETAIL & CONFIG");
+
+            let fitted_left_hdr = fit(&left_hdr, left_width);
+            let pad_left_hdr = " ".repeat(left_width.saturating_sub(visible_len(&fitted_left_hdr)));
+            let left_hdr_cell = format!("{fitted_left_hdr}{pad_left_hdr}");
+
+            let fitted_right_hdr = fit(&right_hdr, right_width);
+            let pad_right_hdr =
+                " ".repeat(right_width.saturating_sub(visible_len(&fitted_right_hdr)));
+            let right_hdr_cell = format!("{fitted_right_hdr}{pad_right_hdr}");
+
+            lines.push(dialog_line(
+                &format!("{left_hdr_cell}{divider}{right_hdr_cell}"),
                 inner,
                 colour,
-                style,
-            )
-        }));
-        if let Some(hint) = self.choices_hint() {
-            lines.push(dialog_line(&hint, inner, colour, sgr_dim()));
+                "",
+            ));
+
+            let sep_divider = if colour {
+                paint(true, sgr_border(), "─┼─")
+            } else {
+                "─┼─".to_owned()
+            };
+            let left_sep = paint(colour, sgr_border(), &"─".repeat(left_width));
+            let right_sep = paint(colour, sgr_border(), &"─".repeat(right_width));
+            lines.push(dialog_line(
+                &format!("{left_sep}{sep_divider}{right_sep}"),
+                inner,
+                colour,
+                "",
+            ));
+
+            let mut left_lines = Vec::new();
+            for (index, row) in self.rows.iter().enumerate() {
+                let marked = index == self.selected;
+                let prefix = if marked { "› " } else { "  " };
+                let line = format!("{prefix}{}", row.key);
+                let styled = match (marked, row.set) {
+                    (true, _) => paint(colour, sgr_accent(), &line),
+                    (false, true) => line,
+                    _ => paint(colour, sgr_dim(), &line),
+                };
+                left_lines.push(styled);
+            }
+
+            let mut right_lines = Vec::new();
+            if let Some(row) = self.rows.get(self.selected) {
+                let pending = self
+                    .editing
+                    .as_ref()
+                    .filter(|edit| edit.index == self.selected)
+                    .map(|edit| edit.pending.as_str());
+
+                let origin_label = if row.set { "set" } else { "default" };
+                let origin_badge = if colour {
+                    if row.set {
+                        format!("{}[{origin_label}]{RESET}", sgr_ok())
+                    } else {
+                        format!("{}[{origin_label}]{RESET}", sgr_dim())
+                    }
+                } else {
+                    format!("[{origin_label}]")
+                };
+                right_lines.push(format!("{}  {origin_badge}", paint(colour, BOLD, &row.key)));
+                right_lines.push(paint(
+                    colour,
+                    sgr_border(),
+                    &"─".repeat(right_width.min(visible_len(&row.key) + 12)),
+                ));
+
+                let desc_lines = wrap_words(&row.description, right_width);
+                for line in desc_lines {
+                    right_lines.push(paint(colour, sgr_assistant(), &line));
+                }
+                right_lines.push(String::new());
+
+                let val_str = match pending {
+                    Some(p) if p != row.value => format!("{} → {p}", row.value),
+                    _ => row.value.clone(),
+                };
+                let val_styled = if pending.is_some() {
+                    paint(colour, sgr_accent(), &val_str)
+                } else {
+                    val_str
+                };
+                right_lines.push(format!("value:   {val_styled}"));
+                right_lines.push(format!(
+                    "default: {}",
+                    paint(colour, sgr_dim(), &row.default)
+                ));
+
+                let hint = match row.kind {
+                    SettingKind::Choice if !row.choices.is_empty() => {
+                        Some(format!("one of {}", row.choices.join(" | ")))
+                    }
+                    SettingKind::Choice => None,
+                    SettingKind::Bool => Some("true or false".to_owned()),
+                    SettingKind::Integer { min, max } => Some(format!("from {min} to {max}")),
+                    SettingKind::Text => {
+                        Some(format!("`{}` is free text; set it in arsy.json", row.key))
+                    }
+                };
+                if let Some(hint_text) = hint {
+                    right_lines.push(paint(colour, sgr_dim(), &format!("allowed: {hint_text}")));
+                }
+
+                if let Some(p) = pending {
+                    match row.kind {
+                        SettingKind::Choice => {
+                            let pills: Vec<String> = row
+                                .choices
+                                .iter()
+                                .map(|c| {
+                                    if c == p {
+                                        if colour {
+                                            format!("{}[• {c}]{RESET}", sgr_accent())
+                                        } else {
+                                            format!("[• {c}]")
+                                        }
+                                    } else {
+                                        paint(colour, sgr_dim(), &format!("  {c}  "))
+                                    }
+                                })
+                                .collect();
+                            right_lines.push(format!("select:  {}", pills.join(" ")));
+                        }
+                        SettingKind::Bool => {
+                            let true_pill = if p == "true" {
+                                if colour {
+                                    format!("{}[• true]{RESET}", sgr_accent())
+                                } else {
+                                    "[• true]".to_owned()
+                                }
+                            } else {
+                                paint(colour, sgr_dim(), "  true  ")
+                            };
+                            let false_pill = if p == "false" {
+                                if colour {
+                                    format!("{}[• false]{RESET}", sgr_accent())
+                                } else {
+                                    "[• false]".to_owned()
+                                }
+                            } else {
+                                paint(colour, sgr_dim(), "  false  ")
+                            };
+                            right_lines.push(format!("toggle:  {true_pill}  {false_pill}"));
+                        }
+                        SettingKind::Integer { min, max } => {
+                            right_lines.push(format!("step:    ◄ {p} ►  ({min}..{max})"));
+                        }
+                        SettingKind::Text => {}
+                    }
+                }
+            }
+
+            let max_lines = left_lines.len().max(right_lines.len());
+            for i in 0..max_lines {
+                let left_text = left_lines.get(i).map(String::as_str).unwrap_or("");
+                let fitted_left = fit(left_text, left_width);
+                let pad_left = " ".repeat(left_width.saturating_sub(visible_len(&fitted_left)));
+                let left_cell = format!("{fitted_left}{pad_left}");
+
+                let right_text = right_lines.get(i).map(String::as_str).unwrap_or("");
+                let fitted_right = fit(right_text, right_width);
+                let pad_right = " ".repeat(right_width.saturating_sub(visible_len(&fitted_right)));
+                let right_cell = format!("{fitted_right}{pad_right}");
+
+                lines.push(dialog_line(
+                    &format!("{left_cell}{divider}{right_cell}"),
+                    inner,
+                    colour,
+                    "",
+                ));
+            }
         }
         lines.push(dialog_line("", inner, colour, ""));
         if let Some(notice) = &self.notice {
@@ -334,6 +527,29 @@ fn setting_row(row: &SettingRow, marked: bool, key_width: usize, pending: Option
     )
 }
 
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if visible_len(&current) + 1 + visible_len(word) <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_owned();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +738,72 @@ mod tests {
         assert_eq!(dialog.editing, None);
         assert_eq!(dialog.selected, 0);
         assert!(dialog.render(80, false).contains("set"));
+    }
+
+    #[test]
+    fn multi_pane_layout_renders_split_columns_and_updates_detail() {
+        let mut dialog = SettingsDialogState::new(vec![
+            choice_row("ui.style", "modern", true),
+            bool_row("false"),
+        ]);
+        let frame = dialog.render(80, false);
+        assert!(frame.contains("SETTING"), "{frame}");
+        assert!(frame.contains("DETAIL & CONFIG"), "{frame}");
+        assert!(frame.contains(" │ "), "{frame}");
+        assert!(frame.contains("─┼─"), "{frame}");
+        assert!(frame.contains("ui.style"), "{frame}");
+        assert!(
+            frame.contains("how an interactive transcript is drawn"),
+            "{frame}"
+        );
+        assert!(frame.contains("value:   modern"), "{frame}");
+
+        dialog.handle_key(Key::Down);
+        assert_eq!(dialog.selected, 1);
+        let frame2 = dialog.render(80, false);
+        assert!(frame2.contains("compat.omp.enabled"), "{frame2}");
+        assert!(
+            frame2.contains("read OMP's files as a lower layer"),
+            "{frame2}"
+        );
+        assert!(frame2.contains("true or false"), "{frame2}");
+    }
+
+    #[test]
+    fn narrow_terminal_falls_back_to_single_pane() {
+        let dialog = SettingsDialogState::new(vec![choice_row("ui.style", "modern", true)]);
+        let frame = dialog.render(40, false);
+        assert!(frame.contains("ui.style"), "{frame}");
+        assert!(
+            !frame.contains("DETAIL & CONFIG"),
+            "narrow mode does not render multi-pane header"
+        );
+    }
+
+    #[test]
+    fn editing_shows_interactive_controls_in_right_pane() {
+        let mut dialog = SettingsDialogState::new(vec![
+            choice_row("ui.style", "modern", true),
+            bool_row("true"),
+            integer_row("2"),
+        ]);
+        dialog.handle_key(Key::Enter);
+        let frame_choice = dialog.render(80, false);
+        assert!(frame_choice.contains("select:"), "{frame_choice}");
+        assert!(frame_choice.contains("[• modern]"), "{frame_choice}");
+
+        dialog.handle_key(Key::Interrupt);
+        dialog.handle_key(Key::Down);
+        dialog.handle_key(Key::Enter);
+        let frame_bool = dialog.render(80, false);
+        assert!(frame_bool.contains("toggle:"), "{frame_bool}");
+        assert!(frame_bool.contains("[• true]"), "{frame_bool}");
+
+        dialog.handle_key(Key::Interrupt);
+        dialog.handle_key(Key::Down);
+        dialog.handle_key(Key::Enter);
+        let frame_int = dialog.render(80, false);
+        assert!(frame_int.contains("step:"), "{frame_int}");
+        assert!(frame_int.contains("◄ 2 ►"), "{frame_int}");
     }
 }
