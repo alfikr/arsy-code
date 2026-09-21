@@ -22,10 +22,10 @@ BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 # leading or trailing blanks is the one a card cannot pad into existence.
 # A run of glyphs like this only ever reaches the terminal under NO_COLOR,
 # because a coloured card escapes every cell of the mark separately.
-MARK='▟█▛ ▐███▌ ▜█▙'
+MARK='*****    ==++++++    +===='
 # That row's leftmost cell as a coloured card paints it: the gradient colour
-# its three lit subpixels average to, from `assets/logo.svg`'s own stops.
-CELL=$(printf '\033[38;2;53;202;217m▟\033[0m')
+# the cell samples, from `assets/logo.svg`'s own stops.
+CELL=$(printf '\033[38;2;53;201;236m*\033[0m')
 
 WORKSPACE=$(mktemp -d "${TMPDIR:-/tmp}/arsy-banner.XXXXXX")
 trap 'rm -rf "$WORKSPACE"' EXIT
@@ -100,8 +100,8 @@ case $plain in
 esac
 
 # Too narrow to hold both: the text is what a small terminal keeps. The mark
-# and its gutter take 16 columns, and the card keeps room for a label and a
-# value beside them, so a card narrower than 42 columns drops it and 40 is
+# and its gutter take 29 columns, and the card keeps room for a label and a
+# value beside them, so a card narrower than 55 columns drops it and 40 is well
 # under that. Run without colour, so the mark it must not have drawn is the
 # unpainted one this script can look for.
 narrow=$(HOME=$WORKSPACE XDG_CONFIG_HOME=$WORKSPACE/config NO_COLOR=1; export HOME XDG_CONFIG_HOME NO_COLOR; banner 40)

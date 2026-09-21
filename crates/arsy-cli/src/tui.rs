@@ -266,40 +266,52 @@ pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
 
 const LABEL_WIDTH: usize = 10;
 
-/// The mark's box on the card, in cells, and the subpixel grid inside it.
+/// The mark's box on the card, in cells.
 ///
 /// One box for both renderings: a terminal that draws images gets the image at
-/// this size and every other terminal gets the block art at this size, so the
-/// card lays out identically either way and only the texture differs.
-///
-/// A cell holds four subpixels, two across and two down, so the art is drawn
-/// at twice the box in each direction. Thirteen by four is close to the mark's
-/// own proportions, so the shape fills the box rather than sitting letterboxed
-/// inside it.
-const MARK_WIDTH: usize = 13;
-const MARK_HEIGHT: usize = 4;
-const MARK_COLUMNS: usize = MARK_WIDTH * 2;
-const MARK_ROWS: usize = MARK_HEIGHT * 2;
+/// this size and every other terminal gets the ASCII art at this size, so the
+/// card lays out identically either way and only the texture differs. Its
+/// proportions are the mark's own, so the shape fills the box rather than
+/// sitting letterboxed inside it.
+const MARK_WIDTH: usize = 26;
+const MARK_HEIGHT: usize = 8;
 const LOGO_GAP: usize = 3;
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 
-/// The mark as subpixels, one glyph each, four to a cell: `#` takes the
-/// spectrum gradient, `o` the green core, a space is unlit.
+/// The mark, one character per cell, off a density ramp: a space is unlit, and
+/// the rest run `=` to `*` as the mark's own gradient gets darker under them.
 ///
-/// Drawn by hand rather than downsampled from the SVG, because a grid this
-/// small is too few pixels for a downsample to survive: the sampler spends
-/// them on the anti-aliased edges and the arch dissolves into noise. The
-/// colours still come from `assets/logo.svg`, below, so the two renderings of
-/// the mark stay the same mark.
-const MARK: [&str; MARK_ROWS] = [
-    "         ########         ",
-    "       ############       ",
-    "      ####      ####      ",
-    "      ###        ###      ",
-    "    ####   oooo   ####    ",
-    "  #####   oooooo   #####  ",
-    " #####   oooooooo   ##### ",
-    "#####    oooooooo    #####",
+/// Rasterised from `assets/logo.svg` once and pasted here, which is why the
+/// two sides are lettered differently — the spectrum is lighter on the left
+/// leg than on the right, and the ramp says so.
+///
+/// Characters rather than block glyphs, because a block fills its cell and so
+/// reads at the size of the cell. These are thin and leave the cell mostly
+/// open, so the eye reads the shape rather than the grid it sits on. They are
+/// also plain ASCII, which every terminal and every font has.
+const MARK: [&str; MARK_HEIGHT] = [
+    "         ++++++==         ",
+    "       ***++++++===       ",
+    "      ****      +===      ",
+    "      ***        +==      ",
+    "   +****   ****   ++===   ",
+    "  **+**   +++***   +====  ",
+    " ****+   ++++++++   +==== ",
+    "*****    ==++++++    +====",
+];
+
+/// The columns the green core covers on each row, where `assets/logo.svg`
+/// puts its second gradient. The ramp above cannot carry this: it says how
+/// dark a cell is, not which of the two gradients it belongs to.
+const CORE_SPAN: [Option<(usize, usize)>; MARK_HEIGHT] = [
+    None,
+    None,
+    None,
+    None,
+    Some((11, 14)),
+    Some((10, 15)),
+    Some((9, 16)),
+    Some((9, 16)),
 ];
 
 /// The `spectrum` stops of `assets/logo.svg`, in the order it lists them.
@@ -335,49 +347,42 @@ fn logo(colour: bool) -> &'static [String] {
     }
 }
 
-/// The block art as `MARK_HEIGHT` painted rows.
+/// The ASCII art as `MARK_HEIGHT` painted rows.
 fn mark_rows(colour: bool) -> Vec<String> {
-    let glyph = |art: &str, column: usize| {
-        art.as_bytes()
-            .get(column)
-            .map_or(' ', |byte| char::from(*byte))
-    };
-    let corner = |row: usize, column: usize| mark_pixel(glyph(MARK[row], column), column, row);
-    (0..MARK_HEIGHT)
-        .map(|row| {
-            let (top, bottom) = (row * 2, row * 2 + 1);
+    MARK.iter()
+        .enumerate()
+        .map(|(row, art)| {
             let mut line = String::new();
-            for cell in 0..MARK_WIDTH {
-                let (left, right) = (cell * 2, cell * 2 + 1);
-                line.push_str(&quadrant(
-                    [
-                        corner(top, left),
-                        corner(top, right),
-                        corner(bottom, left),
-                        corner(bottom, right),
-                    ],
-                    colour,
-                ));
+            for (column, glyph) in art.chars().enumerate() {
+                if glyph == ' ' {
+                    line.push(' ');
+                    continue;
+                }
+                if !colour {
+                    line.push(glyph);
+                    continue;
+                }
+                let (red, green, blue) = mark_colour(column, row);
+                line.push_str(&format!("\x1b[38;2;{red};{green};{blue}m{glyph}{RESET}"));
             }
             line
         })
         .collect()
 }
 
-/// The colour of one art pixel, or `None` where the art leaves it unlit.
-fn mark_pixel(glyph: char, column: usize, row: usize) -> Option<(u8, u8, u8)> {
-    if glyph == ' ' {
-        return None;
-    }
+/// The colour of one art cell: the SVG's own gradients, sampled where that
+/// cell sits inside the drawn shape.
+fn mark_colour(column: usize, row: usize) -> (u8, u8, u8) {
     let (left, top, width, height) = MARK_BOUNDS;
-    let across = (column as f32 + 0.5) / MARK_COLUMNS as f32;
-    let down = (row as f32 + 0.5) / MARK_ROWS as f32;
+    let across = (column as f32 + 0.5) / MARK_WIDTH as f32;
+    let down = (row as f32 + 0.5) / MARK_HEIGHT as f32;
     let (x, y) = (left + across * width, top + down * height);
-    Some(if glyph == 'o' {
+    let core = CORE_SPAN[row].is_some_and(|(first, last)| (first..=last).contains(&column));
+    if core {
         stop_colour(&CORE, along(CORE_AXIS, x, y))
     } else {
         stop_colour(&SPECTRUM, along(SPECTRUM_AXIS, x, y))
-    })
+    }
 }
 
 /// Where a point falls along a gradient axis, clamped to the axis's ends the
@@ -574,47 +579,6 @@ fn logo_pixel(pixel: resvg::tiny_skia::PremultipliedColorU8) -> Option<(u8, u8, 
             channel(pixel.blue()),
         )
     })
-}
-
-/// One cell of the art: four subpixels as a quadrant glyph, painted in the
-/// average of the colours the lit ones carry.
-///
-/// A cell can hold one foreground and one background, which is fewer colours
-/// than four subpixels have. Over a gradient this smooth the four are close
-/// enough that averaging the lit ones loses nothing a reader could see, and it
-/// buys the shape twice the resolution a half block would give it. The unlit
-/// subpixels take no background at all, so the card shows through them instead
-/// of a block of near-black.
-///
-/// `corners` reads top-left, top-right, bottom-left, bottom-right.
-fn quadrant(corners: [Option<(u8, u8, u8)>; 4], colour: bool) -> String {
-    /// Indexed by the lit corners as bits, most significant first.
-    const GLYPHS: [&str; 16] = [
-        " ", "▗", "▖", "▄", "▝", "▐", "▞", "▟", "▘", "▚", "▌", "▙", "▀", "▜", "▛", "█",
-    ];
-
-    let lit = corners.iter().enumerate().fold(0, |bits, (corner, pixel)| {
-        bits | (usize::from(pixel.is_some()) << (3 - corner))
-    });
-    let glyph = GLYPHS[lit];
-    if !colour {
-        return glyph.to_owned();
-    }
-    let mut sum = [0_u32; 3];
-    let mut count = 0_u32;
-    for (red, green, blue) in corners.into_iter().flatten() {
-        sum = [
-            sum[0] + u32::from(red),
-            sum[1] + u32::from(green),
-            sum[2] + u32::from(blue),
-        ];
-        count += 1;
-    }
-    let Some(count) = std::num::NonZeroU32::new(count) else {
-        return glyph.to_owned();
-    };
-    let [red, green, blue] = sum.map(|total| (total / count) as u8);
-    format!("\x1b[38;2;{red};{green};{blue}m{glyph}{RESET}")
 }
 
 fn paint(colour: bool, code: &str, text: &str) -> String {
@@ -1162,8 +1126,8 @@ mod tests {
         for row in MARK {
             assert_eq!(
                 row.len(),
-                MARK_COLUMNS,
-                "every art row is one glyph per subpixel"
+                MARK_WIDTH,
+                "every art row is one character per cell"
             );
         }
         let mut state = TuiState::new(
@@ -1186,27 +1150,26 @@ mod tests {
             rows.iter().any(|row| strip_sgr(row).contains(&first_mark)),
             "card contains the rendered mark"
         );
-        // Border, a blank line, then the title: whichever column is taller sets
-        // the height and the other is centred against it.
-        assert!(
-            strip_sgr(rows[2]).contains(">_ ARSY CODE"),
-            "the title leads the card"
-        );
         assert_eq!(
             rows.len(),
             // model, directory, sandbox, session, the blank under the title,
-            // and the title — or the taller half-block mark — inside a blank
-            // line and a border each side.
+            // and the title — or the taller mark — inside a blank line and a
+            // border each side.
             MARK_HEIGHT.max(6) + 2 + 2,
             "the taller column sets the card height"
         );
+        // Eight mark rows against six label rows: whichever column is shorter
+        // is centred against the other, so the mark leads the card and the
+        // title starts a row into it.
         let marked = rows
             .iter()
             .position(|row| strip_sgr(row).contains(&first_mark))
             .expect("the mark is on the card");
-        // Four mark rows against six label rows: the shorter column is centred
-        // against the taller one, so the mark starts a row below the title.
-        assert_eq!(marked, 3, "the mark sits beside the labels");
+        assert_eq!(marked, 2, "the mark sits beside the labels");
+        assert!(
+            strip_sgr(rows[3]).contains(">_ ARSY CODE"),
+            "the title leads the labels"
+        );
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
         }
