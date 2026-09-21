@@ -332,6 +332,11 @@ const CORE: [(f32, (u8, u8, u8)); 2] = [(0.0, (0x00, 0xa8, 0x78)), (1.0, (0x65, 
 const SPECTRUM_AXIS: (f32, f32, f32, f32) = (70.0, 900.0, 1180.0, 350.0);
 const CORE_AXIS: (f32, f32, f32, f32) = (500.0, 950.0, 720.0, 640.0);
 
+/// Half the intro band's height, as a fraction of the mark. Wide enough to
+/// light two rows at once, so the band reads as a sweep rather than as a row
+/// switching on and off.
+const SHINE_HALF: f32 = 0.18;
+
 /// The drawn shape's bounding box in that same user space, `(x, y, w, h)`,
 /// which the pixel grid above covers. Taken from the SVG's paths, so a pixel
 /// samples the gradient where the shape it belongs to actually sits.
@@ -341,14 +346,29 @@ fn logo(colour: bool) -> &'static [String] {
     static COLOUR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     static MONOCHROME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     if colour {
-        COLOUR.get_or_init(|| mark_rows(true))
+        COLOUR.get_or_init(|| mark_rows(true, None))
     } else {
-        MONOCHROME.get_or_init(|| mark_rows(false))
+        MONOCHROME.get_or_init(|| mark_rows(false, None))
     }
 }
 
 /// The ASCII art as `MARK_HEIGHT` painted rows.
-fn mark_rows(colour: bool) -> Vec<String> {
+///
+/// `progress` is the intro's position in `0..1`, or `None` for the settled
+/// frame. It moves two things at once: a lit band travels down the mark, and
+/// the spectrum — which starts a full turn around its axis — eases back to
+/// where it rests. Only colours change, never characters, so every frame
+/// occupies the same cells and the card can be repainted in place.
+fn mark_rows(colour: bool, progress: Option<f32>) -> Vec<String> {
+    let (shine, shift) = match progress {
+        None => (None, 0.0),
+        // The band enters above the mark and leaves below it, so the first and
+        // last frames are not already mid-sweep.
+        Some(progress) => (
+            Some(progress.mul_add(1.0 + 2.0 * SHINE_HALF, -SHINE_HALF)),
+            (1.0 - progress).powi(3),
+        ),
+    };
     MARK.iter()
         .enumerate()
         .map(|(row, art)| {
@@ -362,7 +382,7 @@ fn mark_rows(colour: bool) -> Vec<String> {
                     line.push(glyph);
                     continue;
                 }
-                let (red, green, blue) = mark_colour(column, row);
+                let (red, green, blue) = mark_colour(column, row, shift, shine);
                 line.push_str(&format!("\x1b[38;2;{red};{green};{blue}m{glyph}{RESET}"));
             }
             line
@@ -372,17 +392,32 @@ fn mark_rows(colour: bool) -> Vec<String> {
 
 /// The colour of one art cell: the SVG's own gradients, sampled where that
 /// cell sits inside the drawn shape.
-fn mark_colour(column: usize, row: usize) -> (u8, u8, u8) {
+///
+/// `shift` rotates the spectrum along its axis and `shine` lightens the band
+/// the intro sweeps down the mark; both are inert in the settled frame.
+fn mark_colour(column: usize, row: usize, shift: f32, shine: Option<f32>) -> (u8, u8, u8) {
     let (left, top, width, height) = MARK_BOUNDS;
     let across = (column as f32 + 0.5) / MARK_WIDTH as f32;
     let down = (row as f32 + 0.5) / MARK_HEIGHT as f32;
     let (x, y) = (left + across * width, top + down * height);
     let core = CORE_SPAN[row].is_some_and(|(first, last)| (first..=last).contains(&column));
-    if core {
+    let (red, green, blue) = if core {
         stop_colour(&CORE, along(CORE_AXIS, x, y))
     } else {
-        stop_colour(&SPECTRUM, along(SPECTRUM_AXIS, x, y))
-    }
+        stop_colour(
+            &SPECTRUM,
+            (along(SPECTRUM_AXIS, x, y) + shift).rem_euclid(1.0),
+        )
+    };
+    let Some(centre) = shine else {
+        return (red, green, blue);
+    };
+    let lit = (1.0 - (down - centre).abs() / SHINE_HALF).clamp(0.0, 1.0);
+    let toward_white = |value: u8| {
+        let value = f32::from(value);
+        (255.0 - value).mul_add(lit, value) as u8
+    };
+    (toward_white(red), toward_white(green), toward_white(blue))
 }
 
 /// Where a point falls along a gradient axis, clamped to the axis's ends the
@@ -1115,6 +1150,32 @@ mod tests {
             "a file written before routes named a provider meant Codex"
         );
         assert_eq!(legacy.model, "gpt-5.6-luna");
+    }
+
+    #[test]
+    fn an_intro_frame_lights_the_mark_without_moving_the_card() {
+        force_art_mark();
+        let state = TuiState::new("/w".into(), SessionId::new());
+        let settled = state.render(92, true);
+        let swept = state.render_frame(92, true, Some(0.5));
+        assert_ne!(settled, swept, "the band lights part of the mark");
+        assert_eq!(
+            settled.lines().count(),
+            swept.lines().count(),
+            "a frame is the same height as the card it repaints"
+        );
+        // The intro repaints in place, so a frame that is a cell wider or
+        // narrower than the settled card would leave the difference on screen.
+        for (frame, card) in swept.lines().zip(settled.lines()) {
+            assert_eq!(visible_len(frame), visible_len(card));
+        }
+        let rows = mark_rows(false, Some(0.5));
+        assert_eq!(rows.len(), MARK_HEIGHT);
+        for row in &rows {
+            assert_eq!(visible_len(row), MARK_WIDTH);
+        }
+        // The band leaves the mark: the last frame is the resting one.
+        assert_eq!(mark_rows(true, Some(1.0)), mark_rows(true, None));
     }
 
     #[test]
