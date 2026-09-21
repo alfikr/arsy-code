@@ -14,6 +14,15 @@
       - any-glob-to-any-file:
           - "crates/arsy-cli/**"
 
+# The terminal presentation layer. Separate from `area: cli` because it is
+# pure rendering — a diff here changes what a row looks like, never what the
+# harness does.
+"area: tui":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/arsy-tui/**"
+          - "docs/36-cli-tui.md"
+
 "area: kernel":
   - changed-files:
       - any-glob-to-any-file:
@@ -44,8 +53,8 @@
       - any-glob-to-any-file:
           - "crates/arsy-ide/**"
 
-# The pseudoterminal boundary. It owns the workspace's only `unsafe`
-# exception, so it is worth seeing named on its own row.
+# The pseudoterminal boundary. It is one of the two crates that relax the
+# workspace `unsafe` ban, so it is worth seeing named on its own row.
 "area: pty":
   - changed-files:
       - any-glob-to-any-file:
