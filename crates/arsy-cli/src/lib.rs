@@ -498,62 +498,79 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             "--source and --event apply only to MCP, hook, and skill inspection",
         ));
     }
-    let command = match parsed.name.as_deref() {
-        None => Command::Tui,
-        Some("run") => Command::Run {
+    let Some(name) = parsed.name.clone() else {
+        return Ok(invocation(global, Command::Tui));
+    };
+    // A subsystem reads the shared arguments and leaves them alone, so it is
+    // tried first: what is left has to take `parsed` apart, and cannot hand
+    // it back if the name turns out not to be its own.
+    let command = match parse_subsystem(&name, &parsed) {
+        Some(command) => command?,
+        None => parse_owned(&name, parsed)?,
+    };
+    Ok(invocation(global, command))
+}
+
+/// What each subsystem's own parser is called.
+///
+/// A table rather than a match: every entry is a name and a function of the
+/// same shape, so the list of subcommands is something to read rather than
+/// control flow to follow.
+type SubsystemParser = fn(&ParsedArguments) -> Result<Command, Diagnostic>;
+
+const SUBSYSTEMS: &[(&str, SubsystemParser)] = &[
+    ("verify", verify::parse),
+    ("session", session::parse),
+    ("artifact", evidence::parse_artifact),
+    ("gc", evidence::parse_gc),
+    ("migrate", session::parse_migrate),
+    ("review", review::parse),
+    ("code", code::parse),
+    ("memory", memory::parse),
+    ("policy", policy::parse),
+    ("serve", serve::parse),
+    ("skill", extensions::parse_skill),
+    ("plugin", extensions::parse_plugin),
+    ("provider", provider::parse_list),
+    ("model", provider::parse_models),
+    ("mcp", mcp::parse),
+];
+
+fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
+    SUBSYSTEMS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, parse)| parse(parsed))
+}
+
+/// The subcommands that consume the arguments rather than read them.
+///
+/// Each takes `parsed` apart — a positional it turns into a task, a flag it
+/// reads directly — which is why they cannot be entries in [`SUBSYSTEMS`].
+fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagnostic> {
+    Ok(match name {
+        "run" => Command::Run {
             task: only_argument(parsed.positional, "run", "<TASK>")?,
             image: parsed.image.take(),
         },
-        Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
-        Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
-        Some("update") => Command::Update {
+        "resume" => parse_resume(parsed.positional, parsed.follow)?,
+        "doctor" => parse_doctor(parsed.positional, parsed.strict)?,
+        "update" => Command::Update {
             check_only: parsed.check,
         },
-        Some("eval") => Command::Eval {
+        "eval" => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
             trials: parsed.trials,
             strict: parsed.strict,
             out: parsed.out,
         },
-        Some("compat") => Command::CompatExplain {
+        "compat" => Command::CompatExplain {
             ecosystem: compatibility_kind(parsed.positional)?,
         },
-        Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        Some("config") => parse_config(parsed.positional)?,
-        Some("hook") => {
-            integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?
-        }
-        Some(name) => match parse_subsystem(name, &parsed) {
-            Some(command) => command?,
-            None => return Err(unknown_command(name)),
-        },
-    };
-    Ok(invocation(global, command))
-}
-
-/// The subcommands whose own module parses them from the shared arguments.
-///
-/// Separate from [`parse`] because they are all the same shape: a name, and
-/// a module that reads what it needs. The ones left there take `parsed` apart
-/// instead, which is why they cannot be here.
-fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
-    Some(match name {
-        "verify" => verify::parse(parsed),
-        "session" => session::parse(parsed),
-        "artifact" => evidence::parse_artifact(parsed),
-        "gc" => evidence::parse_gc(parsed),
-        "migrate" => session::parse_migrate(parsed),
-        "review" => review::parse(parsed),
-        "code" => code::parse(parsed),
-        "memory" => memory::parse(parsed),
-        "policy" => policy::parse(parsed),
-        "serve" => serve::parse(parsed),
-        "skill" => extensions::parse_skill(parsed),
-        "plugin" => extensions::parse_plugin(parsed),
-        "provider" => provider::parse_list(parsed),
-        "model" => provider::parse_models(parsed),
-        "mcp" => mcp::parse(parsed),
-        _ => return None,
+        "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        "config" => parse_config(parsed.positional)?,
+        "hook" => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        other => return Err(unknown_command(other)),
     })
 }
 
