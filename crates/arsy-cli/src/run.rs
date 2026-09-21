@@ -282,9 +282,7 @@ impl TaskRun {
             }],
             tools: {
                 let mut tools = agent.schemas();
-                if delegates {
-                    tools.push(subagent::schema());
-                }
+                tools.extend(subagent::schemas(delegates));
                 tools
             },
             max_output_tokens: self.resolved.endpoint.max_output_tokens,
@@ -525,8 +523,9 @@ pub(crate) fn dispatch_with_refresh(
         task,
         agent,
     );
-    let delegates = supervisor.can_delegate();
-    let mut supervising = delegates.then_some((supervisor, &mut *graph));
+    // Always present: a supervisor also owns `task.criterion`, and a turn
+    // that cannot delegate still has to be able to commit to what done means.
+    let mut supervising = Some((supervisor, &mut *graph));
     let outcome = dispatch(
         config,
         resolved.provider.as_ref(),
@@ -538,6 +537,16 @@ pub(crate) fn dispatch_with_refresh(
         max_parallel_tools,
         emitter,
     );
+    // The turn is over, so nothing is left to read a child's answer: stop and
+    // reap them here rather than leaving threads spending a budget nobody is
+    // waiting on.
+    if let Some((supervisor, graph)) = supervising.as_mut() {
+        supervisor.finish(emitter);
+        // After the children are settled and before anything reports the
+        // turn: whether the work meets what it committed to is decided from
+        // the record, not from how the turn ended.
+        supervisor.settle_proof(graph, emitter);
+    }
     let interventions: Vec<Value> = supervising
         .as_ref()
         .map(|(supervisor, _)| supervisor.interventions().to_vec())
@@ -564,8 +573,7 @@ pub(crate) fn dispatch_with_refresh(
         task,
         agent,
     );
-    let delegates = supervisor.can_delegate();
-    let mut supervising = delegates.then_some((supervisor, graph));
+    let mut supervising = Some((supervisor, graph));
     let outcome = dispatch(
         config,
         resolved.provider.as_ref(),
@@ -577,6 +585,13 @@ pub(crate) fn dispatch_with_refresh(
         max_parallel_tools,
         emitter,
     );
+    if let Some((supervisor, graph)) = supervising.as_mut() {
+        supervisor.finish(emitter);
+        // After the children are settled and before anything reports the
+        // turn: whether the work meets what it committed to is decided from
+        // the record, not from how the turn ended.
+        supervisor.settle_proof(graph, emitter);
+    }
     let interventions = supervising
         .as_ref()
         .map(|(supervisor, _)| supervisor.interventions().to_vec())
@@ -743,7 +758,12 @@ pub(crate) fn dispatch(
         // are the exception: a hook engine is one interpreter with its own
         // recursion guard, so a workspace that loads hooks keeps the
         // sequential path rather than racing them.
-        let batched = if hooks.is_none() && supervisor.is_none() && parallel > 1 {
+        let batched = if hooks.is_none()
+            && parallel > 1
+            && !calls
+                .iter()
+                .any(|(_, name, _)| subagent::OWNED_TOOLS.contains(&name.as_str()))
+        {
             let batch: Vec<(String, Value)> = calls
                 .iter()
                 .map(|(_, name, arguments)| (name.clone(), arguments.clone()))
@@ -764,8 +784,10 @@ pub(crate) fn dispatch(
                     // Already run, in whatever order the batch chose; the
                     // position is what pairs it back to this call's id.
                     (Some(result), _, _) => result.clone(),
-                    (None, "task.spawn", Some((supervisor, graph))) => {
-                        supervisor.spawn(arguments, graph, emitter)
+                    (None, name, Some((supervisor, graph)))
+                        if subagent::OWNED_TOOLS.contains(&name) =>
+                    {
+                        supervisor.call(name, arguments, graph, emitter)
                     }
                     _ => invoke_hooked(hooks, runtime, name, arguments, emitter),
                 };

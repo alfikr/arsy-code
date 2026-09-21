@@ -8,7 +8,10 @@
 
 use crate::{
     capability::{AttenuationError, CapabilityAction, CapabilityGrant, ResourceScope},
-    domain::{AgentId, AttemptId, CorrelationId, Principal, SessionId, TaskId, WorkspaceVersion},
+    domain::{
+        AgentId, AssignmentId, AttemptId, CorrelationId, CriterionId, MessageId, Principal,
+        SessionId, StateVersion, TaskId, WorkspaceVersion,
+    },
     event::{EventEnvelope, EventPayload, EventStore, SchemaVersion, StoreError, StreamVersion},
 };
 use serde::{Deserialize, Serialize};
@@ -75,6 +78,9 @@ pub enum WorkspaceRequirement {
 pub enum TaskState {
     Pending,
     Ready,
+    /// A dependency ended without completing, so this task can never become
+    /// ready. Distinct from `Failed`: nothing of this task ran.
+    Blocked,
     Running,
     /// Execution finished. That is not the same claim as `Verified`: a model
     /// turn that returned, or a process that exited zero, says the work ran,
@@ -90,19 +96,62 @@ pub enum TaskState {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
+    /// Admitted and recorded, but its worker has not reported work yet. A
+    /// start that returns before the child runs has to be distinguishable
+    /// from one whose child is already spending the budget.
+    Starting,
     Running,
+    /// Running, but parked on something outside itself — a dependency, an
+    /// unanswered question to its parent. Still leased, still cancellable.
+    Waiting,
+    /// Cancellation was requested and the holder has not acknowledged it.
+    /// Kept as its own state so a cancel that never lands is visible rather
+    /// than looking like a clean stop.
+    Cancelling,
     Completed,
     Failed,
     Cancelled,
     /// The lease ran out, or the holder was found gone. The attempt keeps its
     /// evidence, but it can no longer commit a result.
     Expired,
+    /// A retry replaced this attempt. Its evidence stays readable; its result
+    /// can no longer satisfy the task.
+    Superseded,
 }
 
 impl AttemptState {
     pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Expired | Self::Superseded
+        )
     }
+
+    /// Whether the holder may still commit a result against this attempt.
+    pub const fn is_live(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Waiting | Self::Cancelling
+        )
+    }
+}
+
+/// Whether a failed attempt may be tried again without asking anyone.
+///
+/// The holder classifies its own failure because only it knows what actually
+/// happened: a stream that dropped mid-token is not the same event as a denial,
+/// and a write whose outcome is unknown is not the same as one that never ran.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retryability {
+    /// A transient fault: the same request run again is the same request.
+    Retryable,
+    /// A denial, an invalid request, or anything a repeat would only repeat.
+    #[default]
+    NotRetryable,
+    /// The effect may or may not have landed. Never retried automatically,
+    /// because a retry would be a second write nobody asked for.
+    UnknownOutcome,
 }
 
 /// Which model the attempt was routed to, recorded so a replayed attempt is
@@ -157,6 +206,10 @@ pub struct TaskAttempt {
     pub ended_at_ms: Option<u64>,
     pub state: AttemptState,
     pub terminal_reason: Option<String>,
+    /// How its holder classified the failure. Meaningless while the attempt
+    /// is live and for one that completed.
+    #[serde(default)]
+    pub retryable: Retryability,
     /// What the attempt produced, as the caller recorded it.
     pub result: Option<Value>,
     /// Artifact ids and other evidence references produced by this attempt.
@@ -169,6 +222,7 @@ pub struct AttemptOutcome {
     pub state: AttemptState,
     pub used: Budget,
     pub reason: Option<String>,
+    pub retryable: Retryability,
     pub result: Option<Value>,
     pub evidence: Vec<String>,
     pub ended_at_ms: u64,
@@ -180,21 +234,30 @@ impl AttemptOutcome {
             state: AttemptState::Completed,
             used,
             reason: None,
+            retryable: Retryability::NotRetryable,
             result: Some(result),
             evidence: Vec::new(),
             ended_at_ms,
         }
     }
 
+    /// A failure nobody should repeat on its own. `retryable` opts back in.
     pub fn failed(used: Budget, reason: impl Into<String>, ended_at_ms: u64) -> Self {
         Self {
             state: AttemptState::Failed,
             used,
             reason: Some(reason.into()),
+            retryable: Retryability::NotRetryable,
             result: None,
             evidence: Vec::new(),
             ended_at_ms,
         }
+    }
+
+    #[must_use]
+    pub const fn retryable(mut self, retryable: Retryability) -> Self {
+        self.retryable = retryable;
+        self
     }
 }
 
@@ -243,6 +306,225 @@ impl TaskNode {
     }
 }
 
+/// What a task's `required_output` demands of a result.
+///
+/// A task states its required output as text, and text is what most of them
+/// want. When that text is a JSON object schema, the object shape in it is
+/// checked instead, so a child cannot answer a structured request with prose.
+///
+/// ponytail: presence of `required` keys and `type: object`, not full JSON
+/// Schema. A real validator is a dependency; add one when a task actually
+/// needs `oneOf`, formats, or nested constraints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResultContract {
+    Text,
+    Object { required: Vec<String> },
+}
+
+impl ResultContract {
+    /// Read the contract out of a task's `required_output`.
+    pub fn parse(required_output: &str) -> Self {
+        let Ok(schema) = serde_json::from_str::<Value>(required_output) else {
+            return Self::Text;
+        };
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Self::Text;
+        }
+        Self::Object {
+            required: schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Why this result does not meet the contract, if it does not.
+    pub fn violation(&self, result: Option<&Value>) -> Option<String> {
+        let Some(result) = result else {
+            return Some("the attempt completed without a result".into());
+        };
+        match self {
+            Self::Text => match result {
+                Value::Null => Some("the attempt completed without a result".into()),
+                Value::String(text) if text.trim().is_empty() => {
+                    Some("the attempt completed with an empty result".into())
+                }
+                _ => None,
+            },
+            Self::Object { required } => {
+                let Some(object) = result.as_object() else {
+                    return Some(
+                        "the required output is an object and the result is not one".into(),
+                    );
+                };
+                let missing: Vec<&str> = required
+                    .iter()
+                    .filter(|name| !object.contains_key(*name))
+                    .map(String::as_str)
+                    .collect();
+                (!missing.is_empty())
+                    .then(|| format!("the result is missing {}", missing.join(", ")))
+            }
+        }
+    }
+}
+
+/// What one task says to another, durably.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A narrowing of what was already asked. Never a new grant.
+    Instruction,
+    Question,
+    Answer,
+    Progress,
+    PartialResult,
+    ReviewerFeedback,
+    Cancellation,
+    DependencyWakeup,
+}
+
+/// One durable message between tasks.
+///
+/// Messages carry text and structure, never authority: a child's grants are
+/// fixed when it is created, and nothing delivered to it afterwards can add to
+/// them. That is why this record has no capability field to widen.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskMessage {
+    pub id: MessageId,
+    pub from: TaskId,
+    pub to: TaskId,
+    pub kind: MessageKind,
+    pub body: Value,
+    /// The message this one answers or follows from.
+    pub causation: Option<MessageId>,
+    pub sent_at_ms: u64,
+    /// When the recipient took it off its inbox. Delivery is recorded rather
+    /// than assumed, so a message lost to a crash is redelivered rather than
+    /// silently dropped.
+    pub delivered_at_ms: Option<u64>,
+}
+
+/// How an isolated view was made.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationBackend {
+    GitWorktree,
+    CopiedSnapshot,
+}
+
+/// What was done about uncommitted work in the source when a view was cut.
+///
+/// Never absent: a writer that silently started from a tree missing the
+/// operator's uncommitted changes would produce a diff against a base nobody
+/// can reconstruct.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyDisposition {
+    /// The source had nothing uncommitted.
+    Clean,
+    /// The source was dirty and the assignment was refused.
+    Refused,
+    /// The source was dirty and its changes were captured as an artifact the
+    /// view starts from.
+    CapturedPatch { artifact: String },
+}
+
+/// One task's claim on one filesystem view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceAssignment {
+    pub id: AssignmentId,
+    pub task: TaskId,
+    pub attempt: AttemptId,
+    pub owner: AgentId,
+    /// What repository this is, independent of where it happens to be
+    /// checked out — the first commit for a Git repository, so two clones of
+    /// one project are not mistaken for two projects.
+    pub repository: String,
+    /// The canonical checkout the view was cut from.
+    pub source: String,
+    pub base_revision: String,
+    pub view: String,
+    pub backend: IsolationBackend,
+    pub mutable: bool,
+    pub lease_epoch: u64,
+    pub expires_at_ms: u64,
+    pub dirty: DirtyDisposition,
+    pub released: bool,
+}
+
+/// What a writer produced, as the thing an integrator reads.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WriterResult {
+    pub assignment: AssignmentId,
+    pub base_revision: String,
+    /// The revision the writer ended on, when its view was a Git worktree.
+    pub head_revision: Option<String>,
+    /// A patch artifact, for a view with no revisions of its own.
+    pub patch_artifact: Option<String>,
+    pub changed_files: Vec<String>,
+    /// Artifact ids for the checks the writer ran in its own view.
+    pub validation: Vec<String>,
+    /// What the writer knows it did not settle. Stated rather than omitted:
+    /// an integrator has to be able to refuse work that says it is unfinished.
+    pub unresolved: Vec<String>,
+}
+
+/// What decides whether one acceptance criterion is met.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verifier {
+    /// A recorded check. The digest is of the command text, so a pass from a
+    /// different command cannot be offered in its place.
+    Command { digest: StateVersion },
+    /// A reviewer's verdict. Attributed to whoever gave it and never
+    /// described as deterministic, because it is not.
+    Review,
+    /// Only a person can say. Same treatment as a review, and named
+    /// separately so a report can distinguish "nobody has looked" from
+    /// "nobody has run it".
+    Human,
+    /// Nothing available can decide it. Stated rather than left to look
+    /// unchecked: a criterion nobody can verify is a fact about the
+    /// criterion, not a gap in the work.
+    Unverifiable { why: String },
+}
+
+/// One thing that has to hold before work may be called verified.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AcceptanceCriterion {
+    pub id: CriterionId,
+    pub task: TaskId,
+    pub statement: String,
+    pub verifier: Verifier,
+    /// A criterion that is not required may be unmet without blocking.
+    pub required: bool,
+    /// How old its evidence may be. `None` means only the workspace revision
+    /// decides, which is the usual case.
+    pub freshness_ms: Option<u64>,
+    /// Set when the criterion stops applying — a check for a component the
+    /// work removed. Applicability is recorded, never assumed.
+    pub inapplicable: Option<String>,
+}
+
+/// A verdict a person or a reviewing agent gave.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Judgment {
+    pub criterion: CriterionId,
+    pub actor: Principal,
+    pub met: bool,
+    pub note: String,
+    pub workspace_revision: Option<WorkspaceVersion>,
+    pub recorded_at_ms: u64,
+}
+
 pub struct ChildCapabilityRequest {
     pub parent_grant: usize,
     pub action: CapabilityAction,
@@ -279,6 +561,21 @@ pub struct TaskGraph {
     version: StreamVersion,
     nodes: BTreeMap<TaskId, TaskNode>,
     attempts: BTreeMap<AttemptId, TaskAttempt>,
+    messages: BTreeMap<MessageId, TaskMessage>,
+    /// Undelivered message ids per recipient, oldest first. Delivery order is
+    /// the order they were appended to the one stream, so two senders cannot
+    /// disagree about what the recipient saw first.
+    inbox: BTreeMap<TaskId, Vec<MessageId>>,
+    /// The tail of what each attempt recorded.
+    ///
+    /// ponytail: the projection keeps the last [`MAX_TRACE_ENTRIES`], not all
+    /// of them — the stream has the rest. Page it from the store if a reader
+    /// ever needs more than the tail.
+    traces: BTreeMap<AttemptId, Vec<Value>>,
+    assignments: BTreeMap<AssignmentId, WorkspaceAssignment>,
+    writer_results: BTreeMap<AssignmentId, WriterResult>,
+    criteria: BTreeMap<CriterionId, AcceptanceCriterion>,
+    judgments: BTreeMap<CriterionId, Vec<Judgment>>,
 }
 
 impl TaskGraph {
@@ -300,9 +597,26 @@ impl TaskGraph {
             version: StreamVersion(0),
             nodes: BTreeMap::new(),
             attempts: BTreeMap::new(),
+            messages: BTreeMap::new(),
+            inbox: BTreeMap::new(),
+            traces: BTreeMap::new(),
+            assignments: BTreeMap::new(),
+            writer_results: BTreeMap::new(),
+            criteria: BTreeMap::new(),
+            judgments: BTreeMap::new(),
         };
         graph.catch_up()?;
         Ok(graph)
+    }
+
+    /// A second view of the same session, for a worker on another thread.
+    ///
+    /// Not a copy of this projection: it replays the stream for itself, so a
+    /// worker that appends while the parent is busy does not have to reach
+    /// into the parent's state to be seen. Both converge because both read
+    /// the one stream and append against its version.
+    pub fn fork(&self, actor: Principal) -> Result<Self, GraphError> {
+        Self::new(Arc::clone(&self.store), self.session, actor)
     }
 
     pub fn add(&mut self, node: TaskNode) -> Result<(), GraphError> {
@@ -497,8 +811,12 @@ impl TaskGraph {
                 lease_expires_at_ms: request.lease_expires_at_ms,
                 started_at_ms: request.started_at_ms,
                 ended_at_ms: None,
-                state: AttemptState::Running,
+                // Admitted, not yet working. A worker reports `Running` once
+                // it has actually picked the attempt up, so a start that
+                // returns before its child runs is visible as exactly that.
+                state: AttemptState::Starting,
                 terminal_reason: None,
+                retryable: Retryability::default(),
                 result: None,
                 evidence: Vec::new(),
             };
@@ -530,6 +848,425 @@ impl TaskGraph {
         )
     }
 
+    /// Move a live attempt between its non-terminal states.
+    ///
+    /// Terminal states are not reachable from here: ending an attempt settles
+    /// budget and a task state with it, which is [`finish_attempt`]'s job.
+    ///
+    /// [`finish_attempt`]: Self::finish_attempt
+    pub fn advance_attempt(
+        &mut self,
+        attempt: AttemptId,
+        target: AttemptState,
+    ) -> Result<(), GraphError> {
+        if !target.is_live() {
+            return Err(GraphError::NotLive(target));
+        }
+        self.commit("task.attempt_state_changed", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            // Cancellation is one-way: a holder asked to stop does not get to
+            // go back to running and keep spending.
+            if record.state == AttemptState::Cancelling && target != AttemptState::Cancelling {
+                return Err(GraphError::Cancelling(attempt));
+            }
+            Ok(json!({"attempt_id": attempt, "task_id": record.task, "state": target}))
+        })
+    }
+
+    /// Ask a running attempt to stop, without ending it here.
+    ///
+    /// Recorded before the holder acknowledges, because the request is the
+    /// durable part: a process that dies between the ask and the stop must
+    /// come back knowing the attempt was told to end, not resume it.
+    pub fn request_cancel(
+        &mut self,
+        attempt: AttemptId,
+        reason: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let reason = reason.into();
+        self.commit("task.attempt_cancel_requested", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            if !record.state.is_live() {
+                return Err(GraphError::FencedAttempt(attempt));
+            }
+            Ok(json!({
+                "attempt_id": attempt,
+                "task_id": record.task,
+                "reason": reason,
+            }))
+        })
+    }
+
+    /// Retire the task's current attempt and start a fresh one.
+    ///
+    /// Refuses unless the attempt it replaces classified itself retryable: a
+    /// denial repeated is still a denial, and an effect whose outcome is
+    /// unknown must not be applied a second time by a scheduler's initiative.
+    pub fn retry(
+        &mut self,
+        id: TaskId,
+        request: &AttemptRequest,
+        max_attempts: usize,
+    ) -> Result<AttemptId, GraphError> {
+        let node = self.nodes.get(&id).ok_or(GraphError::Unknown(id))?;
+        if node.runtime.attempts.len() >= max_attempts {
+            return Err(GraphError::RetriesExhausted(id));
+        }
+        let last = node
+            .runtime
+            .attempts
+            .last()
+            .and_then(|attempt| self.attempts.get(attempt))
+            .ok_or(GraphError::NothingToRetry(id))?;
+        if last.state.is_live() {
+            return Err(GraphError::StillRunning(last.id));
+        }
+        if last.retryable != Retryability::Retryable {
+            return Err(GraphError::NotRetryable(last.id, last.retryable));
+        }
+        if node.available() == Budget::default() {
+            return Err(GraphError::BudgetExhausted(PartialEvidence {
+                reason: "budget_exhausted".into(),
+                remaining: Budget::default(),
+            }));
+        }
+        let superseded = last.id;
+        self.commit("task.attempt_superseded", |graph| {
+            let record = graph
+                .attempts
+                .get(&superseded)
+                .ok_or(GraphError::UnknownAttempt(superseded))?;
+            Ok(json!({"attempt_id": superseded, "task_id": record.task}))
+        })?;
+        self.transition(id, TaskState::Ready, None)?;
+        self.start_attempt(id, request)
+    }
+
+    /// Commit one acceptance criterion against a task.
+    ///
+    /// Written down before the work is judged against it, so a criterion
+    /// cannot be invented to fit what happened to pass.
+    pub fn declare_criterion(
+        &mut self,
+        criterion: AcceptanceCriterion,
+    ) -> Result<CriterionId, GraphError> {
+        let id = criterion.id;
+        self.commit("task.criterion_declared", |graph| {
+            if !graph.nodes.contains_key(&criterion.task) {
+                return Err(GraphError::Unknown(criterion.task));
+            }
+            if graph.criteria.contains_key(&id) {
+                return Err(GraphError::DuplicateCriterion(id));
+            }
+            Ok(json!({"criterion": &criterion}))
+        })?;
+        Ok(id)
+    }
+
+    /// Record a reviewer's or a person's verdict on one criterion.
+    ///
+    /// Attributed, and never converted into a deterministic result: the
+    /// proof reports it as a judgment by whoever gave it.
+    pub fn judge(&mut self, judgment: Judgment) -> Result<(), GraphError> {
+        self.commit("task.criterion_judged", |graph| {
+            let criterion = graph
+                .criteria
+                .get(&judgment.criterion)
+                .ok_or(GraphError::UnknownCriterion(judgment.criterion))?;
+            if !matches!(criterion.verifier, Verifier::Review | Verifier::Human) {
+                return Err(GraphError::NotAJudgment(judgment.criterion));
+            }
+            Ok(json!({"judgment": &judgment}))
+        })
+    }
+
+    /// Say that a criterion no longer applies, and why.
+    pub fn retire_criterion(
+        &mut self,
+        id: CriterionId,
+        why: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let why = why.into();
+        self.commit("task.criterion_retired", |graph| {
+            if !graph.criteria.contains_key(&id) {
+                return Err(GraphError::UnknownCriterion(id));
+            }
+            Ok(json!({"criterion_id": id, "why": why}))
+        })
+    }
+
+    pub fn criterion(&self, id: CriterionId) -> Option<&AcceptanceCriterion> {
+        self.criteria.get(&id)
+    }
+
+    /// Every criterion committed against one task, in the order declared.
+    pub fn criteria_of(&self, task: TaskId) -> Vec<&AcceptanceCriterion> {
+        self.criteria
+            .values()
+            .filter(|criterion| criterion.task == task)
+            .collect()
+    }
+
+    /// Verdicts given on one criterion, oldest first.
+    pub fn judgments_of(&self, id: CriterionId) -> &[Judgment] {
+        self.judgments
+            .get(&id)
+            .map_or(&[], |verdicts| verdicts.as_slice())
+    }
+
+    /// Claim a filesystem view for one attempt.
+    ///
+    /// Three things are refused here rather than left to whoever cut the
+    /// directory, because they are the invariants the phase exists for:
+    ///
+    /// - a mutable view has exactly one live writer, so two agents cannot be
+    ///   told they own the same tree;
+    /// - a mutable view is never the canonical source, so writer authority
+    ///   cannot reach the workspace an operator is looking at;
+    /// - a refused dirty source produces no claim at all, so nothing runs
+    ///   against a base that quietly dropped uncommitted work.
+    pub fn assign_workspace(
+        &mut self,
+        assignment: WorkspaceAssignment,
+    ) -> Result<AssignmentId, GraphError> {
+        let id = assignment.id;
+        if assignment.dirty == DirtyDisposition::Refused {
+            return Err(GraphError::DirtySource(assignment.source));
+        }
+        if assignment.mutable && assignment.view == assignment.source {
+            return Err(GraphError::WriterOnSource(assignment.source));
+        }
+        self.commit("workspace.assigned", |graph| {
+            if !graph.attempts.contains_key(&assignment.attempt) {
+                return Err(GraphError::UnknownAttempt(assignment.attempt));
+            }
+            if let Some(held) = graph
+                .live_assignments()
+                .find(|held| held.view == assignment.view && (held.mutable || assignment.mutable))
+            {
+                return Err(GraphError::ViewAlreadyOwned(held.owner, held.view.clone()));
+            }
+            Ok(json!({"assignment": &assignment}))
+        })?;
+        Ok(id)
+    }
+
+    /// Give a view back, so the next writer can have it.
+    pub fn release_workspace(
+        &mut self,
+        id: AssignmentId,
+        reason: impl Into<String>,
+    ) -> Result<(), GraphError> {
+        let reason = reason.into();
+        self.commit("workspace.released", |graph| {
+            let assignment = graph
+                .assignments
+                .get(&id)
+                .ok_or(GraphError::UnknownAssignment(id))?;
+            Ok(json!({
+                "assignment_id": id,
+                "task_id": assignment.task,
+                "reason": reason,
+            }))
+        })
+    }
+
+    /// Record what a writer produced, against its assignment.
+    pub fn record_writer_result(&mut self, result: &WriterResult) -> Result<(), GraphError> {
+        self.commit("workspace.writer_result", |graph| {
+            let assignment = graph
+                .assignments
+                .get(&result.assignment)
+                .ok_or(GraphError::UnknownAssignment(result.assignment))?;
+            if !assignment.mutable {
+                return Err(GraphError::NotAWriter(result.assignment));
+            }
+            Ok(json!({
+                "assignment_id": result.assignment,
+                "task_id": assignment.task,
+                "result": result,
+            }))
+        })
+    }
+
+    pub fn assignment(&self, id: AssignmentId) -> Option<&WorkspaceAssignment> {
+        self.assignments.get(&id)
+    }
+
+    pub fn writer_result(&self, id: AssignmentId) -> Option<&WriterResult> {
+        self.writer_results.get(&id)
+    }
+
+    /// Every claim that has not been given back, in creation order.
+    pub fn live_assignments(&self) -> impl Iterator<Item = &WorkspaceAssignment> {
+        self.assignments
+            .values()
+            .filter(|assignment| !assignment.released)
+    }
+
+    /// Claims whose owner is gone: the lease has passed, or the attempt that
+    /// held it has ended without the view being given back.
+    ///
+    /// These are what a restarted process has to decide about — reuse, keep
+    /// for inspection, or delete — and leaving them unnamed is how a machine
+    /// fills up with worktrees nobody remembers cutting.
+    pub fn abandoned_assignments(&self, now_ms: u64) -> Vec<&WorkspaceAssignment> {
+        self.live_assignments()
+            .filter(|assignment| {
+                assignment.expires_at_ms <= now_ms
+                    || self
+                        .attempts
+                        .get(&assignment.attempt)
+                        .is_some_and(|attempt| attempt.state.is_terminal())
+            })
+            .collect()
+    }
+
+    /// Record one thing an attempt did, against the attempt.
+    ///
+    /// This is what makes a child inspectable after the fact: its prompts,
+    /// decisions, and failures land in the same stream as everything else, so
+    /// a restarted process can read what a child was doing without the child
+    /// having a transcript of its own to lose.
+    pub fn record(
+        &mut self,
+        attempt: AttemptId,
+        kind: &str,
+        data: Value,
+    ) -> Result<(), GraphError> {
+        self.commit("task.attempt_trace", |graph| {
+            let record = graph
+                .attempts
+                .get(&attempt)
+                .ok_or(GraphError::UnknownAttempt(attempt))?;
+            Ok(json!({
+                "attempt_id": attempt,
+                "task_id": record.task,
+                "kind": kind,
+                "data": data,
+            }))
+        })
+    }
+
+    /// What an attempt recorded, oldest first.
+    pub fn trace_of(&self, attempt: AttemptId) -> &[Value] {
+        self.traces
+            .get(&attempt)
+            .map_or(&[], |entries| entries.as_slice())
+    }
+
+    /// Post a message to a task's inbox.
+    pub fn send(
+        &mut self,
+        from: TaskId,
+        to: TaskId,
+        kind: MessageKind,
+        body: Value,
+        causation: Option<MessageId>,
+        sent_at_ms: u64,
+    ) -> Result<MessageId, GraphError> {
+        let id = MessageId::new();
+        self.commit("task.message_sent", |graph| {
+            if !graph.nodes.contains_key(&from) {
+                return Err(GraphError::Unknown(from));
+            }
+            let recipient = graph.nodes.get(&to).ok_or(GraphError::Unknown(to))?;
+            if matches!(
+                recipient.state,
+                TaskState::Completed | TaskState::Verified | TaskState::Failed
+            ) {
+                return Err(GraphError::Ended(to, recipient.state));
+            }
+            // Backpressure: a sender that outruns a recipient is told so
+            // rather than growing an inbox nobody drains.
+            if graph.inbox.get(&to).map_or(0, Vec::len) >= MAX_INBOX {
+                return Err(GraphError::InboxFull(to));
+            }
+            let message = TaskMessage {
+                id,
+                from,
+                to,
+                kind,
+                body: body.clone(),
+                causation,
+                sent_at_ms,
+                delivered_at_ms: None,
+            };
+            Ok(json!({"message": &message}))
+        })?;
+        Ok(id)
+    }
+
+    /// Take everything waiting for a task, marking it delivered.
+    ///
+    /// Delivery is committed before the caller acts on the messages, so a
+    /// crash mid-handling redelivers nothing it already recorded as seen —
+    /// and the record says what the recipient was given, which is the part an
+    /// audit needs.
+    pub fn deliver(&mut self, to: TaskId, now_ms: u64) -> Result<Vec<TaskMessage>, GraphError> {
+        let waiting: Vec<MessageId> = self.inbox.get(&to).cloned().unwrap_or_default();
+        if waiting.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.commit("task.messages_delivered", |graph| {
+            let waiting: Vec<MessageId> = graph.inbox.get(&to).cloned().unwrap_or_default();
+            Ok(json!({"task_id": to, "message_ids": waiting, "delivered_at_ms": now_ms}))
+        })?;
+        Ok(waiting
+            .iter()
+            .filter_map(|id| self.messages.get(id).cloned())
+            .collect())
+    }
+
+    /// Messages a task has not taken yet, oldest first.
+    pub fn inbox(&self, to: TaskId) -> Vec<&TaskMessage> {
+        self.inbox
+            .get(&to)
+            .map(|ids| ids.iter().filter_map(|id| self.messages.get(id)).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn message(&self, id: MessageId) -> Option<&TaskMessage> {
+        self.messages.get(&id)
+    }
+
+    /// Mark every task that can no longer become ready.
+    ///
+    /// A dependency that failed or was cancelled never completes, so the tasks
+    /// behind it are not pending work — leaving them `Pending` would make a
+    /// scheduler wait forever for something that already ended.
+    pub fn block_unreachable(&mut self) -> Result<Vec<TaskId>, GraphError> {
+        let blocked: Vec<TaskId> = self
+            .nodes
+            .iter()
+            .filter(|(_, node)| matches!(node.state, TaskState::Pending | TaskState::Ready))
+            .filter(|(_, node)| {
+                node.dependencies.iter().any(|dependency| {
+                    self.nodes.get(dependency).is_some_and(|dependency| {
+                        matches!(
+                            dependency.state,
+                            TaskState::Failed | TaskState::Cancelled | TaskState::Blocked
+                        )
+                    })
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &blocked {
+            self.transition(*id, TaskState::Blocked, None)?;
+        }
+        Ok(blocked)
+    }
+
     /// Close one attempt, settling what it spent.
     ///
     /// Refuses an attempt that is not the task's current one: a lease that
@@ -541,7 +1278,13 @@ impl TaskGraph {
         attempt: AttemptId,
         outcome: &AttemptOutcome,
     ) -> Result<(), GraphError> {
-        if !outcome.state.is_terminal() {
+        // `Expired` and `Superseded` are things done *to* an attempt by
+        // recovery and retry; a holder reporting one would be describing a
+        // decision it did not make.
+        if !matches!(
+            outcome.state,
+            AttemptState::Completed | AttemptState::Failed | AttemptState::Cancelled
+        ) {
             return Err(GraphError::NotTerminal(outcome.state));
         }
         self.commit("task.attempt_finished", |graph| {
@@ -549,7 +1292,7 @@ impl TaskGraph {
                 .attempts
                 .get(&attempt)
                 .ok_or(GraphError::UnknownAttempt(attempt))?;
-            if record.state != AttemptState::Running {
+            if !record.state.is_live() {
                 return Err(GraphError::FencedAttempt(attempt));
             }
             let node = graph
@@ -561,12 +1304,24 @@ impl TaskGraph {
             {
                 return Err(GraphError::FencedAttempt(attempt));
             }
+            // A completed attempt has to have produced what its task asked
+            // for. Without this, "the child returned" and "the child answered
+            // the question" are the same record, and the parent cannot tell
+            // them apart.
+            if outcome.state == AttemptState::Completed {
+                if let Some(violation) = ResultContract::parse(&record.required_output)
+                    .violation(outcome.result.as_ref())
+                {
+                    return Err(GraphError::ContractViolation(attempt, violation));
+                }
+            }
             Ok(json!({
                 "attempt_id": attempt,
                 "task_id": record.task,
                 "state": outcome.state,
                 "used": outcome.used,
                 "reason": outcome.reason,
+                "retryable": outcome.retryable,
                 "result": outcome.result,
                 "evidence": outcome.evidence,
                 "ended_at_ms": outcome.ended_at_ms,
@@ -601,6 +1356,11 @@ impl TaskGraph {
     ///
     /// Separate from `complete` because they are different claims: the graph
     /// will not let "the child returned" stand in for "the check passed".
+    ///
+    /// The evidence has to be a completion proof for *this* task whose state
+    /// is verified. That is the gate: a caller cannot mark work verified by
+    /// passing a sentence about it, because the only shape this accepts is
+    /// one the prover produces by reading recorded operations.
     pub fn verify(&mut self, id: TaskId, evidence: Value) -> Result<(), GraphError> {
         if self
             .nodes
@@ -608,6 +1368,27 @@ impl TaskGraph {
             .is_some_and(|node| node.state == TaskState::Verified)
         {
             return Ok(());
+        }
+        let proved_task = evidence
+            .get("task")
+            .and_then(|task| serde_json::from_value::<TaskId>(task.clone()).ok());
+        if proved_task != Some(id) {
+            return Err(GraphError::NotAProof(
+                id,
+                "the evidence is not a completion proof for this task".into(),
+            ));
+        }
+        match evidence.get("state").and_then(Value::as_str) {
+            Some("verified") => {}
+            Some(other) => {
+                return Err(GraphError::NotAProof(id, format!("its proof says {other}")))
+            }
+            None => {
+                return Err(GraphError::NotAProof(
+                    id,
+                    "the evidence carries no proof state".into(),
+                ))
+            }
         }
         self.transition(id, TaskState::Verified, Some(evidence))
     }
@@ -689,6 +1470,21 @@ impl TaskGraph {
         self.nodes.get(&id)
     }
 
+    pub const fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// The stream this graph is a projection of, for a caller that needs to
+    /// build a second projection over the same history.
+    pub fn store(&self) -> Arc<dyn EventStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Every task in the graph, in creation order.
+    pub fn tasks(&self) -> impl Iterator<Item = &TaskNode> {
+        self.nodes.values()
+    }
+
     pub fn attempt(&self, id: AttemptId) -> Option<&TaskAttempt> {
         self.attempts.get(&id)
     }
@@ -739,6 +1535,7 @@ impl TaskGraph {
                     .get("reason")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                retryable: Retryability::NotRetryable,
                 result: Some(evidence),
                 evidence: Vec::new(),
                 ended_at_ms: crate::artifact::unix_time_ms(),
@@ -800,16 +1597,67 @@ impl TaskGraph {
         let EventPayload::Inline { data } = &event.payload else {
             return Ok(());
         };
-        match event.kind.as_str() {
+        // Four tables rather than one, split by what each event is about.
+        // An event nobody claims is not an error: a stream carries the turn
+        // lifecycle and usage too, and a graph reads only its own part.
+        let kind = event.kind.as_str();
+        match self.replay_lifecycle(kind, data) {
+            Some(replayed) => replayed,
+            None => match self.replay_attempt(kind, data) {
+                Some(replayed) => replayed,
+                None => match self.replay_acceptance(kind, data) {
+                    Some(replayed) => replayed,
+                    None => self.replay_workspace(kind, data).unwrap_or(Ok(())),
+                },
+            },
+        }
+    }
+
+    /// Tasks themselves: created, moved, authorized, charged.
+    fn replay_lifecycle(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "task.created" => self.replay_created(data),
             "task.transitioned" => self.replay_transitioned(data),
+            "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
+            "task.budget_used" => self.replay_budget_used(data),
+            _ => return None,
+        })
+    }
+
+    /// One try of a task, and what it recorded along the way.
+    fn replay_attempt(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "task.attempt_started" => self.replay_attempt_started(data),
             "task.attempt_finished" => self.replay_attempt_finished(data),
             "task.attempt_expired" => self.replay_attempt_expired(data),
-            "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
-            "task.budget_used" => self.replay_budget_used(data),
-            _ => Ok(()),
-        }
+            "task.attempt_state_changed" => self.replay_attempt_state(data),
+            "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
+            "task.attempt_superseded" => self.replay_attempt_superseded(data),
+            "task.attempt_trace" => self.replay_trace(data),
+            _ => return None,
+        })
+    }
+
+    /// What a task committed to, and what was said about it.
+    fn replay_acceptance(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
+            "task.criterion_declared" => self.replay_criterion(data),
+            "task.criterion_judged" => self.replay_judgment(data),
+            "task.criterion_retired" => self.replay_retired(data),
+            "task.message_sent" => self.replay_message_sent(data),
+            "task.messages_delivered" => self.replay_messages_delivered(data),
+            _ => return None,
+        })
+    }
+
+    /// Which view belongs to whom, and what a writer produced in it.
+    fn replay_workspace(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
+            "workspace.assigned" => self.replay_assigned(data),
+            "workspace.released" => self.replay_released(data),
+            "workspace.writer_result" => self.replay_writer_result(data),
+            _ => return None,
+        })
     }
 
     fn replay_created(&mut self, data: &Value) -> Result<(), GraphError> {
@@ -878,6 +1726,7 @@ impl TaskGraph {
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        attempt.retryable = field(data, "retryable").unwrap_or_default();
         attempt.result = data.get("result").cloned().filter(|value| !value.is_null());
         attempt.evidence = field(data, "evidence").unwrap_or_default();
         let task = attempt.task;
@@ -912,6 +1761,138 @@ impl TaskGraph {
         node.assignee = None;
         node.lease_expires_at_ms = None;
         node.runtime.current_attempt = None;
+        Ok(())
+    }
+
+    fn replay_attempt_state(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("state event has no attempt".into()))?;
+        let state: AttemptState = field(data, "state")
+            .map_err(|_| GraphError::InvalidEvent("state event has no state".into()))?;
+        self.attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?
+            .state = state;
+        Ok(())
+    }
+
+    fn replay_cancel_requested(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("cancel event has no attempt".into()))?;
+        let attempt = self
+            .attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?;
+        attempt.state = AttemptState::Cancelling;
+        attempt.terminal_reason = data
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(())
+    }
+
+    fn replay_attempt_superseded(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("supersede event has no attempt".into()))?;
+        let attempt = self
+            .attempts
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAttempt(id))?;
+        attempt.state = AttemptState::Superseded;
+        let task = attempt.task;
+        if let Some(node) = self.nodes.get_mut(&task) {
+            node.runtime.current_attempt = None;
+            node.lease_expires_at_ms = None;
+        }
+        Ok(())
+    }
+
+    fn replay_criterion(&mut self, data: &Value) -> Result<(), GraphError> {
+        let criterion: AcceptanceCriterion = field(data, "criterion")
+            .map_err(|_| GraphError::InvalidEvent("criterion event has no criterion".into()))?;
+        self.criteria.insert(criterion.id, criterion);
+        Ok(())
+    }
+
+    fn replay_judgment(&mut self, data: &Value) -> Result<(), GraphError> {
+        let judgment: Judgment = field(data, "judgment")
+            .map_err(|_| GraphError::InvalidEvent("judgment event has no judgment".into()))?;
+        self.judgments
+            .entry(judgment.criterion)
+            .or_default()
+            .push(judgment);
+        Ok(())
+    }
+
+    fn replay_retired(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: CriterionId = field(data, "criterion_id")
+            .map_err(|_| GraphError::InvalidEvent("retire event has no criterion".into()))?;
+        self.criteria
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownCriterion(id))?
+            .inapplicable = data.get("why").and_then(Value::as_str).map(str::to_owned);
+        Ok(())
+    }
+
+    fn replay_assigned(&mut self, data: &Value) -> Result<(), GraphError> {
+        let assignment: WorkspaceAssignment = field(data, "assignment")
+            .map_err(|_| GraphError::InvalidEvent("assignment event has no assignment".into()))?;
+        self.assignments.insert(assignment.id, assignment);
+        Ok(())
+    }
+
+    fn replay_released(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AssignmentId = field(data, "assignment_id")
+            .map_err(|_| GraphError::InvalidEvent("release event has no assignment".into()))?;
+        self.assignments
+            .get_mut(&id)
+            .ok_or(GraphError::UnknownAssignment(id))?
+            .released = true;
+        Ok(())
+    }
+
+    fn replay_writer_result(&mut self, data: &Value) -> Result<(), GraphError> {
+        let result: WriterResult = field(data, "result")
+            .map_err(|_| GraphError::InvalidEvent("writer event has no result".into()))?;
+        self.writer_results.insert(result.assignment, result);
+        Ok(())
+    }
+
+    fn replay_trace(&mut self, data: &Value) -> Result<(), GraphError> {
+        let id: AttemptId = field(data, "attempt_id")
+            .map_err(|_| GraphError::InvalidEvent("trace event has no attempt".into()))?;
+        let entries = self.traces.entry(id).or_default();
+        entries.push(json!({
+            "kind": data.get("kind").and_then(Value::as_str).unwrap_or_default(),
+            "data": data.get("data").cloned().unwrap_or(Value::Null),
+        }));
+        if entries.len() > MAX_TRACE_ENTRIES {
+            entries.remove(0);
+        }
+        Ok(())
+    }
+
+    fn replay_message_sent(&mut self, data: &Value) -> Result<(), GraphError> {
+        let message: TaskMessage = field(data, "message")
+            .map_err(|_| GraphError::InvalidEvent("message event has no message".into()))?;
+        self.inbox.entry(message.to).or_default().push(message.id);
+        self.messages.insert(message.id, message);
+        Ok(())
+    }
+
+    fn replay_messages_delivered(&mut self, data: &Value) -> Result<(), GraphError> {
+        let to = event_task_id(data)?;
+        let ids: Vec<MessageId> = field(data, "message_ids")
+            .map_err(|_| GraphError::InvalidEvent("delivery event has no messages".into()))?;
+        let at = data.get("delivered_at_ms").and_then(Value::as_u64);
+        for id in &ids {
+            if let Some(message) = self.messages.get_mut(id) {
+                message.delivered_at_ms = at;
+            }
+        }
+        if let Some(waiting) = self.inbox.get_mut(&to) {
+            waiting.retain(|id| !ids.contains(id));
+        }
         Ok(())
     }
 
@@ -981,6 +1962,13 @@ impl TaskGraph {
         build: impl Fn(&Self) -> Result<Value, GraphError>,
     ) -> Result<(), GraphError> {
         for attempt in 0..COMMIT_ATTEMPTS {
+            // Catch up before building, not only after a conflict. A second
+            // view of the same session — a worker's, a scheduler's — has not
+            // seen what the first one appended, and a command built against
+            // that gap refuses work that does exist rather than conflicting.
+            if self.store.current_version(self.session)?.0 > self.version.0 {
+                self.catch_up()?;
+            }
             let payload = build(self)?;
             let sequence = self.version.0.checked_add(1).ok_or(GraphError::Overflow)?;
             let event = EventEnvelope::new(
@@ -1040,9 +2028,22 @@ const fn transition_allowed(current: TaskState, target: TaskState) -> bool {
             | (TaskState::Ready, TaskState::Running)
             | (TaskState::Running, TaskState::Completed | TaskState::Failed)
             | (TaskState::Completed, TaskState::Verified)
+            // A retry brings a failed task back to the queue. Only a failed
+            // one: cancelling is a decision about the future, so a retry must
+            // not be a way to undo it.
+            | (TaskState::Failed, TaskState::Ready)
+            | (TaskState::Pending | TaskState::Ready, TaskState::Blocked)
             | (_, TaskState::Cancelled)
     )
 }
+
+/// Undelivered messages one task may hold. A sender past this is outrunning
+/// the recipient, which is a thing to report rather than to buffer.
+const MAX_INBOX: usize = 64;
+
+/// Trace entries kept in memory per attempt. The stream keeps every one; this
+/// is only how much of the tail a live reader gets without paging.
+const MAX_TRACE_ENTRIES: usize = 256;
 
 /// Events replayed per catch-up read. The same bound the service uses to page
 /// a stream, for the same reason: a long session must not be read at once.
@@ -1081,6 +2082,33 @@ pub enum GraphError {
     /// A result from an attempt that is no longer the task's current one.
     FencedAttempt(AttemptId),
     NotTerminal(AttemptState),
+    /// A state an attempt cannot be moved to while it is still live.
+    NotLive(AttemptState),
+    /// The holder was already asked to stop.
+    Cancelling(AttemptId),
+    /// A completed attempt produced something its task did not ask for.
+    ContractViolation(AttemptId, String),
+    NotRetryable(AttemptId, Retryability),
+    RetriesExhausted(TaskId),
+    NothingToRetry(TaskId),
+    StillRunning(AttemptId),
+    /// A message for a task that has already ended.
+    Ended(TaskId, TaskState),
+    InboxFull(TaskId),
+    UnknownAssignment(AssignmentId),
+    /// Two writers cannot hold one view.
+    ViewAlreadyOwned(AgentId, String),
+    /// A writer's view is never the workspace an operator is looking at.
+    WriterOnSource(String),
+    /// The source had uncommitted work and the policy in force refuses it.
+    DirtySource(String),
+    NotAWriter(AssignmentId),
+    DuplicateCriterion(CriterionId),
+    UnknownCriterion(CriterionId),
+    /// A verdict on a criterion a check decides, not a person.
+    NotAJudgment(CriterionId),
+    /// Verification was offered something that is not a proof of this task.
+    NotAProof(TaskId, String),
     Cycle(TaskId),
     InvalidTransition(TaskState, TaskState),
     BudgetExhausted(PartialEvidence),
@@ -1096,9 +2124,9 @@ pub enum GraphError {
 impl GraphError {
     /// The message for a variant that has nothing to interpolate.
     ///
-    /// The fallback is unreachable through [`Display`](fmt::Display), which
-    /// names these variants explicitly: adding one without giving it a message
-    /// stops compiling there rather than reaching this arm.
+    /// Also where [`Display`](fmt::Display) lands a variant none of its
+    /// tables claimed, so a new one without a message reads as "task graph
+    /// error" rather than as nothing at all.
     const fn constant(&self) -> &'static str {
         match self {
             Self::BudgetExhausted(_) => "task budget exhausted with partial evidence",
@@ -1111,32 +2139,103 @@ impl GraphError {
     }
 }
 
-impl fmt::Display for GraphError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+impl GraphError {
+    /// Something about a task itself.
+    fn describe_task(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::AlreadyAuthorized(id) => {
                 write!(formatter, "task {id} already holds recorded authority")
             }
             Self::Duplicate(id) => write!(formatter, "task {id} already exists"),
             Self::Unknown(id) => write!(formatter, "task {id} does not exist"),
+            Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
+            Self::InvalidTransition(from, to) => {
+                write!(formatter, "invalid task transition {from:?} -> {to:?}")
+            }
+            Self::Ended(id, state) => {
+                write!(formatter, "task {id} is {state:?} and takes no messages")
+            }
+            Self::InboxFull(id) => write!(formatter, "task {id} has too many undelivered messages"),
+            _ => return None,
+        })
+    }
+
+    /// Something about one try of a task.
+    fn describe_attempt(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::UnknownAttempt(id) => write!(formatter, "attempt {id} does not exist"),
             Self::FencedAttempt(id) => write!(
                 formatter,
                 "attempt {id} has been superseded and cannot commit a result"
             ),
             Self::NotTerminal(state) => write!(formatter, "{state:?} does not end an attempt"),
-            Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
-            Self::InvalidTransition(from, to) => {
-                write!(formatter, "invalid task transition {from:?} -> {to:?}")
+            Self::NotLive(state) => write!(formatter, "{state:?} is not a live attempt state"),
+            Self::Cancelling(id) => {
+                write!(formatter, "attempt {id} has already been asked to stop")
             }
+            Self::ContractViolation(id, why) => write!(
+                formatter,
+                "attempt {id} did not meet its required output: {why}"
+            ),
+            Self::NotRetryable(id, how) => {
+                write!(formatter, "attempt {id} is {how:?} and will not be retried")
+            }
+            Self::RetriesExhausted(id) => write!(formatter, "task {id} has no retries left"),
+            Self::NothingToRetry(id) => write!(formatter, "task {id} has no attempt to retry"),
+            Self::StillRunning(id) => write!(formatter, "attempt {id} has not ended"),
+            _ => return None,
+        })
+    }
+
+    /// Something about a view, a criterion, or a proof.
+    fn describe_claim(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
+            Self::UnknownAssignment(id) => {
+                write!(formatter, "workspace assignment {id} does not exist")
+            }
+            Self::ViewAlreadyOwned(owner, view) => {
+                write!(formatter, "agent {owner} already writes {view}")
+            }
+            Self::WriterOnSource(path) => write!(
+                formatter,
+                "a writer cannot be assigned the canonical workspace {path}"
+            ),
+            Self::DirtySource(path) => write!(
+                formatter,
+                "{path} has uncommitted work and this policy refuses to start from it"
+            ),
+            Self::NotAWriter(id) => write!(
+                formatter,
+                "assignment {id} is read-only and produces no result"
+            ),
+            Self::DuplicateCriterion(id) => write!(formatter, "criterion {id} already exists"),
+            Self::UnknownCriterion(id) => write!(formatter, "criterion {id} does not exist"),
+            Self::NotAJudgment(id) => write!(
+                formatter,
+                "criterion {id} is decided by a check, not by a verdict"
+            ),
+            Self::NotAProof(id, why) => write!(formatter, "task {id} cannot be verified: {why}"),
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for GraphError {
+    /// Three tables by subject, then what is left: an error someone else
+    /// wrote, and the ones whose whole message is a constant.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(written) = self
+            .describe_task(formatter)
+            .or_else(|| self.describe_attempt(formatter))
+            .or_else(|| self.describe_claim(formatter))
+        {
+            return written;
+        }
+        match self {
             Self::InvalidEvent(message) => write!(formatter, "invalid task event: {message}"),
             Self::Attenuation(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
-            fixed @ (Self::BudgetExhausted(_)
-            | Self::BudgetExpansion
-            | Self::MissingAssignee
-            | Self::MissingParentGrant
-            | Self::Overflow) => formatter.write_str(fixed.constant()),
+            fixed => formatter.write_str(fixed.constant()),
         }
     }
 }
@@ -1184,6 +2283,367 @@ mod tests {
 
     fn open(store: &Arc<dyn EventStore>, session: SessionId) -> TaskGraph {
         TaskGraph::new(Arc::clone(store), session, Principal::System).unwrap()
+    }
+
+    fn assignment(
+        task: TaskId,
+        attempt: AttemptId,
+        view: &str,
+        mutable: bool,
+    ) -> WorkspaceAssignment {
+        WorkspaceAssignment {
+            id: AssignmentId::new(),
+            task,
+            attempt,
+            owner: AgentId::new(),
+            repository: "root-commit".into(),
+            source: "/repo".into(),
+            base_revision: "a".repeat(40),
+            view: view.into(),
+            backend: IsolationBackend::GitWorktree,
+            mutable,
+            lease_epoch: 1,
+            expires_at_ms: 1_000,
+            dirty: DirtyDisposition::Clean,
+            released: false,
+        }
+    }
+
+    #[test]
+    fn one_mutable_view_has_exactly_one_writer() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let (first, second) = (TaskId::new(), TaskId::new());
+        graph.add(node(first, Vec::new(), budget(10))).unwrap();
+        graph.add(node(second, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let one = graph.lease(first, AgentId::new(), 1_000).unwrap();
+        let two = graph.lease(second, AgentId::new(), 1_000).unwrap();
+
+        let held = graph
+            .assign_workspace(assignment(first, one, "/views/a", true))
+            .unwrap();
+        assert!(matches!(
+            graph.assign_workspace(assignment(second, two, "/views/a", true)),
+            Err(GraphError::ViewAlreadyOwned(_, _))
+        ));
+        // A reader cannot share a view with a writer either: the writer is
+        // changing it underneath them.
+        assert!(matches!(
+            graph.assign_workspace(assignment(second, two, "/views/a", false)),
+            Err(GraphError::ViewAlreadyOwned(_, _))
+        ));
+        // Released, so the next writer may have it.
+        graph.release_workspace(held, "finished").unwrap();
+        graph
+            .assign_workspace(assignment(second, two, "/views/a", true))
+            .unwrap();
+
+        let replayed = open(&store, session);
+        assert_eq!(replayed.live_assignments().count(), 1);
+    }
+
+    #[test]
+    fn writer_authority_never_covers_the_canonical_workspace() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        assert!(matches!(
+            graph.assign_workspace(WorkspaceAssignment {
+                view: "/repo".into(),
+                ..assignment(id, attempt, "/views/a", true)
+            }),
+            Err(GraphError::WriterOnSource(_))
+        ));
+        // A reader may share the canonical path, because it changes nothing.
+        graph
+            .assign_workspace(WorkspaceAssignment {
+                view: "/repo".into(),
+                ..assignment(id, attempt, "/views/a", false)
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_refused_dirty_source_produces_no_claim_at_all() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        assert!(matches!(
+            graph.assign_workspace(WorkspaceAssignment {
+                dirty: DirtyDisposition::Refused,
+                ..assignment(id, attempt, "/views/a", true)
+            }),
+            Err(GraphError::DirtySource(_))
+        ));
+        assert_eq!(graph.live_assignments().count(), 0);
+    }
+
+    #[test]
+    fn a_view_whose_attempt_ended_is_reported_as_abandoned() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+        let held = graph
+            .assign_workspace(assignment(id, attempt, "/views/a", true))
+            .unwrap();
+        graph
+            .record_writer_result(&WriterResult {
+                assignment: held,
+                base_revision: "a".repeat(40),
+                head_revision: Some("b".repeat(40)),
+                patch_artifact: None,
+                changed_files: vec!["src/lib.rs".into()],
+                validation: vec!["artifact-check".into()],
+                unresolved: Vec::new(),
+            })
+            .unwrap();
+        assert!(graph.abandoned_assignments(0).is_empty());
+        graph.complete(id, json!("done")).unwrap();
+
+        // Restarted: the view is still there, still owned, and nobody is
+        // running it. That is the set a recovery pass has to decide about.
+        let replayed = open(&store, session);
+        let abandoned = replayed.abandoned_assignments(0);
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].id, held);
+        assert_eq!(
+            replayed
+                .writer_result(held)
+                .map(|result| result.changed_files.clone()),
+            Some(vec!["src/lib.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn an_attempts_trace_survives_a_restart_and_keeps_its_tail() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let attempt = {
+            let mut graph = open(&store, session);
+            let id = TaskId::new();
+            graph.add(node(id, Vec::new(), budget(10))).unwrap();
+            graph.ready().unwrap();
+            let attempt = graph.lease(id, AgentId::new(), 1_000).unwrap();
+            // More than the projection keeps, so the trimming is exercised
+            // rather than assumed.
+            for index in 0..MAX_TRACE_ENTRIES + 3 {
+                graph
+                    .record(attempt, "model.tool_call", json!({"call": index}))
+                    .unwrap();
+            }
+            attempt
+        };
+
+        let replayed = open(&store, session);
+        let trace = replayed.trace_of(attempt);
+        assert_eq!(trace.len(), MAX_TRACE_ENTRIES);
+        // The tail, not the head: what a child did last is what explains
+        // where it stopped.
+        assert_eq!(trace[0]["data"]["call"], json!(3));
+        assert_eq!(
+            trace[MAX_TRACE_ENTRIES - 1]["data"]["call"],
+            json!(MAX_TRACE_ENTRIES + 2)
+        );
+        assert_eq!(trace[0]["kind"], json!("model.tool_call"));
+        // An attempt nobody recorded against has nothing, rather than a gap
+        // that has to be told from an empty one.
+        assert!(replayed.trace_of(AttemptId::new()).is_empty());
+    }
+
+    #[test]
+    fn messages_are_ordered_delivered_once_and_survive_a_restart() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let mut graph = open(&store, session);
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+
+        let first = graph
+            .send(
+                parent,
+                child,
+                MessageKind::Instruction,
+                json!({"note": "narrow it to the parser"}),
+                None,
+                1,
+            )
+            .unwrap();
+        let second = graph
+            .send(
+                parent,
+                child,
+                MessageKind::Progress,
+                json!("still here"),
+                Some(first),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            graph.inbox(child).iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+
+        let delivered = graph.deliver(child, 3).unwrap();
+        assert_eq!(delivered.len(), 2);
+        // Taken once: a second read is not a redelivery.
+        assert!(graph.inbox(child).is_empty());
+        assert!(graph.deliver(child, 4).unwrap().is_empty());
+
+        // A message carries no authority, and the record says so by having
+        // nowhere to put one: what survives a restart is what was said.
+        let replayed = open(&store, session);
+        assert_eq!(
+            replayed.message(first).unwrap().kind,
+            MessageKind::Instruction
+        );
+        assert_eq!(replayed.message(second).unwrap().causation, Some(first));
+        assert_eq!(replayed.message(second).unwrap().delivered_at_ms, Some(3));
+        assert!(replayed.inbox(child).is_empty());
+    }
+
+    #[test]
+    fn a_task_that_ended_takes_no_more_messages() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        graph.lease(child, AgentId::new(), 10).unwrap();
+        graph.complete(child, json!("answered")).unwrap();
+        assert!(matches!(
+            graph.send(
+                parent,
+                child,
+                MessageKind::Instruction,
+                json!("more"),
+                None,
+                1
+            ),
+            Err(GraphError::Ended(_, TaskState::Completed))
+        ));
+    }
+
+    #[test]
+    fn a_full_inbox_refuses_rather_than_growing() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let parent = TaskId::new();
+        let child = TaskId::new();
+        graph.add(node(parent, Vec::new(), budget(100))).unwrap();
+        graph.add(node(child, Vec::new(), budget(10))).unwrap();
+        for index in 0..MAX_INBOX {
+            graph
+                .send(parent, child, MessageKind::Progress, json!(index), None, 1)
+                .unwrap();
+        }
+        assert!(matches!(
+            graph.send(
+                parent,
+                child,
+                MessageKind::Progress,
+                json!("one too many"),
+                None,
+                1
+            ),
+            Err(GraphError::InboxFull(_))
+        ));
+    }
+
+    #[test]
+    fn a_completed_attempt_has_to_produce_what_its_task_asked_for() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph
+            .add(TaskNode {
+                required_output: json!({
+                    "type": "object",
+                    "required": ["finding", "evidence"],
+                })
+                .to_string(),
+                ..node(id, Vec::new(), budget(10))
+            })
+            .unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+        let violation = graph.finish_attempt(
+            attempt,
+            &AttemptOutcome::completed(Budget::default(), json!({"finding": "here"}), 1),
+        );
+        assert!(matches!(
+            violation,
+            Err(GraphError::ContractViolation(_, _))
+        ));
+        // Refused, so the attempt is still the task's to finish properly.
+        graph
+            .finish_attempt(
+                attempt,
+                &AttemptOutcome::completed(
+                    Budget::default(),
+                    json!({"finding": "here", "evidence": ["artifact-1"]}),
+                    2,
+                ),
+            )
+            .unwrap();
+        assert_eq!(graph.node(id).unwrap().state, TaskState::Completed);
+    }
+
+    #[test]
+    fn a_cancelled_attempt_cannot_go_back_to_running() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let mut graph = open(&store, SessionId::new());
+        let id = TaskId::new();
+        graph.add(node(id, Vec::new(), budget(10))).unwrap();
+        graph.ready().unwrap();
+        let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+        graph
+            .advance_attempt(attempt, AttemptState::Running)
+            .unwrap();
+        graph.request_cancel(attempt, "operator").unwrap();
+        assert!(matches!(
+            graph.advance_attempt(attempt, AttemptState::Running),
+            Err(GraphError::Cancelling(_))
+        ));
+    }
+
+    #[test]
+    fn a_restart_finds_the_cancellation_that_was_requested() {
+        let store: Arc<dyn EventStore> = Arc::new(MemoryEventStore::default());
+        let session = SessionId::new();
+        let attempt = {
+            let mut graph = open(&store, session);
+            let id = TaskId::new();
+            graph.add(node(id, Vec::new(), budget(10))).unwrap();
+            graph.ready().unwrap();
+            let attempt = graph.lease(id, AgentId::new(), 10).unwrap();
+            graph
+                .request_cancel(attempt, "operator changed their mind")
+                .unwrap();
+            attempt
+        };
+        let replayed = open(&store, session);
+        let record = replayed.attempt(attempt).unwrap();
+        assert_eq!(record.state, AttemptState::Cancelling);
+        assert_eq!(
+            record.terminal_reason.as_deref(),
+            Some("operator changed their mind")
+        );
     }
 
     #[test]
@@ -1356,8 +2816,24 @@ mod tests {
         graph.lease(id, AgentId::new(), 100).unwrap();
         graph.complete(id, json!({"answer": "done"})).unwrap();
         assert_eq!(graph.node(id).unwrap().state, TaskState::Completed);
+
+        // A sentence about a check is not a proof, whatever it says.
+        assert!(matches!(
+            graph.verify(id, json!({"validation": "cargo test"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+        // Nor is a proof of some other task, nor one that is not verified.
+        assert!(matches!(
+            graph.verify(id, json!({"task": TaskId::new(), "state": "verified"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+        assert!(matches!(
+            graph.verify(id, json!({"task": id, "state": "partially_verified"})),
+            Err(GraphError::NotAProof(_, _))
+        ));
+
         graph
-            .verify(id, json!({"validation": "cargo test"}))
+            .verify(id, json!({"task": id, "state": "verified"}))
             .unwrap();
         assert_eq!(graph.node(id).unwrap().state, TaskState::Verified);
 
@@ -1366,8 +2842,9 @@ mod tests {
         unverifiable
             .add(node(other, Vec::new(), budget(1)))
             .unwrap();
+        // Even a well-formed proof cannot verify work that never ran.
         assert!(matches!(
-            unverifiable.verify(other, json!({})),
+            unverifiable.verify(other, json!({"task": other, "state": "verified"})),
             Err(GraphError::InvalidTransition(
                 TaskState::Pending,
                 TaskState::Verified

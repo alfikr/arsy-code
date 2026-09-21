@@ -47,6 +47,7 @@ mod transcript;
 #[cfg(feature = "tui")]
 pub mod tui;
 mod turn;
+mod verify;
 
 use config_load::{bootstrap_user_config, replace_file};
 pub(crate) use config_load::{load_config, selected_model};
@@ -301,6 +302,10 @@ pub enum Command {
     ConfigExplain {
         key: Option<String>,
     },
+    /// `arsy verify <SESSION>`: rebuild the completion proof and report it.
+    Verify {
+        session: SessionId,
+    },
     SessionList {
         limit: usize,
     },
@@ -497,48 +502,80 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
             "--source and --event apply only to MCP, hook, and skill inspection",
         ));
     }
-    let command = match parsed.name.as_deref() {
-        None => Command::Tui,
-        Some("run") => Command::Run {
+    let Some(name) = parsed.name.clone() else {
+        return Ok(invocation(global, Command::Tui));
+    };
+    // A subsystem reads the shared arguments and leaves them alone, so it is
+    // tried first: what is left has to take `parsed` apart, and cannot hand
+    // it back if the name turns out not to be its own.
+    let command = match parse_subsystem(&name, &parsed) {
+        Some(command) => command?,
+        None => parse_owned(&name, parsed)?,
+    };
+    Ok(invocation(global, command))
+}
+
+/// What each subsystem's own parser is called.
+///
+/// A table rather than a match: every entry is a name and a function of the
+/// same shape, so the list of subcommands is something to read rather than
+/// control flow to follow.
+type SubsystemParser = fn(&ParsedArguments) -> Result<Command, Diagnostic>;
+
+const SUBSYSTEMS: &[(&str, SubsystemParser)] = &[
+    ("verify", verify::parse),
+    ("session", session::parse),
+    ("artifact", evidence::parse_artifact),
+    ("gc", evidence::parse_gc),
+    ("migrate", session::parse_migrate),
+    ("review", review::parse),
+    ("code", code::parse),
+    ("memory", memory::parse),
+    ("policy", policy::parse),
+    ("serve", serve::parse),
+    ("skill", extensions::parse_skill),
+    ("plugin", extensions::parse_plugin),
+    ("provider", provider::parse_list),
+    ("model", provider::parse_models),
+    ("mcp", mcp::parse),
+];
+
+fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
+    SUBSYSTEMS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, parse)| parse(parsed))
+}
+
+/// The subcommands that consume the arguments rather than read them.
+///
+/// Each takes `parsed` apart — a positional it turns into a task, a flag it
+/// reads directly — which is why they cannot be entries in [`SUBSYSTEMS`].
+fn parse_owned(name: &str, mut parsed: ParsedArguments) -> Result<Command, Diagnostic> {
+    Ok(match name {
+        "run" => Command::Run {
             task: only_argument(parsed.positional, "run", "<TASK>")?,
             image: parsed.image.take(),
         },
-        Some("resume") => parse_resume(parsed.positional, parsed.follow)?,
-        Some("doctor") => parse_doctor(parsed.positional, parsed.strict)?,
-        Some("update") => Command::Update {
+        "resume" => parse_resume(parsed.positional, parsed.follow)?,
+        "doctor" => parse_doctor(parsed.positional, parsed.strict)?,
+        "update" => Command::Update {
             check_only: parsed.check,
         },
-        Some("eval") => Command::Eval {
+        "eval" => Command::Eval {
             suite: PathBuf::from(only_argument(parsed.positional, "eval", "<SUITE>")?),
             trials: parsed.trials,
             strict: parsed.strict,
             out: parsed.out,
         },
-        Some("compat") => Command::CompatExplain {
+        "compat" => Command::CompatExplain {
             ecosystem: compatibility_kind(parsed.positional)?,
         },
-        Some("session") => session::parse(&parsed)?,
-        Some("artifact") => evidence::parse_artifact(&parsed)?,
-        Some("gc") => evidence::parse_gc(&parsed)?,
-        Some("migrate") => session::parse_migrate(&parsed)?,
-        Some("review") => review::parse(&parsed)?,
-        Some("code") => code::parse(&parsed)?,
-        Some("memory") => memory::parse(&parsed)?,
-        Some("policy") => policy::parse(&parsed)?,
-        Some("serve") => serve::parse(&parsed)?,
-        Some("skill") => extensions::parse_skill(&parsed)?,
-        Some("plugin") => extensions::parse_plugin(&parsed)?,
-        Some("provider") => provider::parse_list(&parsed)?,
-        Some("model") => provider::parse_models(&parsed)?,
-        Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
-        Some("config") => parse_config(parsed.positional)?,
-        Some("mcp") => mcp::parse(&parsed)?,
-        Some("hook") => {
-            integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?
-        }
-        Some(other) => return Err(unknown_command(other)),
-    };
-    Ok(invocation(global, command))
+        "auth" => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
+        "config" => parse_config(parsed.positional)?,
+        "hook" => integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?,
+        other => return Err(unknown_command(other)),
+    })
 }
 
 #[derive(Default)]
@@ -1180,6 +1217,7 @@ fn execute_session(
 ) -> Option<Result<i32, Diagnostic>> {
     Some(match &invocation.command {
         Command::SessionList { limit } => session::list(invocation, *limit, emitter),
+        Command::Verify { session } => verify::run(invocation, *session, emitter),
         Command::SessionShow {
             session,
             turns,
@@ -1363,8 +1401,12 @@ fn run_eval(
 ) -> Result<i32, Diagnostic> {
     let workspace = workspace_root(&invocation.workspace)?;
     let report = eval::run(&workspace, suite, trials, strict, out)?;
+    // A blocked gate exits nonzero even when the report is otherwise fine:
+    // that is what makes a safety regression stop a promotion rather than
+    // appear as a line in a document nobody reads.
+    let code = report.exit_code();
     emitter.result(serde_json::to_value(report).map_err(storage_failed)?);
-    Ok(0)
+    Ok(code)
 }
 
 /// Serving ARSY to something else, and running it unattended.
@@ -3002,6 +3044,13 @@ fn summary_number(record: &Value, key: &str) -> u64 {
 /// `watch` sees a redacted projection of each call: the tool and whether it
 /// worked, never the arguments or what came back. Returning
 /// [`Intervention::Deny`] stops the child there.
+///
+/// `trace` takes the child's own events rather than the parent's emitter,
+/// because a child runs on its own thread and the emitter writes to one
+/// terminal. `cancel` is checked between rounds and between tool calls: those
+/// are the points where stopping leaves the workspace in a state the child can
+/// describe, which is what makes cancellation safe rather than merely fast.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn child_turn(
     provider: &dyn ModelProvider,
     runtime: &arsy_code::agent::ToolRuntime,
@@ -3009,7 +3058,10 @@ pub(crate) fn child_turn(
     watch: &mut dyn FnMut(
         &arsy_kernel::observer::RedactedProjection,
     ) -> Option<arsy_kernel::observer::Intervention>,
-    emitter: &mut Emitter,
+    trace: &mut dyn FnMut(&str, Value),
+    steer: &mut dyn FnMut() -> Vec<String>,
+    cancel: &arsy_kernel::scheduler::CancelToken,
+    tokens: &mut (u64, u64),
 ) -> Result<String, String> {
     let mut request = request.clone();
     let base = request.idempotency_key.as_str().to_owned();
@@ -3021,31 +3073,17 @@ pub(crate) fn child_turn(
     let mut answer = String::new();
 
     for round in 0..MAX_CHILD_TOOL_ROUNDS {
+        if cancel.is_cancelled() {
+            return Err(CHILD_CANCELLED.to_owned());
+        }
+        absorb_steering(&mut request.messages, steer(), trace);
         request.idempotency_key =
             IdempotencyKey::new(format!("{base}-{round}")).map_err(|error| error.to_string())?;
         answer.clear();
-        let mut calls: Vec<(String, String, Value)> = Vec::new();
         let stream =
             arsy_kernel::provider::stream_with_retry(provider, &request, &mut std::thread::sleep)
                 .map_err(|error| error.to_string())?;
-        for event in stream {
-            match event.map_err(|error| error.to_string())? {
-                ModelEvent::TextDelta { text } => answer.push_str(&text),
-                ModelEvent::ToolCallCompleted {
-                    id,
-                    name,
-                    arguments,
-                    ..
-                } => {
-                    emitter.trace(
-                        "model.tool_call",
-                        json!({"round": round, "id": id, "name": name, "arguments": arguments}),
-                    );
-                    calls.push((id, name, arguments));
-                }
-                _ => {}
-            }
-        }
+        let calls = absorb_child_stream(stream, round, &mut answer, tokens, trace)?;
         if calls.is_empty() {
             return Ok(if answer.trim().is_empty() {
                 "the subagent finished without an answer".to_owned()
@@ -3077,6 +3115,12 @@ pub(crate) fn child_turn(
 
         let mut results = Vec::with_capacity(calls.len());
         for (id, name, arguments) in &calls {
+            // Between calls, not mid-call: a tool that has started is allowed
+            // to finish and say what it did, so a cancelled child still
+            // reports the effects it already had.
+            if cancel.is_cancelled() {
+                return Err(CHILD_CANCELLED.to_owned());
+            }
             let result = runtime.invoke(name, arguments);
             calls_made += 1;
             consecutive_failures = if result.success {
@@ -3107,11 +3151,7 @@ pub(crate) fn child_turn(
                 is_error: !result.success,
             });
             if let Some(arsy_kernel::observer::Intervention::Deny(reason)) = intervened {
-                emitter.diagnostic(&Diagnostic::warning(
-                    "ARSY-RET-1001",
-                    format!("a subagent was stopped: {reason}"),
-                    "the parent keeps whatever the subagent had established before it stopped",
-                ));
+                trace("subagent.stopped", json!({"reason": reason}));
                 return Err(format!("stopped by its supervisor: {reason}"));
             }
         }
@@ -3130,6 +3170,74 @@ pub(crate) fn child_turn(
 /// Fewer than the parent's: a child has one question, and a child that cannot
 /// answer it in this many rounds is one the parent should take back.
 const MAX_CHILD_TOOL_ROUNDS: usize = 8;
+
+/// Read one round of a child's stream into its answer, its usage, and the
+/// calls it asked for.
+///
+/// The same split the parent's loop already has: what a stream said is one
+/// question, and what to do about it is another.
+fn absorb_child_stream(
+    stream: arsy_kernel::provider::ModelEventStream,
+    round: usize,
+    answer: &mut String,
+    tokens: &mut (u64, u64),
+    trace: &mut dyn FnMut(&str, Value),
+) -> Result<Vec<(String, String, Value)>, String> {
+    let mut calls = Vec::new();
+    for event in stream {
+        match event.map_err(|error| error.to_string())? {
+            ModelEvent::TextDelta { text } => answer.push_str(&text),
+            ModelEvent::ToolCallCompleted {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                trace(
+                    "model.tool_call",
+                    json!({"round": round, "id": id, "name": name, "arguments": arguments}),
+                );
+                calls.push((id, name, arguments));
+            }
+            ModelEvent::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                // Counted here rather than inferred by the parent: what a
+                // child spent has to settle against the budget its task
+                // reserved, and only the child sees its own stream.
+                tokens.0 = tokens.0.saturating_add(input_tokens);
+                tokens.1 = tokens.1.saturating_add(output_tokens);
+            }
+            _ => {}
+        }
+    }
+    Ok(calls)
+}
+
+/// Put what the parent said into the child's next round.
+///
+/// A round boundary is where a child can absorb a new instruction without
+/// abandoning work in progress. Messages narrow what it was already asked to
+/// do; they cannot widen what it may do, because its grants were fixed when
+/// the graph created it — there is nothing in a message to widen them with.
+fn absorb_steering(
+    messages: &mut Vec<ModelMessage>,
+    instructions: Vec<String>,
+    trace: &mut dyn FnMut(&str, Value),
+) {
+    for instruction in instructions {
+        trace("subagent.steered", json!({"instruction": &instruction}));
+        messages.push(ModelMessage {
+            role: ModelRole::User,
+            content: vec![ModelContent::Text { text: instruction }],
+        });
+    }
+}
+
+/// What a child says when it was asked to stop. A reason rather than a
+/// silence, so the attempt's terminal record is explicable.
+pub(crate) const CHILD_CANCELLED: &str = "the subagent was cancelled before it answered";
 
 /// What a turn cost, when configuration says what its model charges.
 ///

@@ -22,7 +22,72 @@ use std::{
 struct FakeProvider {
     port: u16,
     bodies: mpsc::Receiver<String>,
+    /// How many subagent requests were open at once. Never above zero
+    /// unless the provider was built by [`FakeProvider::delegating`].
+    peak_children: std::sync::Arc<Barrier>,
 }
+
+/// Holds each arrival until `target` of them are waiting, or the wait gives
+/// up, and remembers the most that were ever waiting together.
+///
+/// `std::sync::Barrier` cannot be used: it has no timeout, so a runtime that
+/// really did serialize its subagents would hang the suite instead of
+/// failing it with a number.
+struct Barrier {
+    target: usize,
+    state: std::sync::Mutex<Waiting>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    now: usize,
+    peak: usize,
+    /// Whether `target` were ever waiting together. Once they have been, the
+    /// question is answered and nothing waits again — the later requests of
+    /// a conversation are sequential by nature and would only pay the
+    /// timeout.
+    met: bool,
+}
+
+impl Barrier {
+    fn new(target: usize) -> Self {
+        Self {
+            target,
+            state: std::sync::Mutex::new(Waiting::default()),
+            arrived: std::sync::Condvar::new(),
+        }
+    }
+
+    fn arrive(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.now += 1;
+        state.peak = state.peak.max(state.now);
+        state.met |= state.now >= self.target;
+        self.arrived.notify_all();
+        let deadline = std::time::Instant::now() + BARRIER_TIMEOUT;
+        while !state.met {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (next, timed_out) = self.arrived.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timed_out.timed_out() {
+                break;
+            }
+        }
+        state.now -= 1;
+    }
+
+    fn peak(&self) -> usize {
+        self.state.lock().unwrap().peak
+    }
+}
+
+/// How long one subagent request waits for another to join it. Long enough
+/// that a slow runner starting threads is not mistaken for a runtime that
+/// runs its children one at a time.
+const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FakeProvider {
     /// `script` holds one SSE body per expected request, in order.
@@ -62,12 +127,194 @@ impl FakeProvider {
                 let _ = stream.flush();
             }
         });
-        Self { port, bodies }
+        Self {
+            port,
+            bodies,
+            // Nothing arrives at this one, so its peak stays zero.
+            peak_children: std::sync::Arc::new(Barrier::new(1)),
+        }
+    }
+
+    /// Scripts served concurrently: one for the parent, and one per subagent.
+    ///
+    /// `children` is one script per subagent, keyed by a phrase that appears
+    /// in that subagent's own request — its goal.
+    ///
+    /// Keyed rather than a single queue because subagents run at once, so
+    /// which of them reaches the socket first is a race. One shared queue
+    /// hands whichever child got there first the reply meant for another,
+    /// and the test then measures the race instead of the runtime.
+    fn delegating(parent: Vec<String>, children: Vec<(&str, Vec<String>)>) -> Self {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, bodies) = mpsc::channel();
+        // With one subagent there is nothing to overlap with, so it must not
+        // wait for a second that is never coming.
+        let expect_concurrent = children.len().min(2);
+        // Every queue remembers the reply it last served: a dropped
+        // connection reads to the client as the peer disconnecting, which
+        // `stream_with_retry` retries, and the retry must get the reply the
+        // request before it got rather than the entry after it.
+        let scripts = std::sync::Arc::new(std::sync::Mutex::new(Scripts {
+            parent: Script::new(parent),
+            children: children
+                .into_iter()
+                .map(|(marker, script)| (marker.to_owned(), Script::new(script)))
+                .collect(),
+        }));
+        // Subagent requests are held until two of them are open at once, or
+        // until the wait gives up.
+        //
+        // A fixed delay measured whether two happened to overlap inside it,
+        // which is a question about how fast a runner starts threads —
+        // Windows took longer than the delay and the probe saw nothing. A
+        // barrier asks the question the test is about instead: can two be in
+        // flight at the same time. A runtime that answered each child before
+        // the next one asked would wait out the timeout and still show one.
+        let gate = std::sync::Arc::new(Barrier::new(expect_concurrent));
+        let barrier = std::sync::Arc::clone(&gate);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let request = read_request(&mut stream);
+                let _ = sender.send(request.clone());
+                let child = is_child_request(&request);
+                let mut held = scripts.lock().unwrap();
+                let Some(body) = held.next_reply(child, &request) else {
+                    continue;
+                };
+                drop(held);
+                let body = fill_task_ids(&body, &request);
+                let gate = std::sync::Arc::clone(&gate);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                thread::spawn(move || {
+                    if !child {
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    gate.arrive();
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        Self {
+            port,
+            bodies,
+            peak_children: barrier,
+        }
+    }
+
+    /// The most subagent requests that were in flight at the same moment.
+    fn peak_children(&self) -> usize {
+        self.peak_children.peak()
     }
 
     fn request(&self) -> Value {
         serde_json::from_str(&self.bodies.recv().expect("the provider was called")).unwrap()
     }
+
+    /// Every request the provider was sent, once no more are coming.
+    fn requests(&self) -> Vec<Value> {
+        let mut seen = Vec::new();
+        while let Ok(body) = self
+            .bodies
+            .recv_timeout(std::time::Duration::from_millis(500))
+        {
+            seen.push(serde_json::from_str(&body).unwrap());
+        }
+        seen
+    }
+}
+
+/// One correspondent's replies, in order, and the last one served.
+struct Script {
+    remaining: std::collections::VecDeque<String>,
+    last: Option<String>,
+}
+
+impl Script {
+    fn new(replies: Vec<String>) -> Self {
+        Self {
+            remaining: replies.into_iter().collect(),
+            last: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<String> {
+        match self.remaining.pop_front() {
+            Some(reply) => {
+                self.last = Some(reply.clone());
+                Some(reply)
+            }
+            // A retry of the request this already answered.
+            None => self.last.clone(),
+        }
+    }
+}
+
+/// The parent's script, and one per subagent keyed by its goal.
+struct Scripts {
+    parent: Script,
+    children: Vec<(String, Script)>,
+}
+
+impl Scripts {
+    fn next_reply(&mut self, child: bool, request: &str) -> Option<String> {
+        if !child {
+            return self.parent.next();
+        }
+        self.children
+            .iter_mut()
+            .find(|(marker, _)| request.contains(marker.as_str()))
+            .and_then(|(_, script)| script.next())
+    }
+}
+
+/// Replace `{task0}`, `{task1}`, … in a scripted reply with the task ids the
+/// request has already reported.
+///
+/// A spawn's id is minted at run time, so a script cannot name it in advance.
+/// Reading it back out of the conversation is what a real model would do.
+fn fill_task_ids(body: &str, request: &str) -> String {
+    if !body.contains("{task") {
+        return body.to_owned();
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for marker in ["\\\"task\\\":\\\"", "\"task\":\""] {
+        let mut rest = request;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let id: String = rest.chars().take(36).collect();
+            if looks_like_uuid(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let mut body = body.to_owned();
+    for (index, id) in ids.iter().enumerate() {
+        body = body.replace(&format!("{{task{index}}}"), id);
+    }
+    body
+}
+
+fn looks_like_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.char_indices().all(|(at, character)| match at {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        })
+}
+
+/// Whether a request came from a subagent rather than the parent turn.
+///
+/// Read from the instructions the supervisor writes, which is the one thing
+/// only a child's request carries.
+fn is_child_request(body: &str) -> bool {
+    body.contains("You are a subagent")
 }
 
 /// Read one HTTP request and return its body.
@@ -467,6 +714,19 @@ fn spawns(goal: &str, capabilities: &str) -> String {
     ])
 }
 
+/// A parent reply that waits for every subagent it started.
+fn waits() -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-wait",
+            "type": "function",
+            "function": {"name": "task.wait", "arguments": "{}"}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
 /// A child reply that asks to write, which its own grants must refuse.
 fn tries_to_write() -> String {
     sse(&[
@@ -486,22 +746,86 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("notes.txt"), "the answer is 42\n").unwrap();
 
-    // Parent asks for a subagent; the child reads, then tries to write, then
-    // answers. The parent reports what the child said.
-    let provider = FakeProvider::serving(vec![
-        spawns("what does notes.txt say", "\"fs.read\""),
-        asks_to_read("notes.txt"),
-        tries_to_write(),
-        answers("notes.txt says 42."),
-        answers("the subagent found 42."),
-    ]);
+    // The parent starts a subagent, keeps its turn, and only then waits for
+    // the answer. The child reads, tries to write, and answers — on its own
+    // thread, against its own half of the script.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns("what does notes.txt say", "\"fs.read\""),
+            waits(),
+            answers("the subagent found 42."),
+        ],
+        vec![(
+            "what does notes.txt say",
+            vec![
+                asks_to_read("notes.txt"),
+                tries_to_write(),
+                answers("notes.txt says 42."),
+            ],
+        )],
+    );
+    configure_delegating(home.path(), provider.port);
+
+    let (code, records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["run", "find out what notes.txt says"],
+    );
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+    assert_eq!(result["status"], "completed");
+
+    let seen = provider.requests();
+    let (child, parent): (Vec<&Value>, Vec<&Value>) = seen
+        .iter()
+        .partition(|body| is_child_request(&body.to_string()));
+
+    // The parent was offered the whole supervisor surface, because this policy
+    // delegates. Waiting is a separate call now, which is what makes starting
+    // one child and continuing to work possible at all.
+    let tools: Vec<&str> = parent[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"task.spawn"), "{tools:?}");
+    assert!(tools.contains(&"task.wait"), "{tools:?}");
+
+    // What `task.spawn` returned: ids and nothing to wait on, rather than the
+    // child's answer.
+    let spawned = last_tool_result(parent[1]);
+    assert!(
+        !spawned.starts_with("error:"),
+        "the spawn failed: {spawned}"
+    );
+    let spawned: Value = serde_json::from_str(&spawned).unwrap();
+    assert!(spawned["task"].is_string(), "{spawned}");
+    assert!(spawned["attempt"].is_string(), "{spawned}");
+
+    // The child holds only what was delegated: its write was refused by its
+    // own runtime, not by the parent's.
+    let refused = last_tool_result(child.last().expect("the child asked something"));
+    assert!(refused.starts_with("error:"), "{refused}");
+    assert!(
+        !workspace.path().join("escaped.txt").exists(),
+        "a subagent must not be able to write"
+    );
+
+    // And `task.wait` is where the answer reaches the parent.
+    let waited = last_tool_result(parent[2]);
+    assert!(waited.contains("notes.txt says 42."), "{waited}");
+}
+
+/// A workspace whose policy lets the parent write and lets it delegate reads.
+fn configure_delegating(home: &Path, port: u16) {
     write_settings(
-        &settings_path(home.path()),
+        &settings_path(home),
         &format!(
             "schema_version = 1\n\
              [provider.endpoint.local]\n\
              kind = \"openai\"\n\
-             base_url = \"http://127.0.0.1:{}\"\n\
+             base_url = \"http://127.0.0.1:{port}\"\n\
              model = \"test-model\"\n\
              api_key_env = \"ARSY_TEST_KEY\"\n\
              # Delegation is off unless a rule says otherwise, so the depth is\n\
@@ -516,65 +840,402 @@ fn a_subagent_holds_less_authority_than_the_parent_that_spawned_it() {
              id = \"parent-writes\"\n\
              effect = \"allow\"\n\
              action = \"fs.write\"\n\
-             resource = \"file:**\"\n",
-            provider.port
+             resource = \"file:**\"\n"
         ),
     );
+}
+
+/// Three `task.spawn` calls in one reply, so the parent starts them all
+/// before it reads any of them back.
+fn spawns_three() -> String {
+    let call = |index: usize, goal: &str| {
+        serde_json::json!({
+            "index": index,
+            "id": format!("call-spawn-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.spawn",
+                "arguments": format!("{{\"goal\": \"{goal}\", \"capabilities\": [\"fs.read\"]}}")
+            }
+        })
+    };
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            call(0, "what does one.txt say"),
+            call(1, "what does two.txt say"),
+            call(2, "what does three.txt say"),
+        ]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn three_subagents_investigate_at_once_while_the_parent_keeps_its_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // The parent starts three children in one reply, asks what they are doing
+    // while they work, and only then waits. Each child answers in one round.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns_three(),
+            status(),
+            waits(),
+            answers("all three reported."),
+        ],
+        vec![
+            ("what does one.txt say", vec![answers("one says A.")]),
+            ("what does two.txt say", vec![answers("two says B.")]),
+            ("what does three.txt say", vec![answers("three says C.")]),
+        ],
+    );
+    configure_delegating(home.path(), provider.port);
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "survey the repo"]);
+    let result = result(&records);
+    assert_eq!(code, 0, "{result:#?}");
+
+    let seen = provider.requests();
+    let parent: Vec<&Value> = seen
+        .iter()
+        .filter(|body| !is_child_request(&body.to_string()))
+        .collect();
+
+    // The claim of the phase: the children overlapped rather than taking
+    // turns, and the parent was still issuing calls while they did.
+    let children = seen.len() - parent.len();
+    assert!(
+        provider.peak_children() > 1,
+        "subagents ran one after another, not at once: {children} child requests, \
+         parent asked {} times, spawn said {}",
+        parent.len(),
+        last_tool_result(parent[1])
+    );
+    let reported = last_tool_result(parent[2]);
+    assert!(reported.contains("\"state\":\"running\""), "{reported}");
+
+    // And every answer reaches the parent through one wait.
+    let waited = last_tool_result(parent[3]);
+    for answer in ["one says A.", "two says B.", "three says C."] {
+        assert!(waited.contains(answer), "{waited}");
+    }
+}
+
+/// Two isolated writers in one reply, each on its own component.
+fn spawns_two_writers() -> String {
+    let call = |index: usize, goal: &str| {
+        serde_json::json!({
+            "index": index,
+            "id": format!("call-writer-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.spawn",
+                "arguments": serde_json::json!({
+                    "goal": goal,
+                    "capabilities": ["fs.read", "fs.write"],
+                    "workspace": "isolated_writer",
+                }).to_string()
+            }
+        })
+    };
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            call(0, "rewrite one.txt"),
+            call(1, "rewrite two.txt"),
+        ]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// A writer's reply: change one file, then report the manifest its task asked
+/// for. `fs.write` is the child's own grant, into its own view.
+fn writes(path: &str, content: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": format!("call-write-{path}"),
+            "type": "function",
+            "function": {
+                "name": "fs.write",
+                "arguments": serde_json::json!({"path": path, "content": content}).to_string()
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// A writer's manifest, as the object its `required_output` demands.
+fn reports(path: &str) -> String {
+    answers(
+        &serde_json::json!({
+            "summary": format!("rewrote {path}"),
+            "changed_files": [path],
+            "validation": ["artifact-check"],
+            "unresolved": [],
+        })
+        .to_string(),
+    )
+}
+
+/// A parent reply that applies one writer's work.
+fn integrates(index: usize) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": format!("call-integrate-{index}"),
+            "type": "function",
+            "function": {
+                "name": "task.integrate",
+                // The id is not known when the script is written, so the
+                // arguments are filled in from the spawn result by the fake
+                // provider's caller. `{task}` is replaced below.
+                "arguments": format!("{{\"task\": \"{{task{index}}}\"}}")
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn two_writers_change_separate_components_and_an_integrator_applies_both() {
+    let Some(workspace) = git_workspace(&[("one.txt", "base one\n"), ("two.txt", "base two\n")])
+    else {
+        eprintln!("skipped: git is not available");
+        return;
+    };
+    let home = tempfile::tempdir().unwrap();
+
+    // Two writers, each in a tree of its own, then two integrations into the
+    // workspace the parent owns.
+    let provider = FakeProvider::delegating(
+        vec![
+            spawns_two_writers(),
+            waits(),
+            integrates(0),
+            integrates(1),
+            answers("both changes are in."),
+        ],
+        vec![
+            (
+                "rewrite one.txt",
+                vec![writes("one.txt", "from writer one\n"), reports("one.txt")],
+            ),
+            (
+                "rewrite two.txt",
+                vec![writes("two.txt", "from writer two\n"), reports("two.txt")],
+            ),
+        ],
+    );
+    configure_delegating_writers(home.path(), provider.port);
 
     let (code, records) = arsy(
         workspace.path(),
         home.path(),
-        &["run", "find out what notes.txt says"],
+        &["run", "split this work in two"],
     );
     let result = result(&records);
     assert_eq!(code, 0, "{result:#?}");
-    assert_eq!(result["status"], "completed");
 
-    // The parent was offered the spawn tool, because this policy delegates.
-    let first = provider.request();
-    let tools: Vec<&str> = first["tools"]
-        .as_array()
-        .unwrap()
+    let seen = provider.requests();
+    let trail: Vec<String> = seen
         .iter()
-        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .filter(|body| !is_child_request(&body.to_string()))
+        .map(last_tool_result)
         .collect();
-    assert!(tools.contains(&"task.spawn"), "{tools:?}");
+    let child_trail: Vec<String> = seen
+        .iter()
+        .filter(|body| is_child_request(&body.to_string()))
+        .map(last_tool_result)
+        .collect();
 
-    // What the spawn call actually returned, so a failure here says why.
-    let second = provider.request();
-    let spawn_result = second["messages"]
+    // Both writers' work reached the target, and neither overwrote the other.
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("one.txt")).unwrap(),
+        "from writer one\n",
+        "parent saw {trail:#?}\nchildren saw {child_trail:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("two.txt")).unwrap(),
+        "from writer two\n"
+    );
+
+    // The parent's last two tool results are the two integrations.
+    for applied in &trail[3..5] {
+        assert!(applied.contains("\"applied\""), "{trail:#?}");
+    }
+
+    // The views the writers worked in are gone, and nothing they wrote
+    // reached the workspace except through the integrator.
+    let views = workspace.path().join(".arsy/views");
+    let remaining: Vec<_> = std::fs::read_dir(&views)
+        .map(|entries| entries.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        remaining.is_empty(),
+        "isolated views were left behind: {remaining:?}"
+    );
+}
+
+/// A Git workspace with the given files committed, or `None` where Git is
+/// not installed.
+fn git_workspace(files: &[(&str, &str)]) -> Option<tempfile::TempDir> {
+    let workspace = tempfile::tempdir().unwrap();
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .args(arguments)
+            .current_dir(workspace.path())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    git(&["init", "--quiet"])?;
+    git(&["config", "user.name", "ARSY Test"])?;
+    git(&["config", "user.email", "arsy@example.invalid"])?;
+    // Windows runners rewrite line endings on checkout by default, and this
+    // test compares a writer's file byte for byte to say whether its work
+    // arrived. That question is not about Git's line-ending policy.
+    git(&["config", "core.autocrlf", "false"])?;
+    for (path, content) in files {
+        std::fs::write(workspace.path().join(path), content).unwrap();
+    }
+    git(&["add", "--all"])?;
+    git(&["commit", "--quiet", "-m", "base"])?;
+    Some(workspace)
+}
+
+/// As `configure_delegating`, and writing is delegable too — which is what
+/// makes an isolated writer possible.
+fn configure_delegating_writers(home: &Path, port: u16) {
+    write_settings(
+        &settings_path(home),
+        &format!(
+            "schema_version = 1\n\
+             [provider.endpoint.local]\n\
+             kind = \"openai\"\n\
+             base_url = \"http://127.0.0.1:{port}\"\n\
+             model = \"test-model\"\n\
+             api_key_env = \"ARSY_TEST_KEY\"\n\
+             [[policy.rules]]\n\
+             id = \"delegate-reads\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.read\"\n\
+             resource = \"file:**\"\n\
+             delegation_depth = 2\n\
+             [[policy.rules]]\n\
+             id = \"delegate-writes\"\n\
+             effect = \"allow\"\n\
+             action = \"fs.write\"\n\
+             resource = \"file:**\"\n\
+             delegation_depth = 2\n"
+        ),
+    );
+}
+
+/// A reply that commits one acceptance criterion settled by a command.
+fn commits_criterion(statement: &str, check: &str) -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-criterion",
+            "type": "function",
+            "function": {
+                "name": "task.criterion",
+                "arguments": serde_json::json!({
+                    "statement": statement,
+                    "check": check,
+                }).to_string()
+            }
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+#[test]
+fn a_turn_that_finishes_without_running_its_own_check_is_not_verified() {
+    let workspace = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+
+    // The model commits to a criterion, then answers as if it were done —
+    // which is exactly the claim proof-carrying completion refuses.
+    let provider = FakeProvider::serving(vec![
+        commits_criterion("the suite passes", "cargo test --workspace"),
+        answers("all done, the tests pass."),
+    ]);
+    configure(home.path(), provider.port);
+
+    let (code, records) = arsy(workspace.path(), home.path(), &["run", "fix the parser"]);
+    let ran = result(&records);
+    assert_eq!(code, 0, "{ran:#?}");
+    // The turn itself completed: execution finished is a true statement.
+    assert_eq!(ran["status"], "completed");
+
+    // And the turn reported, in its own records, that nothing proves it.
+    let proof = records
+        .iter()
+        .find(|record| record["type"] == "task.proof")
+        .expect("the turn reports what its criteria say");
+    assert_eq!(proof["payload"]["state"], "unverified");
+    assert_eq!(
+        proof["payload"]["outstanding"][0]["why"],
+        "this check has not been run"
+    );
+
+    // `arsy verify`, run from outside, reaches the same verdict and says so
+    // with a nonzero exit code — which is what a CI job reads.
+    let session = ran["session"].as_str().expect("a session id");
+    let (verify_code, verify_records) = arsy(workspace.path(), home.path(), &["verify", session]);
+    assert_ne!(verify_code, 0, "{verify_records:#?}");
+    let verdict = result(&verify_records);
+    assert_eq!(verdict["state"], "unverified", "{verdict:#?}");
+    assert_eq!(
+        verdict["tasks"][0]["criteria"][0]["statement"],
+        "the suite passes"
+    );
+
+    // A session that is not here is a question about the id, not a verdict
+    // about the work: answering a typo with "unverified" reads as a finding.
+    let (missing_code, missing_records) = arsy(
+        workspace.path(),
+        home.path(),
+        &["verify", "00000000-0000-4000-8000-000000000000"],
+    );
+    assert_ne!(missing_code, 0);
+    assert_eq!(result(&missing_records)["code"], "ARSY-SCH-1004");
+
+    // And verifying is read-only: a workspace it was pointed at by mistake
+    // is left exactly as it was found.
+    let untouched = tempfile::tempdir().unwrap();
+    let (fresh_code, _) = arsy(untouched.path(), home.path(), &["verify", session]);
+    assert_ne!(fresh_code, 0);
+    assert!(
+        !untouched.path().join(".arsy").exists(),
+        "verifying created state in a workspace it only read"
+    );
+}
+
+/// A parent reply that asks what its subagents are doing.
+fn status() -> String {
+    sse(&[
+        serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0,
+            "id": "call-status",
+            "type": "function",
+            "function": {"name": "task.status", "arguments": "{}"}
+        }]}}]}),
+        serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+    ])
+}
+
+/// The content of the last tool result in a request's messages.
+fn last_tool_result(body: &Value) -> String {
+    body["messages"]
         .as_array()
         .unwrap()
         .iter()
         .rev()
         .find(|message| message["role"] == "tool")
         .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
-        .unwrap_or_default();
-    assert!(
-        !spawn_result.starts_with("error:"),
-        "the spawn failed: {spawn_result}"
-    );
-
-    // The child was offered the workspace tools but holds only what was
-    // delegated: its write was refused by its own runtime, not by the parent's.
-    drop(provider.request()); // the child has the file and asks to write
-    let refused = provider.request();
-    let messages = refused["messages"].as_array().unwrap();
-    let tool_result = messages
-        .iter()
-        .rev()
-        .find(|message| message["role"] == "tool")
-        .expect("the child was told what happened");
-    let text = tool_result["content"].as_str().unwrap();
-    assert!(text.starts_with("error:"), "{text}");
-    assert!(
-        !workspace.path().join("escaped.txt").exists(),
-        "a subagent must not be able to write"
-    );
-
-    // The parent's last request carries the child's answer as a tool result.
-    let parent = provider.request().to_string();
-    assert!(parent.contains("notes.txt says 42."), "{parent}");
+        .unwrap_or_default()
 }
 
 #[test]

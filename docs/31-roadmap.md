@@ -204,6 +204,22 @@ outputs and integration state.
 | 8 | P2 intelligence/ecosystem | Semantic expansion and automatic memory curation | Each addition proves held-out gain without trust regression |
 | 9 | P1 operations / P3 scale | Launch readiness, then remote/platform maturity | Signed verified release first; distributed features remain ADR-gated |
 
+### Delivered at this revision
+
+Phases 1 through 4 have a reachable slice with executable checks behind it.
+What is **SHIPPED** and what is still **PARTIAL** within each:
+
+| Phase | Shipped | Still partial |
+|---|---|---|
+| 1 | Scheduler with keyed admission, the attempt lifecycle, non-blocking start, status/wait/result/cancel/retry, durable mailbox, cancellation into the child loop, typed results, per-attempt traces | Retry is reported and started by a caller rather than driven by a background loop; achieved parallelism is not measured |
+| 2 | Durable workspace assignments, revision-pinned reader views, worktree writers on their own branch, writer results, typed integration with preflight, serialized Git administration, view cleanup | Recovery of views abandoned by a dead process is reported by the graph but not yet swept by a command; overlay backends remain out of scope |
+| 3 | Acceptance criteria and judgments on the graph, the prover and its fraud checks, the stored manifest, `arsy verify` with distinct exit codes, the graph-level verification gate | Criteria are committed by the turn rather than compiled from TODOs; evidence applicability across an integrated revision is checked by revision only |
+| 4 | Per-trial fresh checkouts, dirty-tree refusal under `--strict`, pinned per-arm manifests and recorded deviations, safety-regression gate, minimum-trials rule, tiered CI | No competitor adapters — an arm can pin another harness and version, but nothing drives one; compactions, conflicts, and achieved parallelism are not observable from a trial's output and are therefore not reported |
+
+Nothing in the "still partial" column is reported as present: a metric no
+trial can observe is absent from the report rather than zero, and a criterion
+nothing can decide is `unverifiable` rather than unchecked.
+
 ## Plan → commitment → execution
 
 Source inspection confirms three useful state classes:
