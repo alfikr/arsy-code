@@ -518,29 +518,43 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, Diag
         Some("compat") => Command::CompatExplain {
             ecosystem: compatibility_kind(parsed.positional)?,
         },
-        Some("verify") => verify::parse(&parsed)?,
-        Some("session") => session::parse(&parsed)?,
-        Some("artifact") => evidence::parse_artifact(&parsed)?,
-        Some("gc") => evidence::parse_gc(&parsed)?,
-        Some("migrate") => session::parse_migrate(&parsed)?,
-        Some("review") => review::parse(&parsed)?,
-        Some("code") => code::parse(&parsed)?,
-        Some("memory") => memory::parse(&parsed)?,
-        Some("policy") => policy::parse(&parsed)?,
-        Some("serve") => serve::parse(&parsed)?,
-        Some("skill") => extensions::parse_skill(&parsed)?,
-        Some("plugin") => extensions::parse_plugin(&parsed)?,
-        Some("provider") => provider::parse_list(&parsed)?,
-        Some("model") => provider::parse_models(&parsed)?,
         Some("auth") => parse_auth(parsed.positional, parsed.handle, parsed.force)?,
         Some("config") => parse_config(parsed.positional)?,
-        Some("mcp") => mcp::parse(&parsed)?,
         Some("hook") => {
             integrations::parse("hook", parsed.positional, parsed.source, parsed.event)?
         }
-        Some(other) => return Err(unknown_command(other)),
+        Some(name) => match parse_subsystem(name, &parsed) {
+            Some(command) => command?,
+            None => return Err(unknown_command(name)),
+        },
     };
     Ok(invocation(global, command))
+}
+
+/// The subcommands whose own module parses them from the shared arguments.
+///
+/// Separate from [`parse`] because they are all the same shape: a name, and
+/// a module that reads what it needs. The ones left there take `parsed` apart
+/// instead, which is why they cannot be here.
+fn parse_subsystem(name: &str, parsed: &ParsedArguments) -> Option<Result<Command, Diagnostic>> {
+    Some(match name {
+        "verify" => verify::parse(parsed),
+        "session" => session::parse(parsed),
+        "artifact" => evidence::parse_artifact(parsed),
+        "gc" => evidence::parse_gc(parsed),
+        "migrate" => session::parse_migrate(parsed),
+        "review" => review::parse(parsed),
+        "code" => code::parse(parsed),
+        "memory" => memory::parse(parsed),
+        "policy" => policy::parse(parsed),
+        "serve" => serve::parse(parsed),
+        "skill" => extensions::parse_skill(parsed),
+        "plugin" => extensions::parse_plugin(parsed),
+        "provider" => provider::parse_list(parsed),
+        "model" => provider::parse_models(parsed),
+        "mcp" => mcp::parse(parsed),
+        _ => return None,
+    })
 }
 
 #[derive(Default)]

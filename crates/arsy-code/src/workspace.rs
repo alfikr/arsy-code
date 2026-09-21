@@ -713,33 +713,46 @@ pub enum WorkspaceError {
     Io(io::Error),
 }
 
-impl fmt::Display for WorkspaceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OwnerAlreadyHasWriter(owner) => {
-                write!(formatter, "agent {owner} already owns a mutable workspace")
-            }
-            Self::PolicyRequired => {
-                formatter.write_str("workspace merge requires policy authorization")
-            }
-            Self::NotGit => formatter.write_str("workspace is not a Git repository"),
-            Self::SnapshotTooLarge => {
-                formatter.write_str("workspace snapshot exceeds bounded limits")
-            }
+impl WorkspaceError {
+    /// The whole message, for a variant that has nothing to interpolate.
+    const fn constant(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::PolicyRequired => "workspace merge requires policy authorization",
+            Self::NotGit => "workspace is not a Git repository",
+            Self::SnapshotTooLarge => "workspace snapshot exceeds bounded limits",
+            Self::InvalidRevision => "writer revision must be a full hexadecimal object ID",
+            Self::Unvalidated => "integration requires recorded validation evidence",
+            _ => return None,
+        })
+    }
+
+    /// Something about a path this module was given.
+    fn describe_path(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::UnsupportedFile(path) => write!(
                 formatter,
                 "snapshot refuses special file {}",
                 path.display()
             ),
             Self::InvalidPath(path) => write!(formatter, "path is not UTF-8: {}", path.display()),
-            Self::InvalidRevision => {
-                formatter.write_str("writer revision must be a full hexadecimal object ID")
-            }
             Self::DirtySource(path) => write!(
                 formatter,
                 "{} has uncommitted work; commit, stash, or allow it to be carried",
                 path.display()
             ),
+            Self::PathOverlap(path) => {
+                write!(formatter, "{path} was already changed by this round")
+            }
+            _ => return None,
+        })
+    }
+
+    /// A reason an integration was refused before it ran.
+    fn describe_refusal(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
+            Self::OwnerAlreadyHasWriter(owner) => {
+                write!(formatter, "agent {owner} already owns a mutable workspace")
+            }
             Self::StaleBase { base, target } => write!(
                 formatter,
                 "the writer started from {base}, which is not in {target}'s history"
@@ -748,16 +761,33 @@ impl fmt::Display for WorkspaceError {
                 formatter,
                 "the target was {expected} when this was decided and is {actual} now"
             ),
-            Self::PathOverlap(path) => {
-                write!(formatter, "{path} was already changed by this round")
-            }
-            Self::Unvalidated => {
-                formatter.write_str("integration requires recorded validation evidence")
-            }
             Self::Unresolved(what) => write!(formatter, "the writer left {what} unresolved"),
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for WorkspaceError {
+    /// The constants, then two tables by subject, then what came from
+    /// somewhere else: Git's own words, and the errors this wraps.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(message) = self.constant() {
+            return formatter.write_str(message);
+        }
+        if let Some(written) = self
+            .describe_path(formatter)
+            .or_else(|| self.describe_refusal(formatter))
+        {
+            return written;
+        }
+        match self {
             Self::Git(message) => formatter.write_str(message),
             Self::Edit(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
+            // Unreachable: every other variant is claimed above, and a new
+            // one that is not stops compiling in whichever table it belongs
+            // to rather than reaching here silently.
+            other => write!(formatter, "workspace error: {other:?}"),
         }
     }
 }

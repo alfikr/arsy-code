@@ -1597,9 +1597,36 @@ impl TaskGraph {
         let EventPayload::Inline { data } = &event.payload else {
             return Ok(());
         };
-        match event.kind.as_str() {
+        // Four tables rather than one, split by what each event is about.
+        // An event nobody claims is not an error: a stream carries the turn
+        // lifecycle and usage too, and a graph reads only its own part.
+        let kind = event.kind.as_str();
+        match self.replay_lifecycle(kind, data) {
+            Some(replayed) => replayed,
+            None => match self.replay_attempt(kind, data) {
+                Some(replayed) => replayed,
+                None => match self.replay_acceptance(kind, data) {
+                    Some(replayed) => replayed,
+                    None => self.replay_workspace(kind, data).unwrap_or(Ok(())),
+                },
+            },
+        }
+    }
+
+    /// Tasks themselves: created, moved, authorized, charged.
+    fn replay_lifecycle(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "task.created" => self.replay_created(data),
             "task.transitioned" => self.replay_transitioned(data),
+            "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
+            "task.budget_used" => self.replay_budget_used(data),
+            _ => return None,
+        })
+    }
+
+    /// One try of a task, and what it recorded along the way.
+    fn replay_attempt(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "task.attempt_started" => self.replay_attempt_started(data),
             "task.attempt_finished" => self.replay_attempt_finished(data),
             "task.attempt_expired" => self.replay_attempt_expired(data),
@@ -1607,18 +1634,30 @@ impl TaskGraph {
             "task.attempt_cancel_requested" => self.replay_cancel_requested(data),
             "task.attempt_superseded" => self.replay_attempt_superseded(data),
             "task.attempt_trace" => self.replay_trace(data),
+            _ => return None,
+        })
+    }
+
+    /// What a task committed to, and what was said about it.
+    fn replay_acceptance(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "task.criterion_declared" => self.replay_criterion(data),
             "task.criterion_judged" => self.replay_judgment(data),
             "task.criterion_retired" => self.replay_retired(data),
+            "task.message_sent" => self.replay_message_sent(data),
+            "task.messages_delivered" => self.replay_messages_delivered(data),
+            _ => return None,
+        })
+    }
+
+    /// Which view belongs to whom, and what a writer produced in it.
+    fn replay_workspace(&mut self, kind: &str, data: &Value) -> Option<Result<(), GraphError>> {
+        Some(match kind {
             "workspace.assigned" => self.replay_assigned(data),
             "workspace.released" => self.replay_released(data),
             "workspace.writer_result" => self.replay_writer_result(data),
-            "task.message_sent" => self.replay_message_sent(data),
-            "task.messages_delivered" => self.replay_messages_delivered(data),
-            "task.authorized" | "task.authority_narrowed" => self.replay_authority(data),
-            "task.budget_used" => self.replay_budget_used(data),
-            _ => Ok(()),
-        }
+            _ => return None,
+        })
     }
 
     fn replay_created(&mut self, data: &Value) -> Result<(), GraphError> {
@@ -2085,9 +2124,9 @@ pub enum GraphError {
 impl GraphError {
     /// The message for a variant that has nothing to interpolate.
     ///
-    /// The fallback is unreachable through [`Display`](fmt::Display), which
-    /// names these variants explicitly: adding one without giving it a message
-    /// stops compiling there rather than reaching this arm.
+    /// Also where [`Display`](fmt::Display) lands a variant none of its
+    /// tables claimed, so a new one without a message reads as "task graph
+    /// error" rather than as nothing at all.
     const fn constant(&self) -> &'static str {
         match self {
             Self::BudgetExhausted(_) => "task budget exhausted with partial evidence",
@@ -2100,14 +2139,30 @@ impl GraphError {
     }
 }
 
-impl fmt::Display for GraphError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+impl GraphError {
+    /// Something about a task itself.
+    fn describe_task(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::AlreadyAuthorized(id) => {
                 write!(formatter, "task {id} already holds recorded authority")
             }
             Self::Duplicate(id) => write!(formatter, "task {id} already exists"),
             Self::Unknown(id) => write!(formatter, "task {id} does not exist"),
+            Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
+            Self::InvalidTransition(from, to) => {
+                write!(formatter, "invalid task transition {from:?} -> {to:?}")
+            }
+            Self::Ended(id, state) => {
+                write!(formatter, "task {id} is {state:?} and takes no messages")
+            }
+            Self::InboxFull(id) => write!(formatter, "task {id} has too many undelivered messages"),
+            _ => return None,
+        })
+    }
+
+    /// Something about one try of a task.
+    fn describe_attempt(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::UnknownAttempt(id) => write!(formatter, "attempt {id} does not exist"),
             Self::FencedAttempt(id) => write!(
                 formatter,
@@ -2118,22 +2173,23 @@ impl fmt::Display for GraphError {
             Self::Cancelling(id) => {
                 write!(formatter, "attempt {id} has already been asked to stop")
             }
-            Self::ContractViolation(id, why) => {
-                write!(
-                    formatter,
-                    "attempt {id} did not meet its required output: {why}"
-                )
-            }
+            Self::ContractViolation(id, why) => write!(
+                formatter,
+                "attempt {id} did not meet its required output: {why}"
+            ),
             Self::NotRetryable(id, how) => {
                 write!(formatter, "attempt {id} is {how:?} and will not be retried")
             }
             Self::RetriesExhausted(id) => write!(formatter, "task {id} has no retries left"),
             Self::NothingToRetry(id) => write!(formatter, "task {id} has no attempt to retry"),
             Self::StillRunning(id) => write!(formatter, "attempt {id} has not ended"),
-            Self::Ended(id, state) => {
-                write!(formatter, "task {id} is {state:?} and takes no messages")
-            }
-            Self::InboxFull(id) => write!(formatter, "task {id} has too many undelivered messages"),
+            _ => return None,
+        })
+    }
+
+    /// Something about a view, a criterion, or a proof.
+    fn describe_claim(&self, formatter: &mut fmt::Formatter<'_>) -> Option<fmt::Result> {
+        Some(match self {
             Self::UnknownAssignment(id) => {
                 write!(formatter, "workspace assignment {id} does not exist")
             }
@@ -2148,6 +2204,10 @@ impl fmt::Display for GraphError {
                 formatter,
                 "{path} has uncommitted work and this policy refuses to start from it"
             ),
+            Self::NotAWriter(id) => write!(
+                formatter,
+                "assignment {id} is read-only and produces no result"
+            ),
             Self::DuplicateCriterion(id) => write!(formatter, "criterion {id} already exists"),
             Self::UnknownCriterion(id) => write!(formatter, "criterion {id} does not exist"),
             Self::NotAJudgment(id) => write!(
@@ -2155,24 +2215,27 @@ impl fmt::Display for GraphError {
                 "criterion {id} is decided by a check, not by a verdict"
             ),
             Self::NotAProof(id, why) => write!(formatter, "task {id} cannot be verified: {why}"),
-            Self::NotAWriter(id) => {
-                write!(
-                    formatter,
-                    "assignment {id} is read-only and produces no result"
-                )
-            }
-            Self::Cycle(id) => write!(formatter, "task {id} introduces a dependency cycle"),
-            Self::InvalidTransition(from, to) => {
-                write!(formatter, "invalid task transition {from:?} -> {to:?}")
-            }
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for GraphError {
+    /// Three tables by subject, then what is left: an error someone else
+    /// wrote, and the ones whose whole message is a constant.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(written) = self
+            .describe_task(formatter)
+            .or_else(|| self.describe_attempt(formatter))
+            .or_else(|| self.describe_claim(formatter))
+        {
+            return written;
+        }
+        match self {
             Self::InvalidEvent(message) => write!(formatter, "invalid task event: {message}"),
             Self::Attenuation(error) => error.fmt(formatter),
             Self::Store(error) => error.fmt(formatter),
-            fixed @ (Self::BudgetExhausted(_)
-            | Self::BudgetExpansion
-            | Self::MissingAssignee
-            | Self::MissingParentGrant
-            | Self::Overflow) => formatter.write_str(fixed.constant()),
+            fixed => formatter.write_str(fixed.constant()),
         }
     }
 }

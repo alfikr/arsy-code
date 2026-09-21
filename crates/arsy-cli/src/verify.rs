@@ -181,26 +181,37 @@ fn human(report: &Value) -> Value {
     }
     for task in report["tasks"].as_array().unwrap_or(&Vec::new()) {
         text.push_str(&format!(
-            "\n  task {} — {}\n    {}\n",
+            "\n  task {} — {}\n    {}\n{}",
             task["task"].as_str().unwrap_or("?"),
             task["state"].as_str().unwrap_or("?"),
             task["goal"].as_str().unwrap_or(""),
+            task["criteria"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(criterion_line)
+                .collect::<String>(),
         ));
-        for criterion in task["criteria"].as_array().unwrap_or(&Vec::new()) {
-            text.push_str(&format!(
-                "    [{}] {}{}\n        {}\n",
-                criterion["state"].as_str().unwrap_or("?"),
-                criterion["statement"].as_str().unwrap_or(""),
-                if criterion["required"] == json!(false) {
-                    " (optional)"
-                } else if criterion["human_judgment"] == json!(true) {
-                    " (judgment, not a check)"
-                } else {
-                    ""
-                },
-                criterion["why"].as_str().unwrap_or(""),
-            ));
-        }
     }
     json!({"text": text})
+}
+
+/// One criterion as a person reads it.
+fn criterion_line(criterion: &Value) -> String {
+    // What decided it, said out loud: a reader has to be able to tell a
+    // check that ran from a person who looked, and an optional criterion
+    // from one that blocks.
+    let kind = if criterion["required"] == json!(false) {
+        " (optional)"
+    } else if criterion["human_judgment"] == json!(true) {
+        " (judgment, not a check)"
+    } else {
+        ""
+    };
+    format!(
+        "    [{}] {}{kind}\n        {}\n",
+        criterion["state"].as_str().unwrap_or("?"),
+        criterion["statement"].as_str().unwrap_or(""),
+        criterion["why"].as_str().unwrap_or(""),
+    )
 }

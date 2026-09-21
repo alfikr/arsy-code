@@ -684,9 +684,7 @@ impl<'a> Supervisor<'a> {
         // satisfied by any of them, and waiting on the first would ignore the
         // second finishing first.
         loop {
-            for index in self.finished(&wanted) {
-                self.reap(index, emitter);
-            }
+            self.reap_finished(&wanted, emitter);
             let states: Vec<TaskState> = wanted
                 .iter()
                 .filter_map(|task| self.child(*task))
@@ -1171,6 +1169,13 @@ impl Supervisor<'_> {
             .parse::<TaskId>()
             .map_err(|_| format!("{id} is not a task id"))?;
         self.child(task).map(|_| task).ok_or_else(|| unknown(task))
+    }
+
+    /// Join every named child whose worker has stopped.
+    fn reap_finished(&mut self, wanted: &[TaskId], emitter: &mut Emitter) {
+        for index in self.finished(wanted) {
+            self.reap(index, emitter);
+        }
     }
 
     /// Indices of children whose worker has finished but not been reaped.
