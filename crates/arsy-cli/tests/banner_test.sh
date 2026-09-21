@@ -18,10 +18,14 @@ BINARY=${1:-${ARSY_BINARY:-target/debug/arsy}}
 }
 BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 
-# One row of the mark, from LOGO in crates/arsy-cli/src/tui.rs. A row with no
+# The mark's bottom row, from MARK in crates/arsy-cli/src/tui.rs. A row with no
 # leading or trailing blanks is the one a card cannot pad into existence.
-MARK='▀▄█    █▀▀▄█'
-LOGO_COLOUR=$(printf '\033[38;2;64;220;121m')
+# A run of glyphs like this only ever reaches the terminal under NO_COLOR,
+# because a coloured card escapes every cell of the mark separately.
+MARK='▟█▛ ▐███▌ ▜█▙'
+# That row's leftmost cell as a coloured card paints it: the gradient colour
+# its three lit subpixels average to, from `assets/logo.svg`'s own stops.
+CELL=$(printf '\033[38;2;53;202;217m▟\033[0m')
 
 WORKSPACE=$(mktemp -d "${TMPDIR:-/tmp}/arsy-banner.XXXXXX")
 trap 'rm -rf "$WORKSPACE"' EXIT
@@ -50,7 +54,9 @@ banner() {
         set -- script -q /dev/null sh "$SESSION" "$columns"
     fi
     {
-        sleep 1
+        # Long enough for the launch intro to finish sweeping the mark, which
+        # runs before raw mode and so before a typed key is read.
+        sleep 2
         printf '/quit\r'
         sleep 1
     } | "$@" >"$out" 2>&1 &
@@ -76,12 +82,8 @@ case $wide in
         ;;
 esac
 case $wide in
-    *"$MARK"*) ;;
-    *) echo "error: banner did not render the logo mark" >&2; exit 1 ;;
-esac
-case $wide in
-    *"$LOGO_COLOUR"*) ;;
-    *) echo "error: the mark was not painted in the logo colour" >&2; exit 1 ;;
+    *"$CELL"*) ;;
+    *) echo "error: banner did not paint the logo mark" >&2; exit 1 ;;
 esac
 
 plain=$(HOME=$WORKSPACE XDG_CONFIG_HOME=$WORKSPACE/config NO_COLOR=1; export HOME XDG_CONFIG_HOME NO_COLOR; banner 120)
@@ -90,7 +92,7 @@ case $plain in
     *) echo "error: NO_COLOR dropped the mark instead of its colour" >&2; exit 1 ;;
 esac
 case $plain in
-    *"$LOGO_COLOUR"*) echo "error: NO_COLOR was ignored: the mark is still coloured" >&2; exit 1 ;;
+    *"$CELL"*) echo "error: NO_COLOR was ignored: the mark is still coloured" >&2; exit 1 ;;
 esac
 case $plain in
     *directory:*) ;;
@@ -98,9 +100,11 @@ case $plain in
 esac
 
 # Too narrow to hold both: the text is what a small terminal keeps. The mark
-# needs 25 columns of gutter plus room for a label and a value, so 40 is under
-# the threshold and 60 is still above it.
-narrow=$(HOME=$WORKSPACE XDG_CONFIG_HOME=$WORKSPACE/config; export HOME XDG_CONFIG_HOME; unset NO_COLOR; banner 40)
+# and its gutter take 16 columns, and the card keeps room for a label and a
+# value beside them, so a card narrower than 42 columns drops it and 40 is
+# under that. Run without colour, so the mark it must not have drawn is the
+# unpainted one this script can look for.
+narrow=$(HOME=$WORKSPACE XDG_CONFIG_HOME=$WORKSPACE/config NO_COLOR=1; export HOME XDG_CONFIG_HOME NO_COLOR; banner 40)
 case $narrow in
     *"$MARK"*) echo "error: a 40-column terminal still drew the mark" >&2; exit 1 ;;
 esac
@@ -109,4 +113,4 @@ case $narrow in
     *) echo "error: the narrow card dropped its fields, not just the mark" >&2; exit 1 ;;
 esac
 
-echo "PASS: mark rendered and coloured at 120 columns, uncoloured under NO_COLOR, dropped at 40"
+echo "PASS: mark painted at 120 columns, unpainted under NO_COLOR, dropped at 40"

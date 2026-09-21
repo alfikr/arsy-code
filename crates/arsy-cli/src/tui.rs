@@ -266,52 +266,161 @@ pub fn spawn_key_reader() -> std::sync::mpsc::Receiver<u8> {
 
 const LABEL_WIDTH: usize = 10;
 
-const LOGO_WIDTH: usize = 10;
-const LOGO_HEIGHT: usize = 5;
-/// The half-block mark gets more cells than the image, because at 10 by 5
-/// it has only a hundred pixels to hold the shape and reads as noise. Six rows
-/// keep the card no taller than its labels.
-const BLOCK_LOGO_WIDTH: usize = 20;
-const BLOCK_LOGO_HEIGHT: usize = 6;
-/// Samples per side of each half-block pixel, so a pixel is lit by how much
-/// of it the shape covers rather than by whether a faint edge touched it.
-const BLOCK_LOGO_SAMPLES: usize = 4;
+/// The mark's box on the card, in cells, and the subpixel grid inside it.
+///
+/// One box for both renderings: a terminal that draws images gets the image at
+/// this size and every other terminal gets the block art at this size, so the
+/// card lays out identically either way and only the texture differs.
+///
+/// A cell holds four subpixels, two across and two down, so the art is drawn
+/// at twice the box in each direction. Thirteen by four is close to the mark's
+/// own proportions, so the shape fills the box rather than sitting letterboxed
+/// inside it.
+const MARK_WIDTH: usize = 13;
+const MARK_HEIGHT: usize = 4;
+const MARK_COLUMNS: usize = MARK_WIDTH * 2;
+const MARK_ROWS: usize = MARK_HEIGHT * 2;
 const LOGO_GAP: usize = 3;
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
+
+/// The mark as subpixels, one glyph each, four to a cell: `#` takes the
+/// spectrum gradient, `o` the green core, a space is unlit.
+///
+/// Drawn by hand rather than downsampled from the SVG, because a grid this
+/// small is too few pixels for a downsample to survive: the sampler spends
+/// them on the anti-aliased edges and the arch dissolves into noise. The
+/// colours still come from `assets/logo.svg`, below, so the two renderings of
+/// the mark stay the same mark.
+const MARK: [&str; MARK_ROWS] = [
+    "         ########         ",
+    "       ############       ",
+    "      ####      ####      ",
+    "      ###        ###      ",
+    "    ####   oooo   ####    ",
+    "  #####   oooooo   #####  ",
+    " #####   oooooooo   ##### ",
+    "#####    oooooooo    #####",
+];
+
+/// The `spectrum` stops of `assets/logo.svg`, in the order it lists them.
+const SPECTRUM: [(f32, (u8, u8, u8)); 7] = [
+    (0.0, (0x35, 0xc8, 0xff)),
+    (0.2, (0x35, 0xd0, 0x7f)),
+    (0.4, (0xe6, 0xc8, 0x4f)),
+    (0.56, (0xff, 0x69, 0x48)),
+    (0.72, (0xed, 0x4f, 0x86)),
+    (0.86, (0x8b, 0x5c, 0xf6)),
+    (1.0, (0x39, 0x7c, 0xff)),
+];
+
+/// Its `core` stops, for the green centre.
+const CORE: [(f32, (u8, u8, u8)); 2] = [(0.0, (0x00, 0xa8, 0x78)), (1.0, (0x65, 0xe3, 0x8d))];
+
+/// The two gradient axes as the file states them, `(x1, y1, x2, y2)`.
+const SPECTRUM_AXIS: (f32, f32, f32, f32) = (70.0, 900.0, 1180.0, 350.0);
+const CORE_AXIS: (f32, f32, f32, f32) = (500.0, 950.0, 720.0, 640.0);
+
+/// The drawn shape's bounding box in that same user space, `(x, y, w, h)`,
+/// which the pixel grid above covers. Taken from the SVG's paths, so a pixel
+/// samples the gradient where the shape it belongs to actually sits.
+const MARK_BOUNDS: (f32, f32, f32, f32) = (95.0, 303.0, 1064.0, 650.0);
 
 fn logo(colour: bool) -> &'static [String] {
     static COLOUR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     static MONOCHROME: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     if colour {
-        COLOUR.get_or_init(|| render_logo(true))
+        COLOUR.get_or_init(|| mark_rows(true))
     } else {
-        MONOCHROME.get_or_init(|| render_logo(false))
+        MONOCHROME.get_or_init(|| mark_rows(false))
     }
 }
 
-/// Rasterise the mark into a canvas `scale` times the `columns` by `rows`
-/// cell grid it occupies.
+/// The block art as `MARK_HEIGHT` painted rows.
+fn mark_rows(colour: bool) -> Vec<String> {
+    let glyph = |art: &str, column: usize| {
+        art.as_bytes()
+            .get(column)
+            .map_or(' ', |byte| char::from(*byte))
+    };
+    let corner = |row: usize, column: usize| mark_pixel(glyph(MARK[row], column), column, row);
+    (0..MARK_HEIGHT)
+        .map(|row| {
+            let (top, bottom) = (row * 2, row * 2 + 1);
+            let mut line = String::new();
+            for cell in 0..MARK_WIDTH {
+                let (left, right) = (cell * 2, cell * 2 + 1);
+                line.push_str(&quadrant(
+                    [
+                        corner(top, left),
+                        corner(top, right),
+                        corner(bottom, left),
+                        corner(bottom, right),
+                    ],
+                    colour,
+                ));
+            }
+            line
+        })
+        .collect()
+}
+
+/// The colour of one art pixel, or `None` where the art leaves it unlit.
+fn mark_pixel(glyph: char, column: usize, row: usize) -> Option<(u8, u8, u8)> {
+    if glyph == ' ' {
+        return None;
+    }
+    let (left, top, width, height) = MARK_BOUNDS;
+    let across = (column as f32 + 0.5) / MARK_COLUMNS as f32;
+    let down = (row as f32 + 0.5) / MARK_ROWS as f32;
+    let (x, y) = (left + across * width, top + down * height);
+    Some(if glyph == 'o' {
+        stop_colour(&CORE, along(CORE_AXIS, x, y))
+    } else {
+        stop_colour(&SPECTRUM, along(SPECTRUM_AXIS, x, y))
+    })
+}
+
+/// Where a point falls along a gradient axis, clamped to the axis's ends the
+/// way an SVG `linearGradient` pads them.
+fn along(axis: (f32, f32, f32, f32), x: f32, y: f32) -> f32 {
+    let (x1, y1, x2, y2) = axis;
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    ((x - x1).mul_add(dx, (y - y1) * dy) / dx.mul_add(dx, dy * dy)).clamp(0.0, 1.0)
+}
+
+/// The colour a stop list holds at `t`, interpolated between the two stops it
+/// falls between.
+fn stop_colour(stops: &[(f32, (u8, u8, u8))], t: f32) -> (u8, u8, u8) {
+    let index = stops
+        .iter()
+        .rposition(|(offset, _)| *offset <= t)
+        .unwrap_or(0)
+        .min(stops.len() - 2);
+    let (low, from) = stops[index];
+    let (high, to) = stops[index + 1];
+    let span = ((t - low) / (high - low)).clamp(0.0, 1.0);
+    let mix =
+        |from: u8, to: u8| (f32::from(to) - f32::from(from)).mul_add(span, f32::from(from)) as u8;
+    (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+/// Rasterise the mark into a canvas `scale` times the `columns` by `rows` cell
+/// grid it occupies.
 ///
-/// `crop` fits the drawn shape rather than the SVG's padded view box, which
-/// the half-block mark needs because it has no pixels to spend on margin.
+/// The drawn shape is fitted rather than the SVG's padded view box, so the
+/// image fills the same box the block art does instead of sitting small inside
+/// it.
 ///
 /// The canvas keeps the grid's own aspect — one cell is two rows of pixels —
-/// so the same geometry serves the half-block rows and the image a terminal
-/// with a graphics protocol draws, and neither comes out stretched.
-fn logo_pixmap(columns: usize, rows: usize, scale: u32, crop: bool) -> resvg::tiny_skia::Pixmap {
+/// so the image comes out the shape the art is, not a stretched one.
+fn logo_pixmap(columns: usize, rows: usize, scale: u32) -> resvg::tiny_skia::Pixmap {
     let tree = resvg::usvg::Tree::from_data(LOGO_SVG, &resvg::usvg::Options::default())
         .expect("embedded ARSY logo must be valid SVG");
     let width = columns as u32 * scale;
     let height = (rows * 2) as u32 * scale;
     let mut pixmap =
         resvg::tiny_skia::Pixmap::new(width, height).expect("fixed logo canvas must be valid");
-    let bounds = if crop {
-        tree.root().abs_bounding_box()
-    } else {
-        tree.size()
-            .to_rect(0.0, 0.0)
-            .expect("logo view box must be valid")
-    };
+    let bounds = tree.root().abs_bounding_box();
     let fit = (width as f32 / bounds.width()).min(height as f32 / bounds.height());
     let left = (width as f32 - bounds.width() * fit) / 2.0 - bounds.x() * fit;
     let top = (height as f32 - bounds.height() * fit) / 2.0 - bounds.y() * fit;
@@ -330,7 +439,7 @@ fn logo_pixmap(columns: usize, rows: usize, scale: u32, crop: bool) -> resvg::ti
 /// terminal this misses draws the half-block mark, which is the old behaviour;
 /// add the handshake if one worth naming turns up.
 fn logo_graphics() -> bool {
-    if HALF_BLOCK_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+    if ART_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     std::env::var_os("KITTY_WINDOW_ID").is_some()
@@ -341,22 +450,22 @@ fn logo_graphics() -> bool {
         )
 }
 
-/// Forces the half-block mark regardless of the terminal.
+/// Forces the block art regardless of the terminal.
 ///
 /// A test that asserts on the drawn mark otherwise depends on whoever ran it:
-/// under Ghostty or Kitty the card carries graphics escapes and no half-blocks
+/// under Ghostty or Kitty the card carries graphics escapes and no block art
 /// at all, so the same code passes on one developer's terminal and fails on
 /// another's. Default `false`, so nothing changes for a real session.
-static HALF_BLOCK_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ART_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Draw the half-block mark for the rest of this process, whatever the
-/// terminal would have supported. Lets a test pin the rendering it asserts on.
+/// Draw the block art for the rest of this process, whatever the terminal
+/// would have supported. Lets a test pin the rendering it asserts on.
 #[cfg(test)]
-pub(crate) fn force_half_block_mark() {
-    HALF_BLOCK_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn force_art_mark() {
+    ART_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The mark drawn into `LOGO_WIDTH` by `LOGO_HEIGHT` cells from wherever the
+/// The mark drawn into `MARK_WIDTH` by `MARK_HEIGHT` cells from wherever the
 /// cursor stands, as Kitty graphics escapes.
 ///
 /// The pixels travel once and every later card places the stored image, so
@@ -377,7 +486,7 @@ fn logo_graphic() -> String {
     const IMAGE_ID: u32 = 0x4152_5359;
 
     static SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let placement = format!("\x1b_Ga=p,i={IMAGE_ID},c={LOGO_WIDTH},r={LOGO_HEIGHT},C=1,q=2\x1b\\");
+    let placement = format!("\x1b_Ga=p,i={IMAGE_ID},c={MARK_WIDTH},r={MARK_HEIGHT},C=1,q=2\x1b\\");
     if SENT.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return placement;
     }
@@ -386,23 +495,36 @@ fn logo_graphic() -> String {
 
 /// The pixels themselves, chunked as the protocol requires.
 fn logo_transmission(id: u32) -> &'static str {
-    /// Pixels per cell in the rasterised canvas. Large enough that the mark is
-    /// drawn from real curves rather than from the cell grid.
-    const SCALE: u32 = 24;
+    /// Pixels per cell in the rasterised canvas.
+    ///
+    /// The terminal scales what it is sent to fit the cells the placement asks
+    /// for, so a canvas smaller than those cells are worth in real pixels is
+    /// enlarged and the mark comes out in visible blocks. A cell is rarely
+    /// more than twenty device pixels across, and a display can put two of
+    /// those in a logical one, so forty per cell covers the mark at that
+    /// density with room to spare.
+    const SCALE: u32 = 40;
     /// The protocol's limit on one chunk of base64 payload.
     const CHUNK: usize = 4096;
 
     static GRAPHIC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GRAPHIC.get_or_init(|| {
-        let pixmap = logo_pixmap(LOGO_WIDTH, LOGO_HEIGHT, SCALE, false);
+        let mut pixmap = logo_pixmap(MARK_WIDTH, MARK_HEIGHT, SCALE);
         let (width, height) = (pixmap.width(), pixmap.height());
-        let mut rgba = Vec::with_capacity(pixmap.pixels().len() * 4);
-        for pixel in pixmap.pixels() {
-            // The protocol wants straight alpha; a pixmap holds premultiplied.
+        // The protocol wants straight alpha; a pixmap holds premultiplied.
+        for pixel in pixmap.pixels_mut() {
             let (red, green, blue) = logo_pixel(*pixel).unwrap_or((0, 0, 0));
-            rgba.extend_from_slice(&[red, green, blue, pixel.alpha()]);
+            *pixel =
+                resvg::tiny_skia::PremultipliedColorU8::from_rgba(red, green, blue, pixel.alpha())
+                    .unwrap_or(*pixel);
         }
-        let payload = base64(&rgba);
+        // Sent as PNG rather than as raw pixels: a canvas fine enough to stay
+        // crisp on a dense display is megabytes of RGBA, and the mark is flat
+        // colour over transparency, which compresses to a fraction of that.
+        let png = pixmap
+            .encode_png()
+            .expect("a rasterised canvas must encode as PNG");
+        let payload = base64(&png);
         let mut escape = String::with_capacity(payload.len() + 256);
         let mut rest = payload.as_str();
         let mut first = true;
@@ -412,7 +534,7 @@ fn logo_transmission(id: u32) -> &'static str {
             let more = u8::from(!tail.is_empty());
             escape.push_str("\x1b_G");
             if first {
-                escape.push_str(&format!("a=t,i={id},f=32,s={width},v={height},q=2,"));
+                escape.push_str(&format!("a=t,i={id},f=100,s={width},v={height},q=2,"));
                 first = false;
             }
             escape.push_str(&format!("m={more};{chunk}\x1b\\"));
@@ -442,43 +564,6 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-fn render_logo(colour: bool) -> Vec<String> {
-    let samples = BLOCK_LOGO_SAMPLES;
-    let pixmap = logo_pixmap(BLOCK_LOGO_WIDTH, BLOCK_LOGO_HEIGHT, samples as u32, true);
-    let pixels = pixmap.pixels();
-    let stride = BLOCK_LOGO_WIDTH * samples;
-    // The average of one pixel's samples, lit only when the shape covers at
-    // least half of it.
-    let pixel = |column: usize, row: usize| {
-        let sum = (row * samples..(row + 1) * samples)
-            .flat_map(|y| &pixels[y * stride + column * samples..][..samples])
-            .fold([0usize; 4], |[red, green, blue, alpha], sample| {
-                [
-                    red + usize::from(sample.red()),
-                    green + usize::from(sample.green()),
-                    blue + usize::from(sample.blue()),
-                    alpha + usize::from(sample.alpha()),
-                ]
-            });
-        let [red, green, blue, alpha] = sum.map(|total| (total / (samples * samples)) as u8);
-        (alpha >= 128)
-            .then(|| resvg::tiny_skia::PremultipliedColorU8::from_rgba(red, green, blue, alpha))
-            .flatten()
-            .and_then(logo_pixel)
-    };
-    (0..BLOCK_LOGO_HEIGHT)
-        .map(|row| {
-            let mut line = String::new();
-            for column in 0..BLOCK_LOGO_WIDTH {
-                let upper = pixel(column, row * 2);
-                let lower = pixel(column, row * 2 + 1);
-                line.push_str(&half_block(upper, lower, colour));
-            }
-            line
-        })
-        .collect()
-}
-
 fn logo_pixel(pixel: resvg::tiny_skia::PremultipliedColorU8) -> Option<(u8, u8, u8)> {
     let alpha = u16::from(pixel.alpha());
     (alpha >= 24).then(|| {
@@ -491,25 +576,45 @@ fn logo_pixel(pixel: resvg::tiny_skia::PremultipliedColorU8) -> Option<(u8, u8, 
     })
 }
 
-fn half_block(upper: Option<(u8, u8, u8)>, lower: Option<(u8, u8, u8)>, colour: bool) -> String {
-    if !colour {
-        return match (upper, lower) {
-            (None, None) => " ",
-            (Some(_), None) => "▀",
-            (None, Some(_)) => "▄",
-            (Some(_), Some(_)) => "█",
-        }
-        .to_owned();
-    }
+/// One cell of the art: four subpixels as a quadrant glyph, painted in the
+/// average of the colours the lit ones carry.
+///
+/// A cell can hold one foreground and one background, which is fewer colours
+/// than four subpixels have. Over a gradient this smooth the four are close
+/// enough that averaging the lit ones loses nothing a reader could see, and it
+/// buys the shape twice the resolution a half block would give it. The unlit
+/// subpixels take no background at all, so the card shows through them instead
+/// of a block of near-black.
+///
+/// `corners` reads top-left, top-right, bottom-left, bottom-right.
+fn quadrant(corners: [Option<(u8, u8, u8)>; 4], colour: bool) -> String {
+    /// Indexed by the lit corners as bits, most significant first.
+    const GLYPHS: [&str; 16] = [
+        " ", "▗", "▖", "▄", "▝", "▐", "▞", "▟", "▘", "▚", "▌", "▙", "▀", "▜", "▛", "█",
+    ];
 
-    match (upper, lower) {
-        (None, None) => " ".to_owned(),
-        (Some((r, g, b)), None) => format!("\x1b[38;2;{r};{g};{b}m▀{RESET}"),
-        (None, Some((r, g, b))) => format!("\x1b[38;2;{r};{g};{b}m▄{RESET}"),
-        (Some((r, g, b)), Some((br, bg, bb))) => {
-            format!("\x1b[38;2;{r};{g};{b}m\x1b[48;2;{br};{bg};{bb}m▀{RESET}")
-        }
+    let lit = corners.iter().enumerate().fold(0, |bits, (corner, pixel)| {
+        bits | (usize::from(pixel.is_some()) << (3 - corner))
+    });
+    let glyph = GLYPHS[lit];
+    if !colour {
+        return glyph.to_owned();
     }
+    let mut sum = [0_u32; 3];
+    let mut count = 0_u32;
+    for (red, green, blue) in corners.into_iter().flatten() {
+        sum = [
+            sum[0] + u32::from(red),
+            sum[1] + u32::from(green),
+            sum[2] + u32::from(blue),
+        ];
+        count += 1;
+    }
+    let Some(count) = std::num::NonZeroU32::new(count) else {
+        return glyph.to_owned();
+    };
+    let [red, green, blue] = sum.map(|total| (total / count) as u8);
+    format!("\x1b[38;2;{red};{green};{blue}m{glyph}{RESET}")
 }
 
 fn paint(colour: bool, code: &str, text: &str) -> String {
@@ -1050,10 +1155,17 @@ mod tests {
 
     #[test]
     fn the_card_sets_the_mark_beside_its_text_and_keeps_colour_when_cut() {
-        // This case is about where the half-block mark lands, so it asks for
-        // that mark rather than inheriting whichever one the terminal running
-        // the suite would have produced.
-        force_half_block_mark();
+        // This case is about where the block art lands, so it asks for that
+        // mark rather than inheriting whichever one the terminal running the
+        // suite would have produced.
+        force_art_mark();
+        for row in MARK {
+            assert_eq!(
+                row.len(),
+                MARK_COLUMNS,
+                "every art row is one glyph per subpixel"
+            );
+        }
         let mut state = TuiState::new(
             "/a/very/long/workspace/path/that/overflows".into(),
             SessionId::new(),
@@ -1085,16 +1197,16 @@ mod tests {
             // model, directory, sandbox, session, the blank under the title,
             // and the title — or the taller half-block mark — inside a blank
             // line and a border each side.
-            BLOCK_LOGO_HEIGHT.max(6) + 2 + 2,
+            MARK_HEIGHT.max(6) + 2 + 2,
             "the taller column sets the card height"
         );
         let marked = rows
             .iter()
             .position(|row| strip_sgr(row).contains(&first_mark))
             .expect("the mark is on the card");
-        // Six mark rows against six label rows: the mark starts level with
-        // the title, inside the blank line.
-        assert_eq!(marked, 2, "the mark sits beside the labels");
+        // Four mark rows against six label rows: the shorter column is centred
+        // against the taller one, so the mark starts a row below the title.
+        assert_eq!(marked, 3, "the mark sits beside the labels");
         for row in &rows {
             assert_eq!(visible_len(row), 92, "every row still reaches the border");
         }
