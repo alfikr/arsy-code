@@ -13,7 +13,7 @@ use std::{
     net::{Ipv4Addr, TcpListener},
     path::Path,
     process::{Command, Stdio},
-    sync::{atomic::Ordering, mpsc},
+    sync::mpsc,
     thread,
 };
 
@@ -22,10 +22,72 @@ use std::{
 struct FakeProvider {
     port: u16,
     bodies: mpsc::Receiver<String>,
-    /// The most subagent requests that were open at once. Zero unless the
-    /// provider was built by [`FakeProvider::delegating`].
-    peak_children: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How many subagent requests were open at once. Never above zero
+    /// unless the provider was built by [`FakeProvider::delegating`].
+    peak_children: std::sync::Arc<Barrier>,
 }
+
+/// Holds each arrival until `target` of them are waiting, or the wait gives
+/// up, and remembers the most that were ever waiting together.
+///
+/// `std::sync::Barrier` cannot be used: it has no timeout, so a runtime that
+/// really did serialize its subagents would hang the suite instead of
+/// failing it with a number.
+struct Barrier {
+    target: usize,
+    state: std::sync::Mutex<Waiting>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    now: usize,
+    peak: usize,
+    /// Whether `target` were ever waiting together. Once they have been, the
+    /// question is answered and nothing waits again — the later requests of
+    /// a conversation are sequential by nature and would only pay the
+    /// timeout.
+    met: bool,
+}
+
+impl Barrier {
+    fn new(target: usize) -> Self {
+        Self {
+            target,
+            state: std::sync::Mutex::new(Waiting::default()),
+            arrived: std::sync::Condvar::new(),
+        }
+    }
+
+    fn arrive(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.now += 1;
+        state.peak = state.peak.max(state.now);
+        state.met |= state.now >= self.target;
+        self.arrived.notify_all();
+        let deadline = std::time::Instant::now() + BARRIER_TIMEOUT;
+        while !state.met {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            let (next, timed_out) = self.arrived.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if timed_out.timed_out() {
+                break;
+            }
+        }
+        state.now -= 1;
+    }
+
+    fn peak(&self) -> usize {
+        self.state.lock().unwrap().peak
+    }
+}
+
+/// How long one subagent request waits for another to join it. Long enough
+/// that a slow runner starting threads is not mistaken for a runtime that
+/// runs its children one at a time.
+const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FakeProvider {
     /// `script` holds one SSE body per expected request, in order.
@@ -68,17 +130,13 @@ impl FakeProvider {
         Self {
             port,
             bodies,
-            peak_children: std::sync::Arc::default(),
+            // Nothing arrives at this one, so its peak stays zero.
+            peak_children: std::sync::Arc::new(Barrier::new(1)),
         }
     }
 
-    /// Two scripts served concurrently: one for the parent, one for whichever
-    /// subagent asks.
+    /// Scripts served concurrently: one for the parent, and one per subagent.
     ///
-    /// A subagent runs on its own thread now, so the parent and the child
-    /// reach the socket in whatever order they get there. Serving one queue in
-    /// arrival order would make the test depend on that race; picking the
-    /// queue from the request's own system prompt does not.
     /// `children` is one script per subagent, keyed by a phrase that appears
     /// in that subagent's own request — its goal.
     ///
@@ -90,6 +148,9 @@ impl FakeProvider {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, bodies) = mpsc::channel();
+        // With one subagent there is nothing to overlap with, so it must not
+        // wait for a second that is never coming.
+        let expect_concurrent = children.len().min(2);
         // Every queue remembers the reply it last served: a dropped
         // connection reads to the client as the peer disconnecting, which
         // `stream_with_retry` retries, and the retry must get the reply the
@@ -101,12 +162,17 @@ impl FakeProvider {
                 .map(|(marker, script)| (marker.to_owned(), Script::new(script)))
                 .collect(),
         }));
-        let peak_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let open_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (peak_out, peak) = (
-            std::sync::Arc::clone(&peak_children),
-            std::sync::Arc::clone(&peak_children),
-        );
+        // Subagent requests are held until two of them are open at once, or
+        // until the wait gives up.
+        //
+        // A fixed delay measured whether two happened to overlap inside it,
+        // which is a question about how fast a runner starts threads —
+        // Windows took longer than the delay and the probe saw nothing. A
+        // barrier asks the question the test is about instead: can two be in
+        // flight at the same time. A runtime that answered each child before
+        // the next one asked would wait out the timeout and still show one.
+        let gate = std::sync::Arc::new(Barrier::new(expect_concurrent));
+        let barrier = std::sync::Arc::clone(&gate);
         thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
                 let request = read_request(&mut stream);
@@ -118,10 +184,7 @@ impl FakeProvider {
                 };
                 drop(held);
                 let body = fill_task_ids(&body, &request);
-                let (peak, open) = (
-                    std::sync::Arc::clone(&peak),
-                    std::sync::Arc::clone(&open_children),
-                );
+                let gate = std::sync::Arc::clone(&gate);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -132,14 +195,7 @@ impl FakeProvider {
                         let _ = stream.flush();
                         return;
                     }
-                    // Held briefly so overlapping subagents are observable at
-                    // the socket. A run that answered each child before the
-                    // next one asked would never raise the peak above one,
-                    // which is exactly the failure this measures.
-                    let now_open = 1 + open.fetch_add(1, Ordering::SeqCst);
-                    peak.fetch_max(now_open, Ordering::SeqCst);
-                    thread::sleep(std::time::Duration::from_millis(150));
-                    open.fetch_sub(1, Ordering::SeqCst);
+                    gate.arrive();
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                 });
@@ -148,13 +204,13 @@ impl FakeProvider {
         Self {
             port,
             bodies,
-            peak_children: peak_out,
+            peak_children: barrier,
         }
     }
 
     /// The most subagent requests that were in flight at the same moment.
     fn peak_children(&self) -> usize {
-        self.peak_children.load(Ordering::SeqCst)
+        self.peak_children.peak()
     }
 
     fn request(&self) -> Value {
