@@ -1285,7 +1285,12 @@ pub(crate) struct Streaming {
 
 #[cfg(feature = "tui")]
 impl Streaming {
-    /// Draw reasoning as it streams, opening its box on the first delta.
+    /// Draw reasoning as it streams, opening its box once real content has
+    /// arrived.
+    ///
+    /// A stream that opens with an empty or whitespace-only delta and never
+    /// sends anything else must not leave a bare, empty box on screen: the
+    /// announcement is held back until there is something to announce.
     pub(crate) fn reason(
         &mut self,
         terminal: &mut dyn Write,
@@ -1296,7 +1301,11 @@ impl Streaming {
         text: &str,
     ) -> io::Result<()> {
         let width = tui::terminal_width();
+        self.thinking.push_str(text);
         if !self.thinking_open {
+            if self.thinking.trim().is_empty() {
+                return Ok(());
+            }
             self.thinking_open = true;
             stream_row(
                 terminal,
@@ -1307,7 +1316,6 @@ impl Streaming {
                 &tui::thinking_box_top(width, colour),
             )?;
         }
-        self.thinking.push_str(text);
         for line in drain_lines(&mut self.thinking) {
             stream_row(
                 terminal,

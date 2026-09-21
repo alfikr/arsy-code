@@ -874,7 +874,7 @@ mod tests {
         let answer =
             row(r#"{"type":"item.completed","item":{"type":"agent_message","text":"PONG\n"}}"#)
                 .expect("an answer is drawn");
-        assert!(answer.contains("Response"), "{answer}");
+        assert!(answer.contains('✦'), "{answer}");
         assert!(answer.contains("PONG"), "{answer}");
         assert_eq!(
             row(r#"{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"cargo test\"","exit_code":1}}"#)
@@ -1896,7 +1896,7 @@ mod tests {
         transcript.repaint(&mut output, 40, false, &state).unwrap();
         let text = String::from_utf8(output.into_inner()).unwrap();
         assert!(text.contains("› You run cargo test"));
-        assert!(!text.contains("✦ Response"));
+        assert!(!text.contains('✦'));
         let card_line = text
             .lines()
             .find(|line| line.contains("$ cargo test"))

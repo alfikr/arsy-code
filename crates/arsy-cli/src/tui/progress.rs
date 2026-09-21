@@ -452,8 +452,10 @@ pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
         let body = arsy_tui::render_markdown(text, width.max(MIN_WIDTH).saturating_sub(4), None);
         // `✦`, the marker the mockup uses. The response is deliberately not a
         // card: the mockup leaves the answer unboxed so it reads as prose
-        // rather than as one more piece of machinery.
-        let mut rows = vec![paint(colour, sgr_assistant(), "  ✦ Response")];
+        // rather than as one more piece of machinery. Icon only, no label: a
+        // turn with several rounds draws several of these, and repeating the
+        // word "Response" on every one of them reads as noise, not structure.
+        let mut rows = vec![paint(colour, sgr_assistant(), "  ✦")];
         rows.extend(
             body.iter()
                 .map(|line| format!("  {}", render_row(colour, line))),
@@ -464,7 +466,7 @@ pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
     let width = width.max(MIN_WIDTH);
     let body = arsy_tui::render_markdown(text, arsy_tui::widget::interior(width), None);
     let spec = arsy_tui::widget::BoxSpec::new(width, arsy_tui::Role::Border.into(), &body)
-        .top(arsy_tui::Line::of(" ✦ Response ", arsy_tui::Role::Accent));
+        .top(arsy_tui::Line::of(" ✦ ", arsy_tui::Role::Accent));
     arsy_tui::widget::bordered_box(&spec)
         .iter()
         .map(|line| render_row(colour, line))
@@ -474,7 +476,7 @@ pub fn assistant_block(width: usize, colour: bool, text: &str) -> String {
 
 /// Header for the final assistant response, separating it from tool trace.
 pub fn assistant_header(colour: bool) -> String {
-    paint(colour, sgr_assistant(), "  ✦ Response")
+    paint(colour, sgr_assistant(), "  ✦")
 }
 
 /// What a lifecycle hook said about a call, dimmed so it reads as an aside.
