@@ -378,6 +378,13 @@ fn choice_label(choice: &SessionChoice) -> String {
     }
 }
 
+/// The fewest characters of a session's UUID the picker will resolve.
+///
+/// The first block of a UUID, which is what an operator copies off a row.
+/// Also the line between "this is a row number" and "this is an ID": no
+/// realistic list has ten million rows.
+const SHORTEST_PREFIX: usize = 8;
+
 pub fn resolve_session_answer(
     answer: &str,
     sessions: &[SessionChoice],
@@ -387,13 +394,25 @@ pub fn resolve_session_answer(
     if answer.is_empty() {
         return Ok(current);
     }
-    if let Ok(number) = answer.parse::<usize>() {
-        return match number.checked_sub(1).and_then(|idx| sessions.get(idx)) {
-            Some(choice) => Ok(choice.id),
-            None if sessions.is_empty() => Err("no sessions found".to_owned()),
-            None => Err(format!("no session {number}; choose 1-{}", sessions.len())),
-        };
-    }
+    // A row number, when there is a row with that number.
+    //
+    // An answer that parses as a number and names no row is usually a
+    // mistyped row number — but roughly one UUID in forty begins with eight
+    // decimal digits, and refusing that prefix as an out-of-range row makes
+    // the picker reject an answer naming exactly one session. So a *short*
+    // numeric answer stays a number, and one at least as long as the
+    // shortest prefix the picker accepts is allowed to be read as one.
+    let out_of_range = match answer.parse::<usize>() {
+        Ok(number) => match number.checked_sub(1).and_then(|idx| sessions.get(idx)) {
+            Some(choice) => return Ok(choice.id),
+            None if sessions.is_empty() => return Err("no sessions found".to_owned()),
+            None if answer.len() < SHORTEST_PREFIX => {
+                return Err(format!("no session {number}; choose 1-{}", sessions.len()))
+            }
+            None => Some(number),
+        },
+        Err(_) => None,
+    };
     // The row as the picker wrote it. A titled row comes back as
     // `<uuid> · <title>`, which is neither a number nor a UUID on its own.
     if let Some(choice) = sessions.iter().find(|s| choice_label(s) == answer) {
@@ -419,6 +438,11 @@ pub fn resolve_session_answer(
     // A UUID this list does not hold is still a UUID the store may know.
     if let Ok(id) = answer.parse::<SessionId>() {
         return Ok(id);
+    }
+    // Nothing read it as anything else, so it really was a number naming a
+    // row that is not there — and that is the more useful message.
+    if let Some(number) = out_of_range {
+        return Err(format!("no session {number}; choose 1-{}", sessions.len()));
     }
     Err(format!("`{answer}` is not a valid session ID"))
 }
@@ -675,6 +699,39 @@ mod tests {
         assert_eq!(
             resolve_session_answer(&second_id.to_string(), &sessions, current).unwrap(),
             second_id
+        );
+    }
+
+    #[test]
+    fn a_uuid_prefix_of_only_digits_is_still_a_uuid_prefix() {
+        // Roughly one UUID in forty starts with eight decimal digits, and
+        // such a prefix parses as a row number far outside the list. It used
+        // to be refused as one, which made the picker reject an answer that
+        // names exactly one session — and made the test above fail about
+        // that often.
+        let digits = SessionId::from_uuid("89501541-0000-4000-8000-000000000000".parse().unwrap());
+        let sessions = vec![SessionChoice {
+            id: digits,
+            title: None,
+            events: 1,
+            last_seen: "now".to_owned(),
+        }];
+        let current = SessionId::new();
+        assert_eq!(
+            resolve_session_answer("89501541", &sessions, current).unwrap(),
+            digits
+        );
+        // A short number is a row number, not a prefix, even where the one
+        // session's UUID starts with that digit: typing `8` in a one-row
+        // list must not silently resume something.
+        assert_eq!(
+            resolve_session_answer("8", &sessions, current).unwrap_err(),
+            "no session 8; choose 1-1"
+        );
+        // And a long one that matches nothing is still reported as a row.
+        assert_eq!(
+            resolve_session_answer("99999999", &sessions, current).unwrap_err(),
+            "no session 99999999; choose 1-1"
         );
     }
 
