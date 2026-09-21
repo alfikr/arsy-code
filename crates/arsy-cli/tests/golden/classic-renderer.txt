@@ -45,7 +45,7 @@
   • src/checkout/request.ts +4 -2
 
 === assistant_header
-  ✦ Response
+  ✦
 
 === assistant_row
 The gateway call now carries its own deadline.
@@ -54,7 +54,7 @@ The gateway call now carries its own deadline.
 **bold**, `code`, and a # heading
 
 === assistant_block · markdown response
-╭── ✦ Response ────────────────────────────────────────────────────────╮
+╭── ✦ ─────────────────────────────────────────────────────────────────╮
 │ Checkout                                                             │
 │                                                                      │
 │ Ready with deadline.                                                 │
@@ -142,7 +142,7 @@ The gateway call now carries its own deadline.
   \e[38;2;167;167;167m•\e[0m \e[38;2;92;194;224msrc/checkout/request.ts\e[0m \e[38;2;78;169;111m+4\e[0m \e[38;2;247;118;142m-2\e[0m
 
 === assistant_header
-\e[38;2;201;201;201m  ✦ Response\e[0m
+\e[38;2;201;201;201m  ✦\e[0m
 
 === assistant_row
 \e[38;2;201;201;201mThe gateway call now carries its own deadline.\e[0m
@@ -151,7 +151,7 @@ The gateway call now carries its own deadline.
 \e[38;2;201;201;201m**bold**, `code`, and a # heading\e[0m
 
 === assistant_block · markdown response
-\e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✦ Response \e[0m\e[38;2;58;58;58m────────────────────────────────────────────────────────╮\e[0m
+\e[38;2;58;58;58m╭──\e[0m\e[38;2;92;194;224m ✦ \e[0m\e[38;2;58;58;58m─────────────────────────────────────────────────────────────────╮\e[0m
 \e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;92;194;224mCheckout\e[0m                                                             \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m                                                                      \e[38;2;58;58;58m│\e[0m
 \e[38;2;58;58;58m│\e[0m \e[1m\e[38;2;201;201;201mReady\e[0m\e[38;2;201;201;201m with \e[0m\e[38;2;92;194;224mdeadline\e[0m\e[38;2;201;201;201m.\e[0m                                                 \e[38;2;58;58;58m│\e[0m

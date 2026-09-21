@@ -330,9 +330,11 @@ fn modern_renderer_uses_the_mockup_transcript_language() {
         "a finished call is a panel: {finished}"
     );
 
-    // The mockup marks the answer with `✦` and leaves it unboxed.
+    // The mockup marks the answer with `✦` and leaves it unboxed. Icon only,
+    // no repeated "Response" label — a multi-round turn draws several of
+    // these blocks.
     let response = tui::assistant_block(WIDTH, false, "# Checkout\n\nready");
-    assert!(response.starts_with("  ✦ Response"), "{response}");
+    assert!(response.starts_with("  ✦"), "{response}");
     assert!(!response.contains('╭'), "the response is not a card");
 
     // One prompt strip, whichever path drew it.

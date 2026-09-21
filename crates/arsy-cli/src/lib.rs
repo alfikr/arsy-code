@@ -5344,7 +5344,7 @@ mod tests {
         let reasoning = drawn
             .find("weighing it up")
             .expect("the reasoning is drawn");
-        let header = drawn.find("Response").expect("the answer announces itself");
+        let header = drawn.find('✦').expect("the answer announces itself");
         let prose = drawn.find("the answer").expect("the answer is drawn");
         assert!(
             reasoning < header,
