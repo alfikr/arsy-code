@@ -495,7 +495,7 @@ fn git_revision(root: &Path) -> Result<String, WorkspaceError> {
 fn git<const N: usize>(root: &Path, args: [&str; N]) -> Result<(), WorkspaceError> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(root)
+        .arg(plain(root))
         .args(args)
         .output()?;
     if output.status.success() {
@@ -510,7 +510,7 @@ fn git<const N: usize>(root: &Path, args: [&str; N]) -> Result<(), WorkspaceErro
 fn git_output<const N: usize>(root: &Path, args: [&str; N]) -> Result<String, WorkspaceError> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(root)
+        .arg(plain(root))
         .args(args)
         .output()?;
     if output.status.success() {
@@ -652,8 +652,33 @@ fn walk_error(error: ignore::Error) -> WorkspaceError {
 }
 
 fn path_text(path: &Path) -> Result<&str, WorkspaceError> {
-    path.to_str()
+    plain(path)
+        .to_str()
         .ok_or_else(|| WorkspaceError::InvalidPath(path.to_owned()))
+}
+
+/// A path Git will take.
+///
+/// `fs::canonicalize` on Windows returns an extended-length path — `\\?\C:\…`
+/// — and Git refuses one as an argument: `could not create leading
+/// directories of '//?/C:/…': Invalid argument`. Every path this module hands
+/// Git was canonicalised here from a directory that exists, so the prefix is
+/// carrying nothing but the length escape, and dropping it loses nothing.
+///
+/// Only a drive path. `\\?\UNC\server\share` means something else, and the
+/// remainder after the prefix is not a path on its own.
+fn plain(path: &Path) -> &Path {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    let drive = rest.as_bytes();
+    if drive.len() >= 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':' {
+        return Path::new(rest);
+    }
+    path
 }
 
 #[derive(Debug)]
@@ -839,6 +864,26 @@ mod tests {
             allow_stale_base: false,
             policy_authorized: true,
         }
+    }
+
+    #[test]
+    fn git_is_handed_a_drive_path_rather_than_an_extended_length_one() {
+        // What `fs::canonicalize` returns on Windows, and what Git refuses:
+        // `could not create leading directories of '//?/C:/…': Invalid
+        // argument`. Asserted on every platform because the transform is a
+        // string one, and the bug it fixes is only reachable on one.
+        assert_eq!(
+            plain(Path::new(r"\\?\C:\Users\runner\repo")),
+            Path::new(r"C:\Users\runner\repo")
+        );
+        // A UNC path means something else, and the remainder after the
+        // prefix is not a path on its own.
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\server\share")),
+            Path::new(r"\\?\UNC\server\share")
+        );
+        // Everything else is already what Git wants.
+        assert_eq!(plain(Path::new("/tmp/repo")), Path::new("/tmp/repo"));
     }
 
     #[test]
