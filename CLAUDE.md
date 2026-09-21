@@ -34,14 +34,22 @@ built*; the other numbered docs describe the target design.
 |---|---|
 | `arsy-kernel` | domain, events, protocol, store, model, context, prompt, capability, policy, agent |
 | `arsy-compat` | Claude Code and Codex configuration read live and translated at the edge |
+| `arsy-pty` | pseudoterminal for a child process, and nothing else |
 | `arsy-code` | fs, search, syntax, LSP, DAP, edit, git, shell, sandboxed execution target |
-| `arsy-cli` | service host, CLI, TUI — produces the `arsy` binary |
+| `arsy-tui` | terminal presentation — roles, spans, palette, wrapping, widgets; no I/O |
+| `arsy-cli` | service host, CLI, terminal lifecycle — produces the `arsy` binary |
 | `arsy-ide` | IDE integration surface |
 | `arsy-sandbox` | sandbox worker / isolation boundary |
 
 `unsafe_code = "forbid"` is a workspace-wide lint (`Cargo.toml`). A boundary
-that genuinely needs `unsafe` (a PTY, a syscall sandbox primitive) gets its
-own crate with the exception scoped there, not a workspace-wide relaxation.
+that genuinely needs `unsafe` gets its own crate with the exception scoped
+there, not a workspace-wide relaxation; `arsy-pty` (a PTY) and `arsy-sandbox`
+(syscall isolation primitives) are the two that do.
+
+`arsy-tui` depends on no other workspace crate and touches no terminal, file,
+or clock, so a widget renders the same string twice for the same input. Raw
+mode, terminal size, and key decoding stay in `arsy-cli`; putting them in
+`arsy-tui` would cost it that property.
 
 ## Rules
 
