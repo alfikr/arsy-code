@@ -2290,6 +2290,12 @@ fn cycle_approval_mode(approval: &approval::ApprovalCell) -> approval::ApprovalM
     mode
 }
 
+/// How long the mark's scan takes, and how often it draws a frame.
+#[cfg(feature = "tui")]
+const INTRO_MS: u64 = 800;
+#[cfg(feature = "tui")]
+const INTRO_TICK_MS: u64 = 33;
+
 #[cfg(feature = "tui")]
 fn draw_launch(
     stdout: &mut io::Stdout,
@@ -2297,7 +2303,10 @@ fn draw_launch(
     colour: bool,
     provider_available: bool,
 ) -> Result<(), Diagnostic> {
-    writeln!(stdout, "{}", state.render(tui::terminal_width(), colour)).map_err(terminal_failed)?;
+    let width = tui::terminal_width();
+    let card = state.render(width, colour);
+    scan_mark(stdout, state, width, colour, &card)?;
+    writeln!(stdout, "{card}").map_err(terminal_failed)?;
     writeln!(
         stdout,
         "{}Use /help for commands, /mcp and /hooks to inspect integrations.",
@@ -2311,6 +2320,54 @@ fn draw_launch(
         writeln!(stdout, "Provider unavailable. Inspection is available; configure a `[provider.endpoint.<name>]` table and run `arsy auth set <name>`, or install Codex and run codex login, to execute tasks.").map_err(terminal_failed)?;
     }
     Ok(())
+}
+
+/// Sweep a lit band down the mark before the card settles.
+///
+/// The frames are painted over one another — one card, the cursor walked back
+/// to its first line, the next card on top — so only the settled card is left
+/// in scrollback for the terminal to scroll back to. Every frame is the same
+/// height and reaches the same width, so a frame covers the one under it
+/// without erasing anything first.
+///
+/// Skipped where nothing would see it, or where it would misbehave: without
+/// colour there is no band to sweep, a redirected stdout would collect every
+/// frame as text, and a window shorter than the card would scroll under the
+/// cursor as it walked back.
+#[cfg(feature = "tui")]
+fn scan_mark(
+    stdout: &mut io::Stdout,
+    state: &tui::TuiState,
+    width: usize,
+    colour: bool,
+    card: &str,
+) -> Result<(), Diagnostic> {
+    use std::io::IsTerminal;
+
+    let height = card.lines().count();
+    if !colour || !stdout.is_terminal() || tui::terminal_rows() <= height + 2 || height < 2 {
+        return Ok(());
+    }
+    // A card too narrow to hold the mark drops it, and then there is nothing
+    // to sweep and nothing worth making the operator wait for.
+    if state.render_frame(width, colour, Some(0.5)) == card {
+        return Ok(());
+    }
+    let frames = (INTRO_MS / INTRO_TICK_MS).max(1);
+    let rewind = height - 1;
+    write!(stdout, "\x1b[?25l").map_err(terminal_failed)?;
+    for frame in 0..frames {
+        let progress = frame as f32 / frames as f32;
+        write!(
+            stdout,
+            "{}\r\x1b[{rewind}A",
+            state.render_frame(width, colour, Some(progress))
+        )
+        .map_err(terminal_failed)?;
+        stdout.flush().map_err(terminal_failed)?;
+        std::thread::sleep(std::time::Duration::from_millis(INTRO_TICK_MS));
+    }
+    write!(stdout, "\x1b[?25h").map_err(terminal_failed)
 }
 
 #[cfg(feature = "tui")]

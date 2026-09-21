@@ -251,10 +251,28 @@ The launch card includes the session's opening approval mode and is reprinted
 when the model changes. Later mode changes are historical transcript strips;
 the live footer always carries the active mode, and the explanatory line below
 the card states what that mode allows. Completed turns report real changed-file,
-displayed-rule, and durable-event counts before `resume with /resume`. On a
-terminal that speaks the Kitty graphics protocol the mark is drawn as an image
-rasterised from `assets/logo.svg`; every other terminal keeps the half-block
-mark. Workspace paths under `$HOME` are displayed with `~`.
+displayed-rule, and durable-event counts before `resume with /resume`.
+
+The mark occupies the same twenty-six by eight cells whichever way a terminal
+draws it, so the card lays out identically either way and only the texture
+differs. A terminal that speaks the Kitty graphics protocol gets an image
+rasterised from `assets/logo.svg`; every other terminal gets ASCII art
+rasterised from the same file and pasted into the source, one character per
+cell off a density ramp, coloured from that file's own gradient stops.
+Characters rather than block glyphs, because a block fills its cell and so
+reads at the size of the grid rather than at the size of the shape — and
+because plain ASCII is in every font. The mark is taller than the label rows,
+so it leads the card and the labels are centred against it. A card too narrow
+to hold the mark and a label beside it drops the mark, not the text.
+
+Opening the TUI sweeps a lit band down the mark for about eight hundred
+milliseconds before the card settles, repainting the card over itself so only
+the settled one reaches scrollback. The sweep is drawn as ASCII art even where
+an image is available, because an image cannot be lit row by row and both
+renderings fill the same box, so settling from one to the other moves nothing.
+It is skipped without colour, when stdout is not a terminal, when the window is
+shorter than the card, and when the card is too narrow to be carrying a mark.
+Workspace paths under `$HOME` are displayed with `~`.
 
 Checks: `cargo test -p arsy-cli --features tui`,
 `cargo test -p arsy-code --test compat_golden`, and

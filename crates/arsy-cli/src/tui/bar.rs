@@ -124,6 +124,16 @@ impl TuiState {
 
     /// The launch card: a bordered box with `>_ ARSY CODE` and its label rows.
     pub fn render(&self, width: usize, colour: bool) -> String {
+        self.render_frame(width, colour, None)
+    }
+
+    /// The same card at one frame of the launch intro.
+    ///
+    /// `progress` is the intro's position in `0..1`, or `None` for the settled
+    /// card every other caller wants. Only the mark's colours move with it, so
+    /// every frame occupies the same cells and the card can be repainted over
+    /// itself.
+    pub fn render_frame(&self, width: usize, colour: bool, progress: Option<f32>) -> String {
         let width = width.max(MIN_WIDTH);
         let inner = width.saturating_sub(4);
         let mut rows = vec![
@@ -181,7 +191,7 @@ impl TuiState {
 
         // One blank line inside each border, so the card breathes rather than
         // starting on the rule.
-        let mut rows = beside_logo(rows, inner, colour);
+        let mut rows = beside_logo(rows, inner, colour, progress);
         rows.insert(0, String::new());
         rows.push(String::new());
         let border = arsy_tui::Role::Border.into();
@@ -341,10 +351,17 @@ fn compact_home(path: String) -> String {
 ///
 /// The mark is dropped when the card is too narrow to hold both, so a small
 /// terminal keeps the text it needs instead of a cropped picture.
-fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
-    let drawn = colour && logo_graphics();
-    let mark_width = if drawn { LOGO_WIDTH } else { BLOCK_LOGO_WIDTH };
-    if inner < mark_width + LOGO_GAP + LABEL_WIDTH + 12 {
+fn beside_logo(
+    text: Vec<String>,
+    inner: usize,
+    colour: bool,
+    progress: Option<f32>,
+) -> Vec<String> {
+    // The intro sweeps the ASCII art even where an image is available: an
+    // image cannot be lit row by row, and both renderings fill the same box,
+    // so settling from one to the other moves nothing on the card.
+    let drawn = colour && progress.is_none() && logo_graphics();
+    if inner < MARK_WIDTH + LOGO_GAP + LABEL_WIDTH + 12 {
         return text;
     }
     // Whichever column is shorter is centred against the other, so the mark
@@ -354,11 +371,13 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
     // A terminal that draws images gets the mark as one, laid out as though it
     // were blank space: the escape leaves the cursor where it stands and the
     // image covers the cells the half-blocks would have filled.
-    let blank = " ".repeat(mark_width);
+    let blank = " ".repeat(MARK_WIDTH);
     let logo: Vec<String> = if drawn {
         std::iter::once(format!("{}{blank}", logo_graphic()))
-            .chain(std::iter::repeat_n(blank.clone(), LOGO_HEIGHT - 1))
+            .chain(std::iter::repeat_n(blank.clone(), MARK_HEIGHT - 1))
             .collect()
+    } else if progress.is_some() {
+        mark_rows(colour, progress)
     } else {
         logo(colour).to_vec()
     };
@@ -370,7 +389,7 @@ fn beside_logo(text: Vec<String>, inner: usize, colour: bool) -> Vec<String> {
                 .checked_sub(mark_offset)
                 .and_then(|index| logo.get(index))
                 .cloned()
-                .unwrap_or_else(|| " ".repeat(mark_width));
+                .unwrap_or_else(|| " ".repeat(MARK_WIDTH));
             let line = row
                 .checked_sub(text_offset)
                 .and_then(|index| text.get(index))
