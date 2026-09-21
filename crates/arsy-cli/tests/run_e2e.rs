@@ -83,11 +83,16 @@ impl FakeProvider {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (sender, bodies) = mpsc::channel();
+        // Two queues, and the last reply served from each: a retry has to be
+        // answered with what the request before it got, not with the entry
+        // after it.
         let scripts = std::sync::Arc::new(std::sync::Mutex::new((
             parent
                 .into_iter()
                 .collect::<std::collections::VecDeque<_>>(),
             child.into_iter().collect::<std::collections::VecDeque<_>>(),
+            None::<String>,
+            None::<String>,
         )));
         let peak_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let open_children = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -100,16 +105,30 @@ impl FakeProvider {
                 let request = read_request(&mut stream);
                 let _ = sender.send(request.clone());
                 let child = is_child_request(&request);
-                let mut scripts = scripts.lock().unwrap();
-                let queue = if child {
-                    &mut scripts.1
+                let mut held = scripts.lock().unwrap();
+                let scripts = &mut *held;
+                let (queue, last) = if child {
+                    (&mut scripts.1, &mut scripts.3)
                 } else {
-                    &mut scripts.0
+                    (&mut scripts.0, &mut scripts.2)
                 };
-                let Some(body) = queue.pop_front() else {
-                    continue;
+                // A reply the script has already used, rather than a dropped
+                // connection, when the queue runs dry. A dropped one reads
+                // to the client as the peer disconnecting, which
+                // `stream_with_retry` retries — and the retry takes the next
+                // script entry, so one transient hiccup cascades into some
+                // later request finding nothing and failing for real.
+                let body = match queue.pop_front() {
+                    Some(body) => {
+                        *last = Some(body.clone());
+                        body
+                    }
+                    None => match last.clone() {
+                        Some(body) => body,
+                        None => continue,
+                    },
                 };
-                drop(scripts);
+                drop(held);
                 let body = fill_task_ids(&body, &request);
                 let (peak, open) = (
                     std::sync::Arc::clone(&peak),
