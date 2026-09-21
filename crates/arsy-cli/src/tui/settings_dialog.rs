@@ -107,227 +107,10 @@ impl SettingsDialogState {
                 colour,
                 sgr_dim(),
             ));
-        } else if inner < 48 {
-            let key_width = self
-                .rows
-                .iter()
-                .map(|row| visible_len(&row.key))
-                .max()
-                .unwrap_or(0);
-            lines.extend(self.rows.iter().enumerate().map(|(index, row)| {
-                let marked = index == self.selected;
-                let pending = self
-                    .editing
-                    .as_ref()
-                    .filter(|edit| edit.index == index)
-                    .map(|edit| edit.pending.as_str());
-                let style = match (marked, row.set) {
-                    (true, _) => sgr_accent(),
-                    (false, true) => "",
-                    _ => sgr_dim(),
-                };
-                dialog_line(
-                    &setting_row(row, marked, key_width, pending),
-                    inner,
-                    colour,
-                    style,
-                )
-            }));
-            if let Some(hint) = self.choices_hint() {
-                lines.push(dialog_line(&hint, inner, colour, sgr_dim()));
-            }
+        } else if inner < 50 {
+            lines.extend(self.single_pane_lines(inner, colour));
         } else {
-            let key_max = self
-                .rows
-                .iter()
-                .map(|row| visible_len(&row.key))
-                .max()
-                .unwrap_or(0);
-            let left_width = (key_max + 4)
-                .max((inner * 35 / 100).clamp(24, 32))
-                .min(inner.saturating_sub(24));
-            let right_width = inner.saturating_sub(left_width + 3);
-            let divider = if colour {
-                format!(" {} ", paint(true, sgr_border(), "│"))
-            } else {
-                " │ ".to_owned()
-            };
-
-            let left_hdr = paint(colour, sgr_dim(), "SETTING");
-            let right_hdr = paint(colour, sgr_dim(), "DETAIL & CONFIG");
-
-            let fitted_left_hdr = fit(&left_hdr, left_width);
-            let pad_left_hdr = " ".repeat(left_width.saturating_sub(visible_len(&fitted_left_hdr)));
-            let left_hdr_cell = format!("{fitted_left_hdr}{pad_left_hdr}");
-
-            let fitted_right_hdr = fit(&right_hdr, right_width);
-            let pad_right_hdr =
-                " ".repeat(right_width.saturating_sub(visible_len(&fitted_right_hdr)));
-            let right_hdr_cell = format!("{fitted_right_hdr}{pad_right_hdr}");
-
-            lines.push(dialog_line(
-                &format!("{left_hdr_cell}{divider}{right_hdr_cell}"),
-                inner,
-                colour,
-                "",
-            ));
-
-            let sep_divider = if colour {
-                paint(true, sgr_border(), "─┼─")
-            } else {
-                "─┼─".to_owned()
-            };
-            let left_sep = paint(colour, sgr_border(), &"─".repeat(left_width));
-            let right_sep = paint(colour, sgr_border(), &"─".repeat(right_width));
-            lines.push(dialog_line(
-                &format!("{left_sep}{sep_divider}{right_sep}"),
-                inner,
-                colour,
-                "",
-            ));
-
-            let mut left_lines = Vec::new();
-            for (index, row) in self.rows.iter().enumerate() {
-                let marked = index == self.selected;
-                let prefix = if marked { "› " } else { "  " };
-                let line = format!("{prefix}{}", row.key);
-                let styled = match (marked, row.set) {
-                    (true, _) => paint(colour, sgr_accent(), &line),
-                    (false, true) => line,
-                    _ => paint(colour, sgr_dim(), &line),
-                };
-                left_lines.push(styled);
-            }
-
-            let mut right_lines = Vec::new();
-            if let Some(row) = self.rows.get(self.selected) {
-                let pending = self
-                    .editing
-                    .as_ref()
-                    .filter(|edit| edit.index == self.selected)
-                    .map(|edit| edit.pending.as_str());
-
-                let origin_label = if row.set { "set" } else { "default" };
-                let origin_badge = if colour {
-                    if row.set {
-                        format!("{}[{origin_label}]{RESET}", sgr_ok())
-                    } else {
-                        format!("{}[{origin_label}]{RESET}", sgr_dim())
-                    }
-                } else {
-                    format!("[{origin_label}]")
-                };
-                right_lines.push(format!("{}  {origin_badge}", paint(colour, BOLD, &row.key)));
-                right_lines.push(paint(
-                    colour,
-                    sgr_border(),
-                    &"─".repeat(right_width.min(visible_len(&row.key) + 12)),
-                ));
-
-                let desc_lines = wrap_words(&row.description, right_width);
-                for line in desc_lines {
-                    right_lines.push(paint(colour, sgr_assistant(), &line));
-                }
-                right_lines.push(String::new());
-
-                let val_str = match pending {
-                    Some(p) if p != row.value => format!("{} → {p}", row.value),
-                    _ => row.value.clone(),
-                };
-                let val_styled = if pending.is_some() {
-                    paint(colour, sgr_accent(), &val_str)
-                } else {
-                    val_str
-                };
-                right_lines.push(format!("value:   {val_styled}"));
-                right_lines.push(format!(
-                    "default: {}",
-                    paint(colour, sgr_dim(), &row.default)
-                ));
-
-                let hint = match row.kind {
-                    SettingKind::Choice if !row.choices.is_empty() => {
-                        Some(format!("one of {}", row.choices.join(" | ")))
-                    }
-                    SettingKind::Choice => None,
-                    SettingKind::Bool => Some("true or false".to_owned()),
-                    SettingKind::Integer { min, max } => Some(format!("from {min} to {max}")),
-                    SettingKind::Text => {
-                        Some(format!("`{}` is free text; set it in arsy.json", row.key))
-                    }
-                };
-                if let Some(hint_text) = hint {
-                    right_lines.push(paint(colour, sgr_dim(), &format!("allowed: {hint_text}")));
-                }
-
-                if let Some(p) = pending {
-                    match row.kind {
-                        SettingKind::Choice => {
-                            let pills: Vec<String> = row
-                                .choices
-                                .iter()
-                                .map(|c| {
-                                    if c == p {
-                                        if colour {
-                                            format!("{}[• {c}]{RESET}", sgr_accent())
-                                        } else {
-                                            format!("[• {c}]")
-                                        }
-                                    } else {
-                                        paint(colour, sgr_dim(), &format!("  {c}  "))
-                                    }
-                                })
-                                .collect();
-                            right_lines.push(format!("select:  {}", pills.join(" ")));
-                        }
-                        SettingKind::Bool => {
-                            let true_pill = if p == "true" {
-                                if colour {
-                                    format!("{}[• true]{RESET}", sgr_accent())
-                                } else {
-                                    "[• true]".to_owned()
-                                }
-                            } else {
-                                paint(colour, sgr_dim(), "  true  ")
-                            };
-                            let false_pill = if p == "false" {
-                                if colour {
-                                    format!("{}[• false]{RESET}", sgr_accent())
-                                } else {
-                                    "[• false]".to_owned()
-                                }
-                            } else {
-                                paint(colour, sgr_dim(), "  false  ")
-                            };
-                            right_lines.push(format!("toggle:  {true_pill}  {false_pill}"));
-                        }
-                        SettingKind::Integer { min, max } => {
-                            right_lines.push(format!("step:    ◄ {p} ►  ({min}..{max})"));
-                        }
-                        SettingKind::Text => {}
-                    }
-                }
-            }
-
-            let max_lines = left_lines.len().max(right_lines.len());
-            for i in 0..max_lines {
-                let left_text = left_lines.get(i).map(String::as_str).unwrap_or("");
-                let fitted_left = fit(left_text, left_width);
-                let pad_left = " ".repeat(left_width.saturating_sub(visible_len(&fitted_left)));
-                let left_cell = format!("{fitted_left}{pad_left}");
-
-                let right_text = right_lines.get(i).map(String::as_str).unwrap_or("");
-                let fitted_right = fit(right_text, right_width);
-                let pad_right = " ".repeat(right_width.saturating_sub(visible_len(&fitted_right)));
-                let right_cell = format!("{fitted_right}{pad_right}");
-
-                lines.push(dialog_line(
-                    &format!("{left_cell}{divider}{right_cell}"),
-                    inner,
-                    colour,
-                    "",
-                ));
-            }
+            lines.extend(self.multi_pane_lines(inner, colour));
         }
         lines.push(dialog_line("", inner, colour, ""));
         if let Some(notice) = &self.notice {
@@ -351,6 +134,167 @@ impl SettingsDialogState {
             &format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
         ));
         lines.join("\n")
+    }
+
+    fn single_pane_lines(&self, inner: usize, colour: bool) -> Vec<String> {
+        let key_width = self
+            .rows
+            .iter()
+            .map(|row| visible_len(&row.key))
+            .max()
+            .unwrap_or(0);
+        let mut lines: Vec<String> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let marked = index == self.selected;
+                let pending = self
+                    .editing
+                    .as_ref()
+                    .filter(|edit| edit.index == index)
+                    .map(|edit| edit.pending.as_str());
+                let style = match (marked, row.set) {
+                    (true, _) => sgr_accent(),
+                    (false, true) => "",
+                    _ => sgr_dim(),
+                };
+                dialog_line(
+                    &setting_row(row, marked, key_width, pending),
+                    inner,
+                    colour,
+                    style,
+                )
+            })
+            .collect();
+        if let Some(hint) = self.choices_hint() {
+            lines.push(dialog_line(&hint, inner, colour, sgr_dim()));
+        }
+        lines
+    }
+
+    fn multi_pane_lines(&self, inner: usize, colour: bool) -> Vec<String> {
+        let key_max = self
+            .rows
+            .iter()
+            .map(|row| visible_len(&row.key))
+            .max()
+            .unwrap_or(0);
+        let left_width = (key_max + 4)
+            .max((inner * 35 / 100).clamp(24, 32))
+            .min(inner.saturating_sub(24));
+        let right_width = inner.saturating_sub(left_width + 3);
+        let divider = paint(colour, sgr_border(), " │ ");
+
+        let mut lines = Vec::new();
+
+        let left_hdr = paint(colour, sgr_dim(), "SETTING");
+        let right_hdr = paint(colour, sgr_dim(), "DETAIL & CONFIG");
+        lines.push(border_line(
+            &format!(
+                "{}{divider}{}",
+                cell(&left_hdr, left_width),
+                cell(&right_hdr, right_width)
+            ),
+            inner,
+            colour,
+        ));
+
+        let sep_line = format!("{}─┼─{}", "─".repeat(left_width), "─".repeat(right_width));
+        lines.push(border_line(
+            &paint(colour, sgr_border(), &sep_line),
+            inner,
+            colour,
+        ));
+
+        let left_lines: Vec<String> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let marked = index == self.selected;
+                let prefix = if marked { "› " } else { "  " };
+                let line = format!("{prefix}{}", row.key);
+                match (marked, row.set) {
+                    (true, _) => paint(colour, sgr_accent(), &line),
+                    (false, true) => line,
+                    _ => paint(colour, sgr_dim(), &line),
+                }
+            })
+            .collect();
+
+        let right_lines = self.right_pane_lines(right_width, colour);
+        let max_lines = left_lines.len().max(right_lines.len());
+        for i in 0..max_lines {
+            let left_cell = cell(
+                left_lines.get(i).map(String::as_str).unwrap_or(""),
+                left_width,
+            );
+            let right_cell = cell(
+                right_lines.get(i).map(String::as_str).unwrap_or(""),
+                right_width,
+            );
+            lines.push(border_line(
+                &format!("{left_cell}{divider}{right_cell}"),
+                inner,
+                colour,
+            ));
+        }
+        lines
+    }
+
+    fn right_pane_lines(&self, right_width: usize, colour: bool) -> Vec<String> {
+        let Some(row) = self.rows.get(self.selected) else {
+            return Vec::new();
+        };
+        let pending = self
+            .editing
+            .as_ref()
+            .filter(|edit| edit.index == self.selected)
+            .map(|edit| edit.pending.as_str());
+        let mut lines = Vec::new();
+
+        let origin_label = if row.set { "set" } else { "default" };
+        let origin_badge = if row.set {
+            paint(colour, sgr_ok(), &format!("[{origin_label}]"))
+        } else {
+            paint(colour, sgr_dim(), &format!("[{origin_label}]"))
+        };
+        lines.push(format!("{}  {origin_badge}", paint(colour, BOLD, &row.key)));
+        lines.push(paint(
+            colour,
+            sgr_border(),
+            &"─".repeat(right_width.min(visible_len(&row.key) + 12)),
+        ));
+
+        for line in wrap_words(&row.description, right_width) {
+            lines.push(paint(colour, sgr_assistant(), &line));
+        }
+        lines.push(String::new());
+
+        let val_str = match pending {
+            Some(p) if p != row.value => format!("{} → {p}", row.value),
+            _ => row.value.clone(),
+        };
+        let val_styled = if pending.is_some() {
+            paint(colour, sgr_accent(), &val_str)
+        } else {
+            val_str
+        };
+        lines.push(format!("value:   {val_styled}"));
+        lines.push(format!(
+            "default: {}",
+            paint(colour, sgr_dim(), &row.default)
+        ));
+
+        if let Some(hint_text) = row_allowed_hint(row) {
+            lines.push(paint(colour, sgr_dim(), &format!("allowed: {hint_text}")));
+        }
+
+        if let Some(p) = pending {
+            lines.extend(edit_control_lines(row, p, colour));
+        }
+        lines
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<SettingsAction> {
@@ -525,6 +469,80 @@ fn setting_row(row: &SettingRow, marked: bool, key_width: usize, pending: Option
         if marked { "›" } else { " " },
         row.description,
     )
+}
+
+fn cell(text: &str, width: usize) -> String {
+    let fitted = fit(text, width);
+    let pad = " ".repeat(width.saturating_sub(visible_len(&fitted)));
+    format!("{fitted}{pad}")
+}
+
+fn border_line(content: &str, inner: usize, colour: bool) -> String {
+    let body = cell(content, inner);
+    let border = paint(colour, sgr_border(), "│");
+    format!("{border} {body} {border}")
+}
+
+fn row_allowed_hint(row: &SettingRow) -> Option<String> {
+    match row.kind {
+        SettingKind::Choice if !row.choices.is_empty() => {
+            Some(format!("one of {}", row.choices.join(" | ")))
+        }
+        SettingKind::Choice => None,
+        SettingKind::Bool => Some("true or false".to_owned()),
+        SettingKind::Integer { min, max } => Some(format!("from {min} to {max}")),
+        SettingKind::Text => Some(format!("`{}` is free text; set it in arsy.json", row.key)),
+    }
+}
+
+fn edit_control_lines(row: &SettingRow, pending: &str, colour: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    match row.kind {
+        SettingKind::Choice => {
+            let pills: Vec<String> = row
+                .choices
+                .iter()
+                .map(|c| {
+                    if c == pending {
+                        if colour {
+                            format!("{}[• {c}]{RESET}", sgr_accent())
+                        } else {
+                            format!("[• {c}]")
+                        }
+                    } else {
+                        paint(colour, sgr_dim(), &format!("  {c}  "))
+                    }
+                })
+                .collect();
+            lines.push(format!("select:  {}", pills.join(" ")));
+        }
+        SettingKind::Bool => {
+            let true_pill = if pending == "true" {
+                if colour {
+                    format!("{}[• true]{RESET}", sgr_accent())
+                } else {
+                    "[• true]".to_owned()
+                }
+            } else {
+                paint(colour, sgr_dim(), "  true  ")
+            };
+            let false_pill = if pending == "false" {
+                if colour {
+                    format!("{}[• false]{RESET}", sgr_accent())
+                } else {
+                    "[• false]".to_owned()
+                }
+            } else {
+                paint(colour, sgr_dim(), "  false  ")
+            };
+            lines.push(format!("toggle:  {true_pill}  {false_pill}"));
+        }
+        SettingKind::Integer { min, max } => {
+            lines.push(format!("step:    ◄ {pending} ►  ({min}..{max})"));
+        }
+        SettingKind::Text => {}
+    }
+    lines
 }
 
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
@@ -805,5 +823,39 @@ mod tests {
         let frame_int = dialog.render(80, false);
         assert!(frame_int.contains("step:"), "{frame_int}");
         assert!(frame_int.contains("◄ 2 ►"), "{frame_int}");
+    }
+
+    #[test]
+    fn multi_pane_preserves_ansi_escapes_without_leaking_raw_sequences() {
+        let dialog = SettingsDialogState::new(vec![
+            choice_row("ui.style", "modern", true),
+            bool_row("true"),
+        ]);
+        let frame = dialog.render(80, true);
+        for (idx, line) in frame.lines().enumerate() {
+            assert_eq!(
+                visible_len(line),
+                80,
+                "line {idx} width mismatch: visible_len={}, line={line:?}",
+                visible_len(line)
+            );
+        }
+        assert!(
+            frame.contains("\x1b["),
+            "should contain ANSI escapes when colour is true"
+        );
+        let stripped = strip_sgr(&frame);
+        assert!(
+            !stripped.contains("[38;2;"),
+            "ANSI escape leaked without leading ESC: {frame}"
+        );
+        assert!(
+            !stripped.contains("mSETTING"),
+            "leaked SGR terminator in header: {frame}"
+        );
+        assert!(
+            !stripped.contains("[0m"),
+            "leaked RESET terminator: {frame}"
+        );
     }
 }
