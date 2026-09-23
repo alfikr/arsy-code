@@ -67,6 +67,7 @@ mod model;
 mod model_dialog;
 mod progress;
 mod provider;
+mod provider_dialog;
 mod session;
 mod settings_dialog;
 mod skill_dialog;
@@ -85,6 +86,7 @@ pub use model::*;
 pub use model_dialog::*;
 pub use progress::*;
 pub use provider::*;
+pub use provider_dialog::*;
 pub use session::*;
 pub use settings_dialog::*;
 pub use skill_dialog::*;
@@ -187,6 +189,18 @@ fn sgr_bullet() -> &'static str {
 /// Codex `user_message_bg`: white at 12% over the `#1a1a1a` terminal surface.
 fn sgr_input_bg() -> &'static str {
     &palette().input_bg
+}
+
+pub(crate) fn cell(text: &str, width: usize) -> String {
+    let fitted = fit(text, width);
+    let pad = " ".repeat(width.saturating_sub(visible_len(&fitted)));
+    format!("{fitted}{pad}")
+}
+
+pub(crate) fn border_line(content: &str, inner: usize, colour: bool) -> String {
+    let body = cell(content, inner);
+    let border = paint(colour, sgr_border(), "│");
+    format!("{border} {body} {border}")
 }
 
 /// `#rrggbb` to an SGR prefix — foreground, or background when `background`.
@@ -1036,12 +1050,12 @@ mod tests {
     fn the_model_picker_takes_a_number_a_slug_or_the_current_default() {
         let models = [
             ModelChoice {
-                provider: CODEX_PROVIDER.into(),
+                provider: "codex".into(),
                 slug: "gpt-5.6-sol".into(),
                 name: "GPT-5.6-Sol".into(),
             },
             ModelChoice {
-                provider: CODEX_PROVIDER.into(),
+                provider: "codex".into(),
                 slug: "gpt-5.6-luna".into(),
                 name: "GPT-5.6-Luna".into(),
             },
@@ -1052,7 +1066,7 @@ mod tests {
             },
         ];
         let current = ModelRoute {
-            provider: CODEX_PROVIDER.into(),
+            provider: "codex".into(),
             model: "gpt-5.6-luna".into(),
         };
         let pick = |answer: &str| resolve_model(answer, &models, &current);
@@ -1060,7 +1074,7 @@ mod tests {
         assert_eq!(
             pick("1").unwrap(),
             ModelRoute {
-                provider: CODEX_PROVIDER.into(),
+                provider: "codex".into(),
                 model: "gpt-5.6-sol".into(),
             }
         );
@@ -1088,7 +1102,7 @@ mod tests {
             }
         );
         // A free-text slug stays on the current provider.
-        assert_eq!(pick("o3-custom").unwrap().provider, CODEX_PROVIDER);
+        assert_eq!(pick("o3-custom").unwrap().provider, "codex");
         assert_eq!(pick("o3-custom").unwrap().model, "o3-custom");
         // Qualified provider/model names switch provider.
         assert_eq!(
@@ -1139,19 +1153,15 @@ mod tests {
     }
 
     #[test]
-    fn a_remembered_route_names_its_provider_and_older_files_still_read() {
-        let native = ModelRoute::parse("gateway/qwen3-coder");
+    fn a_remembered_route_names_its_provider() {
+        let native = ModelRoute::parse("gateway/qwen3-coder").unwrap();
         assert_eq!(native.provider, "gateway");
         assert_eq!(native.model, "qwen3-coder");
-        assert!(!native.is_codex());
         assert_eq!(native.to_string(), "gateway/qwen3-coder");
 
-        let legacy = ModelRoute::parse("gpt-5.6-luna");
-        assert!(
-            legacy.is_codex(),
-            "a file written before routes named a provider meant Codex"
-        );
-        assert_eq!(legacy.model, "gpt-5.6-luna");
+        // Bare slugs written by older builds no longer parse: the caller sees
+        // None and treats it as "no saved route", prompting the user to pick.
+        assert!(ModelRoute::parse("gpt-5.6-luna").is_none());
     }
 
     #[test]
@@ -1198,7 +1208,7 @@ mod tests {
             SessionId::new(),
         );
         state.set_model_route(ModelRoute {
-            provider: CODEX_PROVIDER.into(),
+            provider: "codex".into(),
             model: "gpt-5.6-luna".into(),
         });
 
@@ -1285,7 +1295,7 @@ mod tests {
         assert!(!state.card_is_stale(), "the mode is not a card field");
 
         state.set_model_route(ModelRoute {
-            provider: CODEX_PROVIDER.into(),
+            provider: "codex".into(),
             model: "gpt-5.6-luna".into(),
         });
         assert!(state.card_is_stale(), "the model the card names changed");
@@ -1568,7 +1578,7 @@ mod tests {
             "/Users/someone/Development/github/acme/arsy-code".into(),
             session,
         );
-        state.set_model_route(ModelRoute::parse("myai/suiflex"));
+        state.set_model_route(ModelRoute::parse("myai/suiflex").unwrap());
         state.set_effort(Some(Effort::High));
 
         // Wide: everything, with the branch at the right edge.
