@@ -49,6 +49,10 @@ class Terminal:
     def send(self, keys):
         os.write(self.master, keys)
 
+    def down(self, count=1):
+        for _ in range(count):
+            self.send(b"\x1b[B")
+
     def expect(self, text, timeout=10):
         deadline = time.monotonic() + timeout
         exited = None
@@ -261,7 +265,7 @@ def main():
             # and the configuration ARSY writes is the one it reads back.
             terminal.send(b"/provider\r")
             terminal.expect("Switch Pane")            # the dialog is open
-            terminal.send(b"\x1b[B\x1b[B")            # access: OAuth -> Key -> Custom
+            terminal.down(2)                          # access: OAuth -> Key -> Custom
             terminal.send(b"\t")                       # focus the provider list (+new)
             terminal.send(b"\t")                       # focus manage (Add)
             terminal.send(b"\r")                       # Add -> manual add wizard
@@ -308,10 +312,10 @@ def main():
             # configured endpoint is reachable under Custom access; its Manage
             # column offers Use, Set key, then Remove.
             terminal.send(b"/provider\r")
-            terminal.send(b"\x1b[B\x1b[B")            # access: -> Custom
+            terminal.down(2)                          # access: -> Custom
             terminal.send(b"\t")                       # list: acme is row 0
             terminal.send(b"\t")                       # manage: Use is action 0
-            terminal.send(b"\x1b[B\x1b[B")            # -> Remove
+            terminal.down(2)                          # manage: Use -> Set key -> Remove
             terminal.send(b"\r")                       # hand off to the confirm step
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"no\r")
@@ -319,7 +323,10 @@ def main():
             assert "acme" in json.loads(written.read_text())["provider"]["endpoint"]
 
             terminal.send(b"/provider\r")
-            terminal.send(b"\x1b[B\x1b[B\t\t\x1b[B\x1b[B\r")
+            terminal.down(2)
+            terminal.send(b"\t\t")
+            terminal.down(2)
+            terminal.send(b"\r")
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"yes\r")
             terminal.expect("Removed provider acme")
