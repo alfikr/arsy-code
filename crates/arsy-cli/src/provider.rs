@@ -97,7 +97,8 @@ pub fn resolve_with_route(
         .or_else(|| config.provider_default())
         .filter(|id| *id != "auto")
     {
-        // A named provider is used as named, or reported as missing.
+        // A named provider is used as named, or reported as missing. Routing
+        // must never substitute another one for the one that was asked for.
         if let Some(endpoint) = config.endpoint(Some(id)).cloned() {
             return Ok((endpoint, None));
         }

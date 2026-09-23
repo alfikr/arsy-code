@@ -755,7 +755,6 @@ fn provider_login_flow(
     }
 }
 
-#[cfg(feature = "tui")]
 /// Shared core: fetch the live model list for `id` from its endpoint and write
 /// it back to the config. Returns the count on success, the error message on
 /// failure. Used by both the manual "Fetch model list" action and the
