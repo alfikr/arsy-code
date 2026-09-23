@@ -209,18 +209,25 @@ pub(crate) fn take_provider(
             writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
             *providers = configured_providers(invocation);
             *chosen = configured_default(invocation);
+            let removed = provider_step_removed(&message);
+            let added: Option<String> = provider_step_added(&message).map(str::to_owned);
             *draft = tui::ProviderDraft::default();
             // A removed endpoint's models must not stay in the picker, and a
             // route that named it can no longer be driven by this session.
-            let removed = provider_step_removed(&message);
             if let Some(name) = &removed {
                 models.retain(|choice| &choice.provider != name);
                 if route.provider == *name {
                     *route = tui::ModelRoute {
-                        provider: tui::CODEX_PROVIDER.to_owned(),
-                        model: "default".into(),
+                        provider: String::new(),
+                        model: String::new(),
                     };
                     return Ok(Prompt::Task);
+                }
+            }
+            // Auto-fetch the live model list for a newly added key provider.
+            if let Some(name) = added {
+                if let Ok(count) = fetch_and_store_models(invocation, &name) {
+                    let _ = writeln!(stdout, "Fetched {count} model(s) for `{name}`.");
                 }
             }
             // Configuration decides the provider, so the session has to be
@@ -258,6 +265,14 @@ pub(crate) fn provider_step_removed(message: &str) -> Option<String> {
         .strip_prefix("Removed provider ")
         .and_then(|rest| rest.strip_suffix(" and its credentials."))
         .map(str::to_owned)
+}
+
+/// The provider name a new-provider message reports, or nothing for any other.
+#[cfg(feature = "tui")]
+fn provider_step_added(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("Added provider ")
+        .and_then(|rest| rest.split_once(' ').map(|(name, _)| name))
 }
 
 /// Take the reasoning effort the operator picked.
@@ -339,6 +354,12 @@ pub(crate) fn take_auth(
     let authorised = match step {
         tui::AuthStep::LoginProvider => line.trim().to_owned(),
         tui::AuthStep::SetKey => draft.clone(),
+        // draft holds "{provider}\n{verifier}" at this point; extract the name
+        // so the auto-fetch and activate blocks can run after the code is accepted.
+        tui::AuthStep::PasteCode => draft
+            .split_once('\n')
+            .map(|(p, _)| p.to_owned())
+            .unwrap_or_default(),
         _ => String::new(),
     };
     let (mut message, next, finished) =
@@ -361,26 +382,58 @@ pub(crate) fn take_auth(
             Err(reason) => (reason, Prompt::Auth(step), false),
         };
 
-    if finished && !authorised.is_empty() {
-        // The endpoint may have only just been written (a preset that had
-        // none), so the configured list is re-read rather than appended to.
-        if !providers.iter().any(|name| name == &authorised) {
-            *providers = configured_providers(invocation);
-        }
-        if activate_signed_in_provider(
+    if finished {
+        finish_auth(
             invocation,
             workspace,
             &authorised,
+            providers,
             route,
+            provider_available,
             resolved,
             unavailable,
-        ) {
-            message = format!("Signed in to `{authorised}`; you can use it now.");
-            *provider_available = true;
-        }
+            &mut message,
+        );
     }
     writeln!(stdout, "{}", tui::safe_text(&message)).map_err(terminal_failed)?;
     Ok(next)
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn finish_auth(
+    invocation: &Invocation,
+    workspace: &Path,
+    authorised: &str,
+    providers: &mut Vec<String>,
+    route: &mut tui::ModelRoute,
+    provider_available: &mut bool,
+    resolved: &mut std::collections::HashMap<String, provider::Resolved>,
+    unavailable: &mut std::collections::HashSet<String>,
+    message: &mut String,
+) {
+    if authorised.is_empty() {
+        return;
+    }
+    if !providers.iter().any(|name| name == authorised) {
+        *providers = configured_providers(invocation);
+    }
+    if activate_signed_in_provider(
+        invocation,
+        workspace,
+        authorised,
+        route,
+        resolved,
+        unavailable,
+    ) {
+        *message = format!("Signed in to `{authorised}`; you can use it now.");
+        *provider_available = true;
+    }
+    if arsy_kernel::oauth::presets::get(authorised).is_some() {
+        if let Err(reason) = fetch_and_store_oauth_models(authorised) {
+            *message = format!("{message} Model discovery failed: {reason}");
+        }
+    }
 }
 
 /// Point the running session at a provider whose credential was just stored.
@@ -581,6 +634,221 @@ pub(crate) fn run_session_dialog(
     Ok(())
 }
 
+/// Drive the unified `/provider` dialog: access method, then a provider, then
+/// what to do with it. `/auth` is an alias for the same dialog.
+///
+/// The dialog is pure navigation; anything that collects text — a key, a URL,
+/// an OAuth code — is handed back as the `Prompt` the composer then answers,
+/// so every validation, masking, and storage rule stays in the wizard it
+/// already lived in. A pure write (make default) is done here and the dialog
+/// closes.
+/// The configured endpoints, each sorted into the one access bucket it belongs
+/// to, so the dialog's access column filters rather than repeats.
+#[cfg(feature = "tui")]
+pub(crate) fn provider_dialog_endpoints(invocation: &Invocation) -> Vec<tui::ConfiguredEndpoint> {
+    crate::provider::configuration(invocation)
+        .map(|config| {
+            config
+                .endpoints()
+                .map(|endpoint| {
+                    let has_oauth = endpoint.oauth.is_some();
+                    tui::ConfiguredEndpoint {
+                        access: tui::classify(&endpoint.id, &endpoint.base_url, has_oauth),
+                        oauth: has_oauth
+                            || arsy_kernel::oauth::presets::get(&endpoint.id).is_some(),
+                        id: endpoint.id.clone(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a chosen dialog action asks the loop to do next, decided without any
+/// terminal I/O so the loop keeps sole ownership of drawing and closing.
+#[cfg(feature = "tui")]
+enum ProviderFlow {
+    /// Close the dialog, print these lines, and return to the task prompt.
+    Close(Vec<String>),
+    /// Close the dialog and hand this prompt to the composer for its text.
+    Handoff(Prompt),
+    /// Keep the dialog open, showing this notice.
+    Notice(String),
+}
+
+/// Apply one dialog action's side effects (a config write, a login, a prefilled
+/// draft) and say what the loop should do. Anything that still needs typed text
+/// becomes a `Handoff` to the wizard the composer already drives.
+#[cfg(feature = "tui")]
+fn provider_action_flow(
+    action: tui::ProviderDialogAction,
+    invocation: &Invocation,
+    typing: &mut Typing<'_>,
+    emitter: &mut Emitter,
+) -> ProviderFlow {
+    match action {
+        tui::ProviderDialogAction::Close => ProviderFlow::Close(Vec::new()),
+        tui::ProviderDialogAction::SetDefault(name) => {
+            match super::wizard::write_config(|config| config_edit::set_default(config, &name)) {
+                Ok(()) => {
+                    ProviderFlow::Close(vec![format!("Provider: {name} (from the next session).")])
+                }
+                Err(reason) => ProviderFlow::Notice(reason),
+            }
+        }
+        tui::ProviderDialogAction::Remove(name) => {
+            *typing.draft = tui::ProviderDraft {
+                name,
+                ..Default::default()
+            };
+            ProviderFlow::Handoff(Prompt::Provider(tui::ProviderStep::ConfirmRemove))
+        }
+        tui::ProviderDialogAction::SetKey(name) => {
+            *typing.auth_draft = name;
+            ProviderFlow::Handoff(Prompt::Auth(tui::AuthStep::SetKey))
+        }
+        tui::ProviderDialogAction::AddPreset(row) => {
+            *typing.draft = tui::ProviderDraft {
+                name: row.id,
+                kind: row.kind,
+                base_url: row.base_url,
+                models: row.models,
+                store: "file".to_owned(),
+            };
+            ProviderFlow::Handoff(Prompt::Provider(tui::ProviderStep::Key))
+        }
+        tui::ProviderDialogAction::NewCustom => {
+            *typing.draft = tui::ProviderDraft::default();
+            ProviderFlow::Handoff(Prompt::Provider(tui::ProviderStep::Name))
+        }
+        tui::ProviderDialogAction::FetchModels(id) => fetch_models_flow(invocation, id),
+        tui::ProviderDialogAction::Login(id) => {
+            provider_login_flow(invocation, &id, typing, emitter)
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn provider_login_flow(
+    invocation: &Invocation,
+    id: &str,
+    typing: &mut Typing<'_>,
+    emitter: &mut Emitter,
+) -> ProviderFlow {
+    match auth_step(
+        invocation,
+        tui::AuthStep::LoginProvider,
+        id,
+        typing.auth_draft,
+        typing.providers,
+        emitter,
+    ) {
+        Ok(AuthNext::Ask(next)) => ProviderFlow::Handoff(Prompt::Auth(next)),
+        Ok(AuthNext::Done(message)) => match fetch_and_store_oauth_models(id) {
+            Ok(count) => ProviderFlow::Close(vec![format!("{message} Fetched {count} model(s).")]),
+            Err(reason) => {
+                ProviderFlow::Close(vec![format!("{message} Model discovery failed: {reason}")])
+            }
+        },
+        Ok(AuthNext::Cancelled(message)) => ProviderFlow::Close(vec![message]),
+        Err(reason) => ProviderFlow::Notice(reason),
+    }
+}
+
+/// Shared core: fetch the live model list for `id` from its endpoint and write
+/// it back to the config. Returns the count on success, the error message on
+/// failure. Used by both the manual "Fetch model list" action and the
+/// post-add auto-fetch in `take_provider`.
+#[cfg(feature = "tui")]
+fn fetch_and_store_models(invocation: &Invocation, id: &str) -> Result<usize, String> {
+    let (name, models) = provider::fetch_endpoint_models(invocation, id)?;
+    let count = models.len();
+    store_endpoint_models(&name, &models)?;
+    Ok(count)
+}
+
+#[cfg(feature = "tui")]
+fn store_endpoint_models(name: &str, models: &[String]) -> Result<(), String> {
+    let models = serde_json::Value::Array(
+        models
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+    super::wizard::write_config(|config| {
+        crate::config_edit::set_existing(config, &["provider", "endpoint", name], "models", models)?
+            .ok_or_else(|| format!("endpoint `{name}` not found in config file"))
+    })
+}
+
+#[cfg(feature = "tui")]
+fn fetch_and_store_oauth_models(id: &str) -> Result<usize, String> {
+    let preset = arsy_kernel::oauth::presets::get(id)
+        .ok_or_else(|| format!("`{id}` is not an OAuth preset"))?;
+    let models = provider::fetch_oauth_preset_models(preset)
+        .ok_or_else(|| format!("could not fetch models for `{id}`"))?;
+    let count = models.len();
+    store_endpoint_models(id, &models)?;
+    Ok(count)
+}
+
+#[cfg(feature = "tui")]
+fn fetch_models_flow(invocation: &Invocation, id: String) -> ProviderFlow {
+    match fetch_and_store_models(invocation, &id) {
+        Ok(count) => ProviderFlow::Notice(format!("Fetched {count} model(s) for `{id}`")),
+        Err(reason) => ProviderFlow::Notice(reason),
+    }
+}
+
+#[cfg(feature = "tui")]
+pub(crate) fn run_provider_dialog(
+    invocation: &Invocation,
+    typing: &mut Typing<'_>,
+    stdout: &mut io::Stdout,
+    keys: &std::sync::mpsc::Receiver<u8>,
+    decoder: &mut tui::Keys,
+    emitter: &mut Emitter,
+) -> Result<Option<Prompt>, Diagnostic> {
+    *typing.providers = configured_providers(invocation);
+    let mut dialog = tui::ProviderDialogState::new(
+        provider_dialog_endpoints(invocation),
+        configured_default(invocation),
+    );
+    let mut drawn = 0;
+    loop {
+        drawn = repaint_dialog(
+            stdout,
+            typing.colour,
+            drawn,
+            &dialog.render(tui::terminal_width(), typing.colour),
+        )?;
+        let action = match next_dialog_key(&mut dialog, keys, decoder, |dialog: &mut _, key| {
+            dialog.handle_key(key)
+        }) {
+            Keyed::Ended => break,
+            Keyed::Redraw => continue,
+            Keyed::Acted(action) => action,
+        };
+        match provider_action_flow(action, invocation, typing, emitter) {
+            ProviderFlow::Notice(reason) => {
+                dialog.notice = Some(reason);
+                drawn = 0;
+            }
+            ProviderFlow::Close(lines) => {
+                close_dialog(stdout, drawn, &lines, "")?;
+                return Ok(None);
+            }
+            ProviderFlow::Handoff(prompt) => {
+                close_dialog(stdout, drawn, &[], "")?;
+                return Ok(Some(prompt));
+            }
+        }
+    }
+    close_dialog(stdout, drawn, &[], "")?;
+    Ok(None)
+}
+
 /// Open the dialog a bare slash command named.
 ///
 /// Every one of these writes the operator's own `arsy.json`, so a bare
@@ -623,9 +891,7 @@ pub(crate) fn run_dialog(
             typing.roles,
         ),
         Dialog::Model => {
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
-            *typing.models = models;
+            *typing.models = endpoint_models(invocation);
             run_model_dialog(
                 invocation,
                 typing.models,
@@ -876,8 +1142,7 @@ pub(crate) fn open_picker(
             let Some(answer) = answer else {
                 return Ok(None);
             };
-            let mut models = endpoint_models(invocation);
-            models.extend(tui::available_models());
+            let models = endpoint_models(invocation);
             *opening.models = models;
             let next = take_model(
                 answer,
@@ -1140,6 +1405,14 @@ pub(crate) fn answer_task(
     }
     if line.trim().starts_with('/') || line.trim().is_empty() {
         write!(stdout, "{}", composer.clear()).map_err(terminal_failed)?;
+        // `/provider` and `/auth` are one dialog now: access -> provider ->
+        // manage. It may hand back a composer prompt for the text it still
+        // needs (a key, a URL, an OAuth code).
+        if matches!(line.trim(), "/provider" | "/auth") {
+            let next =
+                run_provider_dialog(invocation, &mut typing, stdout, keys, decoder, emitter)?;
+            return Ok(next.map_or(TaskPass::Go, TaskPass::Ask));
+        }
         // `/mcp`, `/hooks`, `/skill`, `/session`, `/settings` and `/model` alone
         // open their dialog, which writes the operator's configuration; with any
         // argument each is the read-only inspection it always was.
@@ -1551,20 +1824,17 @@ pub(crate) fn open_route(invocation: &Invocation, workspace: &Path) -> Result<Op
             Ok((resolved, model))
         })
         .ok();
-    let detected = match &native {
-        Some((resolved, model)) => Some(tui::ModelRoute {
-            provider: resolved.endpoint.id.clone(),
-            model: model.clone(),
-        }),
-        None => tui::detect_model_route(),
-    };
-    // Nothing configured and no Codex login is not fatal: the session still
-    // opens so `/mcp` and `/hooks` can inspect the workspace. Only a task turn
-    // is refused, which `provider_available` gates below.
+    let detected = native.as_ref().map(|(resolved, model)| tui::ModelRoute {
+        provider: resolved.endpoint.id.clone(),
+        model: model.clone(),
+    });
+    // Nothing configured is not fatal: the session still opens so `/mcp` and
+    // `/hooks` can inspect the workspace. Only a task turn is refused, which
+    // `provider_available` gates below.
     let provider_available = detected.is_some();
     let detected = detected.unwrap_or_else(|| tui::ModelRoute {
-        provider: tui::CODEX_PROVIDER.to_owned(),
-        model: "default".into(),
+        provider: String::new(),
+        model: String::new(),
     });
     Ok(Opened {
         native: native.map(|(resolved, _)| resolved),

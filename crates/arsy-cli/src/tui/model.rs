@@ -10,51 +10,6 @@ pub struct ModelChoice {
     pub name: String,
 }
 
-/// Read the models the Codex CLI has cached for the signed-in account.
-///
-/// This is Codex's own cache, so an unreadable or reshaped file is not an
-/// error: the picker falls back to free text, which always worked.
-pub fn available_models() -> Vec<ModelChoice> {
-    let home = std::env::var_os("CODEX_HOME").map_or_else(
-        || {
-            std::env::var_os("HOME")
-                .map(|home| std::path::Path::new(&home).join(".codex"))
-                .unwrap_or_default()
-        },
-        std::path::PathBuf::from,
-    );
-    let Ok(text) = std::fs::read_to_string(home.join("models_cache.json")) else {
-        return Vec::new();
-    };
-    let Ok(cache) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
-    };
-    let Some(models) = cache.get("models").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut listed: Vec<(i64, ModelChoice)> = models
-        .iter()
-        .filter(|model| model.get("visibility").and_then(Value::as_str) == Some("list"))
-        .filter_map(|model| {
-            let slug = model.get("slug").and_then(Value::as_str)?;
-            Some((
-                model.get("priority").and_then(Value::as_i64).unwrap_or(0),
-                ModelChoice {
-                    provider: CODEX_PROVIDER.to_owned(),
-                    slug: slug.to_owned(),
-                    name: model
-                        .get("display_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(slug)
-                        .to_owned(),
-                },
-            ))
-        })
-        .collect();
-    listed.sort_by_key(|(priority, _)| *priority);
-    listed.into_iter().map(|(_, choice)| choice).collect()
-}
-
 /// Offer every configured provider's models, grouped under their provider, by
 /// number; `current` is marked where it appears.
 ///
@@ -173,8 +128,6 @@ pub fn model_rows(
             let label = format!("[{}] {}", choice.provider, choice.slug);
             let desc = if choice.name.is_empty() || choice.name == choice.slug {
                 format!("on {}", choice.provider)
-            } else if choice.provider == CODEX_PROVIDER {
-                format!("{} · codex", choice.name)
             } else {
                 format!("{} · on {}", choice.name, choice.provider)
             };

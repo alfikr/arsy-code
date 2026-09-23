@@ -59,7 +59,12 @@ impl ModelDialogState {
         current_route: ModelRoute,
         current_effort: Option<Effort>,
     ) -> Self {
-        if !providers.iter().any(|p| p == &current_route.provider) {
+        // Only add the saved route's provider as a ghost entry if it has models
+        // (non-empty name + appears in the model list). Empty route or deleted
+        // providers must not appear as "[set]" with no selectable models.
+        let route_has_models = !current_route.provider.is_empty()
+            && models.iter().any(|m| m.provider == current_route.provider);
+        if route_has_models && !providers.iter().any(|p| p == &current_route.provider) {
             providers.push(current_route.provider.clone());
         }
         for m in &models {
@@ -68,9 +73,6 @@ impl ModelDialogState {
             }
         }
         providers.sort();
-        if providers.is_empty() {
-            providers.push(CODEX_PROVIDER.to_owned());
-        }
 
         let selected_provider = providers
             .iter()
@@ -466,18 +468,6 @@ impl ModelDialogState {
             .map(|l| border_line(&l, inner, colour))
             .collect()
     }
-}
-
-fn cell(text: &str, width: usize) -> String {
-    let fitted = fit(text, width);
-    let pad = " ".repeat(width.saturating_sub(visible_len(&fitted)));
-    format!("{fitted}{pad}")
-}
-
-fn border_line(content: &str, inner: usize, colour: bool) -> String {
-    let body = cell(content, inner);
-    let border = paint(colour, sgr_border(), "│");
-    format!("{border} {body} {border}")
 }
 
 #[cfg(test)]

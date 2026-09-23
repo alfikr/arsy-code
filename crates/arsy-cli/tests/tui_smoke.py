@@ -49,6 +49,10 @@ class Terminal:
     def send(self, keys):
         os.write(self.master, keys)
 
+    def down(self, count=1):
+        for _ in range(count):
+            self.send(b"\x1b[B")
+
     def expect(self, text, timeout=10):
         deadline = time.monotonic() + timeout
         exited = None
@@ -81,8 +85,6 @@ class Terminal:
 
 
 def workspace(root):
-    (root / "bin").mkdir()
-    (root / "bin/codex").symlink_to("/usr/bin/false")
     (root / ".claude").mkdir()
     (root / ".mcp.json").write_text(json.dumps({
         "mcpServers": {"docs": {"command": "never-execute-this", "args": ["--serve"]}}
@@ -106,7 +108,7 @@ def isolated(root):
     """
     environment = dict(
         os.environ,
-        PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+        PATH=os.environ['PATH'],
         HOME=str(root),
         XDG_CONFIG_HOME=str(root / "config"),
     )
@@ -210,13 +212,12 @@ def main():
             terminal.send(b"/unknown\r")
             terminal.expect("Unknown command")
 
-            # A mistyped answer never becomes the remembered model, and leaving
-            # the picker returns to the task prompt instead of ending the session.
+            # `/model` opens the model/effort dialog; leaving it applies nothing
+            # and returns to the task prompt instead of ending the session.
             terminal.send(b"/model\r")
-            terminal.send(b"/model gpt-5\r")
-            terminal.expect("is a command")
+            terminal.expect("MODEL & EFFORT")
             terminal.send(b"\x03")
-            terminal.expect("Model unchanged")
+            assert child.poll() is None, "leaving the model dialog ended the session"
             assert not (root / ".arsy/model").exists()
 
             # The effort picker is arrowed and taken like the command menu. It
@@ -257,12 +258,17 @@ def main():
             terminal.send(b"/theme mono\r")
             terminal.expect("Theme: mono")
 
-            # `/provider` adds an endpoint without leaving the session: every
-            # field is asked for, the credential is typed masked, and the
-            # configuration ARSY writes is the one it reads back.
+            # `/provider` (and its alias `/auth`) open one 3-pane dialog:
+            # access -> provider -> manage. Adding a custom endpoint navigates
+            # to Custom access, the new-endpoint row, then Add, which hands off
+            # to the same field-by-field wizard; the credential is typed masked
+            # and the configuration ARSY writes is the one it reads back.
             terminal.send(b"/provider\r")
-            terminal.expect("add a provider")
-            terminal.send(b"+new\r")
+            terminal.expect("Switch Pane")            # the dialog is open
+            terminal.down(2)                          # access: OAuth -> Key -> Custom
+            terminal.send(b"\t")                       # focus the provider list (+new)
+            terminal.send(b"\t")                       # focus manage (Add)
+            terminal.send(b"\r")                       # Add -> manual add wizard
             terminal.expect("new provider")
             terminal.send(b"acme\r")
             terminal.expect("dialect")
@@ -277,12 +283,6 @@ def main():
             terminal.send(b"sk-provider-wizard-value\r")
             terminal.expect("Added provider acme")
 
-            # A credential the wizard stored is catalogued like one `auth set`
-            # stores: `/auth` menu offers `list` to show it.
-            terminal.send(b"/auth\r")
-            terminal.expect("sign in to a provider with OAuth")
-            terminal.send(b"list\r")
-            terminal.expect("secret://file/acme.key")
             written = root / ".arsy/arsy.json"
             body = json.loads(written.read_text())
             endpoint = body["provider"]["endpoint"]["acme"]
@@ -301,34 +301,33 @@ def main():
             with terminal.lock:
                 assert b"sk-provider-wizard-value" not in terminal.received
 
-            # Switching without restarting: the session still runs what it
-            # resolved at startup, and the rows say which is which rather than
-            # letting the new choice look like it did not take.
-            terminal.send(b"/provider\r")
-            terminal.expect("acme")
-            terminal.expect("in use after a restart")
-
-            # Leaving a wizard step cancels the wizard, not the session.
-            terminal.send(b"/provider\r")
-            terminal.send(b"+new\r")
-            terminal.expect("new provider")
+            # `/auth` is an alias for the same dialog; Esc leaves it without
+            # touching the session.
+            terminal.send(b"/auth\r")
+            terminal.expect("Switch Pane")
             terminal.send(b"\x03")
-            terminal.expect("Provider unchanged")
-            assert child.poll() is None, "leaving /provider ended the session"
+            assert child.poll() is None, "leaving the provider dialog ended the session"
 
-            # Removing asks first, and `no` leaves the configuration alone.
+            # Removing asks first, and `no` leaves the configuration alone. The
+            # configured endpoint is reachable under Custom access; its Manage
+            # column offers Use, Set key, then Remove.
             terminal.send(b"/provider\r")
-            terminal.send(b"-remove\r")
-            terminal.expect("remove which provider")
-            terminal.send(b"acme\r")
+            terminal.down(2)                          # access: -> Custom
+            terminal.send(b"\t")                       # list: acme is row 0
+            terminal.send(b"\t")                       # manage: Use is action 0
+            terminal.down(2)                          # manage: Use -> Set key -> Remove
+            terminal.send(b"\r")                       # hand off to the confirm step
             terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"no\r")
             terminal.expect("Provider unchanged")
             assert "acme" in json.loads(written.read_text())["provider"]["endpoint"]
 
             terminal.send(b"/provider\r")
-            terminal.send(b"-remove\r")
-            terminal.send(b"acme\r")
+            terminal.down(2)
+            terminal.send(b"\t\t")
+            terminal.down(2)
+            terminal.send(b"\r")
+            terminal.expect("remove `acme` from the configuration?")
             terminal.send(b"yes\r")
             terminal.expect("Removed provider acme")
             assert "acme" not in json.loads(written.read_text()).get("provider", {}).get(

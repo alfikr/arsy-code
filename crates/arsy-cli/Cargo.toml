@@ -33,6 +33,7 @@ serde.workspace = true
 serde_json.workspace = true
 unicode-width.workspace = true
 
+
 [dev-dependencies]
 # The reference thin client, so the pair can be tested as a pair. The
 # dependency runs this way round because the client depends on nothing.

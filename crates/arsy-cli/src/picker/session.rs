@@ -140,12 +140,7 @@ pub(crate) fn reconstruct_session_conversation(
 /// is not hidden behind a stale list.
 #[cfg(feature = "tui")]
 pub(crate) fn configured_providers(invocation: &Invocation) -> Vec<String> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
-        return Vec::new();
-    };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) else {
-        return Vec::new();
-    };
-    config.endpoint_ids()
+    crate::provider::configuration(invocation)
+        .map(|config| config.endpoint_ids())
+        .unwrap_or_default()
 }

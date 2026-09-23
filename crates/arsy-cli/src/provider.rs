@@ -12,9 +12,13 @@ use arsy_kernel::{
     config::{Config, Dialect, Endpoint},
     oauth::{self, TokenSet},
     provider::{
-        anthropic::AnthropicProvider, google_code_assist::GoogleCodeAssistProvider,
-        http::HttpTransport, openai::OpenAiProvider, openai_responses::OpenAiResponsesProvider,
-        wire::ApiKey, ModelProvider,
+        anthropic::AnthropicProvider,
+        google_code_assist::{GoogleCodeAssistProvider, ANTIGRAVITY_USER_AGENT},
+        http::HttpTransport,
+        openai::OpenAiProvider,
+        openai_responses::OpenAiResponsesProvider,
+        wire::{ApiKey, WireRequest, WireResponse, WireTransport},
+        ModelProvider,
     },
     routing,
     secret::{
@@ -612,7 +616,7 @@ fn model_report(
     }))
 }
 
-fn configuration(invocation: &crate::Invocation) -> Result<Config, Diagnostic> {
+pub(crate) fn configuration(invocation: &crate::Invocation) -> Result<Config, Diagnostic> {
     let root = crate::workspace_root(&invocation.workspace)?;
     let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
     crate::load_config(&root, &working, invocation.config.as_deref())
@@ -698,6 +702,185 @@ fn human_models(report: &serde_json::Value) -> String {
         }
     }
     text
+}
+
+/// Fetch the live model list for a configured endpoint.
+///
+/// Returns the model IDs and the endpoint's config-file name (for the write
+/// step), or an error string the caller can surface as a dialog notice.
+#[cfg(feature = "tui")]
+pub(crate) fn fetch_endpoint_models(
+    invocation: &crate::Invocation,
+    endpoint_id: &str,
+) -> Result<(String, Vec<String>), String> {
+    let config = configuration(invocation).map_err(|d| d.message)?;
+    let endpoint = config
+        .all_endpoints()
+        .find(|e| e.id == endpoint_id)
+        .ok_or_else(|| format!("endpoint `{endpoint_id}` not found in config"))?
+        .clone();
+    let api_key = credential(&endpoint, &from_env).ok().map(|(k, _)| k);
+    let models = fetch_models_http(
+        &HttpTransport::default(),
+        endpoint.kind.as_str(),
+        &endpoint.base_url,
+        api_key.as_deref(),
+    )
+    .ok_or_else(|| format!("could not fetch models for `{endpoint_id}`"))?;
+    Ok((endpoint.id, models))
+}
+
+/// Fetch the model list for an OAuth preset using its stored credential.
+/// Returns `None` if the token is absent, the fetch fails, or the dialect does
+/// not support discovery. Expired tokens are refreshed and written back before
+/// the fetch is attempted, so a background `/model` open does not fail silently.
+#[cfg(feature = "tui")]
+pub(crate) fn fetch_oauth_preset_models(
+    preset: &arsy_kernel::oauth::presets::Preset,
+) -> Option<Vec<String>> {
+    let handle_name = format!("{}.key", preset.id);
+    let raw = FileCredentialStore.resolve(&handle_name).ok()?;
+    let tokens = serde_json::from_str::<TokenSet>(&raw).ok()?;
+    let access_token = if tokens.is_expired(oauth::now()) {
+        let oauth_client = preset.oauth();
+        let refreshed = oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).ok()?;
+        let raw = serde_json::to_string(&refreshed).ok()?;
+        let _ = FileCredentialStore.set(&handle_name, &raw);
+        refreshed.access_token
+    } else {
+        tokens.access_token
+    };
+    fetch_models_http(
+        &HttpTransport::default(),
+        preset.dialect.as_str(),
+        preset.base_url,
+        Some(&access_token),
+    )
+}
+
+#[cfg(feature = "tui")]
+fn fetch_models_http(
+    transport: &HttpTransport,
+    kind: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Option<Vec<String>> {
+    let bearer = |headers: &mut Vec<(String, String)>| {
+        if let Some(token) = api_key {
+            headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
+        }
+    };
+    match kind {
+        "anthropic" => {
+            let mut headers = vec![
+                ("x-api-key".to_owned(), api_key?.to_owned()),
+                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+            ];
+            let body = fetch_json(transport.get(
+                "https://api.anthropic.com/v1/models",
+                std::mem::take(&mut headers),
+            ))?;
+            extract_ids(&body["data"])
+        }
+        "openai_responses" => {
+            let url = format!(
+                "{}/models?client_version=0.153.0",
+                base_url.trim_end_matches('/')
+            );
+            let mut headers = vec![
+                ("accept".to_owned(), "application/json".to_owned()),
+                (
+                    "OpenAI-Beta".to_owned(),
+                    "responses=experimental".to_owned(),
+                ),
+                ("originator".to_owned(), "omp".to_owned()),
+                ("version".to_owned(), "0.153.0".to_owned()),
+            ];
+            bearer(&mut headers);
+            let body = fetch_json(transport.get(url, headers))?;
+            let arr = body.get("models").or_else(|| body.get("data"))?;
+            let ids: Vec<String> = arr
+                .as_array()?
+                .iter()
+                .filter(|model| {
+                    !matches!(
+                        model.get("visibility").and_then(|value| value.as_str()),
+                        Some("hide" | "hidden")
+                    )
+                })
+                .filter_map(|model| {
+                    model
+                        .get("slug")
+                        .or_else(|| model.get("id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .collect();
+            (!ids.is_empty()).then_some(ids)
+        }
+        "google_code_assist" => {
+            let url = format!(
+                "{}/v1internal:fetchAvailableModels",
+                base_url.trim_end_matches('/')
+            );
+            let mut headers = vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("User-Agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
+            ];
+            bearer(&mut headers);
+            let body = fetch_json(transport.send(WireRequest {
+                url,
+                headers,
+                body: "{}".to_owned(),
+            }))?;
+            let models = body.get("models")?.as_object()?;
+            let mut ids: Vec<String> = models
+                .iter()
+                .filter(|(_, value)| {
+                    value.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.sort();
+            (!ids.is_empty()).then_some(ids)
+        }
+        _ => {
+            let mut headers = Vec::new();
+            bearer(&mut headers);
+            let body = fetch_json(transport.get(
+                format!("{}/models", base_url.trim_end_matches('/')),
+                headers,
+            ))?;
+            extract_ids(&body["data"])
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn fetch_json(
+    response: Result<WireResponse, arsy_kernel::provider::ProviderError>,
+) -> Option<serde_json::Value> {
+    let body = response
+        .ok()?
+        .lines
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .join("\n");
+    serde_json::from_str(&body).ok()
+}
+
+#[cfg(feature = "tui")]
+fn extract_ids(data: &serde_json::Value) -> Option<Vec<String>> {
+    let ids: Vec<String> = data
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_owned))
+        .collect();
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
 }
 
 #[cfg(test)]

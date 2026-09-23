@@ -2452,11 +2452,7 @@ fn run_tui(invocation: &Invocation, emitter: &mut Emitter) -> Result<i32, Diagno
     let colour = !invocation.no_color && std::env::var_os("NO_COLOR").is_none();
 
     let (theme_config, mut theme) = open_palette(invocation, &workspace, emitter);
-    let mut models = {
-        let mut models = endpoint_models(invocation);
-        models.extend(tui::available_models());
-        models
-    };
+    let mut models = endpoint_models(invocation);
     let remembered = saved_route().filter(|saved| saved.provider == detected.provider);
     let mut route = remembered.clone().unwrap_or(detected);
     let (mut resolved_providers, mut unavailable_providers) =
@@ -5646,7 +5642,7 @@ mod tests {
     #[test]
     fn a_follow_up_typed_during_a_provider_turn_is_carried_to_the_next_one() {
         let route = tui::ModelRoute {
-            provider: tui::CODEX_PROVIDER.to_owned(),
+            provider: "test-provider".to_owned(),
             model: "default".to_owned(),
         };
         let approval =
@@ -5703,7 +5699,7 @@ mod tests {
     fn interactive_provider_cancellation_and_terminal_failures_are_bounded() {
         use std::time::{Duration, Instant};
         let route = tui::ModelRoute {
-            provider: tui::CODEX_PROVIDER.to_owned(),
+            provider: "test-provider".to_owned(),
             model: "default".to_owned(),
         };
         let approval =
@@ -5803,7 +5799,7 @@ mod tests {
     #[test]
     fn external_provider_skips_a_repeated_successful_git_command() {
         let route = tui::ModelRoute {
-            provider: tui::CODEX_PROVIDER.to_owned(),
+            provider: "test-provider".to_owned(),
             model: "default".to_owned(),
         };
         let approval =

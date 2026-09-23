@@ -183,7 +183,8 @@ pub(crate) fn provider_removed(name: &str) -> Result<ProviderNext, String> {
         let removed: Vec<SecretHandle> = records
             .iter()
             .filter(|record| {
-                record.handle.name() == name || record.handle.name() == format!("endpoint.{name}")
+                record.handle.name() == format!("{name}.key")
+                    || record.handle.name() == format!("endpoint.{name}")
             })
             .map(|record| record.handle.clone())
             .collect();
@@ -378,7 +379,17 @@ fn auth_remove_handle_answer(answer: &str) -> Result<AuthNext, String> {
     let handle: SecretHandle =
         SecretHandle::try_from(answer.to_owned()).map_err(|error| format!("{error}"))?;
     let mut records = catalog().map_err(|e| e.message)?;
-    records.retain(|r| r.handle != handle);
+    let provider = records
+        .iter()
+        .find(|record| record.handle == handle)
+        .map(|record| record.provider.clone());
+    if let Some(provider) = provider
+        .as_deref()
+        .filter(|provider| arsy_kernel::oauth::presets::get(provider).is_some())
+    {
+        write_config(|config| config_edit::remove_endpoint(config, provider))?;
+    }
+    records.retain(|record| record.handle != handle);
     save_catalog(&records).map_err(|e| e.message)?;
     forget_credential(&handle);
     Ok(AuthNext::Done(format!("Removed credential `{handle}`.")))

@@ -119,7 +119,6 @@ fn persist_failed_turn(
     turn_id: arsy_kernel::domain::TurnId,
     session: SessionId,
     node: TaskId,
-    route: &tui::ModelRoute,
     failure: &str,
     base: usize,
     conversation: &mut Vec<ModelMessage>,
@@ -134,7 +133,6 @@ fn persist_failed_turn(
         actor.clone(),
         turn_id,
         session,
-        route,
         failure.to_owned(),
         emitter,
     )?;
@@ -265,7 +263,6 @@ fn persist_turn(
             turn_id,
             session,
             node,
-            route,
             failure,
             base,
             conversation,
@@ -427,15 +424,7 @@ pub(crate) fn run_turn(
             graph
                 .fail(node, json!({"message": reason.clone()}))
                 .map_err(graph_failed)?;
-            fail_turn(
-                &service,
-                actor,
-                admission.turn,
-                session,
-                route,
-                reason,
-                emitter,
-            )?;
+            fail_turn(&service, actor, admission.turn, session, reason, emitter)?;
             return Ok(Turn::default());
         }
     };
@@ -2978,7 +2967,6 @@ fn fail_turn(
     actor: Principal,
     turn: arsy_kernel::domain::TurnId,
     session: SessionId,
-    route: &tui::ModelRoute,
     message: String,
     emitter: &mut Emitter,
 ) -> Result<i32, Diagnostic> {
@@ -2992,12 +2980,6 @@ fn fail_turn(
             ARSY_TRN_1000,
             "turn",
             "raise `execution.max_tool_rounds`, or continue with a narrower task",
-        )
-    } else if route.is_codex() {
-        (
-            "ARSY-PRV-1002",
-            "provider_cli",
-            "verify the selected CLI login and model, then retry",
         )
     } else {
         (

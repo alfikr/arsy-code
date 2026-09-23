@@ -21,7 +21,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "plan a task; show | approve | revise [NOTE] | cancel",
     ),
     ("/todo", "show this session's durable checklist"),
-    ("/provider", "choose, add, or remove a provider endpoint"),
+    (
+        "/provider",
+        "providers: choose access (OAuth/key/custom/local), add, sign in, or remove",
+    ),
     ("/model", "choose the provider model"),
     ("/effort", "set reasoning effort; low | medium | high | off"),
     (
@@ -47,7 +50,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/doctor", "check workspace, storage, and sandbox assurance"),
     (
         "/auth",
-        "manage credentials; list | login PROVIDER | set PROVIDER | remove HANDLE",
+        "alias of /provider (access, sign-in, and credentials)",
     ),
     (
         "/compat",
