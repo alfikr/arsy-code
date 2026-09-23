@@ -56,14 +56,54 @@ impl HttpTransport {
 
 impl WireTransport for HttpTransport {
     fn send(&self, request: WireRequest) -> Result<WireResponse, ProviderError> {
-        require_transport_security(&request.url)?;
-        let mut builder = self.agent.post(&request.url);
-        for (name, value) in &request.headers {
-            builder = builder.header(name, value);
-        }
-        let response = builder
-            .send(request.body.as_bytes())
-            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        self.request("POST", request.url, request.headers, request.body)
+    }
+}
+
+impl HttpTransport {
+    /// Send a credentialed metadata request without widening [`WireRequest`]'s
+    /// provider-call contract.
+    pub fn get(
+        &self,
+        url: impl Into<String>,
+        headers: Vec<(String, String)>,
+    ) -> Result<WireResponse, ProviderError> {
+        self.request("GET", url.into(), headers, String::new())
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    ) -> Result<WireResponse, ProviderError> {
+        require_transport_security(&url)?;
+        let response = match method {
+            "GET" => {
+                let mut builder = self.agent.get(&url);
+                for (name, value) in &headers {
+                    builder = builder.header(name, value);
+                }
+                builder
+                    .call()
+                    .map_err(|error| ProviderError::Transport(error.to_string()))?
+            }
+            "POST" => {
+                let mut builder = self.agent.post(&url);
+                for (name, value) in &headers {
+                    builder = builder.header(name, value);
+                }
+                builder
+                    .send(body)
+                    .map_err(|error| ProviderError::Transport(error.to_string()))?
+            }
+            other => {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "unsupported HTTP method: {other}"
+                )))
+            }
+        };
         let status = response.status().as_u16();
         let headers = response
             .headers()

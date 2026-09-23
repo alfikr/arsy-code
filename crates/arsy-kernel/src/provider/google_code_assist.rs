@@ -39,8 +39,8 @@ fn wire_tool_name(name: &str) -> String {
 
 pub const DEFAULT_BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 const API_VERSION: &str = "v1internal";
-/// Antigravity User-Agent matching official antigravity/hub client.
-const USER_AGENT: &str =
+/// User agent expected by the Cloud Code Assist endpoint for Antigravity.
+pub const ANTIGRAVITY_USER_AGENT: &str =
     "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
 
 pub struct GoogleCodeAssistProvider<T> {
@@ -103,7 +103,7 @@ impl<T: WireTransport> GoogleCodeAssistProvider<T> {
                 format!("Bearer {}", self.key.expose()),
             ),
             ("content-type".to_owned(), "application/json".to_owned()),
-            ("user-agent".to_owned(), USER_AGENT.to_owned()),
+            ("user-agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
         ];
         if streaming {
             headers.push(("accept".to_owned(), "text/event-stream".to_owned()));
@@ -820,6 +820,58 @@ mod tests {
                 .map(|(status, body)| (*status, (*body).to_owned()))
                 .collect(),
         ))
+    }
+
+    struct Capturing {
+        response: (u16, String),
+        sender: std::sync::mpsc::Sender<WireRequest>,
+    }
+
+    impl WireTransport for Capturing {
+        fn send(&self, request: WireRequest) -> Result<WireResponse, ProviderError> {
+            self.sender
+                .send(request)
+                .expect("test receiver is available");
+            let (status, body) = &self.response;
+            Ok(WireResponse {
+                status: *status,
+                headers: vec![],
+                lines: Box::new(
+                    body.lines()
+                        .map(|line| Ok(line.to_owned()))
+                        .collect::<Vec<_>>()
+                        .into_iter(),
+                ),
+            })
+        }
+    }
+
+    #[test]
+    fn available_model_discovery_identifies_as_antigravity() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let transport = Capturing {
+            response: (200, r#"{"models":{"gemini-3-pro":{}}}"#.to_owned()),
+            sender,
+        };
+        let provider = GoogleCodeAssistProvider::with_base_url(
+            "https://host.test",
+            ApiKey::new("t"),
+            transport,
+        );
+
+        assert_eq!(
+            provider.fetch_available_models(),
+            Some(vec!["gemini-3-pro".to_owned()])
+        );
+        let request = receiver.recv().expect("discovery request sent");
+        assert_eq!(
+            request.url,
+            "https://host.test/v1internal:fetchAvailableModels"
+        );
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "user-agent" && value == ANTIGRAVITY_USER_AGENT));
     }
 
     fn request() -> CanonicalModelRequest {

@@ -1,7 +1,6 @@
 //! The remembered `/model`, `/effort` and `/theme` choices: where they live
 //! beside the user configuration, and how a session reads them back.
 
-use super::wizard::catalog_handles;
 #[cfg(feature = "tui")]
 use crate::*;
 use arsy_kernel::provider::Effort;
@@ -47,7 +46,9 @@ fn model_store() -> Option<PathBuf> {
 pub(crate) fn saved_route() -> Option<tui::ModelRoute> {
     let raw = std::fs::read_to_string(model_store()?).ok()?;
     let raw = raw.trim();
-    let route = (!raw.is_empty()).then(|| tui::ModelRoute::parse(raw))?;
+    let route = (!raw.is_empty())
+        .then(|| tui::ModelRoute::parse(raw))
+        .flatten()?;
     tui::validate_slug(&route.model).ok()?;
     Some(route)
 }
@@ -145,35 +146,20 @@ pub(crate) fn apply_theme(
 
 #[cfg(feature = "tui")]
 pub(crate) fn endpoint_models(invocation: &Invocation) -> Vec<tui::ModelChoice> {
-    let Ok(root) = workspace_root(&invocation.workspace) else {
-        return Vec::new();
-    };
-    let working = std::env::current_dir().unwrap_or_else(|_| root.clone());
-    let mut choices = Vec::new();
-    if let Ok(config) = load_config(&root, &working, invocation.config.as_deref()) {
-        for endpoint in config.endpoints() {
-            choices.extend(endpoint.models.iter().map(|slug| tui::ModelChoice {
-                provider: endpoint.id.clone(),
-                slug: slug.clone(),
-                name: format!("on {}", endpoint.id),
-            }));
-        }
-    }
-    // Model discovery must be read-only. Probing the macOS keychain here
-    // triggers an unlock prompt every time `/model` opens; auth state is already
-    // represented by the credential catalog.
-    let saved_handles = catalog_handles();
-    for preset in arsy_kernel::oauth::presets::all() {
-        let has_auth = saved_handles.iter().any(|h| h.contains(preset.id));
-        if has_auth && !choices.iter().any(|c| c.provider == preset.id) {
-            choices.extend(preset.models.iter().map(|slug| tui::ModelChoice {
-                provider: preset.id.to_string(),
-                slug: (*slug).to_string(),
-                name: format!("on {}", preset.id),
-            }));
-        }
-    }
-    choices
+    crate::provider::configuration(invocation)
+        .map(|config| {
+            config
+                .endpoints()
+                .flat_map(|endpoint| {
+                    endpoint.models.iter().map(move |slug| tui::ModelChoice {
+                        provider: endpoint.id.clone(),
+                        slug: slug.clone(),
+                        name: format!("on {}", endpoint.id),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The palette the session paints with: a built-in base — the `[theme]` base,

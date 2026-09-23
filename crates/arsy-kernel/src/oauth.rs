@@ -831,7 +831,6 @@ pub mod presets {
     /// The preset `id` names, if any.
     pub fn get(id: &str) -> Option<&'static Preset> {
         let canonical = match id {
-            "codex" | "openai-codex" | "codex-oauth" => "codex-oauth",
             "antigravity" | "google-antigravity" => "antigravity",
             "claude" | "claude-pro" | "anthropic-oauth" | "claude-oauth" => "claude-oauth",
             other => other,
@@ -852,7 +851,9 @@ pub mod presets {
             label: "OpenAI Codex — sign in with a ChatGPT account",
             dialect: Dialect::OpenaiResponses,
             base_url: "https://chatgpt.com/backend-api/codex",
-            models: &["gpt-5-codex", "gpt-5", "gpt-5-mini"],
+            // The live model list is fetched after login and stored on the
+            // synthesized endpoint so `/model` reflects configured providers.
+            models: &[],
             build_oauth: || OAuth {
                 authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
                 token_url: "https://auth.openai.com/oauth/token".to_owned(),
@@ -882,24 +883,10 @@ pub mod presets {
             label: "Google Antigravity — sign in with a Google account",
             dialect: Dialect::GoogleCodeAssist,
             base_url: "https://daily-cloudcode-pa.googleapis.com",
-            models: &[
-                "gemini-3.8-flash",
-                "gemini-3.7-flash",
-                "gemini-3.7-pro",
-                "gemini-3.1-pro",
-                "gemini-3-flash",
-                "gemini-3-pro",
-                "gemini-2.5-flash",
-                "gemini-2.5-pro",
-                "claude-3-7-sonnet",
-                "claude-sonnet-4-5",
-                "claude-sonnet-4-6",
-                "claude-opus-4-5",
-                "claude-opus-4-6",
-                "gpt-5",
-                "gpt-5-codex",
-                "gpt-oss",
-            ],
+            // Model list is fetched automatically after login via
+            // POST /v1internal:fetchAvailableModels and stored on the
+            // synthesized endpoint.
+            models: &[],
             build_oauth: || OAuth {
                 authorize_url: "https://accounts.google.com/o/oauth2/auth".to_owned(),
                 token_url: "https://oauth2.googleapis.com/token".to_owned(),
@@ -1362,6 +1349,13 @@ mod tests {
             serde_json::from_str(&sent[0]).expect("a manual-grant client refreshes with JSON too");
         assert_eq!(body["grant_type"], "refresh_token");
         assert_eq!(body["refresh_token"], "rt-1");
+    }
+
+    #[test]
+    fn codex_oauth_is_a_builtin_provider_preset() {
+        let preset = presets::get("codex-oauth").expect("Codex OAuth preset");
+        assert_eq!(preset.id, "codex-oauth");
+        assert_eq!(preset.dialect, crate::config::Dialect::OpenaiResponses);
     }
 
     #[test]
