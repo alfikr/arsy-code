@@ -90,16 +90,18 @@ An empty result names the files that were read and the filters that were applied
 In a TUI build (`cargo build -p arsy-cli --features tui`), use `/help`, `/mcp`,
 `/mcp show NAME --source claude`, or `/hooks --event PreToolUse`. The same route
 carries the other read-only inspections under their own names: `/settings [KEY]`
-for `config explain`, `/doctor`, `/auth` for the credential listing, and
-`/compat claude|codex|omp|agents`. Each expands to the CLI command it stands for
-and is parsed by the same grammar, so an unsupported argument is refused with the
-CLI's diagnostic. Every command on this route is read-only — `auth set`,
-`auth login`, and `auth remove` are not reachable from the TUI — so `/model`,
-which writes the accepted answer to the user configuration, and the `/mcp`
-dialog, which writes only `enabled` toggles and adoptions, are the slash
-commands that change state. These work even without provider
-authentication. Repeat an inspection to reload its source files. Unknown slash
-commands report an error instead of becoming model prompts.
+for `config explain`, `/doctor`, and `/compat claude|codex|omp|agents`. Each
+expands to the CLI command it stands for and is parsed by the same grammar, so an
+unsupported argument is refused with the CLI's diagnostic. The state-changing
+slash commands are `/model`, which writes the accepted answer to the user
+configuration; the `/mcp` dialog, which writes only `enabled` toggles and
+adoptions; and `/provider` (aliased as `/auth`), which owns the credential
+lifecycle in the TUI — adding an endpoint, signing in with OAuth, storing an
+API key, and removing an endpoint or credential. These write the operator's
+own `arsy.json` and the `0600` credential files beside it; nothing else on this
+route mutates state. They work even without provider authentication. Repeat an
+inspection to reload its source files. Unknown slash commands report an error
+instead of becoming model prompts.
 
 Typing `/` opens a command menu under the composer, one row per command with its
 description, narrowed as the line is typed and closed once an argument follows.
@@ -115,24 +117,36 @@ forward deletion, and bracketed paste to insert text without submitting pasted
 newlines. History is in memory only; multiline paste becomes spaces in the
 single-line composer.
 
-`/provider` opens the configured endpoints in the composer's own menu, with a row
-to add one and, once something is configured, a row to remove one. Choosing an
-endpoint makes it the default. The rows say which endpoint is which: the one
-this session resolved at startup is marked in use, and one chosen since then is
-marked as taking effect at the next restart. Adding a provider makes it the
-default, and without those markers the one it replaced reads as removed rather
-than as merely not current. Adding walks one question per field — name,
-dialect, base URL, models (one slug, or several separated by commas, the first
-being the default), where to keep the credential, then the credential
-itself, which is painted as bullets, kept out of the input history, and never
-written to the scrollback. Each answer is validated as it is given, an empty
-answer leaves the wizard, and nothing reaches the configuration until the last
-answer, so an abandoned wizard changes nothing. Removing is confirmed first and
-leaves the credential in place; `arsy auth list` still shows it. ARSY edits only
-the `provider.endpoint.*` objects it owns and the `provider.default` key; every
-other key in the file comes back exactly as it was. A session resolves its
-provider at startup, so a change asks
-for a restart rather than pretending the running session moved.
+`/provider` (aliased as `/auth`) opens one three-pane dialog: **access**, then a
+**provider**, then what to **manage**. `←`/`→` or `Tab` move between panes,
+`↑`/`↓` mark a row, `Enter` acts on the marked action, and `Esc` closes it. The
+access pane frames the two mechanisms the configuration actually has as four
+choices — `OAuth` (a subscription or browser sign-in), `API key` (a provider
+key), `Custom` (any OpenAI-compatible URL), and `Local` (Ollama or LM Studio on
+localhost). The provider pane lists what fits the chosen access: the built-in
+OAuth presets, curated key presets (OpenAI, Anthropic, Mistral, Gemini, xAI,
+Groq, Together, Fireworks, Cerebras, Perplexity, Cohere, NVIDIA, OpenRouter,
+DeepSeek) and local presets (Ollama, LM Studio), the endpoints
+already configured (marked `[set]`, and `[default]` for the resolved default),
+and, under `Custom`, a row that starts a by-hand add. The manage pane offers the
+actions that make sense for the marked row — use (make default), sign in, set an
+API key, fetch model list, add, or remove.
+
+The dialog is pure navigation; anything that collects text is handed to the same
+composer wizard as before, so its rules are unchanged: a masked credential
+painted as bullets, kept out of history and scrollback; a base URL that must
+start with `http`; a model list of one slug or several comma-separated (the first
+the default); each answer validated as given; an empty answer leaving the wizard;
+and nothing written until the last answer, so an abandoned wizard changes
+nothing. A preset prefills the dialect, base URL, and models, dropping straight
+to the credential. Signing in with an OAuth preset opens the browser and collects
+the code the issuer shows. Removing is confirmed first. A stored API key or a
+completed login is usable in the running session; a change of default endpoint
+asks for a restart rather than pretending the running session moved, because a
+session resolves its provider at startup. ARSY edits only the
+`provider.endpoint.*` objects it owns and the `provider.default` key, and the
+`0600` credential files beside the configuration; every other key comes back
+exactly as it was.
 
 A bare `/effort` opens the levels in the composer's own menu, marked at the
 current setting: Up/Down move the mark and Enter takes the marked level into the
@@ -154,9 +168,10 @@ Esc, Ctrl-C, or Ctrl-D at the effort picker leaves the level unchanged and
 returns to the task prompt, as at the model picker.
 
 `/model` lists the models the active endpoint offers, re-read when the picker
-opens so one added since startup appears without a restart. A Codex route lists
-what the CLI cached instead, and an endpoint that lists no models still takes a
-slug as free text. A slug that is not on the list is accepted either way: the
+opens so one added since startup appears without a restart. An endpoint that
+lists no models still takes a slug as free text. Use `/provider` → Manage →
+"Fetch model list" to pull the live model list from a configured endpoint and
+write it back to `arsy.json`. A slug that is not on the list is accepted either way: the
 list is what the endpoint advertises, not what it will refuse. Unlike a provider
 change, a model change takes effect on the next turn — the endpoint is the same
 one the session already resolved.
