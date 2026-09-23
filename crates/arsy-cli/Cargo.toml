@@ -16,7 +16,7 @@ path = "src/main.rs"
 # without rebuilding the harness, so the WASM host ships by default rather
 # than behind a flag only a developer knows to pass.
 default = ["tui", "wasm"]
-tui = ["dep:resvg", "dep:ureq"]
+tui = ["dep:resvg"]
 dap = ["arsy-code/dap"]
 wasm = ["arsy-code/wasm"]
 remote-transports = ["arsy-code/remote-transports"]
@@ -32,7 +32,6 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unicode-width.workspace = true
-ureq = { workspace = true, optional = true }
 
 
 [dev-dependencies]

@@ -17,7 +17,7 @@ use arsy_kernel::{
         http::HttpTransport,
         openai::OpenAiProvider,
         openai_responses::OpenAiResponsesProvider,
-        wire::ApiKey,
+        wire::{ApiKey, WireRequest, WireResponse, WireTransport},
         ModelProvider,
     },
     routing,
@@ -97,7 +97,7 @@ pub fn resolve_with_route(
         .or_else(|| config.provider_default())
         .filter(|id| *id != "auto")
     {
-        // A named provider is used as named, or reported as missing. Routing
+        // A named provider is used as named, or reported as missing.
         if let Some(endpoint) = config.endpoint(Some(id)).cloned() {
             return Ok((endpoint, None));
         }
@@ -712,7 +712,6 @@ pub(crate) fn fetch_endpoint_models(
     invocation: &crate::Invocation,
     endpoint_id: &str,
 ) -> Result<(String, Vec<String>), String> {
-    use std::time::Duration;
     let config = configuration(invocation).map_err(|d| d.message)?;
     let endpoint = config
         .all_endpoints()
@@ -720,15 +719,8 @@ pub(crate) fn fetch_endpoint_models(
         .ok_or_else(|| format!("endpoint `{endpoint_id}` not found in config"))?
         .clone();
     let api_key = credential(&endpoint, &from_env).ok().map(|(k, _)| k);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .user_agent(concat!("arsy/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
     let models = fetch_models_http(
-        &agent,
+        &HttpTransport::default(),
         endpoint.kind.as_str(),
         &endpoint.base_url,
         api_key.as_deref(),
@@ -745,11 +737,9 @@ pub(crate) fn fetch_endpoint_models(
 pub(crate) fn fetch_oauth_preset_models(
     preset: &arsy_kernel::oauth::presets::Preset,
 ) -> Option<Vec<String>> {
-    use std::time::Duration;
     let handle_name = format!("{}.key", preset.id);
     let raw = FileCredentialStore.resolve(&handle_name).ok()?;
     let tokens = serde_json::from_str::<TokenSet>(&raw).ok()?;
-    // Refresh the access token if it has lapsed before trying the fetch.
     let access_token = if tokens.is_expired(oauth::now()) {
         let oauth_client = preset.oauth();
         let refreshed = oauth::refresh(&HttpTransport::default(), &oauth_client, &tokens).ok()?;
@@ -759,15 +749,8 @@ pub(crate) fn fetch_oauth_preset_models(
     } else {
         tokens.access_token
     };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
-        .user_agent(concat!("arsy/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
     fetch_models_http(
-        &agent,
+        &HttpTransport::default(),
         preset.dialect.as_str(),
         preset.base_url,
         Some(&access_token),
@@ -776,109 +759,113 @@ pub(crate) fn fetch_oauth_preset_models(
 
 #[cfg(feature = "tui")]
 fn fetch_models_http(
-    agent: &ureq::Agent,
+    transport: &HttpTransport,
     kind: &str,
     base_url: &str,
     api_key: Option<&str>,
 ) -> Option<Vec<String>> {
+    let bearer = |headers: &mut Vec<(String, String)>| {
+        if let Some(token) = api_key {
+            headers.push(("Authorization".to_owned(), format!("Bearer {token}")));
+        }
+    };
     match kind {
         "anthropic" => {
-            let mut resp = agent
-                .get("https://api.anthropic.com/v1/models")
-                .header("x-api-key", api_key?)
-                .header("anthropic-version", "2023-06-01")
-                .call()
-                .ok()?;
-            let buf = resp.body_mut().read_to_string().ok()?;
-            let body: serde_json::Value = serde_json::from_str(&buf).ok()?;
+            let mut headers = vec![
+                ("x-api-key".to_owned(), api_key?.to_owned()),
+                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+            ];
+            let body = fetch_json(transport.get(
+                "https://api.anthropic.com/v1/models",
+                std::mem::take(&mut headers),
+            ))?;
             extract_ids(&body["data"])
         }
-        // Codex Responses backend: requires client_version param and uses
-        // OAuth bearer, not an API key.
         "openai_responses" => {
             let url = format!(
                 "{}/models?client_version=0.153.0",
                 base_url.trim_end_matches('/')
             );
-            // Required Codex negotiation headers (from codex-rs / oh-my-pi wire constants).
-            let mut req = agent
-                .get(&url)
-                .header("accept", "application/json")
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("originator", "omp")
-                .header("version", "0.153.0");
-            if let Some(token) = api_key {
-                req = req.header("Authorization", &format!("Bearer {token}"));
-            }
-            let mut resp = req.call().ok()?;
-            let buf = resp.body_mut().read_to_string().ok()?;
-            let body: serde_json::Value = serde_json::from_str(&buf).ok()?;
-            // Codex returns `{ "models": [{slug, ...}] }`. Each entry uses
-            // "slug" as the id field (not OpenAI API's "id"). Entries with
-            // visibility "hide"/"hidden" are not shown to users.
+            let mut headers = vec![
+                ("accept".to_owned(), "application/json".to_owned()),
+                (
+                    "OpenAI-Beta".to_owned(),
+                    "responses=experimental".to_owned(),
+                ),
+                ("originator".to_owned(), "omp".to_owned()),
+                ("version".to_owned(), "0.153.0".to_owned()),
+            ];
+            bearer(&mut headers);
+            let body = fetch_json(transport.get(url, headers))?;
             let arr = body.get("models").or_else(|| body.get("data"))?;
             let ids: Vec<String> = arr
                 .as_array()?
                 .iter()
-                .filter(|m| {
-                    let vis = m.get("visibility").and_then(|v| v.as_str()).unwrap_or("");
-                    vis != "hide" && vis != "hidden"
+                .filter(|model| {
+                    !matches!(
+                        model.get("visibility").and_then(|value| value.as_str()),
+                        Some("hide" | "hidden")
+                    )
                 })
-                .filter_map(|m| {
-                    m.get("slug")
-                        .or_else(|| m.get("id"))
-                        .and_then(|v| v.as_str())
+                .filter_map(|model| {
+                    model
+                        .get("slug")
+                        .or_else(|| model.get("id"))
+                        .and_then(|value| value.as_str())
                         .map(str::to_owned)
                 })
                 .collect();
-            if ids.is_empty() {
-                None
-            } else {
-                Some(ids)
-            }
+            (!ids.is_empty()).then_some(ids)
         }
-        // Antigravity (Google Code Assist): POST to a discovery endpoint that
-        // returns the live per-account model catalog, filtered for non-internal.
         "google_code_assist" => {
             let url = format!(
                 "{}/v1internal:fetchAvailableModels",
                 base_url.trim_end_matches('/')
             );
-            let mut req = agent
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", ANTIGRAVITY_USER_AGENT);
-            if let Some(token) = api_key {
-                req = req.header("Authorization", &format!("Bearer {token}"));
-            }
-            let mut resp = req.send(b"{}").ok()?;
-            let buf = resp.body_mut().read_to_string().ok()?;
-            let body: serde_json::Value = serde_json::from_str(&buf).ok()?;
-            let models_obj = body.get("models")?.as_object()?;
-            let mut ids: Vec<String> = models_obj
+            let mut headers = vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("User-Agent".to_owned(), ANTIGRAVITY_USER_AGENT.to_owned()),
+            ];
+            bearer(&mut headers);
+            let body = fetch_json(transport.send(WireRequest {
+                url,
+                headers,
+                body: "{}".to_owned(),
+            }))?;
+            let models = body.get("models")?.as_object()?;
+            let mut ids: Vec<String> = models
                 .iter()
-                .filter(|(_, v)| v.get("isInternal").and_then(|b| b.as_bool()) != Some(true))
-                .map(|(k, _)| k.clone())
+                .filter(|(_, value)| {
+                    value.get("isInternal").and_then(|value| value.as_bool()) != Some(true)
+                })
+                .map(|(id, _)| id.clone())
                 .collect();
             ids.sort();
-            if ids.is_empty() {
-                None
-            } else {
-                Some(ids)
-            }
+            (!ids.is_empty()).then_some(ids)
         }
         _ => {
-            let url = format!("{}/models", base_url.trim_end_matches('/'));
-            let mut req = agent.get(&url);
-            if let Some(key) = api_key {
-                req = req.header("Authorization", &format!("Bearer {key}"));
-            }
-            let mut resp = req.call().ok()?;
-            let buf = resp.body_mut().read_to_string().ok()?;
-            let body: serde_json::Value = serde_json::from_str(&buf).ok()?;
+            let mut headers = Vec::new();
+            bearer(&mut headers);
+            let body = fetch_json(transport.get(
+                format!("{}/models", base_url.trim_end_matches('/')),
+                headers,
+            ))?;
             extract_ids(&body["data"])
         }
     }
+}
+
+#[cfg(feature = "tui")]
+fn fetch_json(
+    response: Result<WireResponse, arsy_kernel::provider::ProviderError>,
+) -> Option<serde_json::Value> {
+    let body = response
+        .ok()?
+        .lines
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .join("\n");
+    serde_json::from_str(&body).ok()
 }
 
 #[cfg(feature = "tui")]
