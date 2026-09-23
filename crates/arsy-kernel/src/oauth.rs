@@ -831,6 +831,7 @@ pub mod presets {
     /// The preset `id` names, if any.
     pub fn get(id: &str) -> Option<&'static Preset> {
         let canonical = match id {
+            "codex" | "openai-codex" | "codex-oauth" => "codex-oauth",
             "antigravity" | "google-antigravity" => "antigravity",
             "claude" | "claude-pro" | "anthropic-oauth" | "claude-oauth" => "claude-oauth",
             other => other,
@@ -851,8 +852,6 @@ pub mod presets {
             label: "OpenAI Codex — sign in with a ChatGPT account",
             dialect: Dialect::OpenaiResponses,
             base_url: "https://chatgpt.com/backend-api/codex",
-            // The live model list is fetched after login and stored on the
-            // synthesized endpoint so `/model` reflects configured providers.
             models: &[],
             build_oauth: || OAuth {
                 authorize_url: "https://auth.openai.com/oauth/authorize".to_owned(),
@@ -883,9 +882,6 @@ pub mod presets {
             label: "Google Antigravity — sign in with a Google account",
             dialect: Dialect::GoogleCodeAssist,
             base_url: "https://daily-cloudcode-pa.googleapis.com",
-            // Model list is fetched automatically after login via
-            // POST /v1internal:fetchAvailableModels and stored on the
-            // synthesized endpoint.
             models: &[],
             build_oauth: || OAuth {
                 authorize_url: "https://accounts.google.com/o/oauth2/auth".to_owned(),
@@ -1352,10 +1348,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_oauth_is_a_builtin_provider_preset() {
-        let preset = presets::get("codex-oauth").expect("Codex OAuth preset");
-        assert_eq!(preset.id, "codex-oauth");
-        assert_eq!(preset.dialect, crate::config::Dialect::OpenaiResponses);
+    fn codex_oauth_preset_resolves_by_its_aliases() {
+        for alias in ["codex", "openai-codex", "codex-oauth"] {
+            let preset = presets::get(alias).expect("Codex OAuth preset");
+            assert_eq!(preset.id, "codex-oauth");
+            assert_eq!(preset.dialect, crate::config::Dialect::OpenaiResponses);
+        }
     }
 
     #[test]
